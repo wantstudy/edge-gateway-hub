@@ -1,0 +1,17 @@
+//! `daemon` — 工业边缘数据汇聚与统一分发网关核心库。
+//!
+//! Wave 1 已落地模块：
+//! - `auth`     机器码指纹（多源锚点 + N-of-M + HMAC-SHA256，task 3）
+//! - `config`   TOML 强类型配置 + notify 热重载（防抖 + 版本号，task 4）
+//! - `logging`  tracing 分级 + JSON 结构化可选 + 按天轮转（task 5）
+//! - `error`    DaemonError / DaemonResult 统一错误与错误码（task 6）
+//!
+//! 规划模块（后续任务逐步填充）：
+//! - `driver`   南向协议驱动 trait（Wave 2 task 8+）
+//! - `pipeline` 数据处理链路（Wave 2b task 15+）
+//! - `north`    北向 MQTT 转发（Wave 3 task 19+）
+
+pub mod auth;
+pub mod config;
+pub mod error;
+pub mod logging;

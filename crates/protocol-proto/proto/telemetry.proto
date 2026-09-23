@@ -1,0 +1,69 @@
+// 北向遥测 Protobuf schema（计划 task 2）。
+//
+// ⚠️ JSON 编码约定（与 task 62 北向双编码器对齐，跨端一致性验收项）：
+//   1. int64 字段（纳秒时间戳 ts、各类 uint64/int64 计数器）在 JSON 中**必须编码为字符串**
+//      —— JSON number 是 IEEE754 double，超出 2^53-1 的整数会静默丢失精度，不可接受；
+//   2. bytes 字段（value、sig）在 JSON 中编码为 base64 字符串；
+//   3. f64 的 NaN / ±Infinity 在 JSON 中编码为 null，数值有效性借 quality 表达；
+//   4. 字段名统一 snake_case，Protobuf 与 JSON 两种编码的语义必须一一对应；
+//   5. quality 枚举在 JSON 中输出英文枚举名（"GOOD"/"UNCERTAIN"/"BAD"/"SIMULATED"），
+//      中文展示由界面层负责，协议层不承载本地化文案。
+
+syntax = "proto3";
+
+package iotdaq.telemetry;
+
+// 消息级授权块（与 task 21 AuthBlock 签名模块对齐：签名对象为业务语义哈希，
+// 禁止直接签 Protobuf 序列化字节）。
+message AuthBlock {
+  // 网关机器码指纹（HMAC-SHA256 hex，见 daemon::auth::machine_id）。
+  string mid = 1;
+  // 单调唯一随机串（防重放）。
+  string nonce = 2;
+  // 签名时刻，Unix 纳秒。JSON: string。
+  int64 ts = 3;
+  // Ed25519 签名。JSON: base64。
+  bytes sig = 4;
+}
+
+// 单个采集点位数据。
+message DataPoint {
+  // 质量码（解码与质量规范见 task 53；JSON 输出英文枚举名）。
+  enum Quality {
+    // proto3 首成员必须为 0；仅作未初始化占位，不用于业务输出。
+    QUALITY_UNSPECIFIED = 0;
+    // 良好。
+    GOOD = 1;
+    // 不确定。
+    UNCERTAIN = 2;
+    // 坏。
+    BAD = 3;
+    // 模拟。
+    SIMULATED = 4;
+  }
+
+  // 南向设备标识。
+  string device_id = 1;
+  // 点位标识（点位表主键）。
+  string point_id = 2;
+  // 采集原始值字节（字节序/类型解码见 task 53）。JSON: base64。
+  bytes value = 3;
+  // 工程单位（如 "°C"、"kPa"）；经单位换算后填写。
+  string unit = 4;
+  // 采集时刻，Unix 纳秒。JSON: string。
+  int64 ts = 5;
+  // 质量码。
+  Quality quality = 6;
+}
+
+// 一批遥测数据（单网关单批次；北向 MQTT payload 的 protobuf 编码体）。
+message TelemetryBatch {
+  // 批内数据点。
+  repeated DataPoint points = 1;
+  // 批次时间戳，Unix 纳秒。JSON: string。
+  int64 ts = 2;
+  // 网关标识（平台侧登记的 gateway id）。
+  string gateway_id = 3;
+  // 消息级授权块（B 档网关侧本地签名；缺失视为未授权，接收侧拒绝）。
+  AuthBlock auth = 4;
+}

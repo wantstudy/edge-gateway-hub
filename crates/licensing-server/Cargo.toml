@@ -1,0 +1,12 @@
+[package]
+name = "licensing-server"
+description = "云端授权服务（激活 / 心跳 / Lease Token 签发 / 激活码生命周期 / 服务端二次校验）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# task 6：LicenseError / LicenseResult 统一错误（主体实现 Wave 6 task 45-46）。
+thiserror = "2"

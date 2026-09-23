@@ -1,0 +1,29 @@
+[package]
+name = "daemon"
+description = "工业边缘网关核心守护进程库（驱动 / 数据处理 / 缓存 / 北向 MQTT / 授权 / 管理 API）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# task 3 机器码指纹：多源锚点 + N-of-M + HMAC-SHA256（纯 Rust 栈）。
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+# task 4 配置管理：TOML 解析 + notify 热重载（纯 Rust；Windows 侧 notify 走系统 API 声明）。
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+notify = "8"
+
+# task 5 日志：tracing 分级 + JSON 结构化可选 + 按天轮转。
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+[dev-dependencies]
+# 热重载/日志轮转测试用临时目录。
+tempfile = "3"

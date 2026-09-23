@@ -1,0 +1,20 @@
+[package]
+name = "protocol-proto"
+description = "北向遥测 Protobuf schema 与生成代码（TelemetryBatch / DataPoint / AuthBlock）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# 方案 a：.proto 为唯一 schema 源，prost 生成消息类型（纯 Rust 编解码）。
+prost = "0.13"
+
+[build-dependencies]
+# protoc 走 vendored 二进制，构建机无需安装 protoc。
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+hex = "0.4"
