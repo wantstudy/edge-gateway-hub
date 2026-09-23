@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/daemon",
+    "crates/licensing-server",
+    "crates/protocol-proto",
+]
+# 以下目录为后续 Wave 的成员/资产占位，当前阶段（Wave 1）不参与 Cargo 构建：
+# - tauri-shell/   Windows Tauri 桌面壳（task 32 / 打包 task 38）
+# - headless/      Linux headless 服务，容器镜像运行体（task 33）
+# - web-console/   网关侧 Vue 3 管理界面（task 27）
+# - admin-console/ 厂商总管理后台（task 47）
+# - ui-kit/        两端共用前端基础包（task 27）
+# - deploy/        容器与部署资产目录，非 Cargo 成员（task 60）
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "LicenseRef-Proprietary"
+authors = ["iot-daq team"]
+
+[workspace.dependencies]
+# 共享依赖随 Wave 1 后续任务（task 2-6）按需登记。
+# 硬约束：纯 Rust 依赖栈，禁止引入 C 编译依赖（rusqlite / openssl-sys 等）。
+
+# Tier-1 防逆向基线（设计定稿口径）：release 产物 strip + LTO + panic=abort。
+# 注意：panic=abort 仅作用于 release 产物；cargo test 默认走 dev profile 不受影响。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

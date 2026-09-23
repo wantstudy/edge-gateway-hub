@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 交付形态仅覆盖 Windows（Tauri 桌面）与 Linux（headless/Docker）。
+        # 设计定稿明确不引入 macos-latest（浪费 CI 配额且增加无关失败面）。
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Test workspace（CI 门禁）
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # 后续 Wave 接入说明（本阶段不建，避免空跑）：
+  # - Wave 5 task 38：Tauri 桌面打包（tauri-action，NSIS/MSI），仅在 tag/手动触发时执行；
+  # - Wave 5 task 60：Docker 多架构镜像构建（linux/amd64 + linux/arm64）+ cosign 签名。

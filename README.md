@@ -1,0 +1,42 @@
+# iot-daq — 工业边缘数据汇聚与统一分发网关
+
+跨平台（Windows Tauri 桌面 + Linux headless/Docker）工业边缘网关：南向采集 Modbus / OPC UA / S7 / MC / HTTP / 第三方 MQTT，北向经 MQTT 统一分发（protobuf 默认 / json 可选）。授权体系：云端 Lease Token（Ed25519）+ 消息级 AuthBlock 二次校验 + 7 天离线宽限。
+
+> 设计基线见 `docs/design/`（授权与防破解、一机一码、激活码生命周期、容器化、两端界面）；任务计划见 `.omo/plans/iot-daq-gateway.md`。
+
+## 仓库结构
+
+| 目录 | 说明 | 状态 |
+|---|---|---|
+| `crates/daemon` | 核心守护进程库（驱动 + 处理 + 缓存 + MQTT + 授权 + 管理 API） | Wave 1 骨架 |
+| `crates/licensing-server` | 云授权服务（激活 / 心跳 / Token 签发 / 激活码生命周期） | Wave 1 骨架 |
+| `crates/protocol-proto` | 北向 Protobuf schema（TelemetryBatch / DataPoint / AuthBlock） | Wave 1 骨架 |
+| `tauri-shell/` | Windows Tauri 桌面壳（含安装包签名与防篡改） | 占位（task 32/38） |
+| `headless/` | Linux headless 服务（AppImage/deb/rpm + systemd，容器运行体） | 占位（task 33） |
+| `web-console/` | 网关侧 Vue 3 管理界面（Arco Design Vue） | 占位（task 27） |
+| `admin-console/` | 厂商总管理后台（激活码 / 设备 / 租户管理） | 占位（task 47） |
+| `ui-kit/` | 两端共用前端基础包（设计 token + 共享业务组件） | 占位（task 27） |
+| `deploy/` | 容器与部署资产（Dockerfile / compose / 离线包，非 Cargo 成员） | 占位（task 60） |
+| `docs/design/` | Wave 0 定稿设计图与界面设计 | 已入库 |
+
+## 构建与测试
+
+```bash
+cargo build --workspace   # 构建全部 Rust 成员
+cargo test --workspace    # CI 门禁（task 7 起）
+```
+
+> **windows-gnu 工具链注意**：本机使用 `stable-x86_64-pc-windows-gnu`，构建命令统一使用前缀
+> `PATH="/d/rust/cargo/bin:/d/rust/mingw64/bin:$PATH"`（winlibs mingw-w64 独立发行版：
+> gcc 16.2 + binutils 2.47，提供 rustc raw-dylib 链接所需的 dlltool + as；后续 Wave 2b 的
+> C 依赖如 rusqlite bundled 也依赖 mingw gcc）。**顺序红线**：mingw64/bin 必须在 rustup
+> self-contained 目录之前（或直接省略 self-contained）——否则 self-contained 的 ld 与
+> mingw gcc 不匹配，报 `cannot find -lmsvcrt`。新增依赖时仍需确认
+> 纯 Rust 约束与 `cargo deny`（Wave 7 起）。
+
+## 约束
+
+- **平台矩阵**：CI 仅 `windows-latest` / `ubuntu-latest` 双平台，不含 macOS。
+- **纯 Rust 依赖栈**：当前阶段禁止引入 C 编译依赖（rusqlite / openssl-sys 等）。
+- **安全红线**：仓库内不提交任何激活码 / 私钥 / 真实机器码；release 产物按 Tier-1 基线 strip + LTO + panic=abort。
+- **JSON 编码约定**：纳秒时间戳 / uint64 计数器在 JSON 路径必须字符串编码（`int64` → string），见 `crates/protocol-proto`。

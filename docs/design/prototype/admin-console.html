@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IoT-DAQ 授权管理后台 · 界面原型</title>
+<style>
+:root{
+  --brand:#1F6FEB;--brand-hover:#3B82F6;--brand-subtle:#E8F1FE;
+  --text-1:#1D2129;--text-2:#4E5969;--text-3:#86909C;
+  --border:#E5E6EB;--divider:#F2F3F5;--bg-app:#F7F8FA;--bg-card:#FFF;--bg-hover:#F7F8FA;
+  --ok:#00A870;--warn:#FF7D00;--danger:#F53F3F;--info:#1F6FEB;--unknown:#86909C;
+  --ok-bg:#E8FFEA;--warn-bg:#FFF7E8;--danger-bg:#FFECE8;--info-bg:#E8F1FE;--unknown-bg:#F2F3F5;
+  --radius:8px;--radius-sm:4px;--shadow:0 4px 16px rgba(29,33,41,.08);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;font-size:14px;line-height:1.6;color:var(--text-1);background:var(--bg-app);-webkit-font-smoothing:antialiased}
+.mono,.kpi-val,td.mono{font-family:"Cascadia Mono",Consolas,monospace;font-variant-numeric:tabular-nums}
+.app{display:flex;flex-direction:column;height:100vh}
+.topbar{height:56px;flex:0 0 56px;display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--bg-card);border-bottom:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:15px;white-space:nowrap}
+.logo{width:26px;height:26px;border-radius:6px;background:#7C3AED;color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
+.spacer{flex:1}
+.topbar .mini{font-size:12px;color:var(--text-3)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:1px solid transparent}
+.pill.warn{background:var(--warn-bg);color:#8A4B00;border-color:#FFE0B2}
+.pill.ok{background:var(--ok-bg);color:#0A6B47;border-color:#B5F0CE}
+.pill.plain{background:#fff;color:var(--text-2);border-color:var(--border)}
+.avatar{width:30px;height:30px;border-radius:50%;background:#F3E8FF;color:#7C3AED;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600}
+.body{display:flex;flex:1;min-height:0}
+.sidebar{width:236px;flex:0 0 236px;background:var(--bg-card);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto}
+.nav-group-title{padding:14px 16px 6px;font-size:11px;letter-spacing:.08em;color:var(--text-3)}
+.nav-item{display:flex;align-items:center;gap:10px;padding:8px 16px;cursor:pointer;color:var(--text-2);font-size:13px;border-left:3px solid transparent}
+.nav-item:hover{background:var(--bg-hover)}
+.nav-item.on{background:var(--brand-subtle);color:var(--brand);border-left-color:var(--brand);font-weight:600}
+.nav-item .badge{margin-left:auto;background:var(--danger);color:#fff;font-size:11px;border-radius:999px;padding:0 6px;line-height:16px}
+.nav-item .badge.warn{background:var(--warn)}
+.sidebar-foot{margin-top:auto;padding:12px 16px;border-top:1px solid var(--divider);font-size:11px;color:var(--text-3);line-height:1.7}
+.main{flex:1;min-width:0;overflow-y:auto;padding-bottom:40px}
+.page-head{background:var(--bg-card);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:flex-start;gap:16px}
+.page-head h1{margin:0;font-size:20px;font-weight:600}
+.page-head .desc{margin:4px 0 0;font-size:12px;color:var(--text-3);max-width:900px}
+.page-head .ops{margin-left:auto;display:flex;gap:8px;flex:0 0 auto}
+.crumb{font-size:12px;color:var(--text-3);margin-bottom:6px}
+.content{padding:16px 24px;display:flex;flex-direction:column;gap:16px;max-width:1560px}
+.banner{display:flex;gap:12px;align-items:flex-start;padding:12px 16px;border-radius:var(--radius);border:1px solid;font-size:13px}
+.banner.warn{background:var(--warn-bg);border-color:#FFE0B2;color:#6B3B00}
+.banner.danger{background:var(--danger-bg);border-color:#FFCDC5;color:#7A1418}
+.banner.info{background:var(--info-bg);border-color:#C6DDFB;color:#123C86}
+.banner.ok{background:var(--ok-bg);border-color:#B5F0CE;color:#0A5C3D}
+.banner .bops{margin-left:auto;display:flex;gap:8px;flex:0 0 auto;align-items:center}
+.btn{font-family:inherit;font-size:13px;padding:6px 14px;min-height:32px;border-radius:var(--radius-sm);border:1px solid var(--border);background:#fff;color:var(--text-1);cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:#C9CDD4;background:var(--bg-hover)}
+.btn.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+.btn.primary:hover{background:var(--brand-hover)}
+.btn.danger{background:var(--danger);border-color:var(--danger);color:#fff}
+.btn.sm{padding:3px 10px;min-height:26px;font-size:12px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius)}
+.card-head{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--divider)}
+.card-head h3{margin:0;font-size:15px;font-weight:600}
+.card-head .sub{font-size:12px;color:var(--text-3)}
+.card-head .ops{margin-left:auto;display:flex;gap:8px}
+.card-body{padding:16px}
+.grid{display:grid;gap:16px}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.g-2-1{grid-template-columns:minmax(0,2fr) minmax(0,1fr)}
+.g-1-2{grid-template-columns:minmax(0,1fr) minmax(0,2fr)}
+@media(max-width:1280px){.g4{grid-template-columns:repeat(2,minmax(0,1fr))}.g3,.g2,.g-2-1,.g-1-2{grid-template-columns:1fr}}
+.kpi{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+.kpi .lbl{font-size:12px;color:var(--text-3)}
+.kpi-val{font-size:26px;font-weight:600;line-height:1.3;display:flex;align-items:baseline;gap:4px}
+.kpi-val .unit{font-size:12px;font-weight:400;color:var(--text-3)}
+.kpi .sub{font-size:12px;color:var(--text-3)}
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:500;color:var(--text-2);background:#FAFBFC;padding:9px 12px;border-bottom:1px solid var(--border);white-space:nowrap;font-size:12px}
+td{padding:9px 12px;border-bottom:1px solid var(--divider)}
+tbody tr:hover{background:var(--bg-hover)}
+tbody tr:last-child td{border-bottom:0}
+td.right,th.right{text-align:right}
+.row-warn td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
+.row-danger td:first-child{box-shadow:inset 3px 0 0 var(--danger)}
+.tag{display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:999px;font-size:12px;line-height:18px;border:1px solid}
+.tag.ok{background:var(--ok-bg);color:#0A6B47;border-color:#B5F0CE}
+.tag.warn{background:var(--warn-bg);color:#8A4B00;border-color:#FFE0B2}
+.tag.danger{background:var(--danger-bg);color:#A8171B;border-color:#FFCDC5}
+.tag.info{background:var(--info-bg);color:#12489C;border-color:#C6DDFB}
+.tag.unknown{background:var(--unknown-bg);color:#5A6069;border-color:var(--border)}
+.kv{display:grid;grid-template-columns:150px 1fr;gap:9px 16px;font-size:13px;margin:0}
+.kv dt{color:var(--text-3);font-size:12px}
+.kv dd{margin:0}
+.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 16px}
+.fld{display:flex;flex-direction:column;gap:5px}
+.fld.full{grid-column:1/-1}
+.fld label{font-size:12px;color:var(--text-2)}
+.fld .req{color:var(--danger)}
+.fld .hint{font-size:11px;color:var(--text-3);line-height:1.5}
+.fld input,.fld select,.fld textarea{width:100%;font-family:inherit;font-size:13px;color:var(--text-1);background:#fff;border:1px solid var(--border);border-radius:var(--radius-sm);padding:5px 8px;min-height:32px}
+.radio-row{display:flex;flex-direction:column;gap:8px}
+.radio{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;cursor:pointer}
+.radio.on{border-color:var(--brand);background:var(--brand-subtle)}
+.rdo{width:14px;height:14px;border-radius:50%;border:1px solid #C9CDD4;flex:0 0 14px;margin-top:3px;background:#fff}
+.radio.on .rdo{border-color:var(--brand);border-width:4px}
+.radio .rt{font-size:13px;font-weight:500}
+.radio .rd{font-size:12px;color:var(--text-3)}
+.switch{width:34px;height:18px;border-radius:999px;background:#C9CDD4;position:relative;flex:0 0 34px}
+.switch.on{background:var(--brand)}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff}
+.switch.on::after{left:18px}
+.timeline{position:relative;padding-left:20px}
+.timeline::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:1px;background:var(--border)}
+.tl-item{position:relative;padding-bottom:16px}
+.tl-item:last-child{padding-bottom:0}
+.tl-item::before{content:"";position:absolute;left:-19px;top:5px;width:9px;height:9px;border-radius:50%;background:#fff;border:2px solid var(--border)}
+.tl-item.ok::before{border-color:var(--ok);background:var(--ok)}
+.tl-item.warn::before{border-color:var(--warn)}.tl-item.danger::before{border-color:var(--danger)}
+.tl-t{font-size:12px;color:var(--text-3);font-family:Consolas,monospace}
+.tl-h{font-size:13px;font-weight:600}
+.tl-d{font-size:12px;color:var(--text-2)}
+.bar-track{height:8px;border-radius:999px;background:var(--divider);overflow:hidden}
+.bar-fill{height:100%;border-radius:999px;background:var(--brand)}
+.bar-fill.ok{background:var(--ok)}.bar-fill.warn{background:var(--warn)}.bar-fill.danger{background:var(--danger)}
+.list-item{display:flex;gap:12px;align-items:flex-start;padding:11px 0;border-bottom:1px solid var(--divider)}
+.list-item:last-child{border-bottom:0}
+.li-h{font-size:13px;font-weight:600}.li-d{font-size:12px;color:var(--text-3)}
+.li-ops{margin-left:auto;display:flex;gap:8px}
+.note{font-size:12px;color:var(--text-3);line-height:1.6;display:flex;gap:8px}
+.note .ni{color:var(--info)}
+.coverage{display:grid;grid-template-columns:repeat(24,1fr);gap:3px}
+.cov{height:22px;border-radius:3px;background:var(--ok-bg);border:1px solid #B5F0CE}
+.cov.gap{background:var(--danger-bg);border-color:#FFCDC5}
+.cov.miss{background:var(--unknown-bg);border-color:var(--border)}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--text-3);flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.hint-strip{font-size:12px;color:var(--text-3);background:var(--bg-app);border-radius:var(--radius-sm);padding:8px 12px}
+.mask{position:fixed;inset:0;background:rgba(29,33,41,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:24px}
+.modal{background:#fff;border-radius:var(--radius);box-shadow:var(--shadow);width:640px;max-width:100%;max-height:88vh;display:flex;flex-direction:column}
+.modal-head{padding:16px 20px;border-bottom:1px solid var(--divider)}
+.modal-head h3{margin:0;font-size:16px}
+.modal-body{padding:20px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+.modal-foot{padding:14px 20px;border-top:1px solid var(--divider);display:flex;justify-content:flex-end;gap:8px}
+.impact{background:var(--danger-bg);border:1px solid #FFCDC5;border-radius:var(--radius-sm);padding:12px 14px;font-size:13px;color:#7A1418}
+.impact ul{margin:6px 0 0;padding-left:18px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="modal-root"></div>
+<script>
+"use strict";
+var state = { page: "ad-overview", role: "admin" };
+var ROLE_LABEL = { admin: "管理员 admin", ops: "运营 ops", viewer: "只读 viewer" };
+
+function tag(t, tone){ return '<span class="tag ' + (tone||"unknown") + '">' + t + "</span>"; }
+function fmtNum(v){ if(v>=1000) return (v/1000).toFixed(1)+"k"; if(v>=10) return Math.round(v)+""; return (Math.round(v*10)/10)+""; }
+
+function barChart(series, labels, h){
+  h = h || 150; var w = 620, p = {l:40,r:12,t:14,b:24};
+  var all = []; series.forEach(function(s){ s.data.forEach(function(v){ all.push(v); }); });
+  var max = (Math.max.apply(null, all) * 1.15) || 1;
+  var iw = w-p.l-p.r, ih = h-p.t-p.b, n = labels.length, gw = iw/n, bw = Math.max(2, gw*0.7/series.length);
+  var s = '<svg viewBox="0 0 '+w+' '+h+'" style="width:100%;height:'+h+'px" preserveAspectRatio="none">';
+  for(var g=0; g<=3; g++){ var y = p.t+ih*g/3;
+    s += '<line x1="'+p.l+'" y1="'+y+'" x2="'+(w-p.r)+'" y2="'+y+'" stroke="#F2F3F5"/>';
+    s += '<text x="'+(p.l-6)+'" y="'+(y+4)+'" text-anchor="end" font-size="10" fill="#86909C">'+fmtNum(max*(1-g/3))+'</text>'; }
+  labels.forEach(function(lb,i){
+    var gx = p.l + i*gw + gw*0.15;
+    series.forEach(function(se,si){
+      var v = se.data[i]||0, bh = (v/max)*ih;
+      var fill = (se.missFlag && se.missFlag[i]) ? "#F53F3F" : se.color;
+      s += '<rect x="'+(gx+si*bw).toFixed(1)+'" y="'+(p.t+ih-bh).toFixed(1)+'" width="'+(bw-1).toFixed(1)+'" height="'+bh.toFixed(1)+'" rx="2" fill="'+fill+'"/>';
+    });
+    if(i % Math.ceil(n/8) === 0) s += '<text x="'+(p.l+i*gw+gw/2)+'" y="'+(h-6)+'" text-anchor="middle" font-size="10" fill="#86909C">'+lb+'</text>';
+  });
+  return s + "</svg>";
+}
+
+function btn(a){
+  var cls = "btn" + (a.kind?" "+a.kind:"") + (a.sm?" sm":"");
+  var click = a.modal ? ' onclick=\'openModal(' + JSON.stringify(a.modal) + ')\'' : "";
+  return '<button class="'+cls+'"'+(a.disabled?" disabled":"")+click+">"+a.label+"</button>";
+}
+function renderBlocks(list){ return list.map(renderBlock).join(""); }
+function renderBlock(b){
+  if(typeof b === "string") return b;
+  switch(b.type){
+    case "banner":
+      return '<div class="banner '+(b.kind||"info")+'"><div><b>'+b.title+'</b>'+(b.text?"<br>"+b.text:"")+'</div>'+
+        (b.actions?'<div class="bops">'+b.actions.map(btn).join("")+'</div>':"")+'</div>';
+    case "kpis":
+      return '<div class="grid g4">'+b.items.map(function(k){
+        return '<div class="kpi"><div class="lbl">'+k.label+'</div><div class="kpi-val '+(k.tone||"")+'">'+k.value+
+          (k.unit?'<span class="unit">'+k.unit+'</span>':"")+'</div><div class="sub">'+(k.sub||"")+'</div></div>'; }).join("")+'</div>';
+    case "grid":
+      return '<div class="grid '+(b.cls||"g2")+'">'+b.blocks.map(renderBlock).join("")+'</div>';
+    case "card":
+      return '<div class="card">'+(b.title?'<div class="card-head"><h3>'+b.title+'</h3>'+
+        (b.sub?'<span class="sub">'+b.sub+'</span>':"")+(b.actions?'<div class="ops">'+b.actions.map(btn).join("")+'</div>':"")+'</div>':"")+
+        '<div class="card-body">'+b.blocks.map(renderBlock).join("")+'</div></div>';
+    case "table":
+      return '<div class="tbl-wrap"><table><thead><tr>'+b.columns.map(function(c){
+          return '<th class="'+(c.align||"")+'">'+c.label+'</th>'; }).join("")+
+        (b.rowActions?'<th class="right">操作</th>':"")+'</tr></thead><tbody>'+
+        b.rows.map(function(r){
+          return '<tr class="'+(r.cls||"")+'">'+b.columns.map(function(c){
+            return '<td class="'+(c.align||"")+(c.mono?" mono":"")+'">'+(r[c.k]===undefined?"":r[c.k])+'</td>'; }).join("")+
+            (b.rowActions?'<td class="right">'+(r._ops||"")+'</td>':"")+'</tr>'; }).join("")+
+        '</tbody></table>'+(b.foot?'<div style="padding:10px 12px;font-size:12px;color:var(--text-3);border-top:1px solid var(--divider)">'+b.foot+'</div>':"")+'</div>';
+    case "fields":
+      return '<div class="fields">'+b.items.map(function(f){
+        var inner;
+        if(f.type==="select") inner = "<select>"+f.options.map(function(o){ return "<option"+(o===f.value?" selected":"")+">"+o+"</option>"; }).join("")+"</select>";
+        else if(f.type==="textarea") inner = "<textarea rows='"+(f.rows||3)+"' placeholder='"+(f.placeholder||"")+"'>"+(f.value||"")+"</textarea>";
+        else if(f.type==="switch") inner = '<div style="display:flex;align-items:center;gap:8px"><span class="switch'+(f.value?" on":"")+'"></span><span style="font-size:12px;color:var(--text-3)">'+(f.value?"已启用":"已关闭")+'</span></div>';
+        else if(f.type==="radio") inner = '<div class="radio-row">'+f.options.map(function(o){
+          var on = o.value===f.value;
+          return '<div class="radio'+(on?" on":"")+'"><span class="rdo"></span><div><div class="rt">'+o.label+'</div>'+(o.desc?'<div class="rd">'+o.desc+'</div>':"")+'</div></div>'; }).join("")+"</div>";
+        else inner = '<input type="text" value="'+(f.value||"")+'" placeholder="'+(f.placeholder||"")+'">';
+        return '<div class="fld'+((f.full||f.type==="radio"||f.type==="textarea")?" full":"")+'"><label>'+f.label+(f.req?' <span class="req">*</span>':"")+'</label>'+inner+
+          (f.hint?'<div class="hint">'+f.hint+'</div>':"")+'</div>'; }).join("")+"</div>"+
+        (b.footer?'<div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">'+b.footer.map(btn).join("")+'</div>':"");
+    case "kv":
+      return '<dl class="kv">'+b.items.map(function(i){ return "<dt>"+i.k+"</dt><dd"+(i.mono?' class="mono"':"")+">"+i.v+"</dd>"; }).join("")+"</dl>";
+    case "timeline":
+      return '<div class="timeline">'+b.items.map(function(i){
+        return '<div class="tl-item '+(i.tone||"")+'"><div class="tl-t">'+i.time+'</div><div class="tl-h">'+i.title+'</div>'+(i.desc?'<div class="tl-d">'+i.desc+'</div>':"")+'</div>'; }).join("")+'</div>';
+    case "list":
+      return '<div>'+b.items.map(function(i){
+        return '<div class="list-item"><div><div class="li-h">'+i.title+'</div>'+(i.desc?'<div class="li-d">'+i.desc+'</div>':"")+'</div>'+
+          (i.actions?'<div class="li-ops">'+i.actions.map(btn).join("")+'</div>':"")+'</div>'; }).join("")+'</div>';
+    case "progress":
+      return '<div style="display:flex;flex-direction:column;gap:12px">'+b.items.map(function(i){
+        var pct = Math.min(100, Math.round(i.value/i.max*100));
+        var tone = i.tone || (pct>90?"danger":pct>70?"warn":"ok");
+        return '<div><div style="display:flex;gap:10px;font-size:12px;margin-bottom:5px"><span style="color:var(--text-2)">'+i.label+'</span>'+
+          '<span style="margin-left:auto;color:var(--text-3)">'+i.note+'</span></div><div class="bar-track"><div class="bar-fill '+tone+'" style="width:'+pct+'%"></div></div></div>'; }).join("")+'</div>';
+    case "coverage":
+      var cells = "";
+      for(var i=0;i<b.total;i++){
+        var k = b.gaps.indexOf(i+1)>=0 ? " gap" : ((b.missing && b.missing.indexOf(i+1)>=0) ? " miss" : "");
+        cells += '<div class="cov'+k+'" title="区间 #'+(i+1)+'"></div>';
+      }
+      return '<div>'+(b.title?'<div style="font-size:13px;font-weight:600;margin-bottom:8px">'+b.title+'</div>':"")+
+        '<div class="coverage">'+cells+'</div>'+
+        '<div class="legend" style="margin-top:10px"><span><i style="background:#E8FFEA;border:1px solid #B5F0CE"></i>回执正常</span>'+
+        '<span><i style="background:#FFECE8;border:1px solid #FFCDC5"></i>序号跳空</span>'+
+        '<span><i style="background:#F2F3F5;border:1px solid var(--border)"></i>缺失</span></div>'+
+        (b.note?'<div class="note" style="margin-top:10px"><span class="ni">ⓘ</span><div>'+b.note+'</div></div>':"")+'</div>';
+    case "note":
+      return '<div class="note"><span class="ni">ⓘ</span><div>'+b.text+'</div></div>';
+    case "hint":
+      return '<div class="hint-strip">'+b.text+'</div>';
+    case "impact":
+      return '<div class="impact">'+b.text+'</div>';
+    case "chart":
+      return '<div>'+(b.title?'<div style="font-size:13px;font-weight:600;margin-bottom:8px">'+b.title+'</div>':"")+
+        barChart(b.series,b.labels,b.h)+
+        '<div class="legend" style="margin-top:8px">'+b.series.map(function(s){ return '<span><i style="background:'+s.color+'"></i>'+s.name+'</span>'; }).join("")+'</div></div>';
+    default: return "";
+  }
+}
+function openModal(spec){
+  document.getElementById("modal-root").innerHTML =
+    '<div class="mask" onclick="if(event.target===this)closeModal()"><div class="modal">'+
+    '<div class="modal-head"><h3>'+(spec.danger?"⚠ ":"")+spec.title+'</h3></div>'+
+    '<div class="modal-body">'+renderBlocks(spec.blocks)+'</div>'+
+    '<div class="modal-foot">'+(spec.cancel===false?"":'<button class="btn" onclick="closeModal()">'+(spec.cancelLabel||"取消")+'</button>')+
+    '<button class="btn '+(spec.danger?"danger":"primary")+'" onclick="closeModal()">'+spec.confirm+'</button></div></div></div>';
+}
+function closeModal(){ document.getElementById("modal-root").innerHTML = ""; }
+function setRole(r){ state.role = r; if(!PAGES[state.page] || PAGES[state.page].roles.indexOf(r)<0) state.page = firstAllowed(r); render(); }
+function go(p){ state.page = p; closeModal(); render(); }
+function firstAllowed(r){
+  var ids = Object.keys(PAGES);
+  for(var i=0;i<ids.length;i++){ if(PAGES[ids[i]].roles.indexOf(r)>=0) return ids[i]; }
+  return ids[0];
+}
+
+var ROWS_OPS = '<button class="btn sm">详情</button>';
+
+var PAGES = {
+  "ad-overview": { title:"总览", group:"运营", roles:["admin","ops","viewer"], crumb:"运营 / 总览", ops:[{label:"导出日报"}],
+    blocks:[
+      {type:"banner", kind:"warn", title:"待处理：3 台设备回执跳空 · 1 台超 24h 无回执 · 2 张激活码在宽限期 · kid-2026Q3 将在 14 天后到期",
+        actions:[{label:"去处理", kind:"primary"},{label:"密钥轮换"}]},
+      {type:"kpis", items:[
+        {label:"租户", value:"38", sub:"本月新增 3"},
+        {label:"已授权设备", value:"412", sub:"本月新激活 46"},
+        {label:"试用中", value:"27", sub:"7 天内到期 9"},
+        {label:"在线设备", value:"386<span style='font-size:14px;color:var(--text-3)'>/412</span>", sub:"离线 26"}]},
+      {type:"grid", cls:"g-2-1", blocks:[
+        {type:"card", title:"激活趋势（近 30 天）", sub:"发放 / 绑定 / 废弃",
+          blocks:[{type:"chart", kind:"bars", h:170,
+            labels:["08-25","08-28","08-31","09-03","09-06","09-09","09-12","09-15","09-18","09-21","09-23"],
+            series:[{name:"发放", color:"#1F6FEB", data:[12,8,15,11,9,18,22,14,17,12,9]},
+                    {name:"绑定", color:"#00A870", data:[10,7,14,10,8,16,20,13,15,11,8]},
+                    {name:"废弃", color:"#F53F3F", data:[1,0,2,1,1,0,3,1,2,1,1]}]}]},
+        {type:"card", title:"回执健康度", sub:"B 档唯一在线证据", blocks:[
+          {type:"kv", items:[
+            {k:"正常", v:tag("398 台","ok")},
+            {k:"序号跳空", v:tag("3 台","warn")},
+            {k:"回执缺失 >24h", v:tag("1 台","danger")},
+            {k:"签名无效", v:tag("0 台","ok")}]},
+          {type:"note", text:"B 档下厂商不接收业务数据，回执是唯一在线证据。<b>回执异常不等于破解</b>，须由客服核实后再判定。"}]}]},
+      {type:"card", title:"待处理", blocks:[{type:"list", items:[
+        {title:"换机工单 待处理 4 单", desc:"平均处理时长 2.1h · 最长等待 6.4h（华南包装）", actions:[{label:"去处理", kind:"primary"}]},
+        {title:"回执异常 待核查 4 台", desc:"跳空 3 · 缺失 1", actions:[{label:"去核查"}]},
+        {title:"密钥需求", desc:"kid-2026Q3 计划退役 2026-10-01；存量 v0.9.x 客户端 26 台仍内置旧公钥集", actions:[{label:"轮换"}]}]}]}
+    ]},
+
+  "ad-codes": { title:"激活码管理", group:"授权运营", roles:["admin","ops"], crumb:"授权运营 / 激活码管理",
+    ops:[{label:"导出 CSV"},{label:"发放激活码", kind:"primary", modal:{title:"发放激活码", blocks:[
+      {type:"fields", items:[
+        {label:"租户", type:"select", options:["华中智造集团","华南包装","西南制药","（新租户…）"], req:true},
+        {label:"tier", type:"select", options:["专业版","免费版"], value:"专业版"},
+        {label:"有效期", type:"select", options:["12 个月","24 个月","自定义"], value:"12 个月"},
+        {label:"数量", value:"1"},
+        {label:"预绑定机器码（可选）", value:"", full:true, placeholder:"C1D2-4E5F-6A7B-8C9D", hint:"填写后该码只能在此机器激活；留空则首次激活时绑定"},
+        {label:"备注", type:"textarea", full:true, placeholder:"合同号 / 订单号 / 说明"}]},
+      {type:"note", text:"激活码明文仅在生成后展示一次，后续查看需权限并记录审计。"}],
+      confirm:"生成激活码"}}],
+    blocks:[
+      {type:"hint", text:"筛选：状态[全部] · 租户[全部] · tier[全部] · 有效期[全部] · 时间[近 30 天]　　搜索：激活码 / 机器码摘要 / 客户名称"},
+      {type:"card", title:"激活码列表", sub:"共 143 条",
+        blocks:[{type:"table", columns:[
+            {k:"code",label:"激活码",mono:true},{k:"st",label:"状态"},{k:"tnt",label:"租户"},
+            {k:"dev",label:"绑定设备",mono:true},{k:"tier",label:"tier"},{k:"exp",label:"有效期",mono:true},{k:"trace",label:"溯源"}],
+          rows:[
+            {code:"IOT-2026-8C3F-…-A1", st:tag("已绑定","ok"), tnt:"华中智造集团", dev:"6f2a…c1（线1-网关-01）", tier:"专业版", exp:"2027-09-23", trace:"—"},
+            {code:"IOT-2026-8C3F-…-B7", st:tag("已发放","info"), tnt:"华中智造集团", dev:"—", tier:"专业版", exp:"2027-09-23", trace:"—"},
+            {code:"IOT-2025-1D90-…-3K", st:tag("已废弃","danger"), tnt:"华南包装", dev:"原 a19c…41", tier:"专业版", exp:"—", trace:"→ Q4"},
+            {code:"IOT-2026-77A2-…-Q4", st:tag("已重发","warn"), tnt:"华南包装", dev:"新 b83d…92", tier:"专业版", exp:"2027-06-30", trace:"← 3K"},
+            {code:"IOT-2026-3F19-…-M2", st:tag("试用中","warn"), tnt:"西南制药", dev:"c7e1…0a", tier:"免费版", exp:"试用剩 2 天", trace:"—"}],
+          rowActions:true, foot:"分页 1/12 · 排序：有效期升序 · 行内操作：详情 / 作废 / 废弃 / 重发"}]},
+      {type:"card", title:"三种操作的区别（客服必读）", blocks:[{type:"list", items:[
+        {title:"作废（仅未绑定）", desc:"仅使该码不可用，不影响任何在网设备"},
+        {title:"废弃（已绑定）", desc:"原设备将在下次心跳（≤24h）后立即停止北向转发，本地采集继续；不可撤销"},
+        {title:"重发", desc:"生成新码并建立 reissued_from 溯源链；可预绑定新机器码，或留待客户首次激活时绑定"}]}]}
+    ]},
+
+  "ad-code-detail": { title:"激活码详情", group:"授权运营", roles:["admin","ops"],
+    crumb:"授权运营 / 激活码管理 / IOT-2026-8C3F-…-A1",
+    ops:[{label:"复制激活码"},{label:"废弃激活码", kind:"danger", modal:{
+      title:"废弃激活码 IOT-2026-8C3F-…-A1", danger:true, confirm:"确认废弃",
+      blocks:[
+        {type:"kv", items:[
+          {k:"租户", v:"华中智造集团"},
+          {k:"绑定设备", v:"6f2a…c1（线1-网关-01，native，档位 B）"},
+          {k:"最近心跳", v:"2026-09-23 12:25（6 分钟前）"}]},
+        {type:"impact", text:"影响提示：<ul><li>该设备将在下次心跳（≤24 小时）后<b>立即停止北向转发</b>，本地采集继续。</li><li>客户侧「授权与激活」页将显示授权停用提示，需重新发放新码才能恢复。</li><li>本操作<b>不可撤销</b>。</li></ul>"},
+        {type:"fields", items:[
+          {label:"废弃原因", type:"select", options:["客户更换硬件","设备报废","合同终止","误发放","其他"], req:true},
+          {label:"风险二次确认（输入激活码后 8 位）", value:"", placeholder:"如 8C3F-A1 → 输入 8C3FA1", req:true},
+          {label:"补充说明", type:"textarea", full:true, placeholder:"必填，≥10 字，将记入审计", req:true}]}]}}],
+    blocks:[
+      {type:"grid", cls:"g-1-2", blocks:[
+        {type:"card", title:"基本信息", blocks:[{type:"kv", items:[
+          {k:"激活码", v:"IOT-2026-8C3F-…-A1"},{k:"状态", v:tag("已绑定","ok")},
+          {k:"租户", v:"华中智造集团"},{k:"tier", v:"专业版"},
+          {k:"有效期", v:"2027-09-23"},{k:"来源订单", v:"SO-2026-0912"},
+          {k:"明文查看", v:"已掩码 · 查看需权限且记审计"}]}]},
+        {type:"card", title:"生命周期时间线", blocks:[
+          {type:"timeline", items:[
+            {time:"2026-09-12 10:02", title:"发放", desc:"操作者 李工（ops）· 备注：合同首期 · 有效期 12 个月", tone:"ok"},
+            {time:"2026-09-12 14:31", title:"绑定设备", desc:"6f2a…c1（线1-网关-01，native）· 宿主锚点指纹校验通过", tone:"ok"},
+            {time:"2026-09-23 11:40", title:"废弃", desc:"操作者 李工 · 原因：客户更换硬件 · 补充：主板返修后机器码变化", tone:"danger"},
+            {time:"2026-09-23 11:44", title:"重发", desc:"→ 新码 IOT-2026-77A2-…-Q4（继承 tier 专业版，有效期顺延 12 个月）", tone:"warn"}]}]}]},
+      {type:"card", title:"绑定设备详情", blocks:[
+        {type:"kv", items:[
+          {k:"机器码摘要", v:"6f2a…c1（sha256 前 8 位）", mono:true},
+          {k:"锚点来源", v:"宿主板 UUID · 宿主物理网卡 MAC · 磁盘序列号（HMAC 已签名）"},
+          {k:"部署形态", v:"native"},{k:"客户端版本", v:"v1.0.0 (a91f3c2)"},
+          {k:"校验档位", v:tag("B","info")},{k:"最近心跳", v:"2026-09-23 12:25"},
+          {k:"回执健康", v:tag("近 24h 区间连续，无跳空","ok")},{k:"首次激活", v:"2026-09-12 14:31"}]},
+        {type:"list", items:[{title:"换机记录", desc:"2026-09-23 申请换机：6f2a…c1 → 新机器码 C1D2-4E5F-…-9A0B · 重发 IOT-2026-77A2-…-Q4"}]}]},
+      {type:"note", text:"废弃与重发在同一事务内执行，接口幂等：重复提交同一请求不会产生第二个结果。"}
+    ]},
+
+  "ad-devices": { title:"设备管理", group:"授权运营", roles:["admin","ops"], crumb:"授权运营 / 设备管理", ops:[{label:"导出"}],
+    blocks:[
+      {type:"hint", text:"筛选：租户[全部] · tier[全部] · 档位[A/B/C] · 部署形态[native/docker] · 回执健康[全部/正常/异常] · 在线状态[全部]"},
+      {type:"card", title:"设备列表", sub:"412 台",
+        blocks:[{type:"table", columns:[
+            {k:"mid",label:"机器码摘要",mono:true},{k:"tnt",label:"租户"},{k:"name",label:"设备名"},
+            {k:"tier",label:"tier"},{k:"dep",label:"部署"},{k:"lvl",label:"档位"},{k:"lic",label:"授权"},
+            {k:"hb",label:"最近心跳",mono:true},{k:"rc",label:"回执"}],
+          rows:[
+            {mid:"6f2a…c1", tnt:"华中智造集团", name:"线1-网关-01", tier:"专业版", dep:tag("native","unknown"), lvl:tag("B","info"), lic:tag("已授权","ok"), hb:"12:25", rc:tag("正常","ok")},
+            {cls:"row-warn", mid:"b83d…92", tnt:"华南包装", name:"包装2线-网关", tier:"专业版", dep:tag("docker","info"), lvl:tag("B","info"), lic:tag("已授权","ok"), hb:"12:19", rc:tag("跳空 ×2","warn")},
+            {mid:"c7e1…0a", tnt:"西南制药", name:"制粒车间-网关", tier:"免费版", dep:tag("native","unknown"), lvl:tag("C","unknown"), lic:tag("试用 2 天","warn"), hb:"11:58", rc:tag("无（C 档）","unknown")},
+            {cls:"row-danger", mid:"a19c…41", tnt:"华南包装", name:"包装1线-网关", tier:"专业版", dep:tag("native","unknown"), lvl:tag("B","info"), lic:tag("已废弃","danger"), hb:"昨日 10:02", rc:tag("缺失 26h","danger")},
+            {mid:"3d70…f5", tnt:"华中智造集团", name:"线2-网关-01（容器）", tier:"专业版", dep:tag("docker","info"), lvl:tag("B","info"), lic:tag("已授权","ok"), hb:"12:26", rc:tag("正常","ok")}],
+          rowActions:true, foot:"注意：同一宿主上容器重建不视为换机（宿主锚点指纹一致）"}]}
+    ]},
+
+  "ad-device-detail": { title:"设备详情", group:"授权运营", roles:["admin","ops"],
+    crumb:"授权运营 / 设备管理 / 6f2a…c1",
+    ops:[{label:"标记异常（仅备注）"},{label:"废弃关联激活码", kind:"danger"}],
+    blocks:[
+      {type:"grid", cls:"g-1-2", blocks:[
+        {type:"card", title:"设备信息", blocks:[{type:"kv", items:[
+          {k:"机器码摘要", v:"6f2a…c1", mono:true},{k:"租户", v:"华中智造集团"},
+          {k:"设备名", v:"线1-网关-01"},{k:"tier", v:"专业版"},
+          {k:"校验档位", v:tag("B","info")},{k:"部署形态", v:"native"},
+          {k:"关联激活码", v:"IOT-2026-8C3F-…-A1", mono:true},{k:"授权状态", v:tag("已授权","ok")},
+          {k:"首次激活", v:"2026-09-12 14:31"}]}]},
+        {type:"card", title:"回执连续性（近 24 小时，B 档核心证据）", blocks:[
+          {type:"coverage", total:24, gaps:[9,10], missing:[23],
+            note:"每格为 1 小时的序号区间覆盖：区间 #1204→#1209 跳空（红色），第 23 小时未收到回执（灰色）。<b>回执异常不等于破解</b>，须先核实是否检修 / 断电 / 更换硬件。"},
+          {type:"kv", items:[
+            {k:"最新区间号", v:"#1216", mono:true},{k:"近 24h 条数", v:"1,796,400", mono:true},
+            {k:"摘要哈希", v:"b7c1e9…44a0", mono:true},{k:"回执延迟", v:"平均 42s（允许延迟补报）"}]}]}]},
+      {type:"card", title:"心跳时序（近 7 天）", blocks:[
+        {type:"chart", kind:"bars", h:150,
+          labels:["09-17","09-18","09-19","09-20","09-21","09-22","09-23"],
+          series:[{name:"心跳次数", color:"#1F6FEB", data:[1,1,1,1,0,1,1], missFlag:[false,false,false,false,true,false,false]}]},
+        {type:"note", text:"09-21 缺失一次心跳：客户端在 7 天离线宽限期内仍正常转发（设计如此，属宽限而非故障）。"}]}
+    ]},
+
+  "ad-tenants": { title:"租户与策略", group:"授权运营", roles:["admin"], crumb:"授权运营 / 租户与策略",
+    ops:[{label:"新增租户", kind:"primary"}],
+    blocks:[
+      {type:"card", title:"租户列表", blocks:[{type:"table", columns:[
+          {k:"n",label:"租户"},{k:"dev",label:"设备",align:"right"},{k:"lic",label:"已授权",align:"right"},
+          {k:"lvl",label:"默认档位"},{k:"tier",label:"默认 tier"},{k:"hb",label:"心跳间隔"},
+          {k:"gr",label:"离线宽限"},{k:"rc",label:"回执要求"},{k:"c",label:"联系人"}],
+        rows:[
+          {n:"华中智造集团", dev:"128", lic:"124", lvl:tag("B","info"), tier:"专业版", hb:"24h", gr:"7 天", rc:tag("强制","ok"), c:"张工 138****0000"},
+          {n:"华南包装", dev:"86", lic:"80", lvl:tag("B","info"), tier:"专业版", hb:"24h", gr:"7 天", rc:tag("强制","ok"), c:"李经理 139****1111"},
+          {n:"西南制药", dev:"12", lic:"3", lvl:tag("C","unknown"), tier:"免费版", hb:"12h", gr:"3 天", rc:tag("不要求","unknown"), c:"王主任 137****2222"},
+          {n:"特种材料（大客户）", dev:"46", lic:"46", lvl:tag("A","ok"), tier:"专业版", hb:"1h", gr:"14 天", rc:tag("强制 + 计量","ok"), c:"刘总 136****3333"}],
+        rowActions:true}]},
+      {type:"card", title:"离线运行策略", sub:"租户默认策略（新增租户时继承，可按租户覆盖）· 修改为高影响操作，需二次确认并记审计",
+        blocks:[{type:"fields", items:[
+          {label:"允许离线运行", type:"radio", value:"yes", options:[
+            {value:"yes", label:"允许（推荐）", desc:"心跳超时后在「允许离线时长」内继续北向转发，本地采集不受影响"},
+            {value:"no", label:"不允许", desc:"一旦超过心跳间隔未续租，立即停止北向转发（本地采集保留）"}]},
+          {label:"允许离线时长", type:"select", options:["24 小时","3 天","7 天（默认）","14 天"], value:"7 天（默认）"},
+          {label:"超期动作", type:"select", options:["停北向转发 · 保留本地采集（默认）","停北向转发 · 停止采集"], value:"停北向转发 · 保留本地采集（默认）"}]},
+          {type:"note", text:"允许离线时长即租约宽限期：超期后停止北向转发、保留本地采集，恢复联网并续租成功后自动恢复。关闭「允许离线运行」时时长不生效。策略随 Lease Token 下发，网关本地只读执行，客户端界面不可修改。"}]},
+      {type:"card", title:"校验档位说明", sub:"修改档位为高影响操作，需二次确认并记审计",
+        blocks:[{type:"table", columns:[
+            {k:"l",label:"档位"},{k:"how",label:"校验方式"},{k:"see",label:"厂商可见范围"},{k:"risk",label:"风险"}],
+          rows:[
+            {l:tag("A","ok"), how:"数据经厂商云 /verify：验签 + ±5min 窗口 + 全局 Nonce + 白名单 + 计量", see:"全量业务数据", risk:"客户对数据出网敏感，需单独签约"},
+            {l:tag("B","info"), how:"业务数据直连客户 Broker；网关侧签名 + 单调序号 + 本地去重；上报审计回执", see:"仅回执（序号区间 / 条数 / 摘要哈希，无业务数值）", risk:"无法阻止破解后完全断网静默自用"},
+            {l:tag("C","unknown"), how:"仅租约心跳", see:"仅心跳", risk:"证据最少，仅适合信任关系场景"}]}]}
+    ]},
+
+  "ad-receipts": { title:"回执与异常", group:"风控", roles:["admin","ops","viewer"], crumb:"风控 / 回执与异常", ops:[{label:"导出"}],
+    blocks:[
+      {type:"banner", kind:"info", title:"B 档下厂商不接收业务数据，回执是唯一的在线证据",
+        text:"回执异常 <b>不等于</b> 破解。连续跳空 / 长期缺失应在续约或售后环节核查（运维手册第 4 章）。"},
+      {type:"card", title:"异常列表", blocks:[{type:"table", columns:[
+          {k:"dev",label:"设备",mono:true},{k:"tnt",label:"租户"},{k:"type",label:"异常类型"},
+          {k:"detail",label:"明细",mono:true},{k:"first",label:"首次出现",mono:true},
+          {k:"cnt",label:"次数",align:"right"},{k:"st",label:"处置状态"}],
+        rows:[
+          {cls:"row-danger", dev:"a19c…41", tnt:"华南包装", type:tag("回执缺失","danger"), detail:"超 26h 未上报", first:"昨日 10:02", cnt:"1", st:tag("待核查","warn")},
+          {cls:"row-warn", dev:"b83d…92", tnt:"华南包装", type:tag("序号跳空","warn"), detail:"#1204 → #1209（缺 5 个区间）", first:"08:12", cnt:"2", st:tag("待核查","warn")},
+          {dev:"6f2a…c1", tnt:"华中智造集团", type:tag("序号跳空","warn"), detail:"#0881 → #0883（缺 2 个区间）", first:"09-21 17:40", cnt:"1", st:tag("已核实：客户检修断电","ok")},
+          {dev:"3d70…f5", tnt:"华中智造集团", type:tag("回执延迟","info"), detail:"平均延迟 42s（允许补报）", first:"常态", cnt:"—", st:tag("正常","ok")}],
+        rowActions:true}]}
+    ]},
+
+  "ad-transfers": { title:"换机工单", group:"风控", roles:["admin","ops"], crumb:"风控 / 换机工单", ops:[{label:"筛选：待处理"}],
+    blocks:[
+      {type:"card", title:"待处理工单", sub:"平均处理 2.1h · 目标 ≤3 次点击完成",
+        blocks:[{type:"table", columns:[
+            {k:"id",label:"受理编号",mono:true},{k:"tnt",label:"租户"},{k:"old",label:"原机器码",mono:true},
+            {k:"neu",label:"新机器码",mono:true},{k:"why",label:"原因"},{k:"at",label:"提交时间",mono:true}],
+          rows:[
+            {id:"RV-2026-0923-0118", tnt:"华南包装", old:"a19c…41", neu:"b83d…92", why:"主板损坏返修", at:"昨日 09:40"},
+            {id:"RV-2026-0923-0119", tnt:"华中智造集团", old:"6f2a…c1", neu:"C1D2-4E5F-…-9A0B", why:"系统重装导致机器码变化", at:"今日 10:12"},
+            {id:"RV-2026-0923-0120", tnt:"西南制药", old:"c7e1…0a", neu:"（未提供）", why:"设备整体更换", at:"今日 11:30"}],
+          rowActions:true}]},
+      {type:"card", title:"处理工单 RV-2026-0923-0119", sub:"一键执行「废弃旧码 + 重发新码」，同一事务、接口幂等",
+        blocks:[
+          {type:"kv", items:[
+            {k:"原激活码", v:"IOT-2026-8C3F-…-A1（已绑定 6f2a…c1）", mono:true},
+            {k:"原设备影响", v:"废弃后将在下次心跳（≤24h）后停止北向转发，本地采集继续"},
+            {k:"新机器码", v:"C1D2-4E5F-6A7B-8C9D（未被占用 ✓）", mono:true}]},
+          {type:"fields", items:[
+            {label:"绑定模式", type:"radio", value:"pre", options:[
+              {value:"pre", label:"预绑定新机器码", desc:"该码只能在新机器上激活"},
+              {value:"later", label:"留待首次激活时绑定", desc:"客户自助激活，推荐"}]},
+            {label:"继承 tier", type:"select", options:["专业版","免费版"], value:"专业版"},
+            {label:"有效期", type:"select", options:["顺延 12 个月","沿用源码到期日 2027-09-23"], value:"顺延 12 个月"},
+            {label:"备注", value:"系统重装，客服 王工"}],
+            footer:[
+              {label:"仅废弃旧码", kind:"danger"},
+              {label:"废弃并重发", kind:"primary", modal:{title:"确认废弃并重发", danger:true, confirm:"确认执行", blocks:[
+                {type:"impact", text:"影响提示：<ul><li>旧码 IOT-2026-8C3F-…-A1 立即废弃；设备 6f2a…c1 将在下次心跳后停止北向转发（本地采集继续）。</li><li>生成新码并预绑定机器码 C1D2-4E5F-6A7B-8C9D，建立 reissued_from 溯源链。</li><li>两步在同一事务内完成，接口幂等：重复提交不会产生第二个结果。</li></ul>"},
+                {type:"fields", items:[{label:"补充说明", type:"textarea", full:true, placeholder:"必填，≥10 字，将记入审计", req:true}]}]}}]}]}
+    ]},
+
+  "ad-keys": { title:"签名密钥管理", group:"风控", roles:["admin"], crumb:"风控 / 签名密钥管理",
+    ops:[{label:"轮换密钥", kind:"danger", modal:{title:"轮换签发密钥", danger:true, confirm:"确认轮换", blocks:[
+      {type:"impact", text:"轮换影响：<ul><li>新 kid 生效后<b>只用于签发新租约</b>；旧客户端仍可验签（客户端内置<b>公钥集</b>，非单钥）。</li><li>客户端内置公钥版本升级依赖客户端发布，须先评估存量版本覆盖率再决定旧 kid 退役时间。</li></ul>"},
+      {type:"kv", items:[
+        {k:"新 kid", v:"kid-2026Q4", mono:true},
+        {k:"存量覆盖", v:"v1.0.0 386 台 / v0.9.x 26 台（内置旧公钥集）"},
+        {k:"建议", v:"旧 kid 先置为「已退役（仅验签）」，观察 30 天后再停用"}]}]}}],
+    blocks:[
+      {type:"card", title:"当前签发密钥", blocks:[
+        {type:"kv", items:[
+          {k:"kid", v:"kid-2026Q3", mono:true},{k:"算法", v:"Ed25519"},
+          {k:"状态", v:tag("启用中（签发 + 验签）","ok")},
+          {k:"启用时间", v:"2026-07-01"},{k:"计划退役", v:"2026-10-01（14 天后）"},
+          {k:"公钥指纹", v:"9c41f8…b2e7", mono:true}]},
+        {type:"progress", items:[{label:"客户端内置公钥版本覆盖率", value:386, max:412, note:"v1.0.0 386 台 · v0.9.x 26 台"}]}]},
+      {type:"card", title:"历史密钥", blocks:[{type:"table", columns:[
+          {k:"kid",label:"kid",mono:true},{k:"st",label:"状态"},{k:"on",label:"启用",mono:true},
+          {k:"off",label:"退役",mono:true},{k:"use",label:"用途"}],
+        rows:[
+          {kid:"kid-2026Q2", st:tag("已退役（仅验签）","warn"), on:"2026-04-01", off:"2026-07-01", use:"存量租约验签"},
+          {kid:"kid-2025Q4", st:tag("已停用","unknown"), on:"2025-10-01", off:"2026-04-01", use:"—"}]}]},
+      {type:"banner", kind:"danger", title:"轮换风险必须讲明",
+        text:"客户端内置的是<b>公钥集</b>而非单钥，因此轮换后旧客户端仍可验签；但客户端内置公钥版本升级依赖客户端发布，须先评估存量覆盖率再决定退役时间。"}
+    ]},
+
+  "ad-audit": { title:"审计日志", group:"系统", roles:["admin","viewer"], crumb:"系统 / 审计日志", ops:[{label:"导出"}],
+    blocks:[
+      {type:"card", title:"操作审计", sub:"全部写操作留痕：操作者 / 对象 / 原因 / 来源 IP / 结果",
+        blocks:[{type:"table", columns:[
+            {k:"t",label:"时间",mono:true},{k:"who",label:"操作者"},{k:"act",label:"操作"},
+            {k:"obj",label:"对象",mono:true},{k:"why",label:"原因 / 备注"},{k:"ip",label:"来源 IP",mono:true},{k:"r",label:"结果"}],
+          rows:[
+            {t:"2026-09-23 11:44:02", who:"李工 (ops)", act:"废弃激活码", obj:"IOT-2026-8C3F-…-A1", why:"客户更换硬件 / 主板返修", ip:"10.20.3.14", r:tag("成功","ok")},
+            {t:"2026-09-23 11:44:02", who:"李工 (ops)", act:"重发激活码", obj:"→ IOT-2026-77A2-…-Q4", why:"同上（同事务）", ip:"10.20.3.14", r:tag("成功","ok")},
+            {t:"2026-09-23 10:12:30", who:"王工 (ops)", act:"处理换机工单", obj:"RV-2026-0923-0119", why:"系统重装", ip:"10.20.3.22", r:tag("成功","ok")},
+            {t:"2026-09-23 09:02:11", who:"李工 (ops)", act:"查看激活码明文", obj:"IOT-2026-8C3F-…-A1", why:"客户电话核对", ip:"10.20.3.14", r:tag("成功","ok")},
+            {t:"2026-09-22 18:40:07", who:"张工 (admin)", act:"修改租户档位", obj:"西南制药 B → C", why:"客户要求最小化数据外发", ip:"10.20.3.9", r:tag("成功","ok")},
+            {t:"2026-09-22 17:15:44", who:"访客 (viewer)", act:"尝试废弃激活码", obj:"IOT-2026-8C3F-…-A1", why:"—", ip:"10.20.3.31", r:tag("拒绝 403","danger")}],
+          foot:"敏感操作（废弃 / 重发 / 密钥 / 档位 / 明文查看）均强制记录原因"}]},
+      {type:"note", text:"审计日志追加写入、不可修改；导出为 CSV 时明文激活码默认掩码，需二次权限确认。"}
+    ]}
+};
+
+var GROUPS = [];
+function render(){
+  var ids = Object.keys(PAGES);
+  GROUPS = [];
+  ids.forEach(function(id){
+    if(PAGES[id].roles.indexOf(state.role) < 0) return;
+    if(GROUPS.indexOf(PAGES[id].group) < 0) GROUPS.push(PAGES[id].group);
+  });
+  var nav = "";
+  GROUPS.forEach(function(g){
+    nav += '<div class="nav-group-title">' + g + "</div>";
+    ids.forEach(function(id){
+      var p = PAGES[id];
+      if(p.group !== g || p.roles.indexOf(state.role) < 0) return;
+      nav += '<div class="nav-item' + (id === state.page ? " on" : "") + '" onclick="go(\'' + id + '\')">' +
+        "<span>" + p.title + "</span>" +
+        (p.badge ? '<span class="badge warn">' + p.badge + "</span>" : "") + "</div>";
+    });
+  });
+  var page = PAGES[state.page];
+  if(!page){ state.page = firstAllowed(state.role); page = PAGES[state.page]; }
+  document.getElementById("app").innerHTML =
+    '<div class="app"><div class="topbar">' +
+      '<div class="brand"><span class="logo">LIC</span>IoT-DAQ 授权管理后台</div>' +
+      '<span class="mini">厂商侧 · 运营与售后</span>' +
+      '<span class="spacer"></span>' +
+      '<span class="mini">角色</span><select onchange="setRole(this.value)">' +
+        Object.keys(ROLE_LABEL).map(function(r){ return "<option value='" + r + "'" + (r === state.role ? " selected" : "") + ">" + ROLE_LABEL[r] + "</option>"; }).join("") +
+      "</select>" +
+      '<span class="pill warn" onclick="go(\'ad-overview\')">⚠ 待处理 9 项</span>' +
+      '<span class="pill ok">● 回执健康 398/412</span>' +
+      '<span class="avatar">李</span>' +
+    "</div>" +
+    '<div class="body"><div class="sidebar">' + nav +
+      '<div class="sidebar-foot">admin-console v1.0<br>独立构建 · 与网关侧隔离<br>' +
+      '<a href="gateway-console.html" style="color:var(--brand)">→ 切换到客户端原型</a></div></div>' +
+      '<div class="main"><div class="page-head"><div><div class="crumb">' + (page.crumb || page.group) + "</div><h1>" + page.title + "</h1>" +
+      (page.sub ? '<p class="desc">' + page.sub + "</p>" : "") + "</div>" +
+      (page.ops ? '<div class="ops">' + page.ops.map(btn).join("") + "</div>" : "") + "</div>" +
+      '<div class="content">' + renderBlocks(page.blocks) + "</div></div>" +
+    "</div></div>";
+}
+render();
+</script>
+</body>
+</html>

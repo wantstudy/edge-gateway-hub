@@ -1,0 +1,42 @@
+
+=== 客户端原型 gateway-console.html ===
+[PASS] 客户端导航渲染（14 个可见页）  → 实测 14 个
+[PASS] 总览 KPI 卡渲染  → 实测 4 个
+[PASS] 图表 SVG 渲染  → 实测 1 个
+[PASS] 浅色主题（页面底色）  → rgb(247, 248, 250)
+[PASS] 浅色主题（侧边栏为浅色）  → rgb(255, 255, 255)
+[PASS] 深色文字（可读性）  → rgb(29, 33, 41)
+[PASS] 无横向溢出  → overflowX=false
+[PASS] 北向转发页 · 编码默认 protobuf  → protobuf（默认，推荐）
+[PASS] 编码可选（含 json 选项）  → radio 数 2
+[PASS] JSON 精度提示就地展示  → 含 2^53−1 说明
+[PASS] 导入弹窗含校验行号与原因  → {"hasRow47":true,"hasRow91":true,"hasAllowed":true,"confirm":"仅导入 128 个有效行"}
+[PASS] RBAC · viewer 看不到「系统设置」  → •总览/•实时监控/•告警中心/•授权与激活/•日志与审计/•诊断与自检
+[PASS] RBAC · viewer 仍可见「实时监控」  → •总览:-1|•实时监控:1|•告警中心:-1|•授权与激活:-1|•日志与审计:-1|•诊断与自检:-1
+[PASS] RBAC · 越权页自动回落  → 当前页 总览
+[PASS] 授权页展示机器码与锚点来源  → {"machineCode":true,"anchor":true,"transfer":true,"forbiddenButtons":[],"buttonCount":4}
+[PASS] 授权页提供换机申请入口  → 含「换机申请」
+[PASS] 客户端无可点击的解绑/重置试用入口  → 可点元素 4 个，命中禁词 []
+[PASS] 客户端原型无 JS 异常/控制台错误  → 0 条
+
+=== 管理后台原型 admin-console.html ===
+[PASS] 后台导航渲染（10 页）  → 实测 10 个
+[PASS] 激活码列表渲染（含 5 种状态）  → 实测 5 行
+[PASS] 生命周期时间线（发放→绑定→废弃→重发）  → 实测 4 步
+[PASS] 废弃弹窗 · 影响提示区块已渲染  → impact 区块数 = 1
+[PASS] 废弃弹窗 · 影响提示完整  → 含停发与不可撤销
+[PASS] 废弃弹窗 · 原因必填（3 个必填项）  → 含废弃原因=true，必填标记 3 个
+[PASS] 废弃弹窗 · 二次校验输入  → 含风险确认输入
+[PASS] 废弃弹窗 · 危险按钮样式  → danger 类
+[PASS] 回执页含「回执异常不等于破解」说明  → 文案在位
+[PASS] 回执连续性图（24 格 + 跳空/缺失标记）  → {"total":24,"gaps":2,"miss":1}
+[PASS] RBAC · ops 看不到「租户与策略」  → 总览/激活码管理/激活码详情/设备管理/设备详情/回执与异常/换机工单
+[PASS] RBAC · ops 可见「换机工单」  → 7 项
+[PASS] 后台原型无 JS 异常/控制台错误  → 0 条
+
+截图：
+  F:\xy\iot-daq\.omo\evidence\ui-prototype-gateway.png
+  F:\xy\iot-daq\.omo\evidence\ui-prototype-admin.png
+
+===== 汇总：31/31 PASS =====
+全部通过

@@ -1,0 +1,254 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1560 1180" font-family="system-ui,'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#475569"/></marker>
+    <marker id="arrRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#dc2626"/></marker>
+  </defs>
+  <style>
+    .h1{font-size:25px;font-weight:700;fill:#0f172a}
+    .h2{font-size:13px;fill:#64748b}
+    .zl{font-size:14px;font-weight:700}
+    .zs{font-size:10.5px}
+    .bt{font-size:12.5px;font-weight:700;fill:#1e293b}
+    .bd{font-size:10.5px;fill:#475569}
+    .as{font-size:9.5px;fill:#475569}
+    .al{font-size:11px;font-weight:700;fill:#1e293b}
+    .cap{font-size:9px;fill:#64748b}
+    .st{font-size:9.5px;font-weight:700}
+  </style>
+  <rect x="0" y="0" width="1560" height="1180" fill="#ffffff"/>
+
+  <!-- ===== 标题 ===== -->
+  <text class="h1" x="28" y="45">iot-daq 授权与防破解总体架构图</text>
+  <text class="h2" x="28" y="73">四类参与方 × 三个信任区 × A/B/C 三档信任边界 · Wave 0 设计基线 · 对应计划 task 40 · 2026-09-23 用户定稿 · 配套：threat-model.md</text>
+
+  <!-- ===== 图例 ===== -->
+  <g transform="translate(560,14)">
+    <rect x="0" y="0" width="470" height="84" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="14" y="22" font-size="11" font-weight="700" fill="#475569">图例</text>
+    <rect x="14" y="32" width="16" height="11" fill="#fffbeb" stroke="#d97706" stroke-dasharray="4 3"/>
+    <text class="as" x="36" y="42">客户可篡改区（虚线）</text>
+    <rect x="14" y="52" width="16" height="11" fill="#f0fdf4" stroke="#16a34a" stroke-dasharray="4 3"/>
+    <text class="as" x="36" y="62">本地可信区（Rust 侧）</text>
+    <rect x="14" y="72" width="16" height="11" fill="#eff6ff" stroke="#2563eb" stroke-dasharray="4 3"/>
+    <text class="as" x="36" y="82">厂商可控区</text>
+    <line x1="240" y1="37" x2="278" y2="37" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text class="as" x="286" y="41">正常信任流 ①-⑨</text>
+    <line x1="240" y1="57" x2="278" y2="57" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrRed)"/>
+    <text class="as" x="286" y="61">拒绝 / 失败 / 降级路径</text>
+    <rect x="240" y="68" width="70" height="13" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-dasharray="4 3"/>
+    <text x="244" y="78" font-size="9.5" fill="#b91c1c">明示残余风险</text>
+  </g>
+
+  <!-- ===== 信任区一：客户可篡改区 ===== -->
+  <rect x="20" y="108" width="410" height="560" rx="10" fill="#fffbeb" fill-opacity="0.65" stroke="#d97706" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="zl" x="36" y="132" fill="#92400e">客户可篡改区</text>
+  <text class="zs" x="150" y="132" fill="#a16207">客户现场：有物理 / 管理员权限即可读取与篡改</text>
+
+  <rect x="40" y="164" width="370" height="78" rx="8" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="bt" x="54" y="186">WebView 前端（gateway-console · Vue 3）</text>
+  <text class="bd" x="54" y="206">· 仅展示与操作入口，无任何授权判定逻辑</text>
+  <text class="bd" x="54" y="224">· 前端资源等同公开：可解包读改（不做保密）</text>
+
+  <rect x="40" y="252" width="370" height="96" rx="8" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="bt" x="54" y="274">网关进程 · 数据面（南向采集 / 北向转发）</text>
+  <text class="bd" x="54" y="294">· 采集 Modbus / OPC UA / PLC，北向 MQTT 出口</text>
+  <text class="bd" x="54" y="312">· 二进制可被 patch：Tier-1 硬化（strip / LTO /</text>
+  <text class="bd" x="54" y="330">  panic=abort / 段哈希自检）提高破解成本</text>
+
+  <rect x="40" y="358" width="370" height="72" rx="8" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="bt" x="54" y="380">文件系统 / 本地存储</text>
+  <text class="bd" x="54" y="400">· 授权文件 · 试用标记（四重冗余）· SQLCipher 库</text>
+  <text class="bd" x="54" y="418">· 可被删除篡改 → 冗余交叉校验 + 云端首激时间兜底</text>
+
+  <rect x="40" y="440" width="370" height="92" rx="8" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="bt" x="54" y="462">现场设备与网络出口</text>
+  <text class="bd" x="54" y="482">· 南向：Modbus RTU/TCP · OPC UA · PLC 设备</text>
+  <text class="bd" x="54" y="500">· 北向：客户 Broker（MQTT）—— B 档业务数据</text>
+  <text class="bd" x="54" y="518">  不经厂商云，仅心跳与审计回执出网</text>
+
+  <rect x="40" y="552" width="370" height="100" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-dasharray="5 3"/>
+  <text class="bt" x="54" y="574" fill="#b91c1c">⚠ 本区防御定位</text>
+  <text class="bd" x="54" y="594">· 一切资产可被篡改：目标是提高成本、可检测、</text>
+  <text class="bd" x="54" y="612">  可审计，而非绝对防破解</text>
+  <text class="bd" x="54" y="630">· 授权与防篡改判定只在本地可信区（Rust 侧）</text>
+
+  <!-- ===== 信任区二：本地可信区 ===== -->
+  <rect x="470" y="108" width="400" height="560" rx="10" fill="#f0fdf4" fill-opacity="0.65" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="zl" x="486" y="132" fill="#166534">本地可信区（同设备宿主机 · Rust 侧）</text>
+  <text class="zs" x="486" y="150" fill="#3f6212">gateway 进程内 licensing 模块 · 本地判定唯一权威</text>
+
+  <rect x="486" y="164" width="368" height="436" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="500" y="188">本地授权模块（Rust · gateway-licensing）</text>
+
+  <circle cx="508" cy="212" r="9" fill="#334155"/>
+  <text x="508" y="216" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+  <text class="al" x="524" y="216">机器码指纹：多源锚点 N-of-M（允许 1 项漂移）</text>
+  <text class="as" x="524" y="232">BIOS/磁盘/MAC/machine-id/CPU → HMAC 加盐 + 截断</text>
+
+  <circle cx="508" cy="258" r="9" fill="#334155"/>
+  <text x="508" y="262" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">5</text>
+  <text class="al" x="524" y="258">本地验签：Ed25519 内置公钥集（kid）</text>
+  <text class="as" x="524" y="274">验签通过才解锁北向转发；失败即拒绝 / 受限</text>
+
+  <text class="as" x="500" y="300" fill="#64748b">租约状态机（⑦-⑨ 为失败 / 超期路径）</text>
+  <rect x="500" y="308" width="56" height="30" rx="5" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text class="st" x="528" y="327" fill="#475569" text-anchor="middle">未激活</text>
+  <rect x="570" y="308" width="56" height="30" rx="5" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text class="st" x="598" y="327" fill="#475569" text-anchor="middle">激活中</text>
+  <rect x="640" y="308" width="56" height="30" rx="5" fill="#dcfce7" stroke="#16a34a"/>
+  <text class="st" x="668" y="322" fill="#166534" text-anchor="middle">已激活</text>
+  <text x="668" y="334" font-size="8.5" fill="#166534" text-anchor="middle">Active</text>
+  <rect x="710" y="308" width="56" height="30" rx="5" fill="#fef3c7" stroke="#d97706"/>
+  <text class="st" x="738" y="322" fill="#92400e" text-anchor="middle">宽限期</text>
+  <text x="738" y="334" font-size="8.5" fill="#92400e" text-anchor="middle">≤7 天</text>
+  <rect x="780" y="308" width="56" height="30" rx="5" fill="#fee2e2" stroke="#dc2626"/>
+  <text class="st" x="808" y="322" fill="#b91c1c" text-anchor="middle">降级</text>
+  <text x="808" y="334" font-size="8.5" fill="#b91c1c" text-anchor="middle">停北向转发</text>
+  <line x1="558" y1="323" x2="568" y2="323" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="628" y1="323" x2="638" y2="323" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="698" y1="323" x2="708" y2="323" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="768" y1="323" x2="778" y2="323" stroke="#dc2626" stroke-width="1.2" stroke-dasharray="3 2" marker-end="url(#arrRed)"/>
+  <text class="cap" x="500" y="352">② 发起激活 · ③④ 绑定并签发 Token · ⑥ 心跳正常维持 Active</text>
+  <text class="cap" x="500" y="366">⑦ 心跳失败→宽限 · ⑧ 超期→降级停北向 · ⑨ 废弃/持续异常→停发</text>
+  <text class="cap" x="500" y="380">恢复心跳或重新激活 → 回到 Active（重新签发租约）</text>
+
+  <text class="bd" x="500" y="406">· ⑥ 心跳调度：每 24h 上报租约状态；B 档附审计回执</text>
+  <text class="bd" x="500" y="424">· 审计回执本地缓存，断网延迟补报（保证序号连续）</text>
+  <text class="bd" x="500" y="442">· 试用标记四重冗余交叉校验（文件/注册表/库/云端）</text>
+  <text class="bd" x="500" y="460">· 时钟回拨检测：单调时钟 + 上次最大时间 + 服务端比对</text>
+  <text class="bd" x="500" y="478">· 凭证加密落盘：DPAPI(Win) / keyring(Linux) + 多处冗余</text>
+  <text class="bd" x="500" y="496">· 二进制完整性自检：段哈希比对，篡改 → 受限模式 + 告警</text>
+
+  <rect x="500" y="512" width="340" height="60" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="514" y="534" font-size="11" font-weight="700" fill="#166534">授权判定只在 Rust 侧执行</text>
+  <text class="bd" x="514" y="554">WebView / JS 层不参与任何授权判定（仅展示）</text>
+
+  <!-- ===== 信任区三：厂商可控区 ===== -->
+  <rect x="1030" y="108" width="510" height="560" rx="10" fill="#eff6ff" fill-opacity="0.65" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="zl" x="1046" y="132" fill="#1e40af">厂商可控区（厂商云）</text>
+  <text class="zs" x="1046" y="150" fill="#3b82f6">licensing-server + admin-console · 私钥保管与全量审计在此</text>
+
+  <rect x="1046" y="164" width="478" height="268" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="1060" y="188">云端授权服务 licensing-server</text>
+  <text class="bd" x="1060" y="210">· ③ 激活绑定：一个激活码 ↔ 一台设备机器码（1:1）</text>
+  <text class="bd" x="1060" y="228">    同码异机激活 → 冲突检测，直接拒绝</text>
+  <text class="bd" x="1060" y="246">· ④ Lease Token 签发：Ed25519 签名（kid 轮换，</text>
+  <text class="bd" x="1060" y="264">    新旧密钥并存）；含 tier / 档位 / 有效期 / 租约 id</text>
+  <text class="bd" x="1060" y="282">· 签名私钥：KMS / 离线托管，与业务 API 隔离</text>
+  <text class="bd" x="1060" y="300">· 心跳接收 + POST /audit/receipt：字段白名单，</text>
+  <text class="bd" x="1060" y="318">    序号跳空 / 回退 / 回执缺失 → 风控告警</text>
+  <text class="bd" x="1060" y="336">· A 档 /verify：验签 + ±5min 时间窗 + 全局 Nonce 防重放</text>
+  <text class="bd" x="1060" y="354">· A/B/C 档位随 Token 下发（租户级 / 设备级配置）</text>
+
+  <rect x="1046" y="456" width="478" height="196" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="1060" y="480">厂商总管理后台 admin-console（仅厂商管理员）</text>
+  <text class="bd" x="1060" y="502">· 激活码：发放（可预绑定机器码）/ 列表 / 详情 / 导出</text>
+  <text class="bd" x="1060" y="520">· 废弃：二次确认 + 原因必填 + 输入激活码后 8 位校验</text>
+  <text class="bd" x="1060" y="538">· 重发：继承 tier / 有效期 · reissued_from 溯源 · 幂等</text>
+  <text class="bd" x="1060" y="556">· 设备 / 租户 / 审计日志 · RBAC · 高危操作双人复核可选</text>
+  <text class="bd" x="1060" y="574">· 客户端无解绑 / 废弃入口 —— 废弃、重发仅经后台执行</text>
+  <text class="bd" x="1060" y="592">· 回执异常 ≠ 破解：仅告警提示，转人工核实，不自动封禁</text>
+
+  <line x1="1285" y1="452" x2="1285" y2="436" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrRed)"/>
+  <text x="1296" y="442" font-size="10" fill="#dc2626" font-weight="700">废弃 / 重发指令：原激活码立即失效</text>
+
+  <!-- ===== 区间信任流箭头（② ④ ⑥ + 拒绝路径） ===== -->
+  <line x1="870" y1="240" x2="1030" y2="240" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="al" x="950" y="214" text-anchor="middle">② 激活请求</text>
+  <text class="as" x="950" y="228" text-anchor="middle">机器码指纹 + 激活码 + 设备公钥 + nonce</text>
+  <text class="as" x="950" y="254" text-anchor="middle" fill="#b91c1c">必须联网 · 不支持离线激活</text>
+
+  <line x1="1030" y1="300" x2="870" y2="300" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="al" x="950" y="276" text-anchor="middle">④ Lease Token 签发</text>
+  <text class="as" x="950" y="290" text-anchor="middle">Ed25519 签名 · tier / 档位 / 有效期</text>
+  <text class="as" x="950" y="324" text-anchor="middle">本地验签 ⑤ 通过 → 解锁北向转发</text>
+
+  <line x1="870" y1="370" x2="1030" y2="370" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="al" x="950" y="346" text-anchor="middle">⑥ 心跳 + 审计回执</text>
+  <text class="as" x="950" y="360" text-anchor="middle">每 24h · 序号区间 / 条数 / 摘要哈希</text>
+  <text class="as" x="950" y="394" text-anchor="middle">无业务数值 · 断网延迟补报</text>
+
+  <line x1="1030" y1="440" x2="870" y2="440" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrRed)"/>
+  <text class="al" x="950" y="416" text-anchor="middle" fill="#dc2626">✗ 拒绝 / 失效路径</text>
+  <text class="as" x="950" y="430" text-anchor="middle">激活码已废弃 · 机器码不匹配</text>
+  <text class="as" x="950" y="462" text-anchor="middle">Nonce 重放 / 签名无效 → 403</text>
+  <text class="as" x="950" y="478" text-anchor="middle" fill="#b91c1c">废弃后心跳被拒 → 原设备降级 / 停发</text>
+
+  <!-- ===== 区一 ↔ 区二 本地交互 ===== -->
+  <line x1="486" y1="400" x2="412" y2="400" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="392" y="374" width="122" height="24" rx="4" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="398" y="385" font-size="9" fill="#475569">激活凭证 / 试用标记读写</text>
+  <text x="398" y="396" font-size="9" fill="#475569">（加密 + 多位置冗余）</text>
+
+  <line x1="484" y1="320" x2="412" y2="320" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrRed)"/>
+  <rect x="394" y="292" width="122" height="24" rx="4" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="400" y="303" font-size="9" fill="#b91c1c" font-weight="700">⑧⑨ 停北向转发</text>
+  <text x="400" y="314" font-size="9" fill="#475569">保留本地采集与缓存</text>
+
+  <!-- ===== Linux 两种部署形态 ===== -->
+  <text class="al" x="28" y="706" font-size="13">Linux 两种部署形态（宿主机信任关注点）· Windows 走 Tauri 原生安装包，容器仅用于 Linux</text>
+
+  <rect x="20" y="716" width="720" height="150" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="36" y="740">形态 A · 原生 systemd 服务（Linux）</text>
+  <text class="bd" x="36" y="762">· 机器码锚点取自宿主：/etc/machine-id · DMI product_uuid · 首个物理网卡 MAC</text>
+  <text class="bd" x="36" y="780">· 凭证保护：Linux keyring + 多位置冗余落盘（详见 task 41）</text>
+  <text class="bd" x="36" y="798">· 升级 / 重启：指纹不变 → 激活与租约保持，无需重新激活</text>
+  <text class="bd" x="36" y="816">· Windows 桌面端同构：DPAPI 保护 + MachineGuid 口径（安装 ID，重装失效）</text>
+
+  <rect x="760" y="716" width="780" height="150" rx="8" fill="#fffdf5" stroke="#d97706"/>
+  <text class="bt" x="776" y="740">形态 B · Docker 容器部署（Linux）—— 三个新增信任关注点（详见 task 59）</text>
+  <text class="bd" x="776" y="762">· ① 宿主锚点只读挂载：--mount type=bind,readonly（/etc/machine-id · DMI · 宿主指纹文件）</text>
+  <text class="bd" x="776" y="780">· ② 持久卷承载授权 / 试用状态：/var/lib/iot-daq（license/ trial/）→ docker rm 后重建容器不重置试用</text>
+  <text class="bd" x="776" y="798">· ③ 镜像供应链：cosign 签名 + digest 固定 + 离线 tar 哈希清单；镜像可写层不含任何授权 / 试用状态</text>
+  <text class="bd" x="776" y="816">· 容器内锚点禁用（machine-id / MAC / 主机名随重建变化）；容器重建 ≠ 换机，宿主重装系统 → 走后台废弃 + 重发</text>
+
+  <!-- ===== A/B/C 三档信任边界 ===== -->
+  <rect x="20" y="892" width="400" height="268" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="al" x="36" y="918" font-size="13" fill="#1e40af">A 档 · 数据经厂商云（校验点最多）</text>
+  <text class="bd" x="36" y="946">路径：业务消息全部经厂商云 /verify 全链校验</text>
+  <text class="al" x="36" y="972">厂商能验证：</text>
+  <text class="bd" x="36" y="990">· 消息级验签 + ±5min 时间窗 + 全局 Nonce 防重放</text>
+  <text class="bd" x="36" y="1008">· 字段白名单 + 计量（转发条数与摘要）</text>
+  <text class="al" x="36" y="1034" fill="#dc2626">厂商验证不了：</text>
+  <text class="bd" x="36" y="1052">· 客户端二进制是否被 patch 绕过本地判定</text>
+  <text class="bd" x="36" y="1070">· 现场侧代码级篡改（只能靠完整性自检提高成本）</text>
+  <text class="cap" x="36" y="1096">适用：接受业务数据出网、要求合规可审计的客户</text>
+
+  <rect x="440" y="892" width="540" height="268" rx="8" fill="#fffbeb" fill-opacity="0.55" stroke="#b45309" stroke-width="2"/>
+  <rect x="908" y="902" width="56" height="20" rx="10" fill="#b45309"/>
+  <text x="936" y="916" font-size="10.5" font-weight="700" fill="#ffffff" text-anchor="middle">默认档</text>
+  <text class="al" x="456" y="918" font-size="13" fill="#92400e">B 档 · 业务数据不经厂商（默认档）</text>
+  <text class="bd" x="456" y="946">路径：网关直连客户 Broker 转发；厂商仅保留两条控制通道</text>
+  <text class="al" x="456" y="972">厂商能验证：</text>
+  <text class="bd" x="456" y="990">· 24h 心跳（设备存活 + 租约有效）</text>
+  <text class="bd" x="456" y="1008">· POST /audit/receipt：序号区间 + 条数 + payload 摘要哈希</text>
+  <text class="bd" x="456" y="1026">  （字段白名单，不含任何业务数值）→ 跳空 / 缺失告警</text>
+  <text class="al" x="456" y="1052" fill="#dc2626">厂商验证不了：</text>
+  <text class="bd" x="456" y="1070">· 业务数值真实性与完整性（数据从未经过厂商）</text>
+  <text class="bd" x="456" y="1088">· 破解代码可不上报回执 → 兜底仅「心跳缺序号区间即告警」，</text>
+  <text class="bd" x="456" y="1106">  无法阻止破解后完全断网静默自用</text>
+  <text class="cap" x="456" y="1132">断网时网关仍持续转发，回执允许延迟补报（对齐 task 44 契约）</text>
+
+  <rect x="1000" y="892" width="260" height="268" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="al" x="1016" y="918" font-size="13" fill="#334155">C 档 · 仅租约心跳</text>
+  <text class="bd" x="1016" y="946">路径：仅 24h 租约心跳出网</text>
+  <text class="al" x="1016" y="976">厂商能验证：</text>
+  <text class="bd" x="1016" y="994">· 设备存活</text>
+  <text class="bd" x="1016" y="1012">· 租约在有效期内</text>
+  <text class="al" x="1016" y="1042" fill="#dc2626">厂商验证不了：</text>
+  <text class="bd" x="1016" y="1060">· 任何业务侧信息</text>
+  <text class="bd" x="1016" y="1078">（无回执、无计量）</text>
+
+  <!-- ===== 防御不住什么（角标区） ===== -->
+  <rect x="1280" y="892" width="260" height="268" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="al" x="1296" y="918" font-size="13" fill="#b91c1c">防御不住什么（明示残余风险）</text>
+  <text class="bd" x="1296" y="946">① B 档破解后可篡改代码不上报回执，</text>
+  <text class="bd" x="1296" y="964">    完全断网静默自用 —— 只能靠心跳缺</text>
+  <text class="bd" x="1296" y="982">    序号区间告警发现，无法阻止</text>
+  <text class="bd" x="1296" y="1006">② Tier-2（控制流平坦化 / 字符串加密 /</text>
+  <text class="bd" x="1296" y="1024">    Frida 检测）与 Tier-3（内核驱动 /</text>
+  <text class="bd" x="1296" y="1042">    商业壳 / 硬件加密狗）明确不做</text>
+  <text class="bd" x="1296" y="1066">③ 前端资源等同公开：可解包读改，</text>
+  <text class="bd" x="1296" y="1084">    机密与判定一律不放 JS 层</text>
+  <text x="1296" y="1116" font-size="10" font-weight="700" fill="#b91c1c">定位：提高成本 ≠ 绝对防破解</text>
+</svg>

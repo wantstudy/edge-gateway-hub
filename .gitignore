@@ -1,0 +1,25 @@
+# ---- Rust / Cargo ----
+/target/
+**/target/
+# Cargo.lock：workspace 含服务/守护进程等可执行产物，锁定版本入库（首批 commit 一并提交）。
+
+# ---- 密钥与敏感文件：严禁入库（红线） ----
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ---- 前端（Wave 4 起使用） ----
+node_modules/
+dist/
+
+# ---- OS / IDE ----
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
+
+# ---- 计划工具的会话续跑状态：不入库 ----
+.omo/run-continuation/

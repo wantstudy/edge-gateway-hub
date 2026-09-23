@@ -1,0 +1,236 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1560 1120" font-family="system-ui,'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#475569"/></marker>
+    <marker id="arrRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#dc2626"/></marker>
+  </defs>
+  <style>
+    .h1{font-size:25px;font-weight:700;fill:#0f172a}
+    .h2{font-size:13px;fill:#64748b}
+    .sl{font-size:14px;font-weight:700;fill:#0f172a}
+    .bt{font-size:11.5px;font-weight:700;fill:#1e293b}
+    .bd{font-size:10.5px;fill:#475569}
+    .sm{font-size:9.5px;fill:#475569}
+    .tn{font-size:8.5px;fill:#64748b}
+    .al{font-size:11px;font-weight:700;fill:#1e293b}
+  </style>
+  <rect x="0" y="0" width="1560" height="1120" fill="#ffffff"/>
+
+  <!-- ===== 标题 ===== -->
+  <text class="h1" x="28" y="42">iot-daq 一机一码：机器码指纹与绑定设计图</text>
+  <text class="h2" x="28" y="70">activation_code 1:1 device · device 1:N lease · N-of-M 容错（允许 1 项漂移）· 对应计划 task 41 · Wave 0 设计基线（2026-09-23 定稿）</text>
+
+  <!-- ===== 图例 ===== -->
+  <g transform="translate(1050,14)">
+    <rect x="0" y="0" width="490" height="96" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="14" y="20" font-size="11" font-weight="700" fill="#475569">图例</text>
+    <line x1="14" y1="34" x2="52" y2="34" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text class="sm" x="60" y="38">正常流程 / 绑定关系</text>
+    <line x1="14" y1="52" x2="52" y2="52" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrRed)"/>
+    <text class="sm" x="60" y="56" fill="#b91c1c">拒绝路径 · 禁用红线</text>
+    <rect x="14" y="64" width="14" height="11" fill="#dcfce7" stroke="#16a34a"/>
+    <text class="sm" x="60" y="73">稳定锚点 / 通过</text>
+    <rect x="14" y="82" width="14" height="11" fill="#fef3c7" stroke="#d97706"/>
+    <text class="sm" x="60" y="91">易漂移锚点 / 容忍项（同机容忍路径）</text>
+  </g>
+
+  <!-- ===== 一、实体绑定关系 ===== -->
+  <text class="sl" x="28" y="126">一、实体绑定关系（服务端数据视角）</text>
+
+  <rect x="40" y="140" width="200" height="170" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="52" y="162">激活码 activation_code</text>
+  <text class="sm" x="52" y="184">· code（厂商发放）</text>
+  <text class="sm" x="52" y="202">· 状态：issued / bound /</text>
+  <text class="sm" x="52" y="218">    revoked / reissued</text>
+  <text class="sm" x="52" y="236">· tier · 有效期</text>
+  <text class="sm" x="52" y="254">· 来源订单</text>
+  <text class="sm" x="52" y="272">· 绑定设备 → device</text>
+
+  <rect x="300" y="140" width="220" height="170" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="312" y="162">设备 device（机器码指纹）</text>
+  <text class="sm" x="312" y="184">· machine_code（组合指纹）</text>
+  <text class="sm" x="312" y="202">· anchor_hashes[5]（锚点哈希）</text>
+  <text class="sm" x="312" y="220">· 部署形态 native / docker</text>
+  <text class="sm" x="312" y="238">· 镜像 digest（docker 时）</text>
+  <text class="sm" x="312" y="256">· 首次激活时间（试用锚点）</text>
+
+  <rect x="580" y="140" width="180" height="170" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="592" y="162">租约 lease</text>
+  <rect x="592" y="178" width="156" height="36" rx="5" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text class="sm" x="600" y="194">租约 #1</text>
+  <text class="tn" x="600" y="208">已结束（作废留痕）</text>
+  <rect x="592" y="224" width="156" height="36" rx="5" fill="#dcfce7" stroke="#16a34a"/>
+  <text class="sm" x="600" y="240" fill="#166534">租约 #2 · 当前</text>
+  <text class="tn" x="600" y="254">Active（宽限/降级见 task 42）</text>
+  <text class="tn" x="592" y="286">随时间更迭：1 : N</text>
+
+  <line x1="240" y1="225" x2="296" y2="225" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="al" x="268" y="212" text-anchor="middle">1 : 1</text>
+  <line x1="520" y1="225" x2="576" y2="225" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="al" x="548" y="212" text-anchor="middle">1 : N</text>
+
+  <rect x="40" y="336" width="180" height="56" rx="8" fill="#ffffff" stroke="#dc2626" stroke-dasharray="5 3"/>
+  <text class="bt" x="52" y="358" fill="#b91c1c">另一台设备</text>
+  <text class="sm" x="52" y="376">异机指纹 M′（或伪造）</text>
+
+  <line x1="220" y1="364" x2="296" y2="364" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrRed)"/>
+  <text x="258" y="352" font-size="9.5" fill="#dc2626" text-anchor="middle" font-weight="700">同码异机激活</text>
+
+  <rect x="300" y="336" width="460" height="112" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+  <text class="bt" x="314" y="356" fill="#b91c1c">服务端冲突检测（一机一码守门，为 task 46 提供依据）</text>
+  <text class="sm" x="314" y="376">① machine_code 与绑定一致 → 正常激活 / 恢复凭证</text>
+  <text class="sm" x="314" y="394">② 不一致但锚点命中 ≥4 → 判同机（重装/漂移）→ 更新绑定、重签租约</text>
+  <text class="sm" x="314" y="412" fill="#b91c1c">③ 命中 ≤3 → 判异机 → ✗ 拒绝：403 CODE_BOUND_TO_OTHER_DEVICE + 审计留痕</text>
+  <text class="sm" x="314" y="430">④ 拒绝后引导：客户端仅可「申请换机」→ 后台废弃 + 重发（task 42）</text>
+
+  <!-- ===== 二、N-of-M 同机判定 ===== -->
+  <text class="sl" x="792" y="126">二、N-of-M 同机判定（阈值 N=4 / M=5，允许 1 项漂移）</text>
+
+  <rect x="800" y="150" width="560" height="26" fill="#fee2e2" stroke="#dc2626"/>
+  <rect x="1360" y="150" width="140" height="26" fill="#dcfce7" stroke="#16a34a"/>
+  <line x1="1360" y1="142" x2="1360" y2="184" stroke="#16a34a" stroke-width="2.5"/>
+  <text x="1360" y="138" font-size="10.5" font-weight="700" fill="#16a34a" text-anchor="middle">阈值 N=4</text>
+  <text x="1080" y="168" font-size="10.5" font-weight="700" fill="#b91c1c" text-anchor="middle">≤3 命中 → 判异机（拒绝）</text>
+  <text x="1430" y="168" font-size="10" font-weight="700" fill="#166534" text-anchor="middle">≥4 → 同机</text>
+  <text class="tn" x="800" y="200">刻度：锚点命中数 0 · 1 · 2 · 3 · 4 · 5（M=5）</text>
+  <text class="sm" x="800" y="222">M=5 锚点，允许漂移 1 项；锚点「稳定性权重」仅用于诊断排序与人工核实参考，不改变计数阈值。</text>
+
+  <rect x="800" y="244" width="226" height="176" rx="8" fill="#ffffff" stroke="#16a34a"/>
+  <text class="bt" x="814" y="266" fill="#166534">例 1 · 换网卡（合法运维）</text>
+  <text class="sm" x="814" y="290">网卡 MAC 1 项漂移</text>
+  <text class="sm" x="814" y="310">命中 4 / 5</text>
+  <text class="al" x="814" y="334" fill="#166534">→ 仍判同机 ✓</text>
+  <text class="sm" x="814" y="356">租约继续，无需重新发码，</text>
+  <text class="sm" x="814" y="372">不误伤合法运维</text>
+  <text class="tn" x="814" y="402">同类：加硬盘 / 虚拟化迁移</text>
+
+  <rect x="1040" y="244" width="226" height="176" rx="8" fill="#ffffff" stroke="#dc2626"/>
+  <text class="bt" x="1054" y="266" fill="#b91c1c">例 2 · 整机更换</text>
+  <text class="sm" x="1054" y="290">BIOS / 磁盘 / MAC / CPU</text>
+  <text class="sm" x="1054" y="306">多项同时变化</text>
+  <text class="sm" x="1054" y="326">命中 ≤ 3 / 5</text>
+  <text class="al" x="1054" y="350" fill="#b91c1c">→ 判异机 ✗ 激活被拒</text>
+  <text class="sm" x="1054" y="372">→ 管理后台「废弃 + 重发」</text>
+  <text class="sm" x="1054" y="388">换机流程（task 42）</text>
+  <text class="tn" x="1054" y="408">拒绝即审计留痕</text>
+
+  <rect x="1280" y="244" width="226" height="176" rx="8" fill="#ffffff" stroke="#16a34a"/>
+  <text class="bt" x="1294" y="266" fill="#166534">例 3 · 同宿主重建容器</text>
+  <text class="sm" x="1294" y="290">锚点全部取自宿主机</text>
+  <text class="sm" x="1294" y="310">（重建 / 升级不影响宿主锚点）</text>
+  <text class="sm" x="1294" y="330">命中 5 / 5</text>
+  <text class="al" x="1294" y="354" fill="#166534">→ 同机 ✓</text>
+  <text class="sm" x="1294" y="376">不需重新发激活码，</text>
+  <text class="sm" x="1294" y="392">租约保持（口径 = task 59）</text>
+
+  <!-- ===== 三、指纹算法链路 ===== -->
+  <text class="sl" x="28" y="478">三、指纹算法链路（本地计算 · 原始锚点不出设备）</text>
+
+  <rect x="40" y="492" width="270" height="70" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="52" y="512">① 主板 / BIOS UUID</text>
+  <text class="sm" x="52" y="530">SMBIOS / DMI：Win=WMI ·</text>
+  <text class="sm" x="52" y="545">Linux=/sys/class/dmi</text>
+  <rect x="248" y="498" width="52" height="16" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="274" y="510" font-size="9" fill="#166534" text-anchor="middle">稳定</text>
+
+  <rect x="334" y="492" width="270" height="70" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="346" y="512">② 系统盘序列号</text>
+  <text class="sm" x="346" y="530">Win=存储 API · Linux=/sys/block</text>
+  <rect x="522" y="498" width="76" height="16" rx="8" fill="#fef3c7" stroke="#d97706"/>
+  <text x="560" y="510" font-size="9" fill="#92400e" text-anchor="middle">换盘/虚拟化漂移</text>
+
+  <rect x="628" y="492" width="270" height="70" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="640" y="512">③ 首个物理网卡 MAC</text>
+  <text class="sm" x="640" y="530">排除虚拟 / USB 网卡 · 固定排序</text>
+  <rect x="816" y="498" width="60" height="16" rx="8" fill="#fef3c7" stroke="#d97706"/>
+  <text x="846" y="510" font-size="9" fill="#92400e" text-anchor="middle">易漂移</text>
+
+  <rect x="922" y="492" width="270" height="70" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="934" y="512">④ 系统 machine-id / MachineGuid</text>
+  <text class="sm" x="934" y="530">Linux /etc/machine-id · Win 注册表</text>
+  <rect x="1104" y="498" width="76" height="16" rx="8" fill="#fef3c7" stroke="#d97706"/>
+  <text x="1142" y="510" font-size="9" fill="#92400e" text-anchor="middle">重装即变</text>
+  <text class="tn" x="934" y="552">注：MachineGuid 是安装 ID，非硬件 ID</text>
+
+  <rect x="1216" y="492" width="270" height="70" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="1228" y="512">⑤ CPU 特征</text>
+  <text class="sm" x="1228" y="530">型号 / 家族 / 步进 / 核数</text>
+  <text class="sm" x="1228" y="545">弱唯一性 · 辅助信号</text>
+  <rect x="1424" y="498" width="52" height="16" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="1450" y="510" font-size="9" fill="#166534" text-anchor="middle">稳定</text>
+
+  <line x1="140" y1="564" x2="140" y2="586" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="40" y="590" width="200" height="46" rx="23" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="56" y="608">归一化</text>
+  <text class="tn" x="56" y="624">trim · 大小写 · 分隔符统一</text>
+  <line x1="240" y1="613" x2="262" y2="613" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="264" y="590" width="170" height="46" rx="23" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="280" y="608">固定排序拼接</text>
+  <text class="tn" x="280" y="624">sorted concat</text>
+  <line x1="434" y1="613" x2="456" y2="613" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="458" y="590" width="250" height="46" rx="23" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
+  <text class="bt" x="474" y="608">HMAC-SHA256</text>
+  <text class="tn" x="474" y="624">盐 = 厂商私密常量（编译期 / KMS 注入）</text>
+  <line x1="708" y1="613" x2="730" y2="613" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="732" y="590" width="150" height="46" rx="23" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="748" y="608">截断</text>
+  <text class="tn" x="748" y="624">128 bit · 32 hex</text>
+  <line x1="882" y1="613" x2="904" y2="613" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="906" y="590" width="200" height="46" rx="23" fill="#dcfce7" stroke="#16a34a"/>
+  <text class="bt" x="922" y="608" fill="#166534">稳定指纹 machine_code</text>
+  <text class="tn" x="922" y="624">对外唯一设备标识</text>
+
+  <line x1="583" y1="636" x2="583" y2="656" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="458" y="658" width="424" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <text class="bt" x="472" y="676" fill="#166534">分支：逐锚点 HMAC（同盐）→ anchor_hashes[5]</text>
+  <text class="sm" x="472" y="694">仅哈希出设备，供 N-of-M 比对；服务端只存哈希、不见原文</text>
+
+  <rect x="906" y="658" width="580" height="50" rx="8" fill="#fffbeb" stroke="#d97706" stroke-dasharray="5 3"/>
+  <text class="bt" x="920" y="676" fill="#92400e">不用裸哈希：硬件标识取值空间有限，裸哈希可被离线字典枚举逆推</text>
+  <text class="sm" x="920" y="694">盐化 HMAC 防预计算 / 逆推；截断控制泄露面；组合指纹无法还原锚点原文</text>
+
+  <!-- ===== 四、Docker 形态锚点专项 ===== -->
+  <text class="sl" x="28" y="748">四、Docker 形态锚点专项（口径与 task 59 完全一致）</text>
+
+  <rect x="20" y="758" width="760" height="280" rx="8" fill="#fffdf5" stroke="#d97706"/>
+  <text class="bt" x="36" y="782">Docker 容器形态 —— 机器码锚点只来自宿主机</text>
+  <text class="sm" x="36" y="806">· 只读挂载宿主锚点：--mount type=bind,readonly：</text>
+  <text class="sm" x="36" y="822">    /etc/machine-id · /sys/class/dmi/id/product_uuid</text>
+  <text class="sm" x="36" y="838">· 安装脚本采集宿主首个物理网卡 MAC → 生成</text>
+  <text class="sm" x="36" y="854">    host-fingerprint.json（HMAC 签名）只读挂载进容器</text>
+  <text class="sm" x="36" y="870">· 容器内仅读取上述宿主锚点计算指纹（锚点缺失 → 签名指纹文件降级）</text>
+  <text class="al" x="36" y="894" fill="#166534">· 结果：容器重建 / 升级 → 宿主锚点不变 → 指纹不变 → 不触发换机判定，无需重新发码</text>
+
+  <rect x="36" y="908" width="728" height="112" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-dasharray="6 4"/>
+  <text class="bt" x="50" y="930" fill="#b91c1c">✗ 禁用红线：容器内标识一律不得用作锚点</text>
+  <text class="sm" x="50" y="950">· 容器 /etc/machine-id（runtime 生成）· veth MAC（随机）· 容器主机名（= 容器 ID）</text>
+  <text class="sm" x="50" y="968">· 理由：docker rm 重建后三者全变 → 授权立即失效，且 SQLCipher 本地库（HKDF 机器码</text>
+  <text class="sm" x="50" y="984">    派生密钥，task 34）解不开 —— 故容器内标识永不做锚点</text>
+  <text class="sm" x="50" y="1004">· 宿主重装系统 → 宿主锚点变化 → 判异机 → 走后台「废弃 + 重发」（对齐 task 42）</text>
+
+  <!-- ===== 五、本地存储与保护 ===== -->
+  <text class="sl" x="800" y="748">五、本地存储与保护（指纹 + 激活凭证）</text>
+
+  <rect x="800" y="758" width="740" height="280" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bd" x="816" y="784">· Windows：%ProgramData%\iot-daq\license\ + DPAPI（CurrentUser）加密</text>
+  <text class="bd" x="816" y="806">· Linux：/var/lib/iot-daq/license/ + keyring 加密</text>
+  <text class="bd" x="816" y="828">· 多位置冗余：主副本 + 备份副本（注册表 / 独立配置目录），交叉校验</text>
+  <text class="bd" x="816" y="850">· 单点被删 → 其余副本 + 云端首次激活时间兜底，试用 / 绑定不被重置</text>
+  <text class="bd" x="816" y="872">· Docker 形态：一律落宿主持久卷 /var/lib/iot-daq（license/ trial/）</text>
+  <text class="bd" x="816" y="894">· 镜像可写层承载授权数据清单 = 空（docker rm 不重置，对齐 task 43 / 59）</text>
+  <text class="bd" x="816" y="916">· 权限：仅服务账户可写，普通用户只读；凭证不明文落盘</text>
+
+  <rect x="816" y="934" width="708" height="86" rx="8" fill="#fffbeb" stroke="#d97706"/>
+  <text class="bt" x="830" y="956" fill="#92400e">重装 / 恢复路径</text>
+  <text class="sm" x="830" y="976">· 仅 OS 重装（machine-id 漂移 1 项）→ 命中 4/5 → 判同机 → 服务端自动更新绑定、重签租约</text>
+  <text class="sm" x="830" y="994">· 系统盘一并更换等（≤3/5）→ 判异机 → 激活被拒 → 管理后台「废弃 + 重发」换机（task 42）</text>
+  <text class="sm" x="830" y="1012">· 指纹不可复现场景（如整机迁移 P2V）：同上走后台换机，客户端无任何自行解绑入口</text>
+
+  <!-- ===== 口径对齐脚注 ===== -->
+  <text class="tn" x="28" y="1072">口径对齐：task 42（换机 = 后台废弃 + 重发，客户端无解绑/重置入口）· task 44（device 记录部署形态 native/docker 与镜像 digest）· task 59（宿主锚点 / 持久卷 / host-fingerprint.json）</text>
+  <text class="tn" x="28" y="1090">同码异机拒绝是「服务端行为」：客户端发起即可被拒；前端 / JS 层不参与任何指纹与绑定判定（对齐 task 40 前端不可保密原则）</text>
+</svg>
