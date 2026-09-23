@@ -21,6 +21,11 @@ use async_trait::async_trait;
 
 use crate::error::{DaemonError, DaemonResult};
 
+// ---- 具体协议驱动 ----
+
+/// Modbus TCP / RTU-over-TCP 驱动（plan task 9）。
+pub mod modbus;
+
 // ---- Driver trait ----
 
 /// 南向协议驱动统一契约。
@@ -119,6 +124,8 @@ impl PointAddressParser {
         }
         if normalized.starts_with("DB") {
             Self::parse_s7(&normalized).map_err(wrap)
+        } else if normalized.starts_with(|c: char| c.is_ascii_digit()) {
+            Self::parse_modbus(&normalized).map_err(wrap)
         } else {
             Self::parse_mc(&normalized).map_err(wrap)
         }
@@ -172,6 +179,56 @@ impl PointAddressParser {
             )),
             _ => Err(format!("unknown S7 access type {access:?} (expected DBX)")),
         }
+    }
+
+    /// Modbus 5 位区段编址：`4xxxx` = 保持寄存器（FC03）、`3xxxx` = 输入寄存器（FC04）。
+    ///
+    /// 首位数字为区段类型，其余数字为 **1 基** 寄存器号（`40001` → 协议地址 0）。
+    /// 线圈 `0xxxx`（FC01）与离散输入 `1xxxx`（FC02）为位访问，不在 task 9 范围。
+    /// 解析结果以 `area = Some('4' | '3')`、`start = 1 基寄存器号` 表示，
+    /// 协议地址 = `start - 1` 由驱动读写时换算。
+    fn parse_modbus(upper: &str) -> Result<PointAddress, String> {
+        if !upper.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "invalid modbus address {upper:?} (digits only expected)"
+            ));
+        }
+        let (area_raw, register_raw) = upper.split_at(1);
+        let area = match area_raw {
+            "4" => '4',
+            "3" => '3',
+            "0" | "1" => {
+                return Err(format!(
+                    "coil/discrete input area {area_raw}xxxx (FC01/FC02) out of task 9 scope (registers 4xxxx/3xxxx only)"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unsupported modbus area {other}xxxx (expected 4xxxx holding or 3xxxx input)"
+                ));
+            }
+        };
+        let start: u32 = register_raw
+            .parse()
+            .map_err(|_| format!("invalid modbus register number {register_raw:?}"))?;
+        if start == 0 {
+            return Err(
+                "modbus register number must be 1-based (e.g. 40001, not 40000)".to_string(),
+            );
+        }
+        if start > u32::from(u16::MAX) + 1 {
+            return Err(format!(
+                "modbus register number {start} out of range (1..={})",
+                u32::from(u16::MAX) + 1
+            ));
+        }
+        Ok(PointAddress {
+            db: 0,
+            area: Some(area),
+            start,
+            bit: false,
+            bit_index: 0,
+        })
     }
 
     /// MC 元件编址：`M<number>`（位）/ `D<number>`（字）。
@@ -378,7 +435,67 @@ mod tests {
             "D100.5",       // 字元件不支持位后缀
             "MX100",        // 元件号含字母
             "X100",         // 未支持的 MC 区
-            "40001",        // Modbus 地址待 task 9 扩展
+        ];
+        for raw in cases {
+            let err = PointAddressParser::parse(raw).expect_err(&format!("must reject {raw:?}"));
+            assert!(
+                matches!(err, DaemonError::ProtocolError(_)),
+                "for {raw:?} must be ProtocolError: {err:?}"
+            );
+            assert_eq!(err.error_code(), ERR_PROTOCOL, "for {raw:?}");
+            assert!(
+                err.to_string().contains(raw),
+                "message keeps input for {raw:?}: {err}"
+            );
+        }
+    }
+
+    // ---- 地址解析：Modbus 5 位区段编址（task 9 扩展） ----
+
+    /// QA Happy: Modbus 保持寄存器 "40001" → {area:'4', start:1}，协议地址 0。
+    #[test]
+    fn modbus_parse_holding_register_40001() {
+        let addr = PointAddressParser::parse("40001").expect("valid modbus holding address");
+        assert_eq!(addr.area, Some('4'), "area '4' = FC03 holding");
+        assert_eq!(addr.start, 1, "1-based register number");
+        assert!(!addr.bit, "register is word access");
+        assert_eq!(addr.db, 0, "non-S7 db is 0");
+        assert_eq!(addr.bit_index, 0, "no bit index");
+    }
+
+    /// QA Happy: Modbus 输入寄存器 "30001" → {area:'3', start:1}（FC04 input）。
+    #[test]
+    fn modbus_parse_input_register_30001() {
+        let addr = PointAddressParser::parse("30001").expect("valid modbus input address");
+        assert_eq!(addr.area, Some('3'), "area '3' = FC04 input");
+        assert_eq!(addr.start, 1, "1-based register number");
+        assert!(!addr.bit, "register is word access");
+    }
+
+    /// 非平凡取值 + trim/大小写归一不影响纯数字地址。
+    #[test]
+    fn modbus_parse_nonzero_and_normalized() {
+        let addr = PointAddressParser::parse("40100").expect("valid");
+        assert_eq!((addr.area, addr.start), (Some('4'), 100));
+        let padded = PointAddressParser::parse(" 465536 ").expect("trimmed");
+        assert_eq!(
+            (padded.area, padded.start),
+            (Some('4'), 65536),
+            "u16 max + 1"
+        );
+    }
+
+    /// QA Error: Modbus 越界与线圈区收敛为 ProtocolError（错误码 1000）。
+    #[test]
+    fn modbus_parse_rejections_return_protocol_error() {
+        let cases = [
+            "00001",  // 线圈 FC01 — task 9 范围外
+            "10001",  // 离散输入 FC02 — task 9 范围外
+            "4",      // 缺寄存器号
+            "40000",  // 寄存器号 0（1-based 起点为 1）
+            "40001A", // 尾部非数字
+            "465537", // 寄存器号 > 65536
+            "90001",  // 未支持的首数字区段
         ];
         for raw in cases {
             let err = PointAddressParser::parse(raw).expect_err(&format!("must reject {raw:?}"));

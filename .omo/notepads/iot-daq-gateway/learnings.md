@@ -47,3 +47,58 @@
 - Reconnector：默认序列 1,2,4,8,16,32,60,60,60；自定义 500ms/2s/3；reset 归零；非法配置钳制。
 - Driver trait：mock 端到端（connect->read->write->disconnect + 状态断言）、`Box<dyn Driver>` 对象安全、
   未连接 read 返回 `ProtocolError`。
+
+## task 9 — Modbus TCP / RTU-over-TCP 驱动（2026-09-23）
+
+### 关键设计决策
+
+1. **tokio-modbus 0.17 导入路径**：crate root 只导出 `Slave/Error/ProtocolError/Request/Response/ExceptionCode`，
+   **没有 `pub mod tcp`/`pub mod rtu`** —— 客户端模块在 `tokio_modbus::client::{tcp, rtu}`。
+   `tcp::connect_slave(SocketAddr, Slave) -> io::Result<Context>`；`rtu::attach_slave(transport, Slave) -> Context`
+   （`T: AsyncRead+AsyncWrite+Unpin+Send+'static`）；`tcp::attach_slave` 还要求 `T: fmt::Debug`。
+   `Context::disconnect()` 是 `Client` trait 方法，必须显式 `use tokio_modbus::client::Client`。
+
+2. **`Context` 非 `Sync` → `tokio::sync::Mutex<Context>`**：`Context` 内部 `Box<dyn Client>` 仅 `Send`，
+   而 `Driver` trait 要求 `Send + Sync`。用 `tokio::sync::Mutex` 包裹后 `Mutex<Context>: Sync` 满足对象安全。
+   每次请求 `ctx.lock().await` 取 guard，`&mut guard` 经 Deref 强转成 `&mut Context`（clippy 会提示
+   `explicit_auto_deref`，直接写 `&mut guard` 即可）。
+
+3. **闭包式请求分发有生命周期陷阱**：`F: Fn(&mut Context) -> Fut` 中 `Fut` 不能依赖参数生命周期
+   （`|ctx| async move {...}` 返回的 future 捕获 `&mut Context`，HRTB 不满足）。改为**枚举分发**：
+   `RequestOp { ReadHolding(u16,u16), ReadInput(u16,u16), WriteSingle(u16,u16) }`（`Copy`，重试可复用）
+   + `async fn execute(ctx: &mut Context, op: RequestOp)` + `RequestOutcome { Words(Vec<u16>), Written }`。
+
+4. **guard 借用与 `&mut self` 冲突**：`run_request` 里 guard 持有 `self.ctx` 的不可变借用，match 分支调用
+   `self.recover(...)`（需 `&mut self`）会 E0502。解法：把 `timeout(...)` 包进块作用域，guard 在块尾 drop，
+   再 match 结果。`recover` 里同样处理，且 guard 需 `let mut`（`&mut *guard` 要 DerefMut）。
+
+5. **错误映射**：拨号失败/传输中断 → `NetworkError`(6000)；请求超时（驱动层 `tokio::time::timeout` 包装）/
+   异常响应/帧校验 → `ProtocolError`(1000)。请求中 `Error::Transport` 视为连接丢失走重连。
+   重连语义：`connect()` 成功 `reset()`；恢复重连不 reset；重试仍失败再推进一次。
+
+6. **测试断言退避状态用 clone-peek**：`driver.reconnector().clone().next_delay()` 读当前值不推进，
+   避免给 `Reconnector` 加 `current_delay()`（更外科手术）。
+
+7. **mock 服务器**：`tokio_modbus::server::tcp::{Server, accept_tcp_connection}` + 自定义 `Service` impl
+   （共享 `Arc<Mutex<MockState>>` 记录请求日志/写日志）。`new_service` 闭包捕获 Arc 引用克隆，
+   `on_connected = move |stream, addr| { let ns = new_service.clone(); async move { accept_tcp_connection(stream, addr, ns) } }`。
+   flaky 服务器：先 accept 一次立即 drop，再起正常 server（模拟设备崩溃恢复）。
+
+### 踩坑记录
+
+- **「静默服务器」测试不能「读空即退出」**：服务器读到请求后继续读，客户端超时后重连，旧连接被服务器
+  读到 EOF 关闭 → 客户端收到 `Transport`(10054) 而非超时。正确做法：accept 后**不读不写**，`sleep` 保持
+  连接打开，且循环 accept（重连会建新连接）。
+- **clippy `await_holding_lock`**：测试里 `let state = state.lock()` 后跨 `driver.disconnect().await` 报错。
+  解法：断言块用 `{ }` 包裹，guard 在 await 前 drop。
+- **clippy `cloned_ref_to_slice_refs`**：`&[point.clone()]` → `std::slice::from_ref(&point)`。
+- **`write` 工具对已存在文件报错**：整文件重写需先 `Read` 再 `Write`，否则报 `File already exists`。
+
+### 测试覆盖（13 个 modbus 测试，58 全绿）
+
+- 解析：40001/30001 归一化、非零字段、拒绝列表（00001/10001/4/40000/40001A/465537/90001）。
+- TCP happy：FC03 读保持（大端拼接+请求日志）、FC04 读输入、FC06 写单个（寄存器更新+写日志）。
+- 错误路径：异常→ProtocolError 不推进退避；拨号失败→NetworkError 推进退避；静默超时→ProtocolError 退避推进 2 次。
+- 重连：flaky 首连接即断→重连成功重试，退避不重置。
+- RTU-over-TCP：slave id/FC03/地址/数量/CRC16 低字节先发。
+- 本地校验：输入区写拒绝、值非 2 字节拒绝、count 0/126 拒绝。
