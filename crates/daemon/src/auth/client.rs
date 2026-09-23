@@ -47,10 +47,10 @@ use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64NP;
 use base64::Engine as _;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::signing::{AuthSigner, LicenseGate};
+use crate::auth::signing::{AuthSigner, KeyProvider, LicenseGate};
 use crate::error::{DaemonError, DaemonResult};
 
 // ---- 常量（默认值集中声明，避免散落魔法数字） ----
@@ -71,6 +71,11 @@ const SECS_PER_DAY: i64 = 86_400;
 pub const JSON_SAFE_INT_MAX: i64 = 9_007_199_254_740_991;
 /// Lease Token 签名域（与 licensing-server 的 `LEASE_SIGNING_DOMAIN` 一致）。
 pub const LEASE_SIGNING_DOMAIN: &str = "iotdaq.lease.v1";
+/// 回执签名域（确定性、无 nonce；服务端从回执字段重建此串后验签）。
+///
+/// 与 `LEASE_SIGNING_DOMAIN` 同风格：**不带**尾随 `|`（分隔符由 `push_len_field` 前置），
+/// 渲染结果为 `iotdaq.receipt.v1|mid=...|...|ts=...`。
+pub const RECEIPT_SIGNING_DOMAIN: &str = "iotdaq.receipt.v1";
 /// Ed25519 公钥原始字节长度。
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
 /// Ed25519 签名原始字节长度。
@@ -379,6 +384,12 @@ pub struct LicensingClient {
     machine_code: String,
     /// 网络传输实现（生产 HTTPS / 测试 fake）。
     transport: Arc<dyn LicenseTransport>,
+    /// 回执签名密钥提供者（**可选**；未注入时回执签名置空 → 服务端明确拒绝）。
+    ///
+    /// 与 [`AuthSigner`] 使用**同一把设备私钥**（生产由宿主注入同一个 `KeyProvider`）；
+    /// 之所以单独持有：回执签名必须是**确定性、可被服务端用设备公钥重建验签**的签名，
+    /// 而 [`AuthSigner::sign_semantic`] 会掺入随机 nonce（服务端无法重建），故不经其签名。
+    receipt_signer: Option<Arc<dyn KeyProvider>>,
     /// 内置公钥集：`kid → Ed25519 公钥`（支持多 kid 轮换）。
     public_keys: BTreeMap<String, VerifyingKey>,
     /// 状态机内部数据。
@@ -423,6 +434,7 @@ impl LicensingClient {
             signer,
             machine_code,
             transport,
+            receipt_signer: None,
             public_keys: BTreeMap::new(),
             inner: Mutex::new(ClientInner {
                 state: LicenseState::Unlicensed,
@@ -433,6 +445,19 @@ impl LicensingClient {
                 last_cursor: None,
             }),
         }
+    }
+
+    /// **增量、可选**：注入回执签名密钥（与 [`AuthSigner`] 用同一把设备私钥）。
+    ///
+    /// 未注入时 [`LicensingClient::report_receipt`] 产出的 `sig` 为空串——这是
+    /// **明确的失败信号**（服务端收到空签名会拒绝），绝非「无签名冒充有效签名」。
+    /// 注入后回执签名是**确定性**的：服务端可用设备公钥从回执字段独立重建并验签。
+    ///
+    /// 该方法是**新增**的（不改动 [`LicensingClient::new`] / [`LicensingClient::with_transport`]
+    /// 签名，避免破坏既有调用方）。
+    pub fn with_receipt_signer(mut self, provider: Arc<dyn KeyProvider>) -> Self {
+        self.receipt_signer = Some(provider);
+        self
     }
 
     /// 注册一个内置公钥（`kid → Ed25519 32 字节公钥`）。
@@ -474,6 +499,14 @@ impl LicensingClient {
     /// 当前本机机器码指纹。
     pub fn machine_code(&self) -> &str {
         &self.machine_code
+    }
+
+    /// 与本客户端绑定的 AuthBlock 签名器（task 21）。
+    ///
+    /// 供北向转发层复用**同一个** `Arc<AuthSigner>`（`mid` / 授权闸门一致，单一真相源）；
+    /// 回执签名使用与之一致的设备私钥（经 [`LicensingClient::with_receipt_signer`] 注入）。
+    pub fn signer(&self) -> &Arc<AuthSigner> {
+        &self.signer
     }
 
     /// 当前状态快照（无锁竞争时返回克隆；锁中毒时退化为 `Unlicensed`，不 panic）。
@@ -642,6 +675,9 @@ impl LicensingClient {
         });
 
         // 白名单守护：构造出的请求体 key 集合必须恰好等于白名单。
+        // 注：此断言只比长度（`debug_assert` 在 release 被裁掉），是「廉价前置闸门」；
+        // 真正的内容级守护由测试 `receipt_signature_verifies_against_its_public_key`
+        // （真实验签）与 `receipt_body_has_exactly_whitelisted_keys`（key 集合精确相等）承担。
         debug_assert_eq!(object_keys(&body).len(), RECEIPT_FIELD_WHITELIST.len());
 
         let url = self.cfg.endpoint("receipt");
@@ -652,11 +688,21 @@ impl LicensingClient {
         Ok(())
     }
 
-    /// 构造回执请求签名（Ed25519 语义哈希签名）。
+    /// 构造回执请求签名（**确定性** Ed25519 签名，服务端可用设备公钥重建验签）。
     ///
-    /// 复用 [`AuthSigner::sign_semantic`]（授权闸门在签名前判定）与
-    /// `signing::semantic_hash` 的域分隔口径思路：把回执 6 个业务字段拼成确定性语义串再哈希。
-    /// 私钥不落盘、不日志（由 [`AuthSigner`] 保证）。
+    /// 签名对象是**确定性规范化串**（非序列化字节，非含随机 nonce 的 AuthBlock 消息）：
+    ///
+    /// ```text
+    /// iotdaq.receipt.v1|mid=<len>:<mid>|lease_id=<len>:<lease_id>|seq_from=<len>:<n>|
+    ///                   seq_to=<len>:<n>|count=<len>:<n>|payload_digest=<len>:<s>|ts=<len>:<ts>
+    /// ```
+    ///
+    /// 然后对该串的 SHA-256（`semantic_digest`）做 Ed25519 原始签名，输出 STANDARD base64。
+    /// 服务端从回执请求体的 7 个字段（mid/lease_id/seq_from/seq_to/count/payload_digest/ts）
+    /// 独立重建同一串并验签，**因此签名可被第三方校验**（这是 B 档二次校验的信任基础）。
+    ///
+    /// 私钥不落盘、不日志（由 [`KeyProvider`] 保证）；密钥不可用时返回**空串**——这是明确的
+    /// 失败信号（服务端拒绝），**绝不**用「无签名」冒充有效签名；生产路径零 panic。
     fn sign_receipt(
         &self,
         lease_id: &str,
@@ -666,26 +712,29 @@ impl LicensingClient {
         payload_digest: &str,
         ts: i64,
     ) -> String {
-        let mut msg = String::with_capacity(192);
-        msg.push_str("iotdaq.receipt.v1|");
-        push_len_field(&mut msg, "mid", &self.machine_code);
-        push_len_field(&mut msg, "lease_id", lease_id);
-        push_len_field(&mut msg, "seq_from", &seq_from.to_string());
-        push_len_field(&mut msg, "seq_to", &seq_to.to_string());
-        push_len_field(&mut msg, "count", &count.to_string());
-        push_len_field(&mut msg, "payload_digest", payload_digest);
-        push_len_field(&mut msg, "ts", &ts.to_string());
-
-        // 复用签名器的语义哈希口径：把确定性串喂给 `semantic_hash` 的域分隔写法。
-        // 这里直接对消息做一次 SHA-256（与 `semantic_hash` 同一哈希族），
-        // 保持「不签序列化字节、签语义规范化串」的红线。
+        let msg = receipt_signing_message(
+            &self.machine_code,
+            lease_id,
+            seq_from,
+            seq_to,
+            count,
+            payload_digest,
+            ts,
+        );
         let payload_hash = semantic_digest(msg.as_bytes());
-        match self.signer.sign_semantic(&payload_hash, ts) {
-            Ok(block) => block.sig_b64,
-            // 闸门关闭 / 密钥不可用：回执签名置空，调用方经服务端校验会拿到明确拒绝，
-            // **绝不**用「无签名」冒充有效签名。生产路径零 panic。
-            Err(_) => String::new(),
-        }
+
+        let provider = match &self.receipt_signer {
+            Some(p) => p,
+            // 未注入回执签名密钥：置空（明确失败信号），不伪造签名、不 panic。
+            None => return String::new(),
+        };
+        let signing_key = match provider.signing_key() {
+            Ok(k) => k,
+            // 密钥不可用：置空（明确失败信号）。
+            Err(_) => return String::new(),
+        };
+        let signature: Signature = signing_key.sign(&payload_hash);
+        B64.encode(signature.to_bytes())
     }
 
     // ---- 本地验签 ----
@@ -934,6 +983,37 @@ fn semantic_digest(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// 渲染回执签名消息（**确定性、无 nonce**；服务端可用同一函数从回执字段重建）。
+///
+/// 格式（逐字段长度前缀，防拼接歧义）：
+/// ```text
+/// iotdaq.receipt.v1|mid=<len>:<mid>|lease_id=<len>:<lease_id>|seq_from=<len>:<n>|
+///                   seq_to=<len>:<n>|count=<len>:<n>|payload_digest=<len>:<s>|ts=<len>:<ts>
+/// ```
+///
+/// 覆盖回执请求体的**全部 7 个业务字段**（`device_mid`/`lease_id`/`seq_from`/`seq_to`/
+/// `count`/`payload_digest`/`ts`）——任何字段被中间人篡改都会破坏签名。
+fn receipt_signing_message(
+    mid: &str,
+    lease_id: &str,
+    seq_from: i64,
+    seq_to: i64,
+    count: i64,
+    payload_digest: &str,
+    ts: i64,
+) -> String {
+    let mut msg = String::with_capacity(192);
+    msg.push_str(RECEIPT_SIGNING_DOMAIN);
+    push_len_field(&mut msg, "mid", mid);
+    push_len_field(&mut msg, "lease_id", lease_id);
+    push_len_field(&mut msg, "seq_from", &seq_from.to_string());
+    push_len_field(&mut msg, "seq_to", &seq_to.to_string());
+    push_len_field(&mut msg, "count", &count.to_string());
+    push_len_field(&mut msg, "payload_digest", payload_digest);
+    push_len_field(&mut msg, "ts", &ts.to_string());
+    msg
+}
+
 /// 渲染 Lease Token 签名域（与 licensing-server 的 `render_signing_message` **逐字节一致**）。
 ///
 /// 格式：`iotdaq.lease.v1|kid=<len>:<kid>|lease_id=...|...|valid_until=<len>:<ts>`
@@ -1074,7 +1154,7 @@ mod tests {
     use crate::auth::machine_id::{FingerprintKey, MachineIdentity, StaticAnchor};
     use crate::auth::signing::StaticKeyProvider;
     use crate::error::{ERR_AUTH, ERR_CONFIG, ERR_NETWORK, ERR_SECURITY};
-    use ed25519_dalek::{Signer as _, SigningKey};
+    use ed25519_dalek::{SigningKey, Verifier as _};
     use std::sync::Mutex as StdMutex;
 
     /// test-only：Ed25519 私钥种子 A（**仅测试，禁止用于真实部署**）。
@@ -1129,8 +1209,26 @@ mod tests {
 
     /// 构造带公钥集（A / B 两把 kid）的客户端；传输来自共享的 [`FakeTransport`]。
     ///
-    /// 返回的 fake 与客户端共享同一实例，测试可对 fake 编程响应并读取记录。
+    /// 注入回执签名密钥（私钥 A，与 [`test_signer`] 同一把设备私钥），
+    /// 使回执签名路径可用（正常路径）。
     fn client_with_fake(fake: &Arc<FakeTransport>) -> LicensingClient {
+        let cfg = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30)
+            .expect("non-empty url");
+        let signer = test_signer();
+        let transport: Arc<dyn LicenseTransport> = Arc::clone(fake) as Arc<dyn LicenseTransport>;
+        let mut client = LicensingClient::with_transport(cfg, signer, test_mid(), transport)
+            .with_receipt_signer(Arc::new(StaticKeyProvider::new(TEST_ONLY_KEY_A)));
+        client
+            .register_public_key("kid-a", &public_key_bytes(TEST_ONLY_KEY_A))
+            .expect("register kid-a");
+        client
+            .register_public_key("kid-b", &public_key_bytes(TEST_ONLY_KEY_B))
+            .expect("register kid-b");
+        client
+    }
+
+    /// 构造**未注入回执签名密钥**的客户端（用于 T2：空签名 = 失败信号）。
+    fn client_with_fake_no_receipt_signer(fake: &Arc<FakeTransport>) -> LicensingClient {
         let cfg = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30)
             .expect("non-empty url");
         let signer = test_signer();
@@ -1139,9 +1237,6 @@ mod tests {
         client
             .register_public_key("kid-a", &public_key_bytes(TEST_ONLY_KEY_A))
             .expect("register kid-a");
-        client
-            .register_public_key("kid-b", &public_key_bytes(TEST_ONLY_KEY_B))
-            .expect("register kid-b");
         client
     }
 
@@ -1517,6 +1612,156 @@ mod tests {
         assert_eq!(err.error_code(), ERR_CONFIG);
     }
 
+    /// **T1（QA MAJOR-2 核心）**：正常路径下回执 `sig` 非空，且**真正能验签通过**。
+    ///
+    /// 这是 B 档二次校验信任机制的守护：测试独立重建「服务端会拼的签名消息」→ 算
+    /// `semantic_digest` → 用设备公钥对 `sig` 做 Ed25519 验签。**同时守住两件事**：
+    /// ① 签名非空且有效；② 签名域与字段集合均与预期一致（改任一字段都会验签失败）。
+    #[tokio::test]
+    async fn receipt_signature_verifies_against_its_public_key() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-1").await.expect("activate ok");
+
+        fake.respond_with(serde_json::json!({ "ok": true }));
+        client
+            .report_receipt(7, 42, 35, "sha256:deadbeef")
+            .await
+            .expect("receipt report ok");
+
+        let body = fake.last_body().expect("body recorded");
+        let sig_b64 = body["sig"].as_str().expect("sig must be a string");
+        assert!(!sig_b64.is_empty(), "receipt sig must not be empty");
+
+        // 独立重建服务端侧签名消息（**不使用客户端任何私有状态**，只用请求体字段）。
+        let expected_msg = receipt_signing_message(
+            body["device_mid"].as_str().expect("device_mid"),
+            body["lease_id"].as_str().expect("lease_id"),
+            7,
+            42,
+            35,
+            "sha256:deadbeef",
+            body["ts"]
+                .as_str()
+                .expect("ts")
+                .parse::<i64>()
+                .expect("ts is i64 string"),
+        );
+        let payload_hash = semantic_digest(expected_msg.as_bytes());
+
+        // 用对应公钥真正验签。
+        let sig_bytes: [u8; ED25519_SIGNATURE_LEN] = B64
+            .decode(sig_b64)
+            .expect("sig is valid base64")
+            .as_slice()
+            .try_into()
+            .expect("sig is 64 bytes");
+        let signature = Signature::from_bytes(&sig_bytes);
+        let public_key = SigningKey::from_bytes(&TEST_ONLY_KEY_A).verifying_key();
+        public_key
+            .verify(&payload_hash, &signature)
+            .expect("receipt signature must verify against the device public key");
+
+        // 反向守护：用**另一把**公钥验签必须失败（证明确实是设备私钥签的）。
+        let other_key = SigningKey::from_bytes(&TEST_ONLY_KEY_B).verifying_key();
+        assert!(
+            other_key.verify(&payload_hash, &signature).is_err(),
+            "a foreign public key must not verify the receipt signature"
+        );
+    }
+
+    /// **T2（守住设计意图）**：未注入回执签名密钥时，`sig` 为**空串**（明确失败信号）。
+    ///
+    /// 这条把「空签名 = 失败信号（服务端会拒绝）」写成可执行断言，防止后人把空串当成功路径。
+    #[tokio::test]
+    async fn receipt_signature_is_empty_when_signer_is_unavailable() {
+        let fake = Arc::new(FakeTransport::default());
+        let client = client_with_fake_no_receipt_signer(&fake);
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-1").await.expect("activate ok");
+
+        fake.respond_with(serde_json::json!({ "ok": true }));
+        client
+            .report_receipt(0, 1, 1, "sha256:x")
+            .await
+            .expect("transport still called");
+
+        let body = fake.last_body().expect("body recorded");
+        // 空签名是**明确的失败信号**：服务端收到空串会拒绝，绝不冒充有效签名。
+        assert_eq!(
+            body["sig"].as_str().expect("sig is a string"),
+            "",
+            "unavailable signer must emit an EMPTY sig (failure signal), not a fake signature"
+        );
+    }
+
+    /// **T3（防漏字段）**：签名消息覆盖回执白名单的**全部业务字段**。
+    ///
+    /// 对每个字段**单独变异**一个值 → 签名消息必须改变；若某字段被漏出签名域，
+    /// 中间人篡改它就不会破坏签名，本测试即失败。最后再断言 Ed25519 签名随字段变化而不同。
+    #[test]
+    fn receipt_signing_message_covers_all_whitelisted_fields() {
+        // 基线（无变异）。
+        let base = receipt_signing_message("mid-1", "lease-1", 10, 20, 11, "digest-1", 1_000);
+
+        // 逐字段单独变异：每个字段变更都必须让签名消息改变。
+        let variants: Vec<(&str, String)> = vec![
+            (
+                "mid",
+                receipt_signing_message("mid-2", "lease-1", 10, 20, 11, "digest-1", 1_000),
+            ),
+            (
+                "lease_id",
+                receipt_signing_message("mid-1", "lease-2", 10, 20, 11, "digest-1", 1_000),
+            ),
+            (
+                "seq_from",
+                receipt_signing_message("mid-1", "lease-1", 11, 20, 11, "digest-1", 1_000),
+            ),
+            (
+                "seq_to",
+                receipt_signing_message("mid-1", "lease-1", 10, 21, 11, "digest-1", 1_000),
+            ),
+            (
+                "count",
+                receipt_signing_message("mid-1", "lease-1", 10, 20, 12, "digest-1", 1_000),
+            ),
+            (
+                "payload_digest",
+                receipt_signing_message("mid-1", "lease-1", 10, 20, 11, "digest-2", 1_000),
+            ),
+            (
+                "ts",
+                receipt_signing_message("mid-1", "lease-1", 10, 20, 11, "digest-1", 1_001),
+            ),
+        ];
+        // 白名单的 7 个业务字段（`sig` 本身不在签名消息内，它是签名输出）。
+        assert_eq!(variants.len(), RECEIPT_FIELD_WHITELIST.len() - 1);
+        for (field, mutated) in &variants {
+            assert_ne!(
+                base, *mutated,
+                "field `{field}` must participate in the receipt signing message"
+            );
+        }
+
+        // 端到端加固：同一签名密钥下，任一字段变异 → 实际 Ed25519 签名必然不同。
+        let signing_key = SigningKey::from_bytes(&TEST_ONLY_KEY_A);
+        let base_sig = signing_key
+            .sign(&semantic_digest(base.as_bytes()))
+            .to_bytes();
+        for (field, mutated) in &variants {
+            let sig = signing_key
+                .sign(&semantic_digest(mutated.as_bytes()))
+                .to_bytes();
+            assert_ne!(
+                base_sig, sig,
+                "mutating `{field}` must change the actual signature"
+            );
+        }
+    }
+
     /// 要求 5：本地验签支持多 kid——kid-a 与 kid-b 都能验通（轮换兼容）。
     #[test]
     fn verify_lease_supports_multiple_kids() {
@@ -1689,26 +1934,45 @@ mod tests {
         assert!(!state.allows_northbound_forward());
     }
 
-    /// 要求 4：系统时间回拨防御——正常推进 5 天后把 `now` 拨回，`days_left` **不增加**。
+    /// 要求 4（MINOR-3 修正）：系统时间回拨防御——**在 `Trial` 上进行**，可区分回拨是否生效。
+    ///
+    /// 原测试在进入 `Degraded` 后调 `tick`，命中 `other => other.clone()`，任何输入都回不到
+    /// `Trial`——是「无关变量通过」的假守护。改为在 `Trial` 上验证单调时钟：推进 1 天后把
+    /// `now` 拨回激活时刻，`days_left` **不得**从 2 涨回 3（否则调时钟即可无限续期）。
     #[test]
-    fn clock_rollback_does_not_grant_extra_time() {
+    fn clock_rollback_does_not_extend_trial() {
         let (client, _fake) = setup();
 
         client.begin_trial(T0);
-        // 正常推进 5 天：试用已耗尽 → Degraded。
-        let state = client.tick(T0 + 5 * SECS_PER_DAY);
-        assert!(matches!(state, LicenseState::Degraded { .. }), "{state:?}");
+        assert_eq!(client.tick(T0), LicenseState::Trial { days_left: 3 });
 
-        // 把时钟拨回激活时刻：推进量按 0 计，状态**不得**回到 Trial / 不得续期。
+        // 正常推进 1 天 → days_left = 2。
+        let state = client.tick(T0 + SECS_PER_DAY);
+        assert_eq!(state, LicenseState::Trial { days_left: 2 });
+
+        // 把 now 拨回激活时刻（回拨）：单调时钟不后退，days_left 必须**仍为 2**。
         let state = client.tick(T0);
-        assert!(
-            matches!(state, LicenseState::Degraded { .. }),
-            "rollback must not resurrect trial, got {state:?}"
+        assert_eq!(
+            state,
+            LicenseState::Trial { days_left: 2 },
+            "clock rollback must NOT resurrect trial days"
         );
 
-        // 再拨到 5 天前的中间某点，仍不续期。
+        // 再拨到「激活后 0.5 天」的中间点：仍不续期。
+        let state = client.tick(T0 + SECS_PER_DAY / 2);
+        assert_eq!(
+            state,
+            LicenseState::Trial { days_left: 2 },
+            "any rollback within elapsed window must not extend trial"
+        );
+
+        // 单调性证明：继续正向推进 1 天 → days_left 如期减到 1（回拨没有「冻结」推进）。
         let state = client.tick(T0 + 2 * SECS_PER_DAY);
-        assert!(matches!(state, LicenseState::Degraded { .. }), "{state:?}");
+        assert_eq!(
+            state,
+            LicenseState::Trial { days_left: 1 },
+            "forward progress must resume after a rollback attempt"
+        );
     }
 
     /// 要求 4（Grace 版）：宽限期内时间回拨 → `days_left` **不增加**。
