@@ -194,22 +194,31 @@ impl AuditReceiptRequest {
     pub fn validate_whitelist(&self) -> LicenseResult<()> {
         // 强类型结构体天然只有 8 个字段；逐字段存在性检查确保字段集合与白名单一致
         // （空字符串视为「未提供」，历史脏数据不得蒙过白名单）。
-        if self.device_mid.is_empty() {
+        //
+        // ⚠️ **用 `trim().is_empty()` 而非 `is_empty()`**：纯空白串（`"   "` / `"\t"`）
+        // 在 `is_empty()` 下会被当作「已提供」而蒙过白名单。实测确认过这条绕过路径：
+        // `sig = "   "` 曾通过白名单校验，只因下游 `decode_signature` 也做 trim 才
+        // 侥幸拦住。**不能依赖下游兜底来补上游的存在性判定**——否则一旦下游放松，
+        // 空白就成了一条完整绕过面。此处统一把「纯空白」视同「未提供」。
+        fn missing(s: &str) -> bool {
+            s.trim().is_empty()
+        }
+        if missing(&self.device_mid) {
             return Err(LicenseError::ActivationRejected(
                 "audit receipt field whitelist violation: device_mid missing".into(),
             ));
         }
-        if self.lease_id.is_empty() {
+        if missing(&self.lease_id) {
             return Err(LicenseError::ActivationRejected(
                 "audit receipt field whitelist violation: lease_id missing".into(),
             ));
         }
-        if self.payload_digest.is_empty() {
+        if missing(&self.payload_digest) {
             return Err(LicenseError::ActivationRejected(
                 "audit receipt field whitelist violation: payload_digest missing".into(),
             ));
         }
-        if self.sig.is_empty() {
+        if missing(&self.sig) {
             return Err(LicenseError::ActivationRejected(
                 "audit receipt field whitelist violation: sig missing".into(),
             ));

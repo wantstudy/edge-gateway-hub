@@ -1,0 +1,249 @@
+# QA Wave 3b-2 — 独立回归验证报告（第二层 QA）
+
+- 验证者：qa-wave3b-2（只读验证方，未修改任何源码）
+- 日期：2026-09-24
+- 仓库：`F:\xy\iot-daq`
+- 基线 HEAD：`6cb25b7`
+- 目标模块：
+  - `crates/daemon/src/telemetry_store.rs`（task 18，提交 `20fb369`）
+  - `crates/daemon/src/auth/client.rs`（task 22，提交 `6cb25b7`）
+  - `crates/licensing-server/src/{keys,token,error}.rs`（task 45，提交 `e6473a9`）
+- 环境（每条 cargo 命令前）：
+  ```bash
+  cd /f/xy/iot-daq && export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' \
+    PATH="/d/rust/cargo/bin:/d/rust/mingw64/bin:$PATH"
+  export HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= NO_PROXY='*'
+  ```
+
+## 0. 我亲自跑出的基线（非复述）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p daemon` | **222 passed / 0 failed / 1 ignored**（EXIT=0） |
+| `cargo test -p licensing-server --lib keys::` | **18 passed / 0 failed** |
+| `cargo test -p licensing-server --lib token::` | **17 passed / 0 failed** |
+| `cargo test -p licensing-server --lib error::` | **2 passed / 0 failed** |
+| `cargo test -p licensing-server --lib`（全量） | 首轮 **114 passed / 7 failed** → 复跑 **121 passed / 0 failed**（见 §4） |
+| `cargo fmt --check` | **EXIT=0** |
+| `cargo clippy --all-targets -- -D warnings` | **EXIT=0** |
+
+⚠️ 所有目标文件在实验结束后 `git status --short` 均为空（完全还原，见 §1 每条“还原复验”）。
+
+---
+
+## 1. 变异实验结果表（核心交付）
+
+方法：每次只改一处、跑测试、贴真实输出、`git checkout --` 还原、`touch` 源文件后复跑确认重新变绿（规避 cargo mtime 旧二进制竞态）。
+
+| # | 模块 | 变异 | 期望失败 | 实际失败？ | 抓它的测试名 | 判定 |
+|---|---|---|---|---|---|---|
+| 1a | telemetry_store | 删掉 tag 校验（`if false && !constant_time_eq(...)`） | 是 | **是** | `tampered_ciphertext_is_rejected_by_authentication`、`decryption_fails_with_different_machine_code` | ✅ 抓到 |
+| 1b | telemetry_store | HKDF `info` 两处同值（enc_key==mac_key） | 是 | **是** | `hkdf_derivation_is_deterministic_and_domain_separated` | ✅ 抓到 |
+| 1c | telemetry_store | nonce 改成常量全 0 | 是（期望） | **否（29/29 全绿）** | 无 | ❌ **未抓到 — MAJOR（见 §5-A）** |
+| 1d | telemetry_store | `machine_code` 从 HKDF 的 **IKM** 删掉（salt 保留） | 是 | **否** | 无 | ⚠️ 未抓到，但可辩解：machine_code 仍是 salt，`decryption_fails_with_different_machine_code` 名实相符；**完全移除 machine_code（IKM+salt）后两条测试均失败** ✅ |
+| 2a | auth/client | 时间回拨不钳制（`max_observed` 允许回退） | 是 | **是（仅 1/2）** | `clock_rollback_does_not_extend_grace` | ✅ 抓到；但 `clock_rollback_does_not_grant_extra_time` **未失败（见 §5-C）** |
+| 2b | auth/client | 宽限期 7→8 天 | 是 | **是** | `offline_grace_seven_days_then_degraded`、`clock_rollback_does_not_extend_grace`、`license_gate_tracks_state` | ✅ 抓到 |
+| 2c | auth/client | 回执 JSON 删掉 `ts` 字段 | 是 | **是** | `receipt_numbers_are_json_strings`、`receipt_body_has_exactly_whitelisted_keys`（`debug_assert_eq!` line 644 触发 7!=8） | ✅ 抓到 |
+| 2d | auth/client | `push_len_field` 的 `len` 改 `chars().count()` | —— | 否（29/29 全绿） | 无 | ⚠️ 仅 ASCII 用例覆盖，字符串长度语义无测试守护（见 §5-D，Minor） |
+| 2e | auth/client | `push_len_field` 去掉字段名 `|name=` | 是 | **是** | `signing_message_layout_matches_server` | ✅ 抓到（证明跨端字面量测试有效） |
+| 3a | token | `render_signing_message` 去掉长度前缀 `len:` | 是（2 条） | **仅 1 条失败** | `signing_message_layout_is_stable` | ⚠️ `pipe_in_field_does_not_create_ambiguity` **未失败（见 §5-B，Minor 虚设断言）** |
+| 3b | keys | `verify` 去掉 `!entry.status.can_verify()`（retired 也能验） | 是 | **是** | `kid_rotation_keeps_old_key_verifiable_then_retires`、`token::rotation_keeps_existing_tokens_verifiable` | ✅ 抓到 |
+| 3c | keys | 未知 kid → 尝试所有已知公钥 | 是 | **是** | `unknown_kid_is_rejected` | ✅ 抓到 |
+| 4 | auth/client | `sign_receipt` 恒返回空 `sig`（回执静默不签名） | 是（期望） | **否（29/29 全绿）** | 无 | ❌ **未抓到 — MAJOR（见 §5-E）** |
+
+### 变异 1c 的加固证明（常量 nonce = keystream 复用）
+
+在**变异体**（常量 nonce）上插入探针，断言两行相同明文的 nonce 段/密文段必须不同：
+```
+assertion `left != right` failed: PROBE: nonce 在行间复用了！(nonce=[00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00])
+  left: [0,0,0,0,0,0,0,0,0,0,0,0]   right: [0,0,0,0,0,0,0,0,0,0,0,0]
+```
+在**基线**上同一探针 **PASS**（19 tests → 探针 ok）。→ 证明基线 nonce 确随行唯一，而变异确实引入 nonce 复用。
+
+### 变异 2e 的跨端一致性核对（独立比对，非自证）
+
+客户端与服务端的期望字面量**逐字节相同**：
+- `crates/daemon/src/auth/client.rs:1879-1885`
+- `crates/licensing-server/src/token.rs:639-645`
+```
+"iotdaq.lease.v1|kid=5:kid-1|lease_id=10:lease-0001|device_id=8:dev-0001|mid=16:a1b2c3d4e5f6a7b8|tier=8:standard|verify_mode=1:B|issued_at=10:1700000000|valid_until=10:1536000"
+```
+两文件各用**独立硬编码字面量**比对自身渲染结果 → 是真跨端守护，非自证。✅
+
+### 变异 3a 的分析结论（长度前缀的真实作用）
+
+用 Python 精确复现朴素拼接碰撞：
+```
+naive A: tier=X|mid=Y|mid=Z
+naive B: tier=X|mid=Y|mid=Z
+naive equal? True
+render with len, equal? False     ← 正确
+render no len,   equal? False     ← 即使去掉长度前缀也不碰撞！
+```
+**原因**：字段名（`tier=`、`mid=`）本身已能消歧。因此 `pipe_in_field_does_not_create_ambiguity`（token.rs:459-478）用 `tier="a|b"` vs `tier="standard"` 两个**平凡不同**的载荷断言 `m1 != m2`，无论有无长度前缀都成立 → **该测试对其声称的目的（证明长度前缀有效）是虚设的**。长度前缀本身由 `signing_message_layout_is_stable` 守护（有真实失败证据）。
+
+---
+
+## 2. 红线扫描结果（逐项证据）
+
+### 2.1 生产路径零 panic —— ✅ PASS
+
+按 `#[cfg(test)]` 边界切分后仅扫描生产代码：
+| 文件 | `#[cfg(test)]` 起始行 | 生产段区间 |
+|---|---|---|
+| telemetry_store.rs | 1153 | 1–1152 |
+| auth/client.rs | 1071 | 1–1070 |
+| keys.rs | 523 | 1–522 |
+| token.rs | 292 | 1–291 |
+| error.rs | 73 | 1–72 |
+
+生产段内 `unwrap()` / `expect(` / `panic!` / `unreachable!` / `unimplemented!` / `todo!` / `.unwrap()` 命中数：**全部为 0**。
+
+生产段内的近似调用（逐条判定）：
+| 位置 | 代码 | 判定 |
+|---|---|---|
+| telemetry_store.rs:1085 | `.unwrap_or_else(poison_recover)` | ✅ 不 panic（锁中毒恢复，取回内部数据） |
+| client.rs:394 | `.unwrap_or_else(\|_\| "<poisoned>")`（Debug） | ✅ 不 panic |
+| client.rs:645 | `debug_assert_eq!(object_keys(&body).len(), RECEIPT_FIELD_WHITELIST.len())` | ⚠️ **debug 构建下可 panic**；release 编译期移除。且只比**长度**不比 key 集合（见 §5-D）。 |
+| token.rs:116 | `.unwrap_or_else(\|_\| b"{}".to_vec())` | ✅ 不 panic；`LeaseClaims` 为扁平 String/i64 结构，`serde_json::to_vec` 实际不可失败，属不可达防御 |
+
+### 2.2 硬编码密钥 —— ✅ PASS
+
+- 所有 `TEST_ONLY_*` 常量均在 `#[cfg(test)]` 内（client.rs:1081/1083/1085，>1071 边界），命名显式声明测试专用。
+- `licensing-server` 生产段**无任何 base64 长串字面量**、无 `-----BEGIN`、无 `PRIVATE KEY`。
+- `keys.rs` 生产段**零** `INSERT`/`UPDATE`/`sqlite`/`Connection`/`persist`/`save` → **私钥确实不落库**。
+- 私钥仅以内存 `SigningKey` 形式经 `register_from_b64` / `register_generated` 注入；`Debug` 手写脱敏（`KeyEntry` 显示 `<injected>`/`<none>`，`KeyRing` 只显示 kid 列表），并有测试 `debug_output_never_leaks_private_key_material` 守护。
+
+### 2.3 JSON 大整数走字符串 —— ✅ PASS
+
+`auth/client.rs` 中所有大整数字段均 `.to_string()`：
+- activate 请求 `"ts": now.to_string()`（:519）
+- heartbeat 请求 `"ts"`（:553）、`cursor_from/cursor_to`（:561-564）
+- receipt 请求 `seq_from`/`seq_to`/`count`/`ts`（:636-640）
+由 `receipt_numbers_are_json_strings`（用 `JSON_SAFE_INT_MAX + 12345 > 2^53-1`）实测守护，且 `hex`/DB 层面 `StoredPoint.seq/ts_ns` 为 SQLite INTEGER（非 JSON），无红线问题。
+
+### 2.4 SQL 注入面 —— ✅ PASS
+
+`telemetry_store.rs` 生产段 SQL 站点：
+- :566 `execute_batch(&format!(...))` — 仅内插 `const BUSY_TIMEOUT_MS: i64`，**无用户输入**。
+- :654/670、:700/707、:724/731、:759、:767/777、:783、:795 — **全部 `params![...]` 参数化**。
+- 其余 `format!`（:238/574/816/819/934/971/1135）均用于**错误消息**，非 SQL。
+→ 无拼接注入面。✅
+
+---
+
+## 3. 断言有效性抽查（抽查 ≥10 条）
+
+| # | 测试 | 断言是否落在真实计算值 | 是否空跑/弱断言 | 判定 |
+|---|---|---|---|---|
+| 1 | `telemetry_store::encryption_evidence_raw_bytes_do_not_contain_plaintext_float` | **是** | 否 | ✅ 强：`Connection::open_with_flags(READ_ONLY)` 绕过模块解密，`SELECT value_enc` 取原始列，`hex::decode` 后做 windows 字节搜索（LE/BE）+ hex 文本子串 + ASCII 检查。变异 1a 证明其可失败。 |
+| 2 | `telemetry_store::decryption_fails_with_different_machine_code` | **是** | 否 | ✅ 强：断言 `err.error_code()==ERR_STORAGE` 且消息含 `authentication failed`，再验原机器码能还原 `42.5`（区分“密钥不符”与“数据损坏”）。 |
+| 3 | `telemetry_store::tampered_ciphertext_is_rejected_by_authentication` | **是** | 否 | ✅ 强：直接用可写连接 `UPDATE value_enc` 翻转一个 hex 字符，再验 `authentication failed`。 |
+| 4 | `telemetry_store::hkdf_derivation_is_deterministic_and_domain_separated` | **是** | 否 | ✅ 强：断言 `enc1==enc2`、`enc1!=mac1`（域隔离）、换机/换网关变钥、RFC5869 结构确定性。 |
+| 5 | `auth/client::receipt_body_has_exactly_whitelisted_keys` | **是** | 否 | ✅ 强：取 `object_keys` **排序后整套相等**比对白名单，另加 6 个业务字段黑名单断言。 |
+| 6 | `auth/client::receipt_numbers_are_json_strings` | **是** | 否 | ✅ 强：用 `>2^53-1` 值断言 `is_string()` 且值等于 `.to_string()`。 |
+| 7 | `auth/client::signing_message_layout_matches_server` | **是** | 否 | ✅ 强：硬编码字面量逐字节比对（变异 2e/2d 佐证）。 |
+| 8 | `auth/client::offline_grace_seven_days_then_degraded` | **是** | 否 | ✅ 强：逐日断言 `days_left==GRACE_DAYS-day`、第 8 天 Degraded、采集/转发/签名三开关。变异 2b 抓到。 |
+| 9 | `keys::kid_rotation_keeps_old_key_verifiable_then_retires` | **是** | 否 | ✅ 强：断言 retiring 仍可验、retired 被拒、签名位抢占。变异 3b 抓到。 |
+| 10 | `keys::unknown_kid_is_rejected` | **是** | 否 | ✅ 强：未知 kid 报错 + 合法 kid 仍可验（排除“签名本身坏”）。变异 3c 抓到。 |
+| 11 | `token::signing_message_layout_is_stable` | **是** | 否 | ✅ 强：硬编码字面量对比（变异 3a 抓到）。 |
+| 12 | `token::pipe_in_field_does_not_create_ambiguity` | **否（无关变量）** | **是（空跑）** | ❌ 弱：两个载荷平凡不同，`assert_ne!(m1,m2)` 与长度前缀无关（变异 3a 未失败，已用 Python 证明）。 |
+| 13 | `auth/client::receipt_body...` 系列 → **`sig` 字段值无任何断言** | — | **是（漏测）** | ❌ 变异 4（sig 恒空）全绿，见 §5-E。 |
+
+其它弱断言观察（非缺陷，记录）：
+- `keys.rs:539` `assert!(!sig.is_empty())`、多处 `assert!(ring.verify(...).is_ok())` — 属**辅助**断言，通常与相邻强断言（如 `entry.public_key_b64()==expected`）配合，单独看偏弱但整体可接受。
+- `telemetry_store.rs:1545` `assert!(store.prune().is_err())` — 只验“报错”，未验错误码；但同测试 :1542 已验 `ERR_STORAGE`，可接受。
+
+---
+
+## 4. Flaky 检查
+
+| 套件 | 次数 | 结果 |
+|---|---|---|
+| `cargo test -p daemon -- --test-threads=1` | 3 | 3× **222 passed / 0 failed / 1 ignored**（7.2s / 7.16s / 7.12s）→ 无 flaky |
+| `cargo test -p licensing-server --lib` | 3 | 3× **121 passed / 0 failed** |
+| `licensing-server keys::/token::/error::` 单跑 | 3×3 | 全部 18/17/2 稳定 |
+
+**并发写带来的首轮噪声（非缺陷）**：我首次运行 `cargo test -p licensing-server` 时得到 **114 passed / 7 failed**，失败全在 `service::tests::*`（另一 agent `engineer-rules-2` 正在并行写 `service.rs`）。数分钟后复跑变为 **121 passed / 0 failed** —— 说明是**并行开发中的中间态**，**不计入缺陷**（与 team-lead 预警一致）。我的目标模块（keys/token/error）在任何时刻均未失败。
+
+**零 sleep 设计目标**：`telemetry_store.rs` / `client.rs` 中 `grep -n "sleep"` 仅命中**文档注释**（:57/:119/:1435），**无任何真实 `thread::sleep`**。`ManualClock` 出现 22 次、`tempdir` 21 次 → 设计目标达成。✅
+
+---
+
+## 5. 缺陷清单
+
+### A. MAJOR — nonce 复用无任何测试守护（telemetry_store.rs）
+
+- **位置**：`crates/daemon/src/telemetry_store.rs:398-416`（`derive_nonce`）
+- **复现命令**：把 `derive_nonce` 改为恒返回 `[0u8; NONCE_LEN]`（两处调用 `:671`/`:817` 同步），跑 `cargo test -p daemon telemetry_store::`
+- **真实输出**：`test result: ok. 19 passed; 0 failed`
+- **为什么是缺陷**：nonce 复用 ⇒ keystream 复用（`keystream_block` 只依赖 `enc_key`+`nonce`）⇒ 两行相同明文产生**相同密文**，攻击者 XOR 两个密文即可消去 keystream = 明文可恢复；HMAC tag 用的是 `mac_key` 且 AAD 含行元数据，**不会**拦截 nonce 复用。全库 19 个测试**无一**断言“nonce 随行变化 / 相同明文不同密文 / 密文不重复”。
+- **附证**（§1 加固）：常量 nonce 下探针显示两行 nonce 均为 `[00×12]`，基线探针 PASS → 确证非误报。
+- **建议**：新增测试断言两行相同 value 的 `value_enc` 的 nonce 段（前 12B）不同，且密文段不同。（我已在变异中证明该测试可抓。）
+
+### B. MAJOR — 回执 `sig` 静默为空无任何测试守护（auth/client.rs）
+
+- **位置**：`crates/daemon/src/auth/client.rs:660-689`（`sign_receipt`），生产路径 `Err(_) => String::new()`（:687）
+- **复现命令**：在 `sign_receipt` 开头插入 `return String::new();`，跑 `cargo test -p daemon auth::client`
+- **真实输出**：`test result: ok. 29 passed; 0 failed`
+- **为什么是缺陷**：`report_receipt` 的产物会**静默**变成未签名回执（`sig=""`），而现测试只校验“`sig` 这个 key 存在”（白名单集合）与“key 数=8”，**从不校验 `sig` 的值非空 / 可被 Ed25519 验签**。任何让签名退化为空串的回归（含闸门误关、密钥不可用）都不会被测试发现。
+- **建议**：新增测试：用与 signer 相同的公钥对回执语义串验签，断言 `body["sig"]` 非空且验签通过。
+
+### C. MINOR — 试用回拨测试为“无关变量通过”（auth/client.rs）
+
+- **位置**：`crates/daemon/src/auth/client.rs:1694-1714`（`clock_rollback_does_not_grant_extra_time`）
+- **复现命令**：破坏回拨钳制（去掉 `max_observed` 单调），跑 `cargo test -p daemon auth::client`
+- **真实输出**：该测试 **ok**；仅 `clock_rollback_does_not_extend_grace` FAILED（`left: 7 right: 4`）
+- **为什么是缺陷（测试强度）**：一旦状态进入 `Degraded`，`tick` 的 `other => other.clone()`（:844）使**任何**时间输入都无法回到 `Trial`，故该测试的断言在回拨 bug 存在时**依然通过**——它测的不是回拨防御。真正的回拨防御只由 Grace 版测试守护（Grace 可逆）。
+- **建议**：把试用回拨测试改为“回拨前处于**尚未耗尽**的 Trial 且 `days_left` 不回增”，才能在 Trial 路径上真正探测回拨。
+
+### D. MINOR — 生产 `debug_assert_eq!` 只比长度、且 release 被裁掉（auth/client.rs）
+
+- **位置**：`crates/daemon/src/auth/client.rs:645`
+- **问题**：`debug_assert_eq!(object_keys(&body).len(), RECEIPT_FIELD_WHITELIST.len())` 仅比**字段数量**，不比对**字段集合**；把 `"ts"` 换成 `"zz"` 长度仍为 8，此断言不会触发（真实守护来自 `#[cfg(test)]` 测试）。且 `debug_assert` 在 release 构建中被编译移除，生产二进制无此守护。
+- **实测**：变异 2c（删字段）触发的是**长度**不符（7!=8），非集合比对。
+- **建议**：若需生产守护，应改为在 release 也生效的显式校验（返回 `AuthError`），并比对排序后的 key 集合而非长度。
+
+### E. MINOR — `pipe_in_field_does_not_create_ambiguity` 属虚设断言（token.rs）
+
+- **位置**：`crates/licensing-server/src/token.rs:459-478`
+- **复现命令**：删掉 `push_field` 的长度前缀，跑 `cargo test -p licensing-server --lib token::`
+- **真实输出**：仅 `signing_message_layout_is_stable` FAILED；`pipe_in_field_does_not_create_ambiguity` **ok**
+- **为什么是缺陷（测试强度）**：该测试用 `tier="a|b"` 与 `tier="standard"` 两个**平凡不同**载荷断言 `m1!=m2`，无论有无长度前缀都成立；已用 Python 证明：去掉长度前缀后，`tier="X|mid=Y",mid="Z"` 与 `tier="X",mid="Y|mid=Z"` 的渲染**仍不相同**（字段名本身消歧）。故该测试**不能**证明它声称守护的性质。长度前缀的实际守护者是 `signing_message_layout_is_stable`。
+- **建议**：要么删除误导性注释/改名，要么改造成真正依赖长度前缀的碰撞用例（如上述 `tier/mid` 对，并断言**朴素拼接相等**而**带前缀渲染不等**）。
+
+### F. INFO — `len` 语义无守护（auth/client.rs:916-923）
+
+- `push_len_field` 用 `value.len()`（字节）；变异为 `chars().count()`（字符）后 29/29 全绿。当前 `LeaseClaims` 字段均受控（ASCII），风险低；仅记录，非缺陷。
+
+---
+
+## 6. 我亲自验证有效的 PASS 清单
+
+以下均由我**本机实跑**得出（非复述 team-lead 基线）：
+
+1. ✅ **加密落盘真实性**：`encryption_evidence_raw_bytes_do_not_contain_plaintext_float` 用原生只读连接直读 `value_enc`，`hex::decode` 后做字节级 windows 搜索；变异 1a 证明其可失败 → **非空跑**。
+2. ✅ **机器码绑定**：完全移除 `machine_code`（IKM+salt）后 `decryption_fails_with_different_machine_code` 与 `hkdf_derivation_is_deterministic_and_domain_separated` 均 FAILED → **真实绑定**。
+3. ✅ **篡改检测（encrypt-then-MAC）**：删 tag 校验即被 `tampered_ciphertext_is_rejected_by_authentication` 抓到 → 认证链真实有效。
+4. ✅ **HKDF 域隔离**：`info` 同值即被 `hkdf_derivation_is_deterministic_and_domain_separated` 抓到（断言 `enc1 != mac1` 字节不等）。
+5. ✅ **跨端签名域一致**：client.rs:1879 与 token.rs:639 的硬编码字面量**逐字节相同**；变异 2e/3a 均能触发各端 layout 测试。
+6. ✅ **宽限期边界**：变异 7→8 天被边界测试 `offline_grace_seven_days_then_degraded` 抓到（第 7 天仍 Grace、第 8 天 Degraded）。
+7. ✅ **回拨防御（Grace 路径）**：破坏钳制即被 `clock_rollback_does_not_extend_grace` 抓到。
+8. ✅ **回执白名单**：删任一字段即被 `receipt_body_has_exactly_whitelisted_keys` + `debug_assert_eq!`(:644) 抓到。
+9. ✅ **json 大整数**：`receipt_numbers_are_json_strings` 用 `>2^53-1` 值实测为字符串。
+10. ✅ **kid 轮换**：retired 也能验（变异 3b）被 2 条测试抓到；未知 kid 兜底（变异 3c）被 `unknown_kid_is_rejected` 抓到。
+11. ✅ **生产零 panic**：5 文件生产段 panic 类调用命中数 = 0（逐行核验，含 `unwrap_or_else` 逐条豁免判定）。
+12. ✅ **私钥不落库/不入码**：keys.rs 生产段无 SQL/无持久化、无密钥字面量；Debug 脱敏有测试守护。
+13. ✅ **零 sleep**：无真实 `thread::sleep`，ManualClock 22×、tempdir 21×。
+14. ✅ **确定性**：daemon 单线程 3×、licensing-server 3×、目标模块 3×3 全稳定，无 flaky。
+15. ✅ **门禁**：`cargo fmt --check` EXIT=0；`cargo clippy --all-targets -- -D warnings` EXIT=0。
+
+---
+
+## 7. 最终判定
+
+**PASS with issues**
+
+一句话理由：三个模块的**核心密码学与状态机逻辑本身正确**（加密真实性、认证、域隔离、机器码绑定、宽限/试用/回拨语义、kid 轮换与未知 kid 拒绝均经变异实测有效，生产路径零 panic、无硬编码私钥、SQL 全参数化、无 flaky），但存在 **2 个 MAJOR 测试守护缺口**——**nonce 复用（§5-A）** 与 **回执签名静默为空（§5-B）** 这两条安全关键回归**均无任何测试能抓到**，另有 3 个 MINOR 测试强度问题（§5-C/D/E）。这些属于**测试有效性**而非当前逻辑错误，修复成本低（补测试），但若不补，未来重构可能静默引入 keystream 复用或未签名回执。
+
+> 备注：本报告全程未修改任何源码；所有变异均已 `git checkout --` 还原，并以 `touch` + 复跑确认重新变绿；`.omo/evidence/task-qa-wave4.log` 为本报告唯一写入物。
