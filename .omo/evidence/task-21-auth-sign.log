@@ -1,0 +1,115 @@
+# task 21 AuthBlock 签名模块（Ed25519 + 业务语义哈希）— 证据日志
+
+日期：2026-09-23
+执行：engineer-sign（Wave 3 并行开发，仅交付 `crates/daemon/src/auth/signing.rs`）
+环境：rustup `stable-x86_64-pc-windows-gnu` + mingw64（`D:\rust`）
+      `export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' PATH="/d/rust/mingw64/bin:/d/rust/cargo/bin:$PATH"`
+      （顺序红线：`/d/rust/mingw64/bin` 必须排在 rustup self-contained 之前）
+
+## 1. 门禁结果
+
+```
+$ cargo fmt -p daemon                                       EXIT=0
+$ cargo clippy -p daemon --all-targets -- -D warnings       EXIT=0（零告警）
+$ cargo test -p daemon auth                                 EXIT=0
+    auth::signing::tests   20 passed / 0 failed
+    auth::machine_id::tests 12 passed / 0 failed  （被 `auth` 过滤一并纳入，全 PASS）
+    合计 32 passed / 0 failed（87 filtered out）
+```
+
+**全绿（三条门禁 EXIT 均为 0）。**
+
+### 过程中一度为 EXIT=101 的说明（**非本任务文件的问题，已消除**）
+
+首次跑 clippy 时，并行开发的 `crates/daemon/src/scheduler.rs`（engineer-sched 负责）
+尚未收敛，clippy `-D warnings` 在该文件报 2 条告警并被升为 error：
+
+1. `scheduler.rs:488` `impl FakeHandler` 的 `polls` / `batches_for` never used → `dead_code`；
+2. `scheduler.rs:461` `Arc<Mutex<Vec<(String, Vec<String>)>>>` → `clippy::type_complexity`。
+
+期间已核实本任务文件零告警：
+
+```
+$ cargo clippy -p daemon --all-targets 2>&1 | grep -c "signing.rs"
+0
+```
+
+已将上述两条同步给 engineer-sched；其修复 scheduler.rs 后复核，三条门禁全部 EXIT=0。
+
+## 2. 交付物
+
+- `crates/daemon/src/auth/signing.rs`（1002 行，20 个单测）
+- 未改动其它任何文件（`mod.rs` 已由上游声明 `pub mod signing;`；未改 `Cargo.toml`，未新增依赖）
+
+## 3. 签名域（signing message）最终构造格式
+
+```
+"iotdaq.authblock.v1|" || "ph=<len>:<hex64(payload_hash)>|" || "mid=<len>:<mid>|" || "ts=<len>:<ts_ns>|" || "nonce=<len>:<nonce>|"
+```
+
+- 常量 `SIGNING_DOMAIN_V1 = "iotdaq.authblock.v1|"` 做域分隔（防跨协议/跨版本复用）；
+- 每字段写入 **十进制字节长度 + 内容** 并以 `|` 收尾，防拼接歧义
+  （单测 `signing_message_is_domain_separated_and_length_delimited` 断言
+  `("ab","c")` 与 `("a","bc")` 不得等价）；
+- `payload_hash` 为 `semantic_hash(batch)`（业务语义哈希，非 protobuf 序列化字节）；
+- `mid` / `ts_ns` / `nonce` 全部进签名域 → 任一篡改即验签失败。
+
+## 4. 业务语义哈希规则（`semantic_hash`）
+
+```
+SHA256( "iotdaq.semantic.v1|"
+      || "points=<n>|"
+      || 逐点（按 (device_id, point_id, ts) 稳定排序）:
+         "device_id=<len>:..|" "point_id=<len>:..|" "unit=<len>:..|"
+         "ts=<len>:<十进制>|" "quality=<len>:<as_str_name>|" "value=<len>:<原始字节>|"
+      || "gateway_id=<len>:..|" || "batch_ts=<len>:<十进制>|" )
+```
+
+- **不写 `auth` 字段**（否则签名块自指）；
+- 点位顺序不影响哈希（单测 `semantic_hash_is_order_independent_and_deterministic`）；
+- 数值一律十进制字符串，跨端/跨字节序一致；零 panic（质量码未知值退化为 `QUALITY_INVALID`）。
+
+## 5. 红线自检
+
+| 红线 | 落实 |
+|---|---|
+| 绝不签 protobuf 序列化字节 | 签名对象恒为 `semantic_hash`；单测 `semantic_hash_differs_from_serialized_bytes_hash` 断言语义哈希 ≠ 裸字段拼接序列化摘要 |
+| 不生成/落盘私钥 | 私钥经 `KeyProvider` trait 取 in-memory 句柄；`StaticKeyProvider` 手动实现 `Debug` 输出 `StaticKeyProvider { key: <redacted> }`；单测断言 Debug 不含密钥字节 |
+| 测试私钥标注 | `TEST_ONLY_KEY_A/B`、`TEST_ONLY_FP_KEY_A/B` 常量，注释写明「仅测试使用，禁止用于真实部署」 |
+| 不自造 mid 算法 | 单测 mid 全部经 `MachineIdentity::get_machine_fingerprint()`（task 3）派生；`AuthSigner::new` 校验 64 hex |
+| 零 panic | 生产代码路径无 `unwrap()`/`expect()`；base64 解码、切片长度、验签失败全转 `DaemonError` |
+
+## 6. 单测清单（20 个，断言全部落在真实验签结果）
+
+| # | 测试 | 覆盖 |
+|---|---|---|
+| 1 | `sign_then_verify_batch_succeeds` | QA Happy：签名 → 验签 PASS |
+| 2 | `tamper_point_unit_fails_verification` | 篡改 unit → SecurityError |
+| 3 | `tamper_point_value_fails_verification` | 篡改 value → SecurityError |
+| 4 | `tamper_point_ts_fails_verification` | 篡改点位 ts → SecurityError |
+| 5 | `tamper_gateway_id_fails_verification` | 篡改 gateway_id → SecurityError |
+| 6 | `tamper_batch_ts_fails_verification` | 篡改 batch.ts → SecurityError |
+| 7 | `tamper_quality_and_device_id_fail_verification` | 篡改 quality / device_id → SecurityError |
+| 8 | `tamper_block_fields_fails_verification` | 篡改 nonce / ts_ns / mid / 空 nonce → 失败 |
+| 9 | `tamper_signature_fails_verification` | 换他钥签名 / 非法 base64 / 长度不足 → SecurityError(7000) |
+| 10 | `license_denied_refuses_to_sign` | 闸门关闭 → AuthError(3000)，两个入口皆拒，attach 不写 auth |
+| 11 | `different_mid_fails_verification` | 换 mid → 验签失败；换机重签则通过 |
+| 12 | `semantic_hash_is_order_independent_and_deterministic` | 哈希确定性 + 点位顺序无关 |
+| 13 | `semantic_hash_is_sensitive_to_content` | 交换 ts / 改 point_id → 哈希改变 |
+| 14 | `invalid_mid_is_rejected` | 空/空白/非 64 hex → ConfigError(2000)；合法 64 hex 放行 |
+| 15 | `attach_writes_auth_block_and_verifies` | attach 后 auth=Some，mid/ts 正确，验签通过 |
+| 16 | `semantic_hash_differs_from_serialized_bytes_hash` | 红线守护：语义哈希 ≠ 序列化字节摘要 |
+| 17 | `signature_from_other_key_fails_verification` | 他钥签名 → 失败；本钥验 → 通过 |
+| 18 | `nonce_is_fresh_per_signature` | 每次签名 nonce/签名串不同（防重放） |
+| 19 | `debug_output_never_leaks_key_material` | Debug 脱敏，密钥字节不进日志 |
+| 20 | `signing_message_is_domain_separated_and_length_delimited` | 签名消息格式与长度定界 |
+
+## 7. 备注 / 偏差
+
+- `SignedAuthBlock` 额外提供 `to_proto()` / `from_proto()`：proto 的 `bytes sig` 字段承载
+  **base64 文本 ASCII 字节**，与 `sig_b64` 及 JSON base64 通道保持一致（proto 未强制，
+  此处为自洽约定，已写入文档注释，供 task 48 二次校验直接 `from_proto` 后 `verify_batch`）。
+- `daemon` 不直接依赖 `prost`，故单测 16 以「同字段同内容裸拼接的 SHA-256」代表序列化字节摘要
+  （`auth` 置空语义一致），结论不变：语义哈希 ≠ 序列化字节哈希。
+- prost 生成的 `Quality` 枚举未提供 `from_i32`（prost 0.13.5），故 `quality_name()` 按 wire 值
+  映射回 `as_str_name()`，未知值退化为 `QUALITY_INVALID`（不 panic）。
