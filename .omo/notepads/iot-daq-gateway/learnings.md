@@ -102,3 +102,39 @@
 - 重连：flaky 首连接即断→重连成功重试，退避不重置。
 - RTU-over-TCP：slave id/FC03/地址/数量/CRC16 低字节先发。
 - 本地校验：输入区写拒绝、值非 2 字节拒绝、count 0/126 拒绝。
+
+---
+
+## task 15 数据处理层（pipeline.rs，14 单测，daemon 72 全绿）
+
+### 关键设计决策
+
+1. **换算必须在死区之前**：死区阈值是工程单位语义。若先判死区再换算，Pa→kPa 场景下
+   阈值会被放大 1000 倍（配置 0.01 kPa 实际按 10 Pa 判定）。用专门测试
+   `deadband_is_evaluated_after_conversion` 锁死该顺序（1000/1001 Pa → 1.000/1.001 kPa，
+   阈值 0.01 → 必须过滤）。
+2. **死区基准 = 上次「输出」值**（不是上次输入值）：QA 场景 36.49/36.50/36.51 阈值 0.1
+   要求只输出 1 次——基准固定在 36.49，而不是逐帧滑动比较。
+3. **quality 变化强制输出**：死区只过滤「值微变且质量不变」。用 `(last_quality == quality) && within_deadband`
+   双条件；仅比较相等性、不解释语义（quality 语义归 task 53）。
+4. **时钟注入而非 trait**：`process_at(sample, collected_ts_ns)` 显式传时间戳，
+   `process()` 走系统时钟并转发给它——避免为可测性引入 `Clock` trait 与泛型污染。
+   纳秒组装用 `saturating_mul/add`（无 `as` 强转，规避 clippy 截断告警）。
+5. **NaN 不被死区吞掉**：`(NaN - x).abs() < d` 恒 false → 恒输出，有效性交 quality 表达。
+6. **错误域选择**：点位配置类问题（未配置 source / 死区为负 / 系数非有限 / 重复 source_id）
+   统一 `ConfigError`（2000 域），七域中无「数据处理域」，不另起炉灶。
+
+### 踩坑
+
+- **move 后再借用**：`map.insert(key, cfg)` 之后在错误信息里再用 `cfg.source_id` 会 E0382。
+  解法：插入前先 `let source = cfg.source_id.clone()`，错误信息用 `source`。
+- **依赖方向**：daemon 原本不依赖 protocol-proto。为复用 `Quality` 枚举（避免两套质量码定义，
+  项目红线「同一字段只留一个来源」）新增路径依赖 `protocol-proto = { path = "../protocol-proto" }`。
+- **`..cfg_pa_to_kpa()` 结构更新语法**：测试里造非法配置用 `PointConfig { deadband: -0.1, ..cfg_pa_to_kpa() }`
+  最省事，但 `deadband` 为负时 `validate` 必须在 `new` 阶段拦（不是处理阶段）。
+
+### 审查 opencode 产出（task 8/9）结论
+
+三道门禁全绿、64 测试、依赖纯 Rust、Mock TCP Server 断言到服务器侧请求
+（`ReadHoldingRegisters(0, 2)` 证明 40001 → PDU 地址 0 偏移正确），实现与测试均非敷衍。
+遗留待办：地址偏移基数硬编码（UI 设计要求可配）、RTU 真串口未启用（已标注后续 wave）。。

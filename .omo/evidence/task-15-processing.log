@@ -1,0 +1,74 @@
+# task 15 数据处理层（DataProcessor）— 证据日志
+
+日期：2026-09-23
+执行：主理人（先审查 opencode 产出的 task 8/9，确认无误后接续 task 15）
+环境：rustup `stable-x86_64-pc-windows-gnu` + mingw64（`D:\rust`）
+      前缀 `export RUSTUP_HOME=... CARGO_HOME=... PATH="/d/rust/cargo/bin:/d/rust/mingw64/bin:$PATH"`
+      （顺序红线：mingw64 必须排在 rustup self-contained 之前）
+
+## 1. 门禁结果
+
+```
+$ cargo fmt --all                                          EXIT=0
+$ cargo test --workspace                                   EXIT=0
+    daemon               72 passed / 0 failed   （task 15 新增 14）
+    licensing-server      1 passed
+    protocol-proto        1 passed
+    roundtrip（集成）     4 passed
+$ cargo clippy --workspace --all-targets -- -D warnings    EXIT=0（零告警）
+```
+
+## 2. 交付物
+
+- `crates/daemon/src/pipeline.rs`（549 行，14 个单测）
+- `crates/daemon/Cargo.toml`：新增 `protocol-proto` 路径依赖（复用 `Quality` 枚举）
+- `crates/daemon/src/lib.rs`：声明 `pub mod pipeline`
+
+### 类型
+
+| 类型 | 职责 |
+|---|---|
+| `PointConfig` | 点位处理配置：`source_id` → `point_id`/`device_id`，`scale`/`offset`/`deadband`/`unit` |
+| `RawSample` | 输入：已解码数值 + quality（原值透传）+ 设备原始时间戳 |
+| `ProcessedSample` | 输出：工程单位值 + `device_ts_ns` + `collected_ts_ns` + quality |
+| `DataProcessor` | 有状态处理器（持有各点位死区基准），`process` / `process_at` / `reset` |
+
+### 处理顺序（关键）
+
+1. **单位换算** `out = in * scale + offset`
+2. **死区过滤**（在换算后的工程单位值上判定）
+3. **时间戳统一**（设备原始时间戳保留 + 采集时间戳打标）
+
+## 3. 测试清单（14）
+
+QA 场景（计划指定）：
+- `unit_conversion_pa_to_kpa`：1000 Pa → 1 kPa ✓（QA Happy）
+- `deadband_suppresses_small_changes`：36.49/36.50/36.51 阈值 0.1 → 仅 1 次输出 ✓（QA Error）
+
+边界与顺序：
+- `unit_conversion_scale_and_offset`（℃→℉：100 → 212）
+- `deadband_passes_when_threshold_exceeded`（0.21 > 0.1 输出）
+- `deadband_boundary_value_is_emitted`（差值 == 阈值 → 输出，判定为 `<`）
+- `quality_change_forces_output_within_deadband`（GOOD→BAD 不被死区吞）
+- `deadband_is_evaluated_after_conversion`（**顺序验证**：1 Pa = 0.001 kPa < 0.01 阈值 → 过滤）
+- `nan_is_not_suppressed`（NaN 恒输出，有效性由 quality 表达）
+- `point_mapping_source_to_target`（源标识 → 对外 point_id/device_id）
+- `timestamps_keep_device_and_collected`（两个时间戳互不覆盖）
+- `unknown_source_is_config_error`（未配置点位不静默丢弃）
+- `reset_clears_deadband_baseline`（热重载后首帧按首次输出）
+- `invalid_configs_are_rejected`（负死区 / 空字段 / NaN·Inf 系数 / 重复源）
+- `passthrough_config_keeps_raw_value`
+
+## 4. Must NOT 合规声明
+
+- 未引入任何规则 DSL / 匹配 / 动作编排（→ task 20/37）
+- 未定义数据类型解码与 quality 语义，仅 `==` 比较与透传（→ task 53）
+- 未实现公式求值（→ task 70）；换算在本层完成，保证先于公式
+- 依赖仍为纯 Rust 栈（新增 `protocol-proto` 为本仓库 crate，无 C 依赖）
+- 无硬编码密钥 / 激活码；无客户端解绑或重置试用入口
+
+## 5. 后续待办（不在本任务范围）
+
+- 地址偏移基数（`40001` → PDU 地址 0 当前硬编码）：界面设计要求为可配置项，
+  待 Modbus 配置接入 task 4 配置层时补 `offset_base`。
+- RTU 真串口（`tokio-serial`）未启用，RTU 目前走 RTU-over-TCP（opencode 已标注为后续 wave）。

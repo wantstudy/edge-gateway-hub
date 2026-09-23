@@ -1146,7 +1146,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence to Capture**: [ ] task-7-cargo-test.log [ ] task-7-vitest.log
   **Commit**: YES — `feat(testing): init cargo test + vitest infrastructure`
 
-- [ ] 8. Driver trait + 地址解析器 + 断线重连基类
+- [x] 8. Driver trait + 地址解析器 + 断线重连基类
 
   **What to do**:
   - 定义 `#[async_trait] pub trait Driver { connect, read(points), write, disconnect }`
@@ -1166,7 +1166,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: .omo/evidence/task-8-driver-trait.log
   **Commit**: YES — `feat(driver): define Driver trait and PointAddressParser`
 
-- [ ] 9. Modbus TCP/RTU 驱动（tokio-modbus 0.17）
+- [x] 9. Modbus TCP/RTU 驱动（tokio-modbus 0.17）
 
   **What to do**:
   - 实现 `ModbusDriver` 结构体，适配 Driver trait
@@ -1298,7 +1298,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
 
 ### Wave 2b — 数据处理 + 缓存（4 任务）
 
-- [ ] 15. 数据处理层（点位映射、单位换算、死区过滤、时间戳统一）
+- [x] 15. 数据处理层（点位映射、单位换算、死区过滤、时间戳统一）
 
   **边界声明（与 20/37 互斥）**: 本任务只做**逐点、无规则的本地处理内核**——按点位配置直接执行映射/换算/死区/时间戳统一。**规则解析、规则匹配、动作编排属于任务 20/37**，本任务不引入任何规则 DSL。与 53 的边界：本任务对 `quality` 仅做**原值透传**，语义规范化归任务 53（避免 15↔53 循环依赖）。与 70 的边界：**公式求值（计算点）不属于本任务**（见任务 70）；但本任务须保证「**单位换算在公式之前完成**」——任务 70 依赖本任务把值换算到工程单位后再参与运算，故本任务的换算能力是 70 的前置。
 
