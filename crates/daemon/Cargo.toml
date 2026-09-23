@@ -24,6 +24,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
+# task 8 南向驱动抽象：`#[async_trait]` 异步 trait（纯 Rust 栈红线合规）。
+async-trait = "0.1"
+
 [dev-dependencies]
+# task 8 驱动 trait 异步单测执行器（task 9+ 具体协议驱动接入时升为正式依赖）。
+tokio = { version = "1", features = ["rt", "macros"] }
 # 热重载/日志轮转测试用临时目录。
 tempfile = "3"

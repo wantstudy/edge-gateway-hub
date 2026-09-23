@@ -6,12 +6,15 @@
 //! - `logging`  tracing 分级 + JSON 结构化可选 + 按天轮转（task 5）
 //! - `error`    DaemonError / DaemonResult 统一错误与错误码（task 6）
 //!
+//! Wave 2 已落地模块：
+//! - `driver`   南向驱动 trait + PointAddressParser + Reconnector 指数退避（task 8）
+//!
 //! 规划模块（后续任务逐步填充）：
-//! - `driver`   南向协议驱动 trait（Wave 2 task 8+）
 //! - `pipeline` 数据处理链路（Wave 2b task 15+）
 //! - `north`    北向 MQTT 转发（Wave 3 task 19+）
 
 pub mod auth;
 pub mod config;
+pub mod driver;
 pub mod error;
 pub mod logging;
