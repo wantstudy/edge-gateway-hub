@@ -30,6 +30,7 @@ use crate::proto::{
     IssueCodesResponse, IssuedCode, ReissueCodeRequest, ReissueCodeResponse, RevokeCodeRequest,
     TimelineEntry, VerifyRequest, VerifyResponse, MAX_ISSUE_BATCH,
 };
+use crate::receipt::verify_receipt_signature;
 use crate::store::{AuditFilter, CodeFilter, Store};
 use crate::token::{issue_lease_token, LeaseClaims};
 
@@ -668,6 +669,41 @@ impl LicensingService {
                 "lease {} is revoked/stopped",
                 lease.lease_id
             )));
+        }
+
+        // 规则 2.5（**安全红线**）：Ed25519 验签。
+        //
+        // B 档信任链的唯一支点：没有这一步，任何人构造一个 `sig` 填 `"x"` 的
+        // 回执都能拿到 `accepted=true`，跳空告警 / 序号区间审计全部可被伪造，
+        // 且伪造记录会污染 `audit_receipt` 表使真实回执的跳空判定失效。
+        //
+        // 顺序：租约存在性之后、幂等与跳空检测**之前**——
+        //   - 在租约校验后：先确认对象存在，避免为不存在的 lease 消耗验签 CPU；
+        //   - 在幂等 / 跳空之前：不可信数据**不得**参与任何业务判定或短路返回，
+        //     否则伪造回执可借"与上一条同区间"路径拿到 `accepted=true`。
+        //
+        // 失败处理：**拒收**（绝不"只打日志照常落库"）+ **记审计**（伪造尝试本身
+        // 是安全事件，必须留痕，便于风控聚合与事后追溯）。
+        match verify_receipt_signature(&self.ring, req, now, self.cfg.clock_skew_secs) {
+            Ok(_verified) => {}
+            Err(e) => {
+                self.write_audit(
+                    ActorType::Device,
+                    &req.device_mid,
+                    "receipt_signature_invalid",
+                    "lease",
+                    &req.lease_id,
+                    &format!(
+                        "{{\"error\":\"{}\",\"code\":\"{}\",\"seq_from\":\"{}\",\"seq_to\":\"{}\"}}",
+                        escape_json(&e.to_string()),
+                        error_code(&e),
+                        escape_json(&req.seq_from),
+                        escape_json(&req.seq_to)
+                    ),
+                    "",
+                )?;
+                return Err(e);
+            }
         }
 
         // 规则 4（幂等）：相同区间重复上报 → 幂等接受，不重复告警。
@@ -1331,6 +1367,23 @@ fn escape_json(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// 错误码短标识（供 `audit_log.detail` 落库，**不含请求原文**）。
+///
+/// 与 [`crate::http::error_to_code`] 同源——后者输出的是 HTTP 层协议码；
+/// 此处是**审计留痕用**的稳定短串，便于按错误类型聚合告警而无需解析自由文本。
+/// 刻意不落 `e.to_string()` 之外的任何输入字段，避免伪造者借错误消息回显
+/// 注入审计内容（错误消息本身已由各校验点控制，不含签名原文）。
+fn error_code(err: &LicenseError) -> &'static str {
+    match err {
+        LicenseError::TokenInvalid(_) => "token_invalid",
+        LicenseError::ActivationRejected(_) => "activation_rejected",
+        LicenseError::QuotaExceeded(_) => "quota_exceeded",
+        LicenseError::HeartbeatRejected(_) => "heartbeat_rejected",
+        LicenseError::KeyStateIllegal(_) => "key_state_illegal",
+        LicenseError::Storage(_) => "storage",
+    }
+}
+
 // ============================================================================
 // 激活码生成与校验（Crockford base32 + 校验位）
 // ============================================================================
@@ -1928,6 +1981,37 @@ mod tests {
         }
     }
 
+    /// 用测试密钥环中的私钥对回执签名（B 档信任链的服务端侧复现）。
+    ///
+    /// 与 daemon 的 `sign_receipt` 走同一条域串 + 同一层 SHA-256 预哈希，
+    /// 因此这里是**跨端一致性**的服务端锚点：若任一端改了域串或编码，
+    /// 依赖本辅助函数的测试会立即失败。
+    fn sign_receipt_req(ring: &Arc<KeyRing>, req: &mut AuditReceiptRequest) {
+        let hash = crate::receipt::receipt_payload_hash(
+            &req.device_mid,
+            &req.lease_id,
+            req.seq_from.parse().unwrap(),
+            req.seq_to.parse().unwrap(),
+            req.count.parse().unwrap(),
+            &req.payload_digest,
+            req.ts.parse().unwrap(),
+        );
+        req.sig = ring.sign(&hash).expect("sign receipt").1;
+    }
+
+    /// 构造并签名的回执请求（绝大多数测试用这个）。
+    fn signed_receipt_req(
+        ring: &Arc<KeyRing>,
+        lease_id: &str,
+        from: u64,
+        to: u64,
+        mid: &str,
+    ) -> AuditReceiptRequest {
+        let mut req = receipt_req(lease_id, from, to, mid);
+        sign_receipt_req(ring, &mut req);
+        req
+    }
+
     /// 回执 1：字段白名单越界 → `ActivationRejected`（对应 `FIELD_WHITELIST_VIOLATION`）并记审计。
     #[test]
     fn audit_receipt_rejects_whitelist_violation_and_audits() {
@@ -1960,26 +2044,26 @@ mod tests {
     /// 回执 2：连续区间 → `GapKind::None`；随后跳空 → `Gap`；再回退 → `Overlap`。
     #[test]
     fn audit_receipt_detects_gap_and_overlap() {
-        let (svc, _s, _r) = service();
+        let (svc, _s, ring) = service();
         let lease = activate_device(&svc, "rc-gap", "rcg0");
         // 首个回执：seq_from=1 → 无历史且 from==1 → None。
         let r0 = svc
-            .audit_receipt(&receipt_req(&lease, 1, 10, "rc-gap"))
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 1, 10, "rc-gap"))
             .unwrap();
         assert_eq!(r0.gap, GapKind::None);
         // 连续：11..20 → None。
         let r1 = svc
-            .audit_receipt(&receipt_req(&lease, 11, 20, "rc-gap"))
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 11, 20, "rc-gap"))
             .unwrap();
         assert_eq!(r1.gap, GapKind::None);
         // 跳空：25..30（期望 21）→ Gap。
         let r2 = svc
-            .audit_receipt(&receipt_req(&lease, 25, 30, "rc-gap"))
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 25, 30, "rc-gap"))
             .unwrap();
         assert_eq!(r2.gap, GapKind::Gap);
         // 回退 / 重叠：15..18（≤ last.seq_to=30）→ Overlap。
         let r3 = svc
-            .audit_receipt(&receipt_req(&lease, 15, 18, "rc-gap"))
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 15, 18, "rc-gap"))
             .unwrap();
         assert_eq!(r3.gap, GapKind::Overlap);
     }
@@ -1987,10 +2071,10 @@ mod tests {
     /// 回执 2b：无历史且 `seq_from > 1` → `Gap`（窗口起点缺失）。
     #[test]
     fn audit_receipt_first_window_missing_prefix_is_gap() {
-        let (svc, _s, _r) = service();
+        let (svc, _s, ring) = service();
         let lease = activate_device(&svc, "rc-missing", "rcm0");
         let r = svc
-            .audit_receipt(&receipt_req(&lease, 5, 9, "rc-missing"))
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 5, 9, "rc-missing"))
             .unwrap();
         assert_eq!(r.gap, GapKind::Gap);
     }
@@ -1998,11 +2082,11 @@ mod tests {
     /// 回执 3：**重复区间幂等，不重复告警**。
     #[test]
     fn audit_receipt_duplicate_range_is_idempotent_without_second_alarm() {
-        let (svc, store, _r) = service();
+        let (svc, store, ring) = service();
         let lease = activate_device(&svc, "rc-dup", "rcd0");
         // 首次跳空 → 告警 1 次。
         let r1 = svc
-            .audit_receipt(&receipt_req(&lease, 100, 105, "rc-dup"))
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 100, 105, "rc-dup"))
             .unwrap();
         assert_eq!(r1.gap, GapKind::Gap);
         let alarms_after_first = store
@@ -2022,7 +2106,7 @@ mod tests {
 
         // 完全相同区间重放 → accepted=true + None，且**不再新增异常告警**。
         let r2 = svc
-            .audit_receipt(&receipt_req(&lease, 100, 105, "rc-dup"))
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 100, 105, "rc-dup"))
             .unwrap();
         assert!(r2.accepted);
         assert_eq!(r2.gap, GapKind::None, "重复区间判定为 None（去重）");
@@ -2045,17 +2129,41 @@ mod tests {
         );
     }
 
-    /// 回执 4：允许**延迟补报**（`ts` 远早于 `received_at`）——仍按 `ts` 评估且被接受。
+    /// 回执 4：允许**延迟补报**（断网期间积压、恢复后补报）。
+    ///
+    /// ⚠️ 语义边界（设计 §1.4 第 5 条）：延迟补报指的是 **网关侧队列积压**
+    /// ——`ts` 是回执生成时刻，正常落后于 `received_at` 若干分钟到数小时。
+    /// 时序窗（默认 ±300s）**仍然适用**：它防的是重放旧回执，不是防补报。
+    ///
+    /// 因此本测试用「落后 4 分钟」的 `ts`（窗内）证明补报被接受，
+    /// 另由 [`audit_receipt_rejects_receipt_older_than_clock_window`] 证明
+    /// 超出窗的旧回执被拒 —— 两条合起来才是完整的补报语义。
     #[test]
-    fn audit_receipt_allows_late_backfill() {
-        let (svc, _s, _r) = service();
+    fn audit_receipt_allows_late_backfill_within_clock_window() {
+        let (svc, _s, ring) = service();
         let lease = activate_device(&svc, "rc-late", "rcl0");
         let mut req = receipt_req(&lease, 1, 5, "rc-late");
-        // 客户端 ts 取很久以前（断网期间）——服务端不得因此拒收。
-        req.ts = (now_unix_secs() - 30 * 86_400).to_string();
+        // 客户端 ts 落后 4 分钟（队列积压）——窗内，必须接受。
+        req.ts = (now_unix_secs() - 240).to_string();
+        sign_receipt_req(&ring, &mut req);
         let r = svc.audit_receipt(&req).unwrap();
         assert!(r.accepted);
         assert_eq!(r.gap, GapKind::None);
+    }
+
+    /// 回执 4b：`ts` 超出时钟窗 → 拒绝（重放旧回执 / 伪造时间）。
+    ///
+    /// 这条与上一条共同钉死补报语义的**下界**：没有这条，攻击者可以用
+    /// 一个极旧但签名合法的回执覆盖序号窗口判定。
+    #[test]
+    fn audit_receipt_rejects_receipt_older_than_clock_window() {
+        let (svc, _s, ring) = service();
+        let lease = activate_device(&svc, "rc-old", "rco0");
+        let mut req = receipt_req(&lease, 1, 5, "rc-old");
+        req.ts = (now_unix_secs() - 30 * 86_400).to_string();
+        sign_receipt_req(&ring, &mut req);
+        let err = svc.audit_receipt(&req).unwrap_err();
+        assert!(err.to_string().contains("skew"), "{err}");
     }
 
     /// 回执 5：租约不存在 → 拒绝；已废弃租约 → 拒绝。
@@ -2066,7 +2174,6 @@ mod tests {
             .audit_receipt(&receipt_req("lease-ghost", 1, 2, "mid"))
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
-
         // 已废弃租约。
         let (code_id, code) = issue_one(&svc);
         let a = anchors(5, "rc-rev");
@@ -2091,6 +2198,121 @@ mod tests {
             .audit_receipt(&receipt_req(&act.lease_id, 1, 2, "rc-rev"))
             .unwrap_err();
         assert!(err.to_string().contains("revoked"), "{err}");
+    }
+
+    // ---------------- audit_receipt 验签（安全红线，3 条） ----------------
+
+    /// **核心证据**：签名为垃圾串的伪造回执 → 拒收，且**不落库**。
+    ///
+    /// 这是本次修复存在的理由。修复前 `audit_receipt` 完全无验签，任何人
+    /// 把 `sig` 填成 `"x"` 都能拿到 `accepted=true` 并写入一条回执记录，
+    /// 从而污染序号窗口、压制真实跳空告警。本测试证明该路径已封死。
+    #[test]
+    fn forged_receipt_is_rejected_by_service() {
+        let (svc, store, _r) = service();
+        let lease = activate_device(&svc, "rc-forge", "rcf0");
+
+        let mut req = receipt_req(&lease, 1, 10, "rc-forge");
+        req.sig = "x".into(); // 伪造：既非 STANDARD base64，也不是合法签名
+
+        let err = svc.audit_receipt(&req).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::TokenInvalid(_)),
+            "伪造签名必须是 TokenInvalid，实际: {err:?}"
+        );
+
+        // **不落库**：伪造成本不能换来任何持久化副作用。
+        let stored = store.list_receipts_by_lease(&lease).unwrap();
+        assert!(
+            stored.is_empty(),
+            "伪造回执绝不能落库，实际落库 {} 条",
+            stored.len()
+        );
+    }
+
+    /// 伪造尝试**必须留痕**（安全事件可追溯、可聚合告警）。
+    ///
+    /// 与白名单违规同等待遇：`action = "receipt_signature_invalid"`。
+    #[test]
+    fn forged_receipt_attempt_is_audited() {
+        let (svc, store, _r) = service();
+        let lease = activate_device(&svc, "rc-forge-audit", "rcfa");
+
+        let mut req = receipt_req(&lease, 1, 10, "rc-forge-audit");
+        req.sig = "x".into();
+        let _ = svc.audit_receipt(&req).unwrap_err();
+
+        let logs = store
+            .list_audit_logs(
+                &AuditFilter {
+                    actor_type: None,
+                    action: Some("receipt_signature_invalid".into()),
+                    entity_type: None,
+                    entity_id: None,
+                },
+                1,
+                100,
+            )
+            .unwrap();
+        assert!(!logs.is_empty(), "伪造回执尝试必须记审计");
+        // 审计的 entity 锚定到 lease，便于按租约聚合风控。
+        assert_eq!(logs[0].entity_id.as_str(), lease.as_str());
+    }
+
+    /// 篡改已签名回执的**任一**白名单字段 → 验签失败。
+    ///
+    /// 与 `receipt.rs` 的单元测试互补：那里逐个变异 `AuditReceiptRequest`，
+    /// 这里走完整 service 路径，证明**验签发生在业务判定之前** ——
+    /// 变异 `seq_from` 后不仅验签失败，且序号窗口未被污染
+    /// （后续一条合法回执仍按「无历史」判定）。
+    #[test]
+    fn tampered_signed_receipt_is_rejected_before_touching_state() {
+        let (svc, store, ring) = service();
+        let lease = activate_device(&svc, "rc-tamper", "rct0");
+
+        let mut req = signed_receipt_req(&ring, &lease, 11, 20, "rc-tamper");
+        req.seq_from = "11".into(); // 无变化
+        assert!(svc.audit_receipt(&req).is_ok(), "未篡改必须通过");
+
+        // 篡改 seq_to（签名覆盖该字段）→ 必须拒绝。
+        let mut tampered = signed_receipt_req(&ring, &lease, 21, 30, "rc-tamper");
+        tampered.seq_to = "999".into();
+        let err = svc.audit_receipt(&tampered).unwrap_err();
+        assert!(matches!(err, LicenseError::TokenInvalid(_)), "{err:?}");
+
+        // 状态未被污染：仅第一条合法回执在库。
+        let stored = store.list_receipts_by_lease(&lease).unwrap();
+        assert_eq!(stored.len(), 1, "被篡改的回执不得落库");
+        assert_eq!(stored[0].seq_to, 20);
+    }
+
+    /// 时序号窗口不被伪造回执推进（**回归守卫**）：
+    /// 先伪造一条「大序号」回执 → 被拒；随后合法回执仍按真实历史判定跳空。
+    #[test]
+    fn forged_receipt_cannot_advance_sequence_window() {
+        let (svc, _s, ring) = service();
+        let lease = activate_device(&svc, "rc-window", "rcw0");
+
+        // 合法首窗：1..10 → None。
+        let r0 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 1, 10, "rc-window"))
+            .unwrap();
+        assert_eq!(r0.gap, GapKind::None);
+
+        // 伪造一条 1000..1010（签名无效）→ 拒收。
+        let mut forged = receipt_req(&lease, 1000, 1010, "rc-window");
+        forged.sig = "A".repeat(88); // 长度像 base64，但内容不是有效签名
+        assert!(svc.audit_receipt(&forged).is_err());
+
+        // 合法续窗 11..20 → 仍为 None（窗口停在上一条真实回执的 10）。
+        let r1 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 11, 20, "rc-window"))
+            .unwrap();
+        assert_eq!(
+            r1.gap,
+            GapKind::None,
+            "伪造回执不得推进序号窗口（否则真实跳空会被掩盖）"
+        );
     }
 
     // ---------------- 激活码校验位 ----------------

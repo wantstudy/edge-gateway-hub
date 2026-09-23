@@ -17,6 +17,7 @@
 //! | [`store`] | 仓储层：全部 SQL 集中于此，API/业务层不写 SQL |
 //! | [`proto`] | 端点请求 / 响应结构（对齐 `docs/design/licensing-api.md`） |
 //! | [`service`] | 业务规则：配额、幂等、时序、跳空检测、一机一码判定 |
+//! | [`http`] | HTTP 层（axum 路由）：认证 / 反序列化 / 调用 service / 错误映射 |
 //!
 //! # 授权判定位置（不可动摇的边界）
 //!
@@ -30,9 +31,11 @@
 //! 绝不写入数据库、绝不写入日志、绝不进仓库（[`model::SigningKey`] 只存公钥与 `hsm_ref`）。
 
 pub mod error;
+pub mod http;
 pub mod keys;
 pub mod model;
 pub mod proto;
+pub mod receipt;
 pub mod service;
 pub mod store;
 pub mod token;
