@@ -102,7 +102,10 @@ fn config_error(message: impl std::fmt::Display) -> DaemonError {
 // ---- 规则模型 ----
 
 /// 数值变换规格：**委托 task 15 的 [`DataProcessor`]**（本模块不实现换算 / 死区）。
+///
+/// **未知字段一律拒绝**：键拼错必须报错，不得静默忽略导致变换失效。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Transform {
     /// 输入点位（与 [`RawSample::source_id`] 对应）。
     pub source_id: String,
@@ -322,7 +325,11 @@ impl<'de> Deserialize<'de> for Action {
 }
 
 /// 一条转发规则（对应 EMQX 的 `SELECT ... WHERE ... DO ...`）。
+///
+/// **未知字段一律拒绝**（`deny_unknown_fields`）：顶层键拼错（如把 `transform` 写成
+/// `tranform`）绝不允许静默降级为通配规则 —— 那会导致对所有样本全量转发。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
     /// 规则唯一标识（全局唯一，重复 → `ConfigError`）。
     pub id: String,
@@ -1422,5 +1429,49 @@ mod tests {
         let out = engine.evaluate(raw("t", 1.0)).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].topic, "obj_topic");
+    }
+
+    // ---- 回归：QA 发现的「未知字段静默忽略」缺陷（Major） ----
+
+    /// 顶层未知字段必须报 ConfigError，**不得**静默忽略。
+    ///
+    /// QA 实测：`[{"id":"a","bogus":123,"actions":[]}]` 曾被 ACCEPTED。
+    /// 最坏后果是把 `transform` 拼错后规则静默降级为通配规则 → 对所有样本全量转发。
+    #[test]
+    fn unknown_top_level_field_is_rejected() {
+        let err = RuleEngine::from_json(r#"[{"id":"a","bogus":123,"actions":[]}]"#)
+            .expect_err("顶层未知字段必须报错");
+        assert_eq!(
+            err.error_code(),
+            crate::error::ERR_CONFIG,
+            "必须是 ConfigError(2000)"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("bogus"), "错误信息应指出字段名: {msg}");
+    }
+
+    /// 把 `transform` 拼错的典型误配置：必须报错，绝不允许降级为通配规则。
+    #[test]
+    fn misspelled_transform_is_rejected_not_silently_wildcarded() {
+        let err = RuleEngine::from_json(
+            r#"[{"id":"a","tranform":{"source_id":"t"},"actions":[{"kind":"publish","topic":"x"}]}]"#,
+        )
+        .expect_err("拼错的 transform 必须报错");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+        assert!(
+            err.to_string().contains("tranform"),
+            "错误信息应指出拼错的键名: {err}"
+        );
+    }
+
+    /// transform 内部的未知字段同样拒绝。
+    #[test]
+    fn unknown_transform_field_is_rejected() {
+        let err = RuleEngine::from_json(
+            r#"[{"id":"a","transform":{"source_id":"t","target_point":"p","device_id":"d","scal":2.0},"actions":[{"kind":"publish","topic":"x"}]}]"#,
+        )
+        .expect_err("transform 内部未知字段必须报错");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+        assert!(err.to_string().contains("scal"), "应指出 scal: {err}");
     }
 }

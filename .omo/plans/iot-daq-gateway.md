@@ -56,6 +56,12 @@
 > - 提交：`47c54dc` 数据处理、`bdabb6e` 调度器、`96e0d2a` 规则引擎、`150d148` 签名、`fd3800f` MQTT。
 >   daemon 143 测试全绿，clippy `--all-targets -D warnings` 零告警。
 >
+> **Wave 3 第二轮（2026-09-23 深夜）**：task 17 断网续传队列（queue.db 独立库 + 单写线程 + WAL +
+> 三级背压 + high-water mark 续传，14 测试）与 task 62 北向双编码器（protobuf/json 双路径语义一致
+> 且验签一致、超 2^53−1 走字符串、MQTT5 属性声明，12 测试 + 性能基线：体积 3.43× / 编码 8.57×）。
+> daemon 169 测试全绿。此轮受平台 429 频率限制打断，两个模块的收尾由主理人接续修复（共 13 处，
+> 含写线程指令循环缺失、seq 偏移 1、高水位字段硬编码为 0 三个功能性缺陷）。
+>
 > **Linux 交付形态**: **Docker 容器为主**（可选原生 deb/rpm + systemd）。容器化直接冲击「一机一码 + 试用期」两条防破解主线——**机器码必须锚定宿主机、试用与授权状态必须落宿主机持久卷**，否则 `docker rm && docker run` 即可重置试用、授权也会失效。
 > **二次校验与北向编码（本轮定案）**: 二次校验**按 A/B/C 三档并存、默认 B**——B 档下业务数据直连客户 Broker（不经厂商），厂商只收**审计回执**（心跳 + 序号区间 + 条数 + 摘要哈希，**不含业务数值**）。北向编码为**每路出口独立可选**（`protobuf` 默认 / `json`），JSON 路径**超 2^53−1 的整数必须转字符串**。防破解力度定案 **Tier-1**（预算 控制面 7 : 客户端 3）。
 
@@ -1365,7 +1371,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: .omo/evidence/task-16-scheduler.log
   **Commit**: YES — `feat(scheduler): implement group-based polling scheduler`
 
-- [ ] 17. 断网续传 — SQLite 持久化队列（独立库文件 + rusqlite 单写 + WAL + 环形覆盖）
+- [x] 17. 断网续传 — SQLite 持久化队列（独立库文件 + rusqlite 单写 + WAL + 环形覆盖）
 
   **存储职责与分库（与 18 的边界）**: 本任务使用**独立的队列库文件** `queue.db`，与任务 18 的遥测库 `telemetry.db` **物理分离、各自持有独立写连接**。SQLite 只允许单写者，共用一个连接会互相阻塞；分库后队列写入不受遥测写入影响。`queue.db` 及其 `-wal`/`-shm` 派生文件一并纳入任务 18 的加密范围。
 
@@ -1603,7 +1609,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: .omo/evidence/task-26-audit.log
   **Commit**: YES — `feat(security): implement audit logging`
 
-- [ ] 62. 北向双编码器（每路出口 protobuf / json + 大整数精度 + MQTT5 编码声明）
+- [x] 62. 北向双编码器（每路出口 protobuf / json + 大整数精度 + MQTT5 编码声明）
 
   **What to do**:
   > **定案（本轮）**：北向编码是**每路出口独立可选的一等配置项**，不是全局调试开关。默认 `protobuf`。

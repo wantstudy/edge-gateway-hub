@@ -50,6 +50,8 @@ serde_json = "1.0.151"
 base64 = "0.23.1"
 # v4：task 21 AuthBlock 的防重放 nonce（其余特性不启用，避免引入不必要的 RNG 依赖面）。
 uuid = { version = "1.26.1", features = ["v4"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+prost = "0.13"
 
 [dev-dependencies]
 # 热重载/日志轮转测试用临时目录。

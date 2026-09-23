@@ -300,7 +300,10 @@ fn ensure_rustls_provider() -> DaemonResult<()> {
 ///
 /// 每路独立声明 `broker` / `port` / `client_id` / `qos` / `encoding` / `tls` /
 /// `clean_session`，互不干扰（多 Broker 场景由 [`MqttConnectionPool`] 按名路由）。
-#[derive(Debug, Clone)]
+///
+/// **Debug 脱敏**：手写实现，`password` 恒打码为 `<redacted>`
+/// —— 禁止把口令带进日志 / 错误串 / 崩溃转储。
+#[derive(Clone)]
 pub struct EndpointConfig {
     /// 出口名（连接池唯一键，日志与诊断用）。
     pub name: String,
@@ -748,6 +751,32 @@ impl MqttClient {
         let delay = self.retry_after.take()?;
         tokio::time::sleep(delay).await;
         Some(delay)
+    }
+}
+
+impl fmt::Debug for EndpointConfig {
+    /// 手写 Debug：`password` 恒打码，其余字段照实输出（便于排障）。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EndpointConfig")
+            .field("name", &self.name)
+            .field("broker", &self.broker)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &match &self.password {
+                    Some(_) => "<redacted>",
+                    None => "<none>",
+                },
+            )
+            .field("topic_prefix", &self.topic_prefix)
+            .field("qos", &self.qos)
+            .field("encoding", &self.encoding)
+            .field("clean_session", &self.clean_session)
+            .field("keep_alive", &self.keep_alive)
+            .field("tls", &self.tls.as_ref().map(|_| "<configured>"))
+            .finish_non_exhaustive()
     }
 }
 
@@ -1920,5 +1949,63 @@ mod tests {
             "telemetry/v1/dev-7/PT-01"
         );
         assert_eq!(endpoint.broker, "broker.local");
+    }
+
+    // ---- 回归：QA 发现的「Debug 明文泄露口令」缺陷（Major） ----
+
+    /// `EndpointConfig` 的 Debug 必须打码口令。
+    ///
+    /// QA 实测：`#[derive(Debug)]` 曾把 `password: Some("SUPER_SECRET_PASSWORD_123")`
+    /// 原样打出来，口令会随任何 `{:?}`（日志 / panic 现场 / 诊断导出）泄露。
+    #[test]
+    fn endpoint_config_debug_redacts_password() {
+        const TEST_ONLY_PASSWORD: &str = "TEST_ONLY_SuperSecret!Pw123";
+        let mut endpoint = EndpointConfig::new("leak-check", "broker.local", 1883);
+        endpoint.username = Some("operator".to_string());
+        endpoint.password = Some(TEST_ONLY_PASSWORD.to_string());
+
+        // 1) 口令绝不能出现在 Debug 输出里。
+        let config_dbg = format!("{endpoint:?}");
+        assert!(
+            !config_dbg.contains(TEST_ONLY_PASSWORD),
+            "EndpointConfig Debug 泄露口令: {config_dbg}"
+        );
+        assert!(
+            config_dbg.contains("<redacted>"),
+            "口令字段应打码为 <redacted>: {config_dbg}"
+        );
+        // 2) 其余可排障字段照常输出（用户名不敏感，保留）。
+        assert!(
+            config_dbg.contains("broker.local"),
+            "broker 应保留: {config_dbg}"
+        );
+        assert!(
+            config_dbg.contains("operator"),
+            "username 应保留: {config_dbg}"
+        );
+
+        // 3) 无口令时明确标注 <none>，便于区分「未配置」与「已脱敏」。
+        let mut anonymous = EndpointConfig::new("anon", "broker.local", 1883);
+        anonymous.password = None;
+        let anon_dbg = format!("{anonymous:?}");
+        assert!(anon_dbg.contains("<none>"), "无口令应为 <none>: {anon_dbg}");
+    }
+
+    /// `TlsConfig` 路径不应在 Debug 里暴露私钥文件内容（只给 `<configured>`）。
+    #[test]
+    fn endpoint_config_debug_hides_tls_paths() {
+        let mut endpoint = EndpointConfig::new("tls-check", "broker.local", 8883);
+        endpoint.tls = Some(TlsConfig {
+            ca_cert_path: Some(PathBuf::from("/etc/iotdaq/ca.pem")),
+            client_cert_path: Some(PathBuf::from("/etc/iotdaq/client.pem")),
+            client_key_path: Some(PathBuf::from("/etc/iotdaq/client.key")),
+            alpn: Vec::new(),
+        });
+        let dbg = format!("{endpoint:?}");
+        assert!(
+            !dbg.contains("client.key"),
+            "TLS 私钥路径不应出现在 Debug: {dbg}"
+        );
+        assert!(dbg.contains("<configured>"), "TLS 应标注已配置: {dbg}");
     }
 }

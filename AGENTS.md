@@ -51,6 +51,10 @@ export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' \
    - ✅ `rusqlite 0.40.2 + bundled`（libsqlite3-sys 0.38.2，task 17/18 用）—— 已实测 `cargo check` EXIT=0
    - ❌ `aws-lc-rs`（cmake/NASM）；rustls 的 crypto provider 统一选 **`ring`**（已显式启用）
    - ❌ `paho-mqtt`（C 库）→ 用 `rumqttc`；❌ `openssl-sys` → 用 rustls 系
+   - ⚠️ vendored C 的两条固化约束（2026-09-23 裁决，QA 提出后主理人接受）：
+     ① 多架构镜像（task 60 的 amd64/arm64）**必须在目标架构容器内构建**（buildx 原生或 qemu），
+     禁止从 Windows 宿主交叉编译 vendored C（交叉时 `cc` 需目标 C 工具链，必然碎）；
+     ② CI 门禁须显式跑 `cargo check -p daemon --all-targets`，把 vendored C 构建失败挡在合并前
 2. **raw-dylib 敏感**：`windows-sys 0.60+` / `getrandom 0.4` 走 raw-dylib，须 mingw dlltool 链接；
    mingw 已就绪（`D:\rust\mingw64`），tempfile 无需钉版
 3. **密钥红线**：仓库不提交激活码 / 私钥 / 真实机器码；HMAC key 从配置 / env 注入；
