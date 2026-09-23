@@ -136,6 +136,21 @@ impl LicensingService {
     /// 6. 成功：建 / 取 device → 原子绑定 → 签发 Lease Token → 落 lease + audit_log
     ///
     /// `first_activation_at` **仅在首次写**——它是试用兜底锚点，绝不能被后续激活覆盖。
+    ///
+    /// **Nonce 占位不变量（三条，禁止破坏）**：
+    /// 1. **拒绝即不占位**：任何在 nonce 占位**之前**返回的拒绝路径（时间窗、空 nonce、
+    ///    码不存在 / 已废弃 / 已换发、配额超限）都**不写** `nonce_cache`，同一次请求重试不会
+    ///    因「上一次被拒」而误判为重放。
+    /// 2. **成功必占位**：只要走到「绑定 + 签发」成功，`nonce` 一定已被写入（新机在
+    ///    `insert_device` 之后、绑码之前补写；已存在机器在入口处即写），故成功过的请求
+    ///    用同一 nonce 重放**必然**被 `NonceReplay` 拦截。
+    /// 3. **惰性清理（非定时任务）**：过期 nonce 由每次占位时的 `purge_expired_nonces`
+    ///    顺带清理，**不依赖外部定时任务**；即使清理失败也不影响主流程正确性（仅靠 TTL）。
+    ///
+    /// **为何拒绝路径也消费 nonce（本版本刻意接受）**：`nonce` 一旦落库即占位，即便该次
+    /// 激活随后因码异常失败，同一 nonce 也被消耗——这是**防重放优先**的取舍：nonce 的作用域
+    /// 是「一次性请求令牌」，宁可让客户端对失败请求**换新 nonce** 重试，也不允许一个 nonce
+    /// 被反复用于探测（否则重放者可用同一 nonce 反复尝试不同码）。现有行为正确，不改。
     pub fn activate(&self, req: &ActivationRequest) -> LicenseResult<ActivationResponse> {
         let now = now_unix_secs();
         let client_ts = parse_ts(&req.ts, "ts")?;
@@ -149,7 +164,18 @@ impl LicensingService {
         }
 
         // 规则 2：nonce 防重放（全局唯一，写入即占位）。
-        self.reject_replayed_nonce(&req.nonce, &req.machine_code, now)?;
+        //
+        // ⚠️ `nonce_cache.device_id` 是 `device(device_id)` 的**硬外键**，故 nonce 的
+        // `device_id` 必须是**已存在的设备 ID**。首次激活时设备尚未建库，此处先用
+        // machine_code 作占位查找：若设备已存在则立即占位（严格防重放）；若不存在，
+        // 则推迟到设备建库之后立即占位（仍在绑定 / 签发之前，语义等价）。
+        if req.nonce.trim().is_empty() {
+            return Err(LicenseError::ActivationRejected("nonce is empty".into()));
+        }
+        let pre_device = self.store.get_device_by_machine_code(&req.machine_code)?;
+        if let Some(dev) = &pre_device {
+            self.reject_replayed_nonce(&req.nonce, &dev.device_id, now)?;
+        }
 
         // 规则 3：码状态。
         if req.activation_code.trim().is_empty() {
@@ -246,8 +272,8 @@ impl LicensingService {
         }
 
         // 规则 6：建 / 取 device。
-        let existing_device = self.store.get_device_by_machine_code(&req.machine_code)?;
-        let device = match existing_device {
+        let is_new_device = pre_device.is_none();
+        let device = match pre_device {
             Some(mut d) => {
                 // 已有设备：更新锚点（锚点可能随升级扩展），不动 first_activation_at。
                 d.anchor_hashes = req.anchor_hashes.clone();
@@ -267,7 +293,12 @@ impl LicensingService {
                 d
             }
         };
-        self.store.insert_device(&device)?;
+        // 新设备才插入（`machine_code` 唯一约束；已存在设备不得重复 INSERT）。
+        if is_new_device {
+            self.store.insert_device(&device)?;
+            // 设备刚建库，补做 nonce 占位（FK 现已满足），仍在绑定 / 签发之前。
+            self.reject_replayed_nonce(&req.nonce, &device.device_id, now)?;
+        }
 
         // 原子绑定（WHERE bound_device_id IS NULL；冲突 → ActivationRejected）。
         self.store
@@ -291,6 +322,13 @@ impl LicensingService {
         now: i64,
     ) -> LicenseResult<ActivationResponse> {
         // 档位：设备级覆盖 > 租户默认（本版本设备级覆盖随 device 记录承载，缺省取租户默认）。
+        //
+        // 契约澄清：apply 路径存在「改码状态 → 签发失败」的部分失败窗口（库内状态已变、
+        // HTTP 报错）。根因是**没有** apply 阶段的开环事务边界。已裁决为**接受**：
+        // ① 全流程无 WS 推送，客户端不会看到中间态；② 该码本身已异常（非可签发态），
+        // 重试同码无论如何都会被拒，不因部分失败而新增影响面；③ 真要做隔离需引入
+        // 事务穿透 store(conn) 接口，收益低于改动成本。若日后新增「撤销即推送」类实时
+        // 联动，必须回来补事务边界。
         let tenant = self.store.get_tenant(&code.tenant_id)?;
         let verify_mode = match &tenant {
             Some(t) => t.verify_mode_default,
@@ -731,33 +769,25 @@ impl LicensingService {
 
     /// 发放激活码（设计 §2.1）。
     ///
-    /// - 幂等：同 `idempotency_key` 重放 → 返回首次结果（查 `code` 表 `idempotency_key`）
+    /// - 幂等：同 `idempotency_key` 重放 → 返回首次批次（`code_batch` 头表 + 逐位一致）
     /// - 租户不存在 → `TenantNotFound`
     /// - `count` 上限 [`MAX_ISSUE_BATCH`]
+    ///
+    /// **幂等仲裁（批次头表）**：`idempotency_key` 是**批次级**标识（一批多码共用），
+    /// 因此 `activation_code.idempotency_key` **不建唯一索引**（行级唯一会让批量发码失败）。
+    /// 唯一性下沉到 `code_batch(idempotency_key PRIMARY KEY)`，以 `INSERT OR IGNORE` +
+    /// `rows_affected` 做**数据库级线性化**仲裁：
+    /// - 认领成功（`true`）→ 本调用是**首个**到达者，执行完整发放；
+    /// - 认领失败（`false`）→ **重复 / 并发重放**，改读既有批次原样返回，**绝不再生成新码**。
+    ///
+    /// **认领时机红线**：`claim_code_batch` 必须放在**参数解析与校验之后**——否则一次
+    /// 「count 非法 / 租户不存在」的坏请求会先烧掉 key，使后续**合法**重试被误判为重放。
     pub fn issue_codes(
         &self,
         req: &IssueCodesRequest,
         actor: &str,
     ) -> LicenseResult<IssueCodesResponse> {
-        // 幂等：先查是否已有同 key 的发放结果。
-        if !req.idempotency_key.trim().is_empty() {
-            let filter = CodeFilter {
-                tenant_id: Some(req.tenant_id.clone()),
-                status: None,
-                tier: None,
-                order_id: None,
-            };
-            let existing = self.store.list_codes(&filter, 1, MAX_ISSUE_BATCH)?;
-            let replay: Vec<IssuedCode> = existing
-                .iter()
-                .filter(|c| c.idempotency_key.as_deref() == Some(req.idempotency_key.as_str()))
-                .map(code_to_issued)
-                .collect();
-            if !replay.is_empty() {
-                return Ok(IssueCodesResponse { codes: replay });
-            }
-        }
-
+        // ---- 先做全部无副作用校验（此阶段绝不碰 code_batch，避免坏请求烧 key）----
         // 数量校验。
         if req.count == 0 || req.count > MAX_ISSUE_BATCH {
             return Err(LicenseError::QuotaExceeded(format!(
@@ -780,7 +810,26 @@ impl LicensingService {
             ));
         }
 
+        // `now` 必须在 `claim_code_batch` **之前**取：保证头表 `created_at` 与随后逐码
+        // 的 `created_at` 同源（同一批次内一致），也避免认领成功后才取时间引入的额外窗口。
         let now = now_unix_secs();
+
+        // ---- 幂等认领（仅当 key 非空）----
+        let key = req.idempotency_key.trim();
+        let has_key = !key.is_empty();
+        if has_key {
+            let claimed = self
+                .store
+                .claim_code_batch(key, &req.tenant_id, req.count, now)?;
+            if !claimed {
+                // 重复 / 并发重放：直接返回既有批次（rowid 升序，逐位一致）。
+                let existing = self.store.list_codes_by_batch_key(key)?;
+                let replay: Vec<IssuedCode> = existing.iter().map(code_to_issued).collect();
+                return Ok(IssueCodesResponse { codes: replay });
+            }
+        }
+
+        // ---- 认领成功（或无 key，跳过幂等）→ 执行完整发放 ----
         let mut issued: Vec<IssuedCode> = Vec::with_capacity(req.count as usize);
         for _ in 0..req.count {
             let code_value = generate_activation_code();
@@ -1425,11 +1474,16 @@ mod tests {
         (svc, store, ring)
     }
 
-    /// 发放一个码并返回 (code_id, code_value)。
+    /// 发放一个码并返回 (code_id, code_value)（默认租户 `t-1`）。
     fn issue_one(svc: &LicensingService) -> (String, String) {
+        issue_one_for(svc, "t-1")
+    }
+
+    /// 为指定租户发放一个码。
+    fn issue_one_for(svc: &LicensingService, tenant_id: &str) -> (String, String) {
         let now = now_unix_secs();
         let req = IssueCodesRequest {
-            tenant_id: "t-1".into(),
+            tenant_id: tenant_id.into(),
             tier: "standard".into(),
             valid_from: now.to_string(),
             valid_until: (now + 365 * 86_400).to_string(),
@@ -1530,7 +1584,7 @@ mod tests {
             &code_id,
             &RevokeCodeRequest {
                 reason: "fraud".into(),
-                note: "客服核实为欺诈换机".into(),
+                note: "客服已核实为欺诈换机场景".into(),
                 confirm_tail8: tail8,
                 second_approver: None,
             },
@@ -1628,9 +1682,8 @@ mod tests {
                 ..ServiceConfig::default()
             },
         );
-        let (_id, code1) = issue_one(&svc);
+        let (_id, code1) = issue_one_for(&svc, "t-q");
         // 用不同机器激活两台 → 第二台撞配额。
-        // 先手工占满：插入一台设备。
         let a = anchors(5, "q1");
         let ar: Vec<&str> = a.iter().map(String::as_str).collect();
         svc.activate(&activation_req(&code1, "mach-q1", &ar, "q1"))
@@ -1638,18 +1691,13 @@ mod tests {
         let (_id2, code2) = {
             let now = now_unix_secs();
             let req = IssueCodesRequest {
-                tenant_id: "t-1".into(),
+                tenant_id: "t-q".into(),
                 tier: "standard".into(),
                 valid_from: now.to_string(),
                 valid_until: (now + 86_400).to_string(),
                 count: 1,
                 prebind_machine_code: None,
                 idempotency_key: format!("idem-q-{}", now_ns_id("k")),
-            };
-            // 该 store 里租户是 t-q，不是 t-1。
-            let req = IssueCodesRequest {
-                tenant_id: "t-q".into(),
-                ..req
             };
             let r = svc.issue_codes(&req, "admin").unwrap();
             (r.codes[0].code_id.clone(), r.codes[0].code.clone())
@@ -2032,7 +2080,7 @@ mod tests {
             &code_id,
             &RevokeCodeRequest {
                 reason: "risk".into(),
-                note: "风控确认异常后废弃".into(),
+                note: "风控已确认异常并人工核实废弃".into(),
                 confirm_tail8: tail8,
                 second_approver: None,
             },
@@ -2087,7 +2135,7 @@ mod tests {
 
     // ---------------- issue / revoke / reissue 全链路 ----------------
 
-    /// 发放幂等：同 `idempotency_key` 重放返回同一批码。
+    /// 发放幂等：同 `idempotency_key` 重放返回同一批码（逐位一致）。
     #[test]
     fn issue_codes_idempotency_replays_same_codes() {
         let (svc, _s, _r) = service();
@@ -2103,11 +2151,26 @@ mod tests {
         };
         let r1 = svc.issue_codes(&req, "admin").unwrap();
         assert_eq!(r1.codes.len(), 3);
+        let first_count = svc
+            .store
+            .count_codes(&CodeFilter {
+                tenant_id: Some("t-1".into()),
+                status: None,
+                tier: None,
+                order_id: None,
+            })
+            .unwrap();
+        assert_eq!(first_count, 3);
+
         let r2 = svc.issue_codes(&req, "admin").unwrap();
+        // `code_id` 与 `code` **双序列**都逐位一致（仅有 id 一致不足以证明未重发码值）。
         let ids1: Vec<&str> = r1.codes.iter().map(|c| c.code_id.as_str()).collect();
         let ids2: Vec<&str> = r2.codes.iter().map(|c| c.code_id.as_str()).collect();
-        assert_eq!(ids1, ids2, "同幂等键必须返回同一批码");
-        // total 未增加。
+        let codes1: Vec<&str> = r1.codes.iter().map(|c| c.code.as_str()).collect();
+        let codes2: Vec<&str> = r2.codes.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(ids1, ids2, "同幂等键必须返回同一批码 ID");
+        assert_eq!(codes1, codes2, "同幂等键必须返回同一批码值");
+        // 总码数与首次一致（重放未产生第二批）。
         let total = svc
             .store
             .count_codes(&CodeFilter {
@@ -2117,7 +2180,126 @@ mod tests {
                 order_id: None,
             })
             .unwrap();
-        assert_eq!(total, 3, "幂等重放不得产生第二批码");
+        assert_eq!(total, first_count, "幂等重放不得产生第二批码");
+    }
+
+    /// 截断回归：发满一批（`MAX_ISSUE_BATCH`）后再尝试超额被拒，随后**重放最早批次的 key**
+    /// 必须命中既有批次（返回原码、总数不变），而**不能**被「当前 tenant 码数已达上限」挡住。
+    ///
+    /// 防回归点：旧实现用 `list_codes(filter, 1, MAX_ISSUE_BATCH)` 只扫**首批**，一旦批次
+    /// 超过一页，重放查询就会漏掉既有批次；且配额/分页耦合会让「重放已成功批次」误判。
+    /// 新实现直接按 `idempotency_key` 精确读头表对应批次，与总数 / 分页**完全解耦**。
+    #[test]
+    fn issue_codes_replay_hits_existing_batch_after_truncation_boundary() {
+        let (svc, _s, _r) = service();
+        let now = now_unix_secs();
+        // 第一批：最早的 key（会被后续大量发放挤出旧查询的首页）。
+        let first = IssueCodesRequest {
+            tenant_id: "t-1".into(),
+            tier: "standard".into(),
+            valid_from: now.to_string(),
+            valid_until: (now + 86_400).to_string(),
+            count: 2,
+            prebind_machine_code: None,
+            idempotency_key: "idem-earliest".into(),
+        };
+        let r1 = svc.issue_codes(&first, "admin").unwrap();
+        let ids1: Vec<String> = r1.codes.iter().map(|c| c.code_id.clone()).collect();
+        assert_eq!(ids1.len(), 2);
+
+        // 第二批：`MAX_ISSUE_BATCH + 1` 个**不同 key** 的码，把总码数推过一页边界。
+        // 用逐码发放（不同 key）批量构造，避免撞上单批上限。
+        let bulk = MAX_ISSUE_BATCH + 1;
+        for i in 0..bulk {
+            let one = IssueCodesRequest {
+                tenant_id: "t-1".into(),
+                tier: "standard".into(),
+                valid_from: now.to_string(),
+                valid_until: (now + 86_400).to_string(),
+                count: 1,
+                prebind_machine_code: None,
+                idempotency_key: format!("idem-bulk-{i}"),
+            };
+            svc.issue_codes(&one, "admin").unwrap();
+        }
+        let total_after_bulk = svc
+            .store
+            .count_codes(&CodeFilter {
+                tenant_id: Some("t-1".into()),
+                status: None,
+                tier: None,
+                order_id: None,
+            })
+            .unwrap();
+        assert_eq!(total_after_bulk, 2 + u64::from(bulk));
+
+        // 重放最早 key：必须命中既有批次，返回**原码**，总数**不变**。
+        let r2 = svc.issue_codes(&first, "admin").unwrap();
+        let ids2: Vec<String> = r2.codes.iter().map(|c| c.code_id.clone()).collect();
+        assert_eq!(ids2, ids1, "跨分页边界后重放仍须命中最早批次");
+        let total_final = svc
+            .store
+            .count_codes(&CodeFilter {
+                tenant_id: Some("t-1".into()),
+                status: None,
+                tier: None,
+                order_id: None,
+            })
+            .unwrap();
+        assert_eq!(total_final, total_after_bulk, "重放不得新增任何码");
+    }
+
+    /// 并发幂等：同 key 多线程并发发放 → 最终只落**一批**（`count` 个码），且至少一个成功。
+    ///
+    /// 断言刻意**放宽**：允许个别线程遇到 `Storage`（SQLite 单写连接竞争 / 忙），
+    /// 只要不存在「两个批次都成功落地」。**不引入额外锁**——正确性由
+    /// `code_batch(idempotency_key PRIMARY KEY)` 的唯一约束仲裁兜底。
+    #[test]
+    fn issue_codes_concurrent_same_key_lands_single_batch() {
+        let (svc, _s, _r) = service();
+        let svc = Arc::new(svc);
+        let now = now_unix_secs();
+        let count: u32 = 5;
+        let threads = 8;
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let svc = Arc::clone(&svc);
+            let handle = std::thread::spawn(move || {
+                let req = IssueCodesRequest {
+                    tenant_id: "t-1".into(),
+                    tier: "standard".into(),
+                    valid_from: now.to_string(),
+                    valid_until: (now + 86_400).to_string(),
+                    count,
+                    prebind_machine_code: None,
+                    idempotency_key: "idem-race".into(),
+                };
+                svc.issue_codes(&req, "admin").is_ok()
+            });
+            handles.push(handle);
+        }
+        let mut ok_count = 0usize;
+        for h in handles {
+            if h.join().unwrap_or(false) {
+                ok_count += 1;
+            }
+        }
+        assert!(ok_count >= 1, "并发同 key 至少应有一个线程成功");
+        // 关键断言：无论多少线程成功，数据库里只有 `count` 个码（只有一个批次胜出）。
+        let total = svc
+            .store
+            .count_codes(&CodeFilter {
+                tenant_id: Some("t-1".into()),
+                status: None,
+                tier: None,
+                order_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            total,
+            u64::from(count),
+            "并发同 key 只允许一个批次落地（不得出现第二批）"
+        );
     }
 
     /// 发放：租户不存在 → 拒绝。
@@ -2174,7 +2356,7 @@ mod tests {
                 &code_id,
                 &RevokeCodeRequest {
                     reason: "risk".into(),
-                    note: "风控确认异常后废弃".into(),
+                    note: "风控已确认异常并人工核实废弃".into(),
                     confirm_tail8: "00000000".into(),
                     second_approver: None,
                 },
@@ -2258,7 +2440,7 @@ mod tests {
             &code_id,
             &RevokeCodeRequest {
                 reason: "risk".into(),
-                note: "风控确认异常后废弃".into(),
+                note: "风控已确认异常并人工核实废弃".into(),
                 confirm_tail8: tail8,
                 second_approver: None,
             },
@@ -2367,7 +2549,7 @@ mod tests {
             &code_b_id,
             &RevokeCodeRequest {
                 reason: "risk".into(),
-                note: "风控确认异常后废弃".into(),
+                note: "风控已确认异常并人工核实废弃".into(),
                 confirm_tail8: tail8,
                 second_approver: None,
             },
@@ -2449,7 +2631,14 @@ mod tests {
             "码值必须掩码: {}",
             list[0].code_masked
         );
-        assert!(!list[0].code_masked.contains(&code[code.len() - 4..])); // 掩码里不含中间明文
+        // 中间段（去掉前缀与末 4 位）不得以明文出现。
+        let body: String = code.chars().filter(|c| *c != '-').collect();
+        let middle = &body[..body.len() - 4];
+        assert!(
+            !list[0].code_masked.contains(middle),
+            "掩码不得泄露码值中间明文: {}",
+            list[0].code_masked
+        );
 
         let detail = svc.code_detail(&code_id).unwrap();
         assert_eq!(detail.code, code);

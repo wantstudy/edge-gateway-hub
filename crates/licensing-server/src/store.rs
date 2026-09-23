@@ -107,8 +107,21 @@ const SCHEMA: &[&str] = &[
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_code_tenant ON activation_code(tenant_id)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_code_bound_device ON activation_code(bound_device_id)"#,
-    r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_code_idem
-        ON activation_code(idempotency_key) WHERE idempotency_key IS NOT NULL"#,
+    // `idempotency_key` 标识**一次发放批次**（一批多码共用同一 key），因此**不建唯一索引**：
+    // 唯一约束属于「批次」而非「单行」，行级唯一会让批量发码直接失败。幂等语义由
+    // service 层按 key 查询既有批次实现（见 `LicensingService::issue_codes`）。
+    r#"CREATE INDEX IF NOT EXISTS idx_code_idem ON activation_code(idempotency_key)"#,
+    // `code_batch` 是**批次头表**：`idempotency_key` 作为主键，把「一次发放批次」的
+    // 幂等仲裁下沉到数据库（`INSERT OR IGNORE` + `rows_affected`），从而在**并发重放**
+    // 下也保证同一 key 只有一个批次胜出。`activation_code.idempotency_key` 仍是**非唯一**
+    // 索引（一批多码必须共用同一 key），头表承担唯一性。
+    r#"CREATE TABLE IF NOT EXISTS code_batch (
+        idempotency_key TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL REFERENCES tenant(tenant_id),
+        expected_count  INTEGER NOT NULL,
+        created_at      INTEGER NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_code_batch_tenant ON code_batch(tenant_id)"#,
     r#"CREATE TABLE IF NOT EXISTS signing_key (
         kid        TEXT PRIMARY KEY,
         status     TEXT NOT NULL,
@@ -117,11 +130,15 @@ const SCHEMA: &[&str] = &[
         enabled_at INTEGER NOT NULL,
         retired_at INTEGER
     )"#,
+    // `lease.kid` **不是硬外键**：签名私钥经环境变量注入、由 [`crate::keys::KeyRing`] 持有，
+    // `signing_key` 表只承载**公钥与 hsm_ref**（设计 §5 私钥隔离）。轮换期间新 kid 可先
+    // 用于签发、再择机登记公钥，故不能把「租约签发」耦合到一次 `signing_key` 写入。
+    // 关系（`SIGNING_KEY ||--o{ LEASE`）以 `idx_lease_kid` 索引 + 应用层校验表达。
     r#"CREATE TABLE IF NOT EXISTS lease (
         lease_id          TEXT PRIMARY KEY,
         device_id         TEXT NOT NULL REFERENCES device(device_id),
         code_id           TEXT NOT NULL REFERENCES activation_code(code_id),
-        kid               TEXT NOT NULL REFERENCES signing_key(kid),
+        kid               TEXT NOT NULL,
         token_sig         TEXT NOT NULL,
         verify_mode       TEXT NOT NULL,
         tier              TEXT NOT NULL,
@@ -131,6 +148,7 @@ const SCHEMA: &[&str] = &[
         status            TEXT NOT NULL
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_lease_device ON lease(device_id)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_lease_kid ON lease(kid)"#,
     r#"CREATE TABLE IF NOT EXISTS heartbeat (
         id             TEXT PRIMARY KEY,
         lease_id       TEXT NOT NULL REFERENCES lease(lease_id),
@@ -549,7 +567,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT tenant_id, name, verify_mode_default, contact, created_at
-             FROM tenant ORDER BY created_at ASC, tenant_id ASC",
+             FROM tenant ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map([], row_to_tenant)?;
         let mut out = Vec::new();
@@ -636,7 +654,7 @@ impl Store {
                     "SELECT device_id, tenant_id, machine_code, anchor_hashes, deploy_mode,
                             image_digest, host_anchor_ref, first_activation_at, status, created_at
                      FROM device WHERE tenant_id = ?1
-                     ORDER BY created_at ASC, device_id ASC
+                     ORDER BY rowid ASC
                      LIMIT ?2 OFFSET ?3",
                 )?;
                 let rows =
@@ -650,7 +668,7 @@ impl Store {
                     "SELECT device_id, tenant_id, machine_code, anchor_hashes, deploy_mode,
                             image_digest, host_anchor_ref, first_activation_at, status, created_at
                      FROM device
-                     ORDER BY created_at ASC, device_id ASC
+                     ORDER BY rowid ASC
                      LIMIT ?1 OFFSET ?2",
                 )?;
                 let rows = stmt.query_map(params![i64::from(page_size), offset], row_to_device)?;
@@ -754,6 +772,10 @@ impl Store {
     }
 
     /// 按过滤条件分页列出激活码（`page` 从 1 起）。
+    ///
+    /// **排序契约：按 `rowid` 升序（= 插入顺序）**。同一个发放批次的多张码共享同一
+    /// `created_at` 秒，若以 `created_at`/`code_id` 排序会因随机主键后缀产生**不稳定顺序**，
+    /// 使「同幂等键重放返回同一批码」无法保证逐位一致。`rowid` 单调且确定。
     pub fn list_codes(
         &self,
         filter: &CodeFilter,
@@ -773,7 +795,7 @@ impl Store {
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         push_code_filter(&mut sql, &mut args, filter);
-        sql.push_str(" ORDER BY created_at ASC, code_id ASC LIMIT ? OFFSET ?");
+        sql.push_str(" ORDER BY rowid ASC LIMIT ? OFFSET ?");
         args.push(Box::new(i64::from(page_size)));
         args.push(Box::new(offset));
 
@@ -986,7 +1008,7 @@ impl Store {
             "SELECT lease_id, device_id, code_id, kid, token_sig, verify_mode, tier,
                     issued_at, valid_until, last_heartbeat_at, status
              FROM lease WHERE device_id = ?1
-             ORDER BY issued_at DESC, lease_id DESC",
+             ORDER BY issued_at DESC, rowid DESC",
         )?;
         let rows = stmt.query_map(params![device_id], row_to_lease)?;
         let mut out = Vec::new();
@@ -1045,7 +1067,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, lease_id, device_id, client_ts, server_ts, result, receipt_cursor, created_at
              FROM heartbeat WHERE lease_id = ?1
-             ORDER BY server_ts ASC, id ASC",
+             ORDER BY server_ts ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![lease_id], row_to_heartbeat)?;
         let mut out = Vec::new();
@@ -1092,7 +1114,7 @@ impl Store {
                 "SELECT id, lease_id, device_mid, seq_from, seq_to, count, payload_digest, ts, sig,
                         received_at, gap_flag
                  FROM audit_receipt WHERE lease_id = ?1
-                 ORDER BY seq_to DESC, received_at DESC, id DESC
+                 ORDER BY seq_to DESC, received_at DESC, rowid DESC
                  LIMIT 1",
                 params![lease_id],
                 row_to_receipt,
@@ -1108,7 +1130,7 @@ impl Store {
             "SELECT id, lease_id, device_mid, seq_from, seq_to, count, payload_digest, ts, sig,
                     received_at, gap_flag
              FROM audit_receipt WHERE lease_id = ?1
-             ORDER BY seq_from ASC, received_at ASC, id ASC",
+             ORDER BY seq_from ASC, received_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![lease_id], row_to_receipt)?;
         let mut out = Vec::new();
@@ -1126,6 +1148,65 @@ impl Store {
             params![receipt_id, i64::from(gap)],
         )?;
         Ok(())
+    }
+
+    // ================= code_batch（批次头表 · 幂等仲裁） =================
+
+    /// **原子认领发放批次**：仅当 `idempotency_key` 从未出现时写入头表，返回是否**首次**。
+    ///
+    /// - 返回 `Ok(true)`：本调用认领成功，调用方应执行完整发放；
+    /// - 返回 `Ok(false)`：该 key 已被占位（**重复 / 并发重放**），调用方必须改为
+    ///   读取既有批次并原样返回，**不得**再生成新码。
+    ///
+    /// 实现依赖主键唯一约束由数据库仲裁（`INSERT OR IGNORE` + `rows_affected`），
+    /// **不用「先 SELECT 再 INSERT」**（并发窗口会让两个请求同时通过校验）。
+    /// 这是把幂等判定下沉到「数据库唯一约束」这一**线性化点**，是批次幂等的唯一正解。
+    pub fn claim_code_batch(
+        &self,
+        idempotency_key: &str,
+        tenant_id: &str,
+        expected_count: u32,
+        created_at: i64,
+    ) -> LicenseResult<bool> {
+        let conn = self.conn.lock();
+        let affected = conn.execute(
+            "INSERT OR IGNORE INTO code_batch
+               (idempotency_key, tenant_id, expected_count, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                idempotency_key,
+                tenant_id,
+                i64::from(expected_count),
+                created_at
+            ],
+        )?;
+        Ok(affected == 1)
+    }
+
+    /// 按批次 key 列出该批次的**全部**激活码（幂等重放读路径）。
+    ///
+    /// **排序契约：按 `rowid` 升序（= 插入顺序）**，与 [`Store::list_codes`] 一致：
+    /// 同批多码共享同一 `created_at` 秒，若按 `created_at`/`code_id` 排序会因随机主键
+    /// 后缀导致**顺序不稳定**，使「同幂等键重放返回同一批码」无法逐位一致。
+    /// 本查询**不设 LIMIT**——批次规模已由 `MAX_ISSUE_BATCH` 在 service 层封顶。
+    pub fn list_codes_by_batch_key(
+        &self,
+        idempotency_key: &str,
+    ) -> LicenseResult<Vec<ActivationCode>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
+                    valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
+                    revoked_reason, idempotency_key, created_at
+             FROM activation_code WHERE idempotency_key = ?1
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![idempotency_key], row_to_code)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     // ================= nonce_cache =================
@@ -1215,7 +1296,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT kid, status, public_key, hsm_ref, enabled_at, retired_at
-             FROM signing_key ORDER BY enabled_at ASC, kid ASC",
+             FROM signing_key ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map([], row_to_signing_key)?;
         let mut out = Vec::new();
@@ -1293,7 +1374,7 @@ impl Store {
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         push_audit_filter(&mut sql, &mut args, filter);
-        sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?");
+        sql.push_str(" ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?");
         args.push(Box::new(i64::from(page_size)));
         args.push(Box::new(offset));
 
@@ -1556,6 +1637,13 @@ mod tests {
     #[test]
     fn code_insert_get_round_trip_with_optionals() {
         let (store, _) = fixture();
+        // 绑定关系与重发溯源是外键，先把被引用行落库。
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+        store
+            .insert_code(&sample_code("c-original", "CODE-ORIG"))
+            .expect("orig");
 
         // 未绑定、无废弃信息（全 None）。
         let issued = sample_code("c-issued", "CODE-ISSUED");
@@ -1611,6 +1699,9 @@ mod tests {
     #[test]
     fn list_codes_and_count_with_filter() {
         let (store, _) = fixture();
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
         store.insert_code(&sample_code("c-1", "V1")).expect("c1");
         store.insert_code(&sample_code("c-2", "V2")).expect("c2");
         let mut bound = sample_code("c-3", "V3");
@@ -1870,15 +1961,26 @@ mod tests {
         };
         assert!(store.insert_lease(&bad_code).is_err());
 
-        // 引用不存在的 kid → 报错。
-        let bad_kid = Lease {
-            lease_id: "l-badkid".into(),
+        // `kid` **刻意不是硬外键**：私钥经环境变量注入、kid 可在尚未登记公钥时先用于签发
+        // （设计 §5 私钥隔离 + 轮换语义）。故引用未知 kid 必须**成功**，而非报错。
+        let unknown_kid = Lease {
+            lease_id: "l-unknown-kid".into(),
             device_id: "dev-1".into(),
             code_id: "c-1".into(),
-            kid: "k-missing".into(),
+            kid: "k-not-yet-registered".into(),
             ..bad_code
         };
-        assert!(store.insert_lease(&bad_kid).is_err());
+        store
+            .insert_lease(&unknown_kid)
+            .expect("lease.kid 不是外键，未知 kid 允许落库");
+        assert_eq!(
+            store
+                .get_lease("l-unknown-kid")
+                .expect("get")
+                .expect("some")
+                .kid,
+            "k-not-yet-registered"
+        );
     }
 
     #[test]
