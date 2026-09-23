@@ -21,7 +21,10 @@ pub mod config;
 pub mod driver;
 pub mod error;
 pub mod logging;
+pub mod north;
 pub mod pipeline;
+pub mod rules;
+pub mod scheduler;
 
 /// 便捷再导出：`daemon::modbus` ≡ `daemon::driver::modbus`（task 9）。
 pub use driver::modbus;

@@ -39,7 +39,21 @@ tokio-modbus = { version = "0.17", features = ["tcp-server"] }
 # io-util 供传输层 AsyncRead/Write，sync 供单测 oneshot 断言通道。
 # tcp-server 特性会额外启用 rt-multi-thread。
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros", "sync"] }
+rumqttc = "0.25.1"
+# task 19 mqtts 依赖修正：rumqttc/tokio-rustls 引入的 rustls 未启用任何 crypto provider，
+# `CryptoProvider::get_default()` 返回 None → mqtts 握手必然无 provider。
+# 显式启用 `ring`（纯 Rust 侧可构建；**不要选 aws-lc-rs**：cmake/NASM C 构建，违反纯 Rust 栈红线）。
+# 特性在同一 rustls 0.23.x 上做版本统一，无需改动 rumqttc/tokio-rustls 自身配置。
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+ed25519-dalek = "3.0.0"
+serde_json = "1.0.151"
+base64 = "0.23.1"
+# v4：task 21 AuthBlock 的防重放 nonce（其余特性不启用，避免引入不必要的 RNG 依赖面）。
+uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
 # 热重载/日志轮转测试用临时目录。
 tempfile = "3"
+
+# task 16 调度器单测：tokio 时间加速（pause / advance），避免真实等待秒级轮询间隔。
+tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "sync"] }
