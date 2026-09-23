@@ -17,16 +17,11 @@ base64 = "0.23"
 # 序列化（Token 载荷、API 请求响应）。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 时间：只取 UTC 秒，避免引入时区依赖。
-time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
-# 随机：激活码生成、nonce、密钥。
+# 随机：激活码生成、nonce、测试密钥。
 rand = "0.9"
-# 摘要：activation code 校验位、payload_digest、HMAC 加盐截断。
-sha2 = "0.10"
-hmac = "0.12"
 # 存储：与 daemon 侧同口径（单文件 SQLite + WAL）。
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-# 并发：连接池 + 互斥。
+# 并发：连接互斥（服务端并发量低，单连接 + Mutex 比连接池更易保证事务语义）。
 parking_lot = "0.12"
 
 [dev-dependencies]

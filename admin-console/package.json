@@ -1,0 +1,25 @@
+{
+  "name": "iot-daq-admin-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "IoT-DAQ 厂商总管理后台（激活码生命周期 / 设备 / 租户 / 密钥 / 审计）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:only": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@arco-design/web-vue": "^2.56.3",
+    "@iot-daq/ui-kit": "file:../ui-kit",
+    "vue": "^3.5.13",
+    "vue-router": "^4.4.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vue-tsc": "^2.1.10"
+  }
+}

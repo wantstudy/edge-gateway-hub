@@ -2901,3 +2901,58 @@ cargo test --package daemon formula        # Expected: all pass（含环检测�
 - [ ] **公式安全通过**：无 `eval` / 脚本引擎；非白名单函数与赋值/循环在解析期被拒；前端编辑器**不可绕过校验**（`validate` 不通过无法保存；试算结果来自后端 `dry-run`）
 - [ ] **公式可追溯**：公式变更写入审计（含改前/改后）；`docs/` 下《公式与计算点手册》齐全并已被索引；改公式后**历史数据不变**（未重算）
 - [ ] 200 设备完成一轮验收；50 设备 × 100ms 无丢数据；断网 1h 补发 1,800,000 条且无重复
+
+---
+
+## 实施记录 · Wave 3 第三轮（QA 复核缺陷处置 + task 45 起步）
+
+> 时间：2026-09-24 00:20 ~ 01:00。承接 Wave 3 第二轮，处置 QA 独立复核报告中的遗留项。
+
+### 已修复（2 个 Major，提交 `2790114`）
+
+| # | 缺陷 | 修法 | 回归测试 |
+|---|------|------|---------|
+| 1 | `rules.rs` 缺 `deny_unknown_fields`：`transform` 键名拼错（如 `tranform`）被静默忽略 → 通配规则全量转发 | `Rule` 与 `Transform` 加 `#[serde(deny_unknown_fields)]` | 3 个（顶层未知字段 / 拼错 transform / transform 内部未知字段） |
+| 2 | `mqtt.rs` `EndpointConfig` derive Debug 明文输出 broker 口令与 TLS 私钥路径 | 移除 derive，手写 Debug（`password` → `<redacted>`/`<none>`，`tls` → `<configured>`） | 2 个（口令脱敏 + 无口令标注；TLS 路径不外泄） |
+
+门禁：`cargo test -p daemon` **174 passed / 0 failed / 1 ignored**；fmt EXIT=0；clippy `--all-targets -D warnings` EXIT=0。
+
+### 已裁决「不修」（1 个 Minor）
+
+**QA 报告**：`rules.rs` 通配规则与 transform 规则对同一样本重复命中 → 产出 2 条消息；`passthrough` 缓存无上限。
+
+**裁决：语义部分不修，缓存上限部分待评估。**
+
+理由：既有测试 `multiple_rules_hit_produce_multiple_messages` 与 `and_or_not_combinations` **明确固化**了「同一点位被多条规则命中时产出多条消息」的语义，测试注释写着「第二条为无 transform 的通配规则」。这是规则引擎的**设计意图**——同一条采集数据可以既进告警主题、又进归档主题（多出口分发是产品要求，参见计划中「每路出口独立可选编码」与「统一分发」定位），不是重复转发缺陷。
+
+主理人曾按 QA 建议实施互斥（新增 `claimed_points` 集合，通配规则跳过已被专属规则接管的点位），实施后**两个既有测试立即变红**——即该改法会破坏已确认的语义。故整体回退，保持现状。
+
+**若后续要求改为互斥语义**（即「一点位只允许一条规则命中」），需先改这两条既有测试并确认产品语义，不可单方面改动。
+
+`passthrough` 缓存无上限：`source_id` 基数由现场数据决定，误配时确可无限增长。但直通处理器是无状态配置（`deadband = 0`），缓存本身不泄漏、不累积语义状态，属于「内存占用随误配基数线性增长」的效率问题而非正确性问题。**降级为技术债**，与 task 26（安全加固）一并处理。
+
+### task 45 进展（云端授权服务）
+
+- `crates/licensing-server/src/keys.rs`（**新增**）：`KeyRing` 多 kid 并存与轮换（active → retiring → retired）；私钥仅经环境变量注入；未知 kid 一律拒绝、不做单钥兜底；无可用签发密钥时签发**明确失败**（不静默选别的密钥）；手写 Debug 保证密钥材料不经 `{:?}` 泄漏。
+- `crates/licensing-server/src/token.rs`（**新增**）：`LeaseClaims` + 三段式 Token `kid.payload.sig`；签名域为**逐字段长度前缀**的语义规范化串（继承 daemon 侧 `semantic_hash` 口径，字段含 `|` 不产生歧义）；kid 在签名域内 → 改写外层 kid 必然验签失败。
+- `crates/licensing-server/src/error.rs`：新增 `Storage` 变体（错误码 1050）+ `From<rusqlite::Error>`。
+- **55 测试通过**，fmt / clippy(-D warnings) / test 三门禁全绿。
+- 提交 `e6473a9`（含 fmt/clippy 修正）。
+
+**待交付文件**：`model.rs` / `store.rs`（9 表仓储）、`proto.rs` / `service.rs`（11 端点 + 业务规则）—— 已派 2 名工程师并行实现。
+
+### 本轮并行派工（5 个 engineer）
+
+| 成员 | 任务 | 文件 |
+|------|------|------|
+| engineer-licensing-2 | task 45 数据层 | `licensing-server/src/{model,store}.rs` |
+| engineer-rules-2 | task 45 业务层 | `licensing-server/src/{proto,service}.rs` |
+| engineer-queue-2 | task 18 遥测加密存储 | `daemon/src/telemetry_store.rs` |
+| engineer-sign-2 | task 22 云授权客户端 | `daemon/src/auth/client.rs` |
+| （待派） | task 47/48 管理后台前端 | `admin-console/` |
+
+### 本机工具链口径（复核确认）
+
+- Rust 环境前缀：`export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' PATH="/d/rust/cargo/bin:/d/rust/mingw64/bin:$PATH"`；**`/d/rust/mingw64/bin` 必须在 rustup 目录之前**，否则 windows-sys raw-dylib 构建失败。
+- `.topic` 是 `RoutedMessage` 的**字段**（不是方法），测试断言里别写 `m.topic()`。
+- `RawSample` 只有 4 个字段：`source_id` / `value` / `quality` / `device_ts_ns: Option<i64>`；**没有** `point_id`（`point_id` 是 `ProcessedSample` 的字段，由 transform 映射产生）。

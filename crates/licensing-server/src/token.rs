@@ -20,7 +20,6 @@
 //! - 载荷**明文可读**（客户端需读 `valid_until` 做本地过期判定），
 //!   **安全性来自签名而非加密**——载荷里不得放任何秘密。
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64NP;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -293,6 +292,7 @@ fn push_field(out: &mut String, name: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
 
     fn claims() -> LeaseClaims {
         LeaseClaims {

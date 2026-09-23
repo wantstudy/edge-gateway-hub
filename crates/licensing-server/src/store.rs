@@ -1,0 +1,2307 @@
+//! `licensing-server` 仓储层：**全部 SQL 集中于此**（API / 业务层不写 SQL）。
+//!
+//! 权威文档：`docs/design/licensing-data-model.md`（9 表）；数据结构见 [`crate::model`]。
+//!
+//! # 设计约束（逐条对齐设计文档）
+//!
+//! 1. **单连接 + Mutex**：服务端并发量低，`parking_lot::Mutex<Connection>` 比连接池
+//!    更易保证事务语义（一个写事务 = 一次锁持有）。
+//! 2. **WAL + 外键强制 + busy_timeout**：`open` 时统一设置（`journal_mode=WAL`、
+//!    `foreign_keys=ON`、`busy_timeout=5000`），跨进程与磁盘抖动场景下行为可预期。
+//! 3. **一机一码是竞态防线**：[`Store::bind_code_to_device`] 用**单条条件 UPDATE** +
+//!    `rows_affected` 判定，**绝不做「先 SELECT 再 UPDATE」**（两种「同码异机激活」
+//!    并发请求会同时通过 SELECT 校验，双双绑定成功 → 一机一码被击穿）。
+//! 4. **防重放用 INSERT OR IGNORE**：[`Store::insert_nonce_if_absent`] 依赖主键唯一约束
+//!    由数据库仲裁，`rows_affected() == 1` 即首次；`0` 即重放。
+//! 5. **时间一律 UTC 秒 INTEGER**：所有 `*_at` / `*_ts` 列均为 `INTEGER`（跨端一致性红线）。
+//! 6. **生产路径零 panic**：全部方法返回 [`LicenseResult`]，**无 `unwrap` / `expect` /
+//!    `panic!`**。`i64 ↔ u32` 转换一律走 `try_from` + `map_err`。
+//! 7. **错误信息不承载敏感值**：错误里**不出现激活码原文、私钥、指纹原文**
+//!    （错误会进日志与审计）。`bind_code_to_device` 的冲突错误只带 `code_id`。
+
+use std::path::{Path, PathBuf};
+
+use parking_lot::Mutex;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+
+use crate::error::{LicenseError, LicenseResult};
+use crate::model::{
+    now_unix_secs, ActivationCode, ActorType, AuditLog, AuditReceipt, CodeStatus, DeployMode,
+    Device, DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, NonceCache, SigningKey,
+    SigningKeyStatus, Tenant, VerifyMode,
+};
+
+// ---- 列表过滤条件 ----
+
+/// `activation_code` 列表过滤条件（`None` 字段 = 不施加该条件）。
+///
+/// **字段集合由 service 层契约固定**：`{ tenant_id, status, tier, order_id }`。
+/// `order_id` 对应列 `source_order_id`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodeFilter {
+    /// 按租户过滤（`activation_code.tenant_id`）。
+    pub tenant_id: Option<String>,
+    /// 按状态过滤。
+    pub status: Option<CodeStatus>,
+    /// 按授权档位过滤（`activation_code.tier`）。
+    pub tier: Option<String>,
+    /// 按来源订单过滤（`activation_code.source_order_id`）。
+    pub order_id: Option<String>,
+}
+
+/// `audit_log` 列表过滤条件（`None` 字段 = 不施加该条件）。
+///
+/// **字段集合由 service 层契约固定**：`{ actor_type, action, entity_type, entity_id }`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditFilter {
+    /// 按主体类型过滤。
+    pub actor_type: Option<ActorType>,
+    /// 按动作过滤。
+    pub action: Option<String>,
+    /// 按实体类型过滤。
+    pub entity_type: Option<String>,
+    /// 按实体 ID 过滤。
+    pub entity_id: Option<String>,
+}
+
+// ---- SQL 迁移 ----
+
+/// 建表 + 索引语句（**幂等**：全部 `IF NOT EXISTS`）。
+const SCHEMA: &[&str] = &[
+    r#"CREATE TABLE IF NOT EXISTS tenant (
+        tenant_id           TEXT PRIMARY KEY,
+        name                TEXT NOT NULL,
+        verify_mode_default TEXT NOT NULL DEFAULT 'B',
+        contact             TEXT NOT NULL DEFAULT '',
+        created_at          INTEGER NOT NULL
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS device (
+        device_id           TEXT PRIMARY KEY,
+        tenant_id           TEXT NOT NULL REFERENCES tenant(tenant_id),
+        machine_code        TEXT NOT NULL UNIQUE,
+        anchor_hashes       TEXT NOT NULL,
+        deploy_mode         TEXT NOT NULL,
+        image_digest        TEXT,
+        host_anchor_ref     TEXT,
+        first_activation_at INTEGER,
+        status              TEXT NOT NULL,
+        created_at          INTEGER NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_device_tenant ON device(tenant_id)"#,
+    r#"CREATE TABLE IF NOT EXISTS activation_code (
+        code_id          TEXT PRIMARY KEY,
+        code             TEXT NOT NULL UNIQUE,
+        status           TEXT NOT NULL,
+        bound_device_id  TEXT REFERENCES device(device_id),
+        tenant_id        TEXT NOT NULL REFERENCES tenant(tenant_id),
+        tier             TEXT NOT NULL,
+        valid_from       INTEGER NOT NULL,
+        valid_until      INTEGER NOT NULL,
+        source_order_id  TEXT NOT NULL,
+        reissued_from_id TEXT REFERENCES activation_code(code_id),
+        issued_by        TEXT NOT NULL,
+        revoked_at       INTEGER,
+        revoked_reason   TEXT,
+        idempotency_key  TEXT,
+        created_at       INTEGER NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_code_tenant ON activation_code(tenant_id)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_code_bound_device ON activation_code(bound_device_id)"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_code_idem
+        ON activation_code(idempotency_key) WHERE idempotency_key IS NOT NULL"#,
+    r#"CREATE TABLE IF NOT EXISTS signing_key (
+        kid        TEXT PRIMARY KEY,
+        status     TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        hsm_ref    TEXT,
+        enabled_at INTEGER NOT NULL,
+        retired_at INTEGER
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS lease (
+        lease_id          TEXT PRIMARY KEY,
+        device_id         TEXT NOT NULL REFERENCES device(device_id),
+        code_id           TEXT NOT NULL REFERENCES activation_code(code_id),
+        kid               TEXT NOT NULL REFERENCES signing_key(kid),
+        token_sig         TEXT NOT NULL,
+        verify_mode       TEXT NOT NULL,
+        tier              TEXT NOT NULL,
+        issued_at         INTEGER NOT NULL,
+        valid_until       INTEGER NOT NULL,
+        last_heartbeat_at INTEGER,
+        status            TEXT NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_lease_device ON lease(device_id)"#,
+    r#"CREATE TABLE IF NOT EXISTS heartbeat (
+        id             TEXT PRIMARY KEY,
+        lease_id       TEXT NOT NULL REFERENCES lease(lease_id),
+        device_id      TEXT NOT NULL REFERENCES device(device_id),
+        client_ts      INTEGER NOT NULL,
+        server_ts      INTEGER NOT NULL,
+        result         TEXT NOT NULL,
+        receipt_cursor TEXT,
+        created_at     INTEGER NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_heartbeat_lease ON heartbeat(lease_id)"#,
+    r#"CREATE TABLE IF NOT EXISTS audit_receipt (
+        id             TEXT PRIMARY KEY,
+        lease_id       TEXT NOT NULL REFERENCES lease(lease_id),
+        device_mid     TEXT NOT NULL,
+        seq_from       INTEGER NOT NULL,
+        seq_to         INTEGER NOT NULL,
+        count          INTEGER NOT NULL,
+        payload_digest TEXT NOT NULL,
+        ts             INTEGER NOT NULL,
+        sig            TEXT NOT NULL,
+        received_at    INTEGER NOT NULL,
+        gap_flag       INTEGER NOT NULL DEFAULT 0
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_receipt_lease ON audit_receipt(lease_id, seq_from)"#,
+    r#"CREATE TABLE IF NOT EXISTS nonce_cache (
+        nonce      TEXT PRIMARY KEY,
+        device_id  TEXT NOT NULL REFERENCES device(device_id),
+        expires_at INTEGER NOT NULL,
+        used_at    INTEGER NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_nonce_expires ON nonce_cache(expires_at)"#,
+    r#"CREATE TABLE IF NOT EXISTS audit_log (
+        id          TEXT PRIMARY KEY,
+        actor_type  TEXT NOT NULL,
+        actor_id    TEXT NOT NULL,
+        action      TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id   TEXT NOT NULL,
+        detail      TEXT NOT NULL,
+        ts          INTEGER NOT NULL,
+        ip          TEXT NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id)"#,
+];
+
+// ---- 行映射辅助 ----
+
+/// `i64 → u32` 分页转换（**不 panic**）。
+fn to_u32(value: i64, what: &str) -> LicenseResult<u32> {
+    u32::try_from(value)
+        .map_err(|_| LicenseError::Storage(format!("{what} does not fit into u32: {value}")))
+}
+
+/// `i64 → u64` 计数转换（**不 panic**：SQLite `COUNT(*)` 非负，负值视为损坏数据）。
+fn to_u64(value: i64, what: &str) -> LicenseResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| LicenseError::Storage(format!("{what} is negative or too large: {value}")))
+}
+
+/// `usize → i64` 转换（**不 panic**）。
+fn to_i64(value: usize, what: &str) -> LicenseResult<i64> {
+    i64::try_from(value)
+        .map_err(|_| LicenseError::Storage(format!("{what} does not fit into i64: {value}")))
+}
+
+/// `LicenseError → rusqlite::Error`：供 `query_map` 回调（签名要求 `rusqlite::Result`）使用。
+///
+/// 把枚举解析 / JSON 解码失败包装为 `FromSqlConversionFailure`，使其能在
+/// `query_row` / `query_map` 内部传播；离开迭代器后再经
+/// `From<rusqlite::Error> for LicenseError` 归一为 [`LicenseError::Storage`]。
+fn conversion_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, message.into())
+}
+
+/// 解析状态枚举并转为 `rusqlite::Error`（供行映射使用）。
+fn parse_enum<T, E>(value: &str, parse: E) -> rusqlite::Result<T>
+where
+    E: FnOnce(&str) -> LicenseResult<T>,
+{
+    parse(value).map_err(|e| conversion_error(e.to_string()))
+}
+
+/// 解析 `device.anchor_hashes`（JSON 数组）。
+fn parse_anchor_hashes(raw: &str) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(raw).map_err(|e| {
+        // 不回显 `raw` 内容（可能含指纹材料）。
+        conversion_error(format!(
+            "device.anchor_hashes is not a JSON string array: {e}"
+        ))
+    })
+}
+
+/// 序列化 `device.anchor_hashes`。
+fn encode_anchor_hashes(anchors: &[String]) -> LicenseResult<String> {
+    serde_json::to_string(anchors)
+        .map_err(|e| LicenseError::Storage(format!("cannot encode anchor_hashes: {e}")))
+}
+
+/// 从行读取 `Tenant`。
+fn row_to_tenant(row: &Row<'_>) -> rusqlite::Result<Tenant> {
+    let verify_raw: String = row.get(2)?;
+    Ok(Tenant {
+        tenant_id: row.get(0)?,
+        name: row.get(1)?,
+        verify_mode_default: parse_enum(&verify_raw, VerifyMode::parse)?,
+        contact: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+/// 从行读取 `Device`。
+fn row_to_device(row: &Row<'_>) -> rusqlite::Result<Device> {
+    let anchor_raw: String = row.get(3)?;
+    let image_digest: Option<String> = row.get(5)?;
+    let host_anchor_ref: Option<String> = row.get(6)?;
+    let first_activation_at: Option<i64> = row.get(7)?;
+    let deploy_raw: String = row.get(4)?;
+    let status_raw: String = row.get(8)?;
+    Ok(Device {
+        device_id: row.get(0)?,
+        tenant_id: row.get(1)?,
+        machine_code: row.get(2)?,
+        anchor_hashes: parse_anchor_hashes(&anchor_raw)?,
+        deploy_mode: parse_enum(&deploy_raw, DeployMode::parse)?,
+        image_digest,
+        host_anchor_ref,
+        first_activation_at,
+        status: parse_enum(&status_raw, DeviceStatus::parse)?,
+        created_at: row.get(9)?,
+    })
+}
+
+/// 从行读取 `ActivationCode`。
+fn row_to_code(row: &Row<'_>) -> rusqlite::Result<ActivationCode> {
+    let status_raw: String = row.get(2)?;
+    Ok(ActivationCode {
+        code_id: row.get(0)?,
+        code: row.get(1)?,
+        status: parse_enum(&status_raw, CodeStatus::parse)?,
+        bound_device_id: row.get(3)?,
+        tenant_id: row.get(4)?,
+        tier: row.get(5)?,
+        valid_from: row.get(6)?,
+        valid_until: row.get(7)?,
+        source_order_id: row.get(8)?,
+        reissued_from_id: row.get(9)?,
+        issued_by: row.get(10)?,
+        revoked_at: row.get(11)?,
+        revoked_reason: row.get(12)?,
+        idempotency_key: row.get(13)?,
+        created_at: row.get(14)?,
+    })
+}
+
+/// 从行读取 `Lease`。
+fn row_to_lease(row: &Row<'_>) -> rusqlite::Result<Lease> {
+    let verify_raw: String = row.get(5)?;
+    let status_raw: String = row.get(10)?;
+    Ok(Lease {
+        lease_id: row.get(0)?,
+        device_id: row.get(1)?,
+        code_id: row.get(2)?,
+        kid: row.get(3)?,
+        token_sig: row.get(4)?,
+        verify_mode: parse_enum(&verify_raw, VerifyMode::parse)?,
+        tier: row.get(6)?,
+        issued_at: row.get(7)?,
+        valid_until: row.get(8)?,
+        last_heartbeat_at: row.get(9)?,
+        status: parse_enum(&status_raw, LeaseStatus::parse)?,
+    })
+}
+
+/// 从行读取 `Heartbeat`。
+fn row_to_heartbeat(row: &Row<'_>) -> rusqlite::Result<Heartbeat> {
+    let result_raw: String = row.get(5)?;
+    Ok(Heartbeat {
+        id: row.get(0)?,
+        lease_id: row.get(1)?,
+        device_id: row.get(2)?,
+        client_ts: row.get(3)?,
+        server_ts: row.get(4)?,
+        result: parse_enum(&result_raw, HeartbeatResult::parse)?,
+        receipt_cursor: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+/// 从行读取 `AuditReceipt`。
+fn row_to_receipt(row: &Row<'_>) -> rusqlite::Result<AuditReceipt> {
+    let gap_raw: i64 = row.get(10)?;
+    Ok(AuditReceipt {
+        id: row.get(0)?,
+        lease_id: row.get(1)?,
+        device_mid: row.get(2)?,
+        seq_from: row.get(3)?,
+        seq_to: row.get(4)?,
+        count: row.get(5)?,
+        payload_digest: row.get(6)?,
+        ts: row.get(7)?,
+        sig: row.get(8)?,
+        received_at: row.get(9)?,
+        gap_flag: gap_raw != 0,
+    })
+}
+
+/// 从行读取 `NonceCache`。
+fn row_to_nonce(row: &Row<'_>) -> rusqlite::Result<NonceCache> {
+    Ok(NonceCache {
+        nonce: row.get(0)?,
+        device_id: row.get(1)?,
+        expires_at: row.get(2)?,
+        used_at: row.get(3)?,
+    })
+}
+
+/// 从行读取 `SigningKey`。
+fn row_to_signing_key(row: &Row<'_>) -> rusqlite::Result<SigningKey> {
+    let status_raw: String = row.get(1)?;
+    Ok(SigningKey {
+        kid: row.get(0)?,
+        status: parse_enum(&status_raw, SigningKeyStatus::parse)?,
+        public_key: row.get(2)?,
+        hsm_ref: row.get(3)?,
+        enabled_at: row.get(4)?,
+        retired_at: row.get(5)?,
+    })
+}
+
+/// 从行读取 `AuditLog`。
+fn row_to_audit_log(row: &Row<'_>) -> rusqlite::Result<AuditLog> {
+    let actor_raw: String = row.get(1)?;
+    Ok(AuditLog {
+        id: row.get(0)?,
+        actor_type: parse_enum(&actor_raw, ActorType::parse)?,
+        actor_id: row.get(2)?,
+        action: row.get(3)?,
+        entity_type: row.get(4)?,
+        entity_id: row.get(5)?,
+        detail: row.get(6)?,
+        ts: row.get(7)?,
+        ip: row.get(8)?,
+    })
+}
+
+// ---- 动态过滤条件拼装（**只用绑定参数**，杜绝注入） ----
+
+/// 把 [`CodeFilter`] 追加到 `sql` 的 WHERE 子句，并按顺序压入绑定参数。
+fn push_code_filter(
+    sql: &mut String,
+    args: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    filter: &CodeFilter,
+) {
+    if let Some(tenant) = &filter.tenant_id {
+        sql.push_str(" AND tenant_id = ?");
+        args.push(Box::new(tenant.clone()));
+    }
+    if let Some(status) = filter.status {
+        sql.push_str(" AND status = ?");
+        args.push(Box::new(status.as_str().to_string()));
+    }
+    if let Some(tier) = &filter.tier {
+        sql.push_str(" AND tier = ?");
+        args.push(Box::new(tier.clone()));
+    }
+    if let Some(order_id) = &filter.order_id {
+        sql.push_str(" AND source_order_id = ?");
+        args.push(Box::new(order_id.clone()));
+    }
+}
+
+/// 把 [`AuditFilter`] 追加到 `sql` 的 WHERE 子句，并按顺序压入绑定参数。
+fn push_audit_filter(
+    sql: &mut String,
+    args: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    filter: &AuditFilter,
+) {
+    if let Some(actor_type) = filter.actor_type {
+        sql.push_str(" AND actor_type = ?");
+        args.push(Box::new(actor_type.as_str().to_string()));
+    }
+    if let Some(action) = &filter.action {
+        sql.push_str(" AND action = ?");
+        args.push(Box::new(action.clone()));
+    }
+    if let Some(entity_type) = &filter.entity_type {
+        sql.push_str(" AND entity_type = ?");
+        args.push(Box::new(entity_type.clone()));
+    }
+    if let Some(entity_id) = &filter.entity_id {
+        sql.push_str(" AND entity_id = ?");
+        args.push(Box::new(entity_id.clone()));
+    }
+}
+
+// ---- Store ----
+
+/// 仓储层：单连接 + `Mutex`，全部表访问的唯一入口。
+///
+/// **不实现 `Debug`**（内含 `rusqlite::Connection`，暴露无益且可能泄露路径细节）；
+/// 需要打印时使用 [`Store::path`]。
+pub struct Store {
+    conn: Mutex<Connection>,
+    path: PathBuf,
+}
+
+/// `Store` 的手写 `Debug`：**只输出数据库文件路径**，不含连接内部状态。
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 配置单连接的 PRAGMA 与会话级外键（对连接池 / 单连接均适用）。
+fn configure(conn: &Connection) -> LicenseResult<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA busy_timeout=5000;",
+    )?;
+    Ok(())
+}
+
+impl Store {
+    /// 打开（必要时创建）磁盘数据库，完成 PRAGMA 与建表迁移。
+    pub fn open(path: &Path) -> LicenseResult<Self> {
+        let conn = Connection::open(path)?;
+        configure(&conn)?;
+        let store = Store {
+            conn: Mutex::new(conn),
+            path: path.to_path_buf(),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// 打开**纯内存**数据库（测试用；同样启用外键约束）。
+    pub fn open_in_memory() -> LicenseResult<Self> {
+        let conn = Connection::open_in_memory()?;
+        configure(&conn)?;
+        let store = Store {
+            conn: Mutex::new(conn),
+            path: PathBuf::from(":memory:"),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// 数据库文件路径（`:memory:` 表示内存库）。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 执行建表 + 索引（**幂等**：全部 `IF NOT EXISTS`）。
+    pub fn migrate(&self) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        for statement in SCHEMA {
+            conn.execute_batch(statement)?;
+        }
+        Ok(())
+    }
+
+    /// 查询当前 `PRAGMA journal_mode`（迁移断言 / 运维自检用）。
+    pub fn journal_mode(&self) -> LicenseResult<String> {
+        let conn = self.conn.lock();
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        Ok(mode)
+    }
+
+    /// 查询当前 `PRAGMA foreign_keys`（0 / 1）。
+    pub fn foreign_keys_enabled(&self) -> LicenseResult<bool> {
+        let conn = self.conn.lock();
+        let flag: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        Ok(flag != 0)
+    }
+
+    // ================= tenant =================
+
+    /// 插入租户。
+    pub fn insert_tenant(&self, tenant: &Tenant) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO tenant (tenant_id, name, verify_mode_default, contact, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                tenant.tenant_id,
+                tenant.name,
+                tenant.verify_mode_default.as_str(),
+                tenant.contact,
+                tenant.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按 ID 查询租户。
+    pub fn get_tenant(&self, tenant_id: &str) -> LicenseResult<Option<Tenant>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT tenant_id, name, verify_mode_default, contact, created_at
+                 FROM tenant WHERE tenant_id = ?1",
+                params![tenant_id],
+                row_to_tenant,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 列出全部租户（按 `created_at` 升序）。
+    pub fn list_tenants(&self) -> LicenseResult<Vec<Tenant>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT tenant_id, name, verify_mode_default, contact, created_at
+             FROM tenant ORDER BY created_at ASC, tenant_id ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_tenant)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    // ================= device =================
+
+    /// 插入设备（`machine_code` 唯一；重复插入返回 [`LicenseError::Storage`]）。
+    pub fn insert_device(&self, device: &Device) -> LicenseResult<()> {
+        let anchors = encode_anchor_hashes(&device.anchor_hashes)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO device
+               (device_id, tenant_id, machine_code, anchor_hashes, deploy_mode,
+                image_digest, host_anchor_ref, first_activation_at, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                device.device_id,
+                device.tenant_id,
+                device.machine_code,
+                anchors,
+                device.deploy_mode.as_str(),
+                device.image_digest,
+                device.host_anchor_ref,
+                device.first_activation_at,
+                device.status.as_str(),
+                device.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按设备 ID 查询。
+    pub fn get_device(&self, device_id: &str) -> LicenseResult<Option<Device>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT device_id, tenant_id, machine_code, anchor_hashes, deploy_mode,
+                        image_digest, host_anchor_ref, first_activation_at, status, created_at
+                 FROM device WHERE device_id = ?1",
+                params![device_id],
+                row_to_device,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 按机器码查询（`machine_code` 唯一，故至多一条）。
+    pub fn get_device_by_machine_code(&self, machine_code: &str) -> LicenseResult<Option<Device>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT device_id, tenant_id, machine_code, anchor_hashes, deploy_mode,
+                        image_digest, host_anchor_ref, first_activation_at, status, created_at
+                 FROM device WHERE machine_code = ?1",
+                params![machine_code],
+                row_to_device,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 分页列出设备（`page` 从 1 起）。
+    ///
+    /// `tenant_id == None` 表示**跨租户**列出全部设备（管理后台总览）。
+    pub fn list_devices(
+        &self,
+        tenant_id: Option<&str>,
+        page: u32,
+        page_size: u32,
+    ) -> LicenseResult<Vec<Device>> {
+        let page = page.max(1);
+        let page_size = page_size.max(1);
+        let offset = to_i64(((page - 1) as usize) * page_size as usize, "device offset")?;
+        let conn = self.conn.lock();
+        let mut out = Vec::new();
+        match tenant_id {
+            Some(tenant) => {
+                let mut stmt = conn.prepare(
+                    "SELECT device_id, tenant_id, machine_code, anchor_hashes, deploy_mode,
+                            image_digest, host_anchor_ref, first_activation_at, status, created_at
+                     FROM device WHERE tenant_id = ?1
+                     ORDER BY created_at ASC, device_id ASC
+                     LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows =
+                    stmt.query_map(params![tenant, i64::from(page_size), offset], row_to_device)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT device_id, tenant_id, machine_code, anchor_hashes, deploy_mode,
+                            image_digest, host_anchor_ref, first_activation_at, status, created_at
+                     FROM device
+                     ORDER BY created_at ASC, device_id ASC
+                     LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = stmt.query_map(params![i64::from(page_size), offset], row_to_device)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 统计设备数（配额判定用）。`tenant_id == None` 表示**全局**计数。
+    pub fn count_devices(&self, tenant_id: Option<&str>) -> LicenseResult<u64> {
+        let conn = self.conn.lock();
+        let count: i64 = match tenant_id {
+            Some(tenant) => conn.query_row(
+                "SELECT COUNT(*) FROM device WHERE tenant_id = ?1",
+                params![tenant],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row("SELECT COUNT(*) FROM device", [], |row| row.get(0))?,
+        };
+        to_u64(count, "device count")
+    }
+
+    /// 更新设备状态（心跳路径回写）。
+    pub fn update_device_status(&self, device_id: &str, status: DeviceStatus) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE device SET status = ?2 WHERE device_id = ?1",
+            params![device_id, status.as_str()],
+        )?;
+        Ok(())
+    }
+
+    // ================= activation_code =================
+
+    /// 插入激活码（`code` 唯一）。**不在此处校验 `validate()`**——由 service 层显式调用，
+    /// 以便错误语义（`KeyStateIllegal`）不被降级为 `Storage`。
+    pub fn insert_code(&self, code: &ActivationCode) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO activation_code
+               (code_id, code, status, bound_device_id, tenant_id, tier, valid_from, valid_until,
+                source_order_id, reissued_from_id, issued_by, revoked_at, revoked_reason,
+                idempotency_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                code.code_id,
+                code.code,
+                code.status.as_str(),
+                code.bound_device_id,
+                code.tenant_id,
+                code.tier,
+                code.valid_from,
+                code.valid_until,
+                code.source_order_id,
+                code.reissued_from_id,
+                code.issued_by,
+                code.revoked_at,
+                code.revoked_reason,
+                code.idempotency_key,
+                code.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按码值查询（激活入口；`code` 唯一）。
+    ///
+    /// **调用方不得把码值写进日志 / 错误信息**。
+    pub fn get_code_by_value(&self, code_value: &str) -> LicenseResult<Option<ActivationCode>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
+                        valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
+                        revoked_reason, idempotency_key, created_at
+                 FROM activation_code WHERE code = ?1",
+                params![code_value],
+                row_to_code,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 按码 ID 查询。
+    pub fn get_code_by_id(&self, code_id: &str) -> LicenseResult<Option<ActivationCode>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
+                        valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
+                        revoked_reason, idempotency_key, created_at
+                 FROM activation_code WHERE code_id = ?1",
+                params![code_id],
+                row_to_code,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 按过滤条件分页列出激活码（`page` 从 1 起）。
+    pub fn list_codes(
+        &self,
+        filter: &CodeFilter,
+        page: u32,
+        page_size: u32,
+    ) -> LicenseResult<Vec<ActivationCode>> {
+        let page = page.max(1);
+        let page_size = page_size.max(1);
+        let offset = to_i64(((page - 1) as usize) * page_size as usize, "code offset")?;
+
+        // 动态拼装 WHERE（**只用绑定参数**，不做字符串拼接注入）。
+        let mut sql = String::from(
+            "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
+                    valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
+                    revoked_reason, idempotency_key, created_at
+             FROM activation_code WHERE 1 = 1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        push_code_filter(&mut sql, &mut args, filter);
+        sql.push_str(" ORDER BY created_at ASC, code_id ASC LIMIT ? OFFSET ?");
+        args.push(Box::new(i64::from(page_size)));
+        args.push(Box::new(offset));
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), row_to_code)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 按过滤条件统计激活码数。
+    pub fn count_codes(&self, filter: &CodeFilter) -> LicenseResult<u64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM activation_code WHERE 1 = 1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        push_code_filter(&mut sql, &mut args, filter);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let count: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0))?;
+        to_u64(count, "code count")
+    }
+
+    /// 更新激活码状态（不改动绑定关系 / 废弃信息）。
+    pub fn update_code_status(&self, code_id: &str, status: CodeStatus) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE activation_code SET status = ?2 WHERE code_id = ?1",
+            params![code_id, status.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// **原子绑定**：把 `code_id` 绑定到 `device_id`（一机一码的竞态防线）。
+    ///
+    /// 实施方式：单条条件 UPDATE + `rows_affected` 判定。
+    /// `rows_affected == 0` 表示该码已被**别的机器**抢先绑定（或码不存在），
+    /// 返回 [`LicenseError::ActivationRejected`]。
+    ///
+    /// ⚠️ **绝不允许改成「先 SELECT 校验再 UPDATE」**：并发两个「同码异机激活」请求
+    /// 会同时看到 `bound_device_id IS NULL` 并双双绑定成功，一机一码被击穿。
+    ///
+    /// 幂等：若该码已绑定到**同一** `device_id`，也返回 `Err`（调用方应先用
+    /// [`Store::get_code_by_id`] 判定是否已完成，再决定是否走本路径）。
+    pub fn bind_code_to_device(&self, code_id: &str, device_id: &str) -> LicenseResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let affected = tx.execute(
+            "UPDATE activation_code
+                SET status = 'bound', bound_device_id = ?2
+              WHERE code_id = ?1 AND bound_device_id IS NULL",
+            params![code_id, device_id],
+        )?;
+        if affected == 1 {
+            tx.commit()?;
+            return Ok(());
+        }
+        // 未抢到：区分「不存在」与「已被绑定」，以便服务端给出正确语义。
+        let existing: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT bound_device_id, status FROM activation_code WHERE code_id = ?1",
+                params![code_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        tx.commit()?;
+        match existing {
+            None => Err(LicenseError::ActivationRejected(format!(
+                "activation code not found: {code_id}"
+            ))),
+            Some((bound, status)) => {
+                let current = bound.unwrap_or_else(|| "<none>".to_string());
+                Err(LicenseError::ActivationRejected(format!(
+                    "activation code {code_id} is already bound (status={status}, \
+                     bound_device_id={current}); refusing to bind to {device_id}"
+                )))
+            }
+        }
+    }
+
+    /// 废弃激活码：置 `revoked` 并写入 `revoked_at = now` / `revoked_reason = reason`。
+    ///
+    /// 只允许从 `issued` / `bound` 迁移（`revoked` / `reissued` 重复废弃返回
+    /// [`LicenseError::KeyStateIllegal`]，保证状态机单向）。
+    pub fn revoke_code(&self, code_id: &str, reason: &str, now: i64) -> LicenseResult<()> {
+        if reason.trim().is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "revoke requires a non-empty reason".into(),
+            ));
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM activation_code WHERE code_id = ?1",
+                params![code_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let status = match current {
+            None => {
+                return Err(LicenseError::KeyStateIllegal(format!(
+                    "activation code not found: {code_id}"
+                )));
+            }
+            Some(raw) => CodeStatus::parse(&raw)?,
+        };
+        if !matches!(status, CodeStatus::Issued | CodeStatus::Bound) {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "cannot revoke activation code {code_id} in status {}",
+                status.as_str()
+            )));
+        }
+        tx.execute(
+            "UPDATE activation_code
+                SET status = 'revoked', revoked_at = ?2, revoked_reason = ?3
+              WHERE code_id = ?1",
+            params![code_id, now, reason],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 标记原码为 `reissued`，并把新码溯源到原码（**同一事务**）。
+    ///
+    /// 迁移规则：`revoked → reissued`（设计「生命周期」表）。仅切原码状态；
+    /// 新码由调用方构造为 `status = reissued`、`reissued_from_id = 原码 ID`
+    /// 并经 [`Store::insert_code`] 落库后再调用本方法（或反之，见实现顺序注释）。
+    pub fn mark_code_reissued(&self, original_code_id: &str) -> LicenseResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM activation_code WHERE code_id = ?1",
+                params![original_code_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let status = match current {
+            None => {
+                return Err(LicenseError::KeyStateIllegal(format!(
+                    "activation code not found: {original_code_id}"
+                )));
+            }
+            Some(raw) => CodeStatus::parse(&raw)?,
+        };
+        if !matches!(status, CodeStatus::Revoked) {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "reissue requires a revoked activation code; {original_code_id} is {}",
+                status.as_str()
+            )));
+        }
+        tx.execute(
+            "UPDATE activation_code SET status = 'reissued' WHERE code_id = ?1",
+            params![original_code_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ================= lease =================
+
+    /// 插入租约。
+    pub fn insert_lease(&self, lease: &Lease) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO lease
+               (lease_id, device_id, code_id, kid, token_sig, verify_mode, tier,
+                issued_at, valid_until, last_heartbeat_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                lease.lease_id,
+                lease.device_id,
+                lease.code_id,
+                lease.kid,
+                lease.token_sig,
+                lease.verify_mode.as_str(),
+                lease.tier,
+                lease.issued_at,
+                lease.valid_until,
+                lease.last_heartbeat_at,
+                lease.status.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按租约 ID 查询。
+    pub fn get_lease(&self, lease_id: &str) -> LicenseResult<Option<Lease>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT lease_id, device_id, code_id, kid, token_sig, verify_mode, tier,
+                        issued_at, valid_until, last_heartbeat_at, status
+                 FROM lease WHERE lease_id = ?1",
+                params![lease_id],
+                row_to_lease,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 列出某设备的全部租约（按 `issued_at` 降序，最新在前）。
+    pub fn list_leases_by_device(&self, device_id: &str) -> LicenseResult<Vec<Lease>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT lease_id, device_id, code_id, kid, token_sig, verify_mode, tier,
+                    issued_at, valid_until, last_heartbeat_at, status
+             FROM lease WHERE device_id = ?1
+             ORDER BY issued_at DESC, lease_id DESC",
+        )?;
+        let rows = stmt.query_map(params![device_id], row_to_lease)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 更新租约最近心跳时间（心跳路径）。
+    pub fn update_lease_heartbeat(&self, lease_id: &str, heartbeat_at: i64) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE lease SET last_heartbeat_at = ?2 WHERE lease_id = ?1",
+            params![lease_id, heartbeat_at],
+        )?;
+        Ok(())
+    }
+
+    /// 更新租约状态（心跳结果 + 时间守卫驱动）。
+    pub fn update_lease_status(&self, lease_id: &str, status: LeaseStatus) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE lease SET status = ?2 WHERE lease_id = ?1",
+            params![lease_id, status.as_str()],
+        )?;
+        Ok(())
+    }
+
+    // ================= heartbeat =================
+
+    /// 插入心跳记录。
+    pub fn insert_heartbeat(&self, heartbeat: &Heartbeat) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO heartbeat
+               (id, lease_id, device_id, client_ts, server_ts, result, receipt_cursor, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                heartbeat.id,
+                heartbeat.lease_id,
+                heartbeat.device_id,
+                heartbeat.client_ts,
+                heartbeat.server_ts,
+                heartbeat.result.as_str(),
+                heartbeat.receipt_cursor,
+                heartbeat.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 列出某租约的全部心跳（按 `server_ts` 升序）。
+    pub fn list_heartbeats_by_lease(&self, lease_id: &str) -> LicenseResult<Vec<Heartbeat>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, lease_id, device_id, client_ts, server_ts, result, receipt_cursor, created_at
+             FROM heartbeat WHERE lease_id = ?1
+             ORDER BY server_ts ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![lease_id], row_to_heartbeat)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    // ================= audit_receipt =================
+
+    /// 插入审计回执。
+    pub fn insert_audit_receipt(&self, receipt: &AuditReceipt) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO audit_receipt
+               (id, lease_id, device_mid, seq_from, seq_to, count, payload_digest, ts, sig,
+                received_at, gap_flag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                receipt.id,
+                receipt.lease_id,
+                receipt.device_mid,
+                receipt.seq_from,
+                receipt.seq_to,
+                receipt.count,
+                receipt.payload_digest,
+                receipt.ts,
+                receipt.sig,
+                receipt.received_at,
+                i64::from(receipt.gap_flag),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 某租约**序号最大**的回执（跳空检测的游标基准）。
+    ///
+    /// 排序依据 `seq_to` 降序、`received_at` 降序，取第一条。
+    pub fn last_receipt_for_lease(&self, lease_id: &str) -> LicenseResult<Option<AuditReceipt>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT id, lease_id, device_mid, seq_from, seq_to, count, payload_digest, ts, sig,
+                        received_at, gap_flag
+                 FROM audit_receipt WHERE lease_id = ?1
+                 ORDER BY seq_to DESC, received_at DESC, id DESC
+                 LIMIT 1",
+                params![lease_id],
+                row_to_receipt,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 列出某租约的全部回执（按 `seq_from` 升序，便于连续性扫描）。
+    pub fn list_receipts_by_lease(&self, lease_id: &str) -> LicenseResult<Vec<AuditReceipt>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, lease_id, device_mid, seq_from, seq_to, count, payload_digest, ts, sig,
+                    received_at, gap_flag
+             FROM audit_receipt WHERE lease_id = ?1
+             ORDER BY seq_from ASC, received_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![lease_id], row_to_receipt)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 更新某回执的跳空标记（风控扫描置位 / 人工核实后复位）。
+    pub fn update_receipt_gap_flag(&self, receipt_id: &str, gap: bool) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE audit_receipt SET gap_flag = ?2 WHERE id = ?1",
+            params![receipt_id, i64::from(gap)],
+        )?;
+        Ok(())
+    }
+
+    // ================= nonce_cache =================
+
+    /// **防重放**：仅当 `nonce` 从未出现时写入，返回是否**首次**。
+    ///
+    /// - 返回 `Ok(true)`：首次使用，调用方应继续处理请求；
+    /// - 返回 `Ok(false)`：**重放**，调用方必须拒绝。
+    ///
+    /// 实现依赖主键唯一约束由数据库仲裁（`INSERT OR IGNORE` + `rows_affected`），
+    /// **不用「先 SELECT 再 INSERT」**（同样存在并发窗口）。
+    /// `used_at` 由本方法内部取当前 UTC 秒填充（调用方无需关心）。
+    pub fn insert_nonce_if_absent(
+        &self,
+        nonce: &str,
+        device_id: &str,
+        expires_at: i64,
+    ) -> LicenseResult<bool> {
+        let conn = self.conn.lock();
+        let affected = conn.execute(
+            "INSERT OR IGNORE INTO nonce_cache (nonce, device_id, expires_at, used_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![nonce, device_id, expires_at, now_unix_secs()],
+        )?;
+        Ok(affected == 1)
+    }
+
+    /// 清理已过期 nonce，返回删除条数（定时任务调用）。
+    pub fn purge_expired_nonces(&self, now: i64) -> LicenseResult<u32> {
+        let conn = self.conn.lock();
+        let removed = conn.execute(
+            "DELETE FROM nonce_cache WHERE expires_at < ?1",
+            params![now],
+        )?;
+        to_u32(to_i64(removed, "nonce delete count")?, "nonce delete count")
+    }
+
+    /// 按 nonce 查询（测试 / 排查用）。
+    pub fn get_nonce(&self, nonce: &str) -> LicenseResult<Option<NonceCache>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT nonce, device_id, expires_at, used_at FROM nonce_cache WHERE nonce = ?1",
+                params![nonce],
+                row_to_nonce,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    // ================= signing_key =================
+
+    /// 插入签名密钥（**仅公钥 + hsm_ref**，私钥绝不落库）。
+    pub fn insert_signing_key(&self, key: &SigningKey) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO signing_key (kid, status, public_key, hsm_ref, enabled_at, retired_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key.kid,
+                key.status.as_str(),
+                key.public_key,
+                key.hsm_ref,
+                key.enabled_at,
+                key.retired_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按 kid 查询。
+    pub fn get_signing_key(&self, kid: &str) -> LicenseResult<Option<SigningKey>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT kid, status, public_key, hsm_ref, enabled_at, retired_at
+                 FROM signing_key WHERE kid = ?1",
+                params![kid],
+                row_to_signing_key,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 列出全部签名密钥（按 `enabled_at` 升序）。
+    pub fn list_signing_keys(&self) -> LicenseResult<Vec<SigningKey>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT kid, status, public_key, hsm_ref, enabled_at, retired_at
+             FROM signing_key ORDER BY enabled_at ASC, kid ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_signing_key)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 更新签名密钥状态（轮换：`active → retiring → retired`）。
+    ///
+    /// 置为 `retired` 时同时写入 `retired_at`。
+    pub fn update_signing_key_status(
+        &self,
+        kid: &str,
+        status: SigningKeyStatus,
+        at: i64,
+    ) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        match status {
+            SigningKeyStatus::Retired => {
+                conn.execute(
+                    "UPDATE signing_key SET status = ?2, retired_at = ?3 WHERE kid = ?1",
+                    params![kid, status.as_str(), at],
+                )?;
+            }
+            SigningKeyStatus::Active | SigningKeyStatus::Retiring => {
+                conn.execute(
+                    "UPDATE signing_key SET status = ?2 WHERE kid = ?1",
+                    params![kid, status.as_str()],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    // ================= audit_log =================
+
+    /// 插入审计日志（后台操作 / 网关心跳 / 风控告警统一入口）。
+    pub fn insert_audit_log(&self, log: &AuditLog) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO audit_log
+               (id, actor_type, actor_id, action, entity_type, entity_id, detail, ts, ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                log.id,
+                log.actor_type.as_str(),
+                log.actor_id,
+                log.action,
+                log.entity_type,
+                log.entity_id,
+                log.detail,
+                log.ts,
+                log.ip,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按过滤条件分页列出审计日志（`page` 从 1 起，`ts` 降序）。
+    pub fn list_audit_logs(
+        &self,
+        filter: &AuditFilter,
+        page: u32,
+        page_size: u32,
+    ) -> LicenseResult<Vec<AuditLog>> {
+        let page = page.max(1);
+        let page_size = page_size.max(1);
+        let offset = to_i64(((page - 1) as usize) * page_size as usize, "audit offset")?;
+
+        let mut sql = String::from(
+            "SELECT id, actor_type, actor_id, action, entity_type, entity_id, detail, ts, ip
+             FROM audit_log WHERE 1 = 1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        push_audit_filter(&mut sql, &mut args, filter);
+        sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?");
+        args.push(Box::new(i64::from(page_size)));
+        args.push(Box::new(offset));
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), row_to_audit_log)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 按过滤条件统计审计日志数。
+    pub fn count_audit_logs(&self, filter: &AuditFilter) -> LicenseResult<u64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM audit_log WHERE 1 = 1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        push_audit_filter(&mut sql, &mut args, filter);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let count: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0))?;
+        to_u64(count, "audit count")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{now_ns_id, ANCHOR_COUNT};
+
+    /// 建一个内存库 + 一个租户，返回 `(store, tenant_id)`。
+    fn fixture() -> (Store, String) {
+        let store = Store::open_in_memory().expect("open in memory");
+        let tenant = Tenant::new(
+            "t-1".into(),
+            "测试租户".into(),
+            "ops@example.com".into(),
+            1_700_000_000,
+        );
+        store.insert_tenant(&tenant).expect("insert tenant");
+        (store, tenant.tenant_id)
+    }
+
+    fn sample_device(device_id: &str, machine_code: &str, status: DeviceStatus) -> Device {
+        Device {
+            device_id: device_id.into(),
+            tenant_id: "t-1".into(),
+            machine_code: machine_code.into(),
+            anchor_hashes: (0..ANCHOR_COUNT).map(|i| format!("anchor{i:02}")).collect(),
+            deploy_mode: DeployMode::Native,
+            image_digest: None,
+            host_anchor_ref: None,
+            first_activation_at: None,
+            status,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn sample_code(code_id: &str, code: &str) -> ActivationCode {
+        ActivationCode::new_issued(
+            code_id.into(),
+            code.into(),
+            "t-1".into(),
+            "pro".into(),
+            1_700_000_000,
+            1_800_000_000,
+            Some("order-1".into()),
+            "admin-1".into(),
+            1_700_000_000,
+        )
+    }
+
+    fn insert_min_keys(store: &Store) {
+        store
+            .insert_signing_key(&SigningKey {
+                kid: "k-test".into(),
+                status: SigningKeyStatus::Active,
+                public_key: "cHVia2V5".into(),
+                hsm_ref: Some("kms://test".into()),
+                enabled_at: 1_700_000_000,
+                retired_at: None,
+            })
+            .expect("insert signing key");
+    }
+
+    #[test]
+    fn wal_mode_and_foreign_keys_are_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("licensing.db");
+        let store = Store::open(&db).expect("open");
+        assert_eq!(
+            store.journal_mode().expect("journal_mode").to_lowercase(),
+            "wal",
+            "WAL 未开启"
+        );
+        assert!(store.foreign_keys_enabled().expect("fk"));
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let store = Store::open_in_memory().expect("open");
+        store.migrate().expect("migrate 1");
+        store.migrate().expect("migrate 2");
+        // 9 张表全部存在（用查询证明而非只断言 migrate 不报错）。
+        let (five, _) = fixture();
+        five.insert_tenant(&Tenant::new("t".into(), "n".into(), "c".into(), 1))
+            .expect("tenant");
+    }
+
+    #[test]
+    fn tenant_insert_get_list_round_trip_optionals() {
+        let (store, _) = fixture();
+        let tenant = Tenant {
+            tenant_id: "t-2".into(),
+            name: "二号租户".into(),
+            verify_mode_default: VerifyMode::C,
+            contact: String::new(),
+            created_at: 1_700_000_100,
+        };
+        store.insert_tenant(&tenant).expect("insert");
+
+        let got = store.get_tenant("t-2").expect("get").expect("some");
+        assert_eq!(got, tenant);
+        assert_eq!(got.verify_mode_default, VerifyMode::C);
+
+        assert!(store.get_tenant("nope").expect("get").is_none());
+
+        let all = store.list_tenants().expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].tenant_id, "t-1");
+        assert_eq!(all[1].tenant_id, "t-2");
+    }
+
+    #[test]
+    fn device_round_trip_with_some_and_none_optionals() {
+        let (store, _) = fixture();
+
+        // 全 None 形态。
+        let native = sample_device("dev-native", "mc-native", DeviceStatus::Active);
+        store.insert_device(&native).expect("insert native");
+        assert_eq!(
+            store.get_device("dev-native").expect("get"),
+            Some(native.clone())
+        );
+        assert_eq!(
+            store
+                .get_device_by_machine_code("mc-native")
+                .expect("get by mc"),
+            Some(native)
+        );
+
+        // 全 Some 形态（docker 溯源字段 + 首次激活时间，非 active 状态）。
+        let docker = Device {
+            device_id: "dev-docker".into(),
+            tenant_id: "t-1".into(),
+            machine_code: "mc-docker".into(),
+            anchor_hashes: vec!["a".into(), "b".into()],
+            deploy_mode: DeployMode::Docker,
+            image_digest: Some("sha256:deadbeef".into()),
+            host_anchor_ref: Some("/host/anchors".into()),
+            first_activation_at: Some(1_700_000_500),
+            status: DeviceStatus::Gracing,
+            created_at: 1_700_000_600,
+        };
+        store.insert_device(&docker).expect("insert docker");
+        let got = store.get_device("dev-docker").expect("get").expect("some");
+        assert_eq!(got, docker);
+        assert_eq!(got.deploy_mode, DeployMode::Docker);
+        assert_eq!(got.image_digest.as_deref(), Some("sha256:deadbeef"));
+        assert_eq!(got.host_anchor_ref.as_deref(), Some("/host/anchors"));
+        assert_eq!(got.first_activation_at, Some(1_700_000_500));
+        assert_eq!(got.anchor_hashes, vec!["a".to_string(), "b".to_string()]);
+
+        assert!(store.get_device("missing").expect("get").is_none());
+        assert!(store
+            .get_device_by_machine_code("missing")
+            .expect("get")
+            .is_none());
+    }
+
+    #[test]
+    fn machine_code_unique_constraint_returns_storage_error() {
+        let (store, _) = fixture();
+        store
+            .insert_device(&sample_device("dev-1", "mc-dup", DeviceStatus::Active))
+            .expect("first");
+        let err = store
+            .insert_device(&sample_device("dev-2", "mc-dup", DeviceStatus::Active))
+            .expect_err("duplicate must fail");
+        assert!(matches!(err, LicenseError::Storage(_)), "{err:?}");
+        // 唯一约束生效：第二个设备未落库。
+        assert!(store.get_device("dev-2").expect("get").is_none());
+    }
+
+    #[test]
+    fn list_devices_paginates_and_counts() {
+        let (store, tenant) = fixture();
+        for i in 0..5 {
+            store
+                .insert_device(&sample_device(
+                    &format!("dev-{i}"),
+                    &format!("mc-{i}"),
+                    DeviceStatus::Active,
+                ))
+                .expect("insert");
+        }
+        assert_eq!(store.count_devices(Some(&tenant)).expect("count"), 5);
+
+        let p1 = store.list_devices(Some(&tenant), 1, 2).expect("p1");
+        let p2 = store.list_devices(Some(&tenant), 2, 2).expect("p2");
+        let p3 = store.list_devices(Some(&tenant), 3, 2).expect("p3");
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p2.len(), 2);
+        assert_eq!(p3.len(), 1);
+        // 不重不漏：三页 ID 集合恰为 5 个。
+        let mut ids: Vec<String> = p1
+            .iter()
+            .chain(p2.iter())
+            .chain(p3.iter())
+            .map(|d| d.device_id.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "dev-0".to_string(),
+                "dev-1".to_string(),
+                "dev-2".to_string(),
+                "dev-3".to_string(),
+                "dev-4".to_string()
+            ]
+        );
+        assert_eq!(store.count_devices(Some("t-none")).expect("count"), 0);
+        // 全局计数（None）应为 5。
+        assert_eq!(store.count_devices(None).expect("count all"), 5);
+        assert_eq!(store.list_devices(None, 1, 10).expect("list all").len(), 5);
+    }
+
+    #[test]
+    fn update_device_status_persists() {
+        let (store, _) = fixture();
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("insert");
+        store
+            .update_device_status("dev-1", DeviceStatus::Degraded)
+            .expect("update");
+        assert_eq!(
+            store
+                .get_device("dev-1")
+                .expect("get")
+                .expect("some")
+                .status,
+            DeviceStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn code_insert_get_round_trip_with_optionals() {
+        let (store, _) = fixture();
+
+        // 未绑定、无废弃信息（全 None）。
+        let issued = sample_code("c-issued", "CODE-ISSUED");
+        store.insert_code(&issued).expect("insert");
+        assert_eq!(
+            store
+                .get_code_by_value("CODE-ISSUED")
+                .expect("get")
+                .expect("some"),
+            issued
+        );
+        assert_eq!(
+            store
+                .get_code_by_id("c-issued")
+                .expect("get")
+                .expect("some"),
+            issued
+        );
+
+        // 已绑定 + 幂等键 + 重发溯源（全 Some）。
+        let mut bound = sample_code("c-bound", "CODE-BOUND");
+        bound.status = CodeStatus::Bound;
+        bound.bound_device_id = Some("dev-1".into());
+        bound.idempotency_key = Some("idem-1".into());
+        bound.reissued_from_id = Some("c-original".into());
+        store.insert_code(&bound).expect("insert bound");
+        let got = store
+            .get_code_by_value("CODE-BOUND")
+            .expect("get")
+            .expect("some");
+        assert_eq!(got, bound);
+        assert_eq!(got.bound_device_id.as_deref(), Some("dev-1"));
+        assert_eq!(got.idempotency_key.as_deref(), Some("idem-1"));
+
+        // 已废弃（revoked_at + reason 均 Some）。
+        let mut revoked = sample_code("c-revoked", "CODE-REVOKED");
+        revoked.status = CodeStatus::Revoked;
+        revoked.revoked_at = Some(1_700_000_900);
+        revoked.revoked_reason = Some("换机重发".into());
+        store.insert_code(&revoked).expect("insert revoked");
+        let got = store
+            .get_code_by_id("c-revoked")
+            .expect("get")
+            .expect("some");
+        assert_eq!(got, revoked);
+        assert_eq!(got.revoked_at, Some(1_700_000_900));
+        assert_eq!(got.revoked_reason.as_deref(), Some("换机重发"));
+
+        assert!(store.get_code_by_value("nope").expect("get").is_none());
+        assert!(store.get_code_by_id("nope").expect("get").is_none());
+    }
+
+    #[test]
+    fn list_codes_and_count_with_filter() {
+        let (store, _) = fixture();
+        store.insert_code(&sample_code("c-1", "V1")).expect("c1");
+        store.insert_code(&sample_code("c-2", "V2")).expect("c2");
+        let mut bound = sample_code("c-3", "V3");
+        bound.status = CodeStatus::Bound;
+        bound.bound_device_id = Some("dev-1".into());
+        store.insert_code(&bound).expect("c3");
+
+        let all = CodeFilter::default();
+        assert_eq!(store.count_codes(&all).expect("count"), 3);
+        assert_eq!(store.list_codes(&all, 1, 10).expect("list").len(), 3);
+
+        let issued_only = CodeFilter {
+            status: Some(CodeStatus::Issued),
+            ..Default::default()
+        };
+        assert_eq!(store.count_codes(&issued_only).expect("count"), 2);
+
+        // tier 过滤：三张码的 tier 均为 "pro"。
+        let pro_tier = CodeFilter {
+            tier: Some("pro".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_codes(&pro_tier).expect("count"), 3);
+        let gold_tier = CodeFilter {
+            tier: Some("gold".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_codes(&gold_tier).expect("count"), 0);
+
+        // order_id 过滤（映射列 source_order_id）：三张码 source_order_id 均为 "order-1"。
+        let by_order = CodeFilter {
+            order_id: Some("order-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_codes(&by_order).expect("count"), 3);
+        let other_order = CodeFilter {
+            order_id: Some("order-none".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_codes(&other_order).expect("count"), 0);
+
+        let other_tenant = CodeFilter {
+            tenant_id: Some("t-none".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_codes(&other_tenant).expect("count"), 0);
+
+        // 分页：page_size=2 → 2 / 1。
+        let p1 = store.list_codes(&all, 1, 2).expect("p1");
+        let p2 = store.list_codes(&all, 2, 2).expect("p2");
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p2.len(), 1);
+    }
+
+    #[test]
+    fn bind_code_to_device_race_is_blocked() {
+        let (store, _) = fixture();
+        store
+            .insert_device(&sample_device("dev-a", "mc-a", DeviceStatus::Active))
+            .expect("a");
+        store
+            .insert_device(&sample_device("dev-b", "mc-b", DeviceStatus::Active))
+            .expect("b");
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+
+        // A 先绑定成功。
+        store
+            .bind_code_to_device("c-1", "dev-a")
+            .expect("A binds first");
+        let after_a = store.get_code_by_id("c-1").expect("get").expect("some");
+        assert_eq!(after_a.status, CodeStatus::Bound);
+        assert_eq!(after_a.bound_device_id.as_deref(), Some("dev-a"));
+
+        // B 再来抢：必须被拒，且**未**覆盖绑定关系（一机一码防线）。
+        let err = store
+            .bind_code_to_device("c-1", "dev-b")
+            .expect_err("B must be rejected");
+        assert!(
+            matches!(err, LicenseError::ActivationRejected(_)),
+            "{err:?}"
+        );
+        let after_b = store.get_code_by_id("c-1").expect("get").expect("some");
+        assert_eq!(
+            after_b.bound_device_id.as_deref(),
+            Some("dev-a"),
+            "绑定被篡改"
+        );
+        assert_eq!(after_b.status, CodeStatus::Bound);
+
+        // 不存在的码 → 同样拒绝（但不影响任何数据）。
+        let err = store
+            .bind_code_to_device("c-missing", "dev-b")
+            .expect_err("missing code");
+        assert!(
+            matches!(err, LicenseError::ActivationRejected(_)),
+            "{err:?}"
+        );
+
+        // 错误信息不含码值原文。
+        let rendered = store
+            .bind_code_to_device("c-1", "dev-b")
+            .expect_err("repeat")
+            .to_string();
+        assert!(
+            !rendered.contains("CODE-1"),
+            "错误信息泄露激活码原文: {rendered}"
+        );
+    }
+
+    #[test]
+    fn revoke_code_state_machine_and_validation() {
+        let (store, _) = fixture();
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+
+        // issued → revoked 合法。
+        store
+            .revoke_code("c-1", "客户退订", 1_700_001_000)
+            .expect("revoke");
+        let got = store.get_code_by_id("c-1").expect("get").expect("some");
+        assert_eq!(got.status, CodeStatus::Revoked);
+        assert_eq!(got.revoked_at, Some(1_700_001_000));
+        assert_eq!(got.revoked_reason.as_deref(), Some("客户退订"));
+        // 落库后的行必须自洽（validate 通过）。
+        assert!(got.validate().is_ok());
+
+        // 重复废弃 → KeyStateIllegal。
+        let err = store
+            .revoke_code("c-1", "again", 1_700_002_000)
+            .expect_err("double revoke");
+        assert!(matches!(err, LicenseError::KeyStateIllegal(_)), "{err:?}");
+
+        // 空原因 → 拒绝。
+        store
+            .insert_code(&sample_code("c-2", "CODE-2"))
+            .expect("c2");
+        assert!(store.revoke_code("c-2", "   ", 1).is_err());
+
+        // 不存在 → 拒绝。
+        assert!(store.revoke_code("nope", "r", 1).is_err());
+
+        // revoked → reissued 合法。
+        store.mark_code_reissued("c-1").expect("reissue");
+        assert_eq!(
+            store
+                .get_code_by_id("c-1")
+                .expect("get")
+                .expect("some")
+                .status,
+            CodeStatus::Reissued
+        );
+        // reissued 再重发 → KeyStateIllegal（单向状态机）。
+        assert!(store.mark_code_reissued("c-1").is_err());
+    }
+
+    #[test]
+    fn lease_round_trip_with_optionals() {
+        let (store, _) = fixture();
+        insert_min_keys(&store);
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+
+        // last_heartbeat_at = None。
+        let lease = Lease {
+            lease_id: "l-1".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-1".into(),
+            kid: "k-test".into(),
+            token_sig: "sig-b64".into(),
+            verify_mode: VerifyMode::B,
+            tier: "pro".into(),
+            issued_at: 1_700_000_000,
+            valid_until: 1_700_600_000,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        store.insert_lease(&lease).expect("insert");
+        assert_eq!(store.get_lease("l-1").expect("get"), Some(lease.clone()));
+        assert_eq!(
+            store
+                .get_lease("l-1")
+                .expect("get")
+                .expect("some")
+                .last_heartbeat_at,
+            None
+        );
+
+        // 第二次心跳后 last_heartbeat_at = Some。
+        store
+            .update_lease_heartbeat("l-1", 1_700_000_500)
+            .expect("hb");
+        let got = store.get_lease("l-1").expect("get").expect("some");
+        assert_eq!(got.last_heartbeat_at, Some(1_700_000_500));
+
+        // 状态更新。
+        store
+            .update_lease_status("l-1", LeaseStatus::Gracing)
+            .expect("status");
+        assert_eq!(
+            store.get_lease("l-1").expect("get").expect("some").status,
+            LeaseStatus::Gracing
+        );
+
+        // 按设备列出。
+        let leases = store.list_leases_by_device("dev-1").expect("list");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].lease_id, "l-1");
+        assert!(store.get_lease("missing").expect("get").is_none());
+        assert!(store
+            .list_leases_by_device("missing")
+            .expect("list")
+            .is_empty());
+    }
+
+    #[test]
+    fn foreign_keys_on_rejects_orphan_lease() {
+        let (store, _) = fixture();
+        insert_min_keys(&store);
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+
+        // 引用不存在的 device_id → 必须报错（foreign_keys=ON 生效）。
+        let orphan = Lease {
+            lease_id: "l-orphan".into(),
+            device_id: "dev-does-not-exist".into(),
+            code_id: "c-1".into(),
+            kid: "k-test".into(),
+            token_sig: "sig".into(),
+            verify_mode: VerifyMode::B,
+            tier: "pro".into(),
+            issued_at: 1,
+            valid_until: 2,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        let err = store.insert_lease(&orphan).expect_err("orphan must fail");
+        assert!(matches!(err, LicenseError::Storage(_)), "{err:?}");
+        assert!(store.get_lease("l-orphan").expect("get").is_none());
+
+        // 引用不存在的 code_id → 同样报错。
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+        let bad_code = Lease {
+            lease_id: "l-badcode".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-missing".into(),
+            ..orphan
+        };
+        assert!(store.insert_lease(&bad_code).is_err());
+
+        // 引用不存在的 kid → 报错。
+        let bad_kid = Lease {
+            lease_id: "l-badkid".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-1".into(),
+            kid: "k-missing".into(),
+            ..bad_code
+        };
+        assert!(store.insert_lease(&bad_kid).is_err());
+    }
+
+    #[test]
+    fn heartbeat_round_trip_with_optionals() {
+        let (store, _) = fixture();
+        insert_min_keys(&store);
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+        let lease = Lease {
+            lease_id: "l-1".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-1".into(),
+            kid: "k-test".into(),
+            token_sig: "sig".into(),
+            verify_mode: VerifyMode::B,
+            tier: "pro".into(),
+            issued_at: 1_700_000_000,
+            valid_until: 1_700_600_000,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        store.insert_lease(&lease).expect("lease");
+
+        let hb_ok = Heartbeat {
+            id: "hb-1".into(),
+            lease_id: "l-1".into(),
+            device_id: "dev-1".into(),
+            client_ts: 1_700_000_400,
+            server_ts: 1_700_000_401,
+            result: HeartbeatResult::Ok,
+            receipt_cursor: Some("10-25".into()),
+            created_at: 1_700_000_401,
+        };
+        let hb_skew = Heartbeat {
+            id: "hb-2".into(),
+            lease_id: "l-1".into(),
+            device_id: "dev-1".into(),
+            client_ts: 1_600_000_000,
+            server_ts: 1_700_000_500,
+            result: HeartbeatResult::Skew,
+            receipt_cursor: None,
+            created_at: 1_700_000_500,
+        };
+        store.insert_heartbeat(&hb_ok).expect("hb1");
+        store.insert_heartbeat(&hb_skew).expect("hb2");
+
+        let list = store.list_heartbeats_by_lease("l-1").expect("list");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], hb_ok);
+        assert_eq!(list[1], hb_skew);
+        assert_eq!(list[0].receipt_cursor.as_deref(), Some("10-25"));
+        assert_eq!(list[1].receipt_cursor, None);
+        assert!(store
+            .list_heartbeats_by_lease("missing")
+            .expect("list")
+            .is_empty());
+    }
+
+    #[test]
+    fn audit_receipt_round_trip_and_gap_flag() {
+        let (store, _) = fixture();
+        insert_min_keys(&store);
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+        store
+            .insert_lease(&Lease {
+                lease_id: "l-1".into(),
+                device_id: "dev-1".into(),
+                code_id: "c-1".into(),
+                kid: "k-test".into(),
+                token_sig: "sig".into(),
+                verify_mode: VerifyMode::B,
+                tier: "pro".into(),
+                issued_at: 1_700_000_000,
+                valid_until: 1_700_600_000,
+                last_heartbeat_at: None,
+                status: LeaseStatus::Active,
+            })
+            .expect("lease");
+
+        // 正常回执（gap=false），received_at 可晚于 ts（断网补报）。
+        let r1 = AuditReceipt {
+            id: "r-1".into(),
+            lease_id: "l-1".into(),
+            device_mid: "mc-1".into(),
+            seq_from: 1,
+            seq_to: 10,
+            count: 10,
+            payload_digest: "digest-1".into(),
+            ts: 1_700_000_100,
+            sig: "sig-1".into(),
+            received_at: 1_700_000_200,
+            gap_flag: false,
+        };
+        // 跳空回执（gap=true）。
+        let r2 = AuditReceipt {
+            id: "r-2".into(),
+            lease_id: "l-1".into(),
+            device_mid: "mc-1".into(),
+            seq_from: 20,
+            seq_to: 25,
+            count: 6,
+            payload_digest: "digest-2".into(),
+            ts: 1_700_000_300,
+            sig: "sig-2".into(),
+            received_at: 1_700_000_500,
+            gap_flag: true,
+        };
+        store.insert_audit_receipt(&r1).expect("r1");
+        store.insert_audit_receipt(&r2).expect("r2");
+
+        let list = store.list_receipts_by_lease("l-1").expect("list");
+        assert_eq!(list, vec![r1.clone(), r2.clone()]);
+        assert!(!list[0].gap_flag);
+        assert!(list[1].gap_flag, "gap_flag 必须真实往返为 true");
+        // received_at 晚于 ts，允许（延迟补报）。
+        assert!(list[0].received_at > list[0].ts);
+
+        // last_receipt：seq_to 最大者为 r-2。
+        let last = store
+            .last_receipt_for_lease("l-1")
+            .expect("last")
+            .expect("some");
+        assert_eq!(last.id, "r-2");
+        assert_eq!(last.seq_to, 25);
+
+        // 置位 / 复位。
+        store.update_receipt_gap_flag("r-1", true).expect("set");
+        assert!(store
+            .last_receipt_for_lease("l-1")
+            .expect("last")
+            .expect("some")
+            .id
+            .eq("r-2"));
+        let list = store.list_receipts_by_lease("l-1").expect("list");
+        assert!(list.iter().all(|r| r.gap_flag), "全部置位");
+        store.update_receipt_gap_flag("r-1", false).expect("reset");
+        let list = store.list_receipts_by_lease("l-1").expect("list");
+        assert!(!list[0].gap_flag);
+
+        assert!(store
+            .last_receipt_for_lease("missing")
+            .expect("last")
+            .is_none());
+    }
+
+    #[test]
+    fn nonce_insert_if_absent_first_true_then_false() {
+        let (store, _) = fixture();
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+
+        let first = store
+            .insert_nonce_if_absent("nonce-abc", "dev-1", 1_700_100_000)
+            .expect("first");
+        assert!(first, "首次使用必须返回 true");
+
+        let second = store
+            .insert_nonce_if_absent("nonce-abc", "dev-1", 1_700_100_000)
+            .expect("second");
+        assert!(!second, "重放必须返回 false");
+
+        // 原记录未被重放覆盖：nonce 只有一条，且 used_at 由内部时钟填充（非 0）。
+        let stored = store.get_nonce("nonce-abc").expect("get").expect("some");
+        assert_eq!(stored.expires_at, 1_700_100_000);
+        assert!(stored.used_at > 1_600_000_000, "used_at 应为真实时钟值");
+    }
+
+    #[test]
+    fn purge_expired_nonces_removes_only_expired() {
+        let (store, _) = fixture();
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+        store
+            .insert_nonce_if_absent("n-old", "dev-1", 1_000)
+            .expect("old");
+        store
+            .insert_nonce_if_absent("n-new", "dev-1", 5_000)
+            .expect("new");
+
+        let removed = store.purge_expired_nonces(2_000).expect("purge");
+        assert_eq!(removed, 1, "only the expired nonce is removed");
+        assert!(store.get_nonce("n-old").expect("get").is_none());
+        assert!(store.get_nonce("n-new").expect("get").is_some());
+        assert_eq!(store.purge_expired_nonces(2_000).expect("again"), 0);
+    }
+
+    #[test]
+    fn signing_key_round_trip_and_rotation() {
+        let (store, _) = fixture();
+        let active = SigningKey {
+            kid: "k-1".into(),
+            status: SigningKeyStatus::Active,
+            public_key: "cHViLTE".into(),
+            hsm_ref: Some("kms://prod".into()),
+            enabled_at: 1_700_000_000,
+            retired_at: None,
+        };
+        // 无 hsm_ref（离线自持）形态。
+        let public_only = SigningKey {
+            kid: "k-2".into(),
+            status: SigningKeyStatus::Retiring,
+            public_key: "cHViLTI".into(),
+            hsm_ref: None,
+            enabled_at: 1_700_000_100,
+            retired_at: None,
+        };
+        store.insert_signing_key(&active).expect("k1");
+        store.insert_signing_key(&public_only).expect("k2");
+
+        assert_eq!(
+            store.get_signing_key("k-1").expect("get"),
+            Some(active.clone())
+        );
+        assert_eq!(
+            store
+                .get_signing_key("k-2")
+                .expect("get")
+                .expect("some")
+                .hsm_ref,
+            None
+        );
+        assert!(store.get_signing_key("k-none").expect("get").is_none());
+
+        let all = store.list_signing_keys().expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].kid, "k-1");
+        assert_eq!(all[1].kid, "k-2");
+
+        // k-1 → retired：写入 retired_at。
+        store
+            .update_signing_key_status("k-1", SigningKeyStatus::Retired, 1_700_002_000)
+            .expect("retire");
+        let k1 = store.get_signing_key("k-1").expect("get").expect("some");
+        assert_eq!(k1.status, SigningKeyStatus::Retired);
+        assert_eq!(k1.retired_at, Some(1_700_002_000));
+
+        // k-2 → active：不改 retired_at。
+        store
+            .update_signing_key_status("k-2", SigningKeyStatus::Active, 1_700_003_000)
+            .expect("promote");
+        let k2 = store.get_signing_key("k-2").expect("get").expect("some");
+        assert_eq!(k2.status, SigningKeyStatus::Active);
+        assert_eq!(k2.retired_at, None);
+    }
+
+    #[test]
+    fn audit_log_round_trip_and_filters() {
+        let (store, _) = fixture();
+        let logs = vec![
+            AuditLog {
+                id: "a-1".into(),
+                actor_type: ActorType::Admin,
+                actor_id: "admin-1".into(),
+                action: "issue".into(),
+                entity_type: "activation_code".into(),
+                entity_id: "c-1".into(),
+                detail: r#"{"order":"order-1"}"#.into(),
+                ts: 1_700_000_000,
+                ip: "10.0.0.1".into(),
+            },
+            AuditLog {
+                id: "a-2".into(),
+                actor_type: ActorType::Device,
+                actor_id: "dev-1".into(),
+                action: "heartbeat".into(),
+                entity_type: "lease".into(),
+                entity_id: "l-1".into(),
+                detail: r#"{"result":"ok"}"#.into(),
+                ts: 1_700_000_100,
+                ip: "10.0.0.2".into(),
+            },
+            AuditLog {
+                id: "a-3".into(),
+                actor_type: ActorType::System,
+                actor_id: "risk-scanner".into(),
+                action: "gap_alarm".into(),
+                entity_type: "lease".into(),
+                entity_id: "l-1".into(),
+                detail: r#"{"gap":true}"#.into(),
+                ts: 1_700_000_200,
+                ip: "localhost".into(),
+            },
+        ];
+        for log in &logs {
+            store.insert_audit_log(log).expect("insert");
+        }
+
+        // ts 降序。
+        let all = store
+            .list_audit_logs(&AuditFilter::default(), 1, 10)
+            .expect("list");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, "a-3");
+        assert_eq!(all[2].id, "a-1");
+        assert_eq!(
+            store
+                .count_audit_logs(&AuditFilter::default())
+                .expect("count"),
+            3
+        );
+
+        // actor_type 过滤。
+        let devices = AuditFilter {
+            actor_type: Some(ActorType::Device),
+            ..Default::default()
+        };
+        let got = store.list_audit_logs(&devices, 1, 10).expect("list");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "a-2");
+
+        // entity_id 过滤。
+        let lease_logs = AuditFilter {
+            entity_type: Some("lease".into()),
+            entity_id: Some("l-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_audit_logs(&lease_logs).expect("count"), 2);
+
+        // action 过滤。
+        let issue = AuditFilter {
+            action: Some("issue".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_audit_logs(&issue).expect("count"), 1);
+
+        // action + entity_id 组合过滤（时间窗过滤已不在 `AuditFilter` 契约内）。
+        let gap_only = AuditFilter {
+            action: Some("gap_alarm".into()),
+            entity_id: Some("l-1".into()),
+            ..Default::default()
+        };
+        let got = store.list_audit_logs(&gap_only, 1, 10).expect("list");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "a-3");
+        assert_eq!(got[0].ts, 1_700_000_200);
+
+        // 分页：page_size=2 → 2 / 1。
+        let p1 = store
+            .list_audit_logs(&AuditFilter::default(), 1, 2)
+            .expect("p1");
+        let p2 = store
+            .list_audit_logs(&AuditFilter::default(), 2, 2)
+            .expect("p2");
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p2.len(), 1);
+
+        // 无交集 → 空。
+        let none = AuditFilter {
+            action: Some("nope".into()),
+            ..Default::default()
+        };
+        assert_eq!(store.count_audit_logs(&none).expect("count"), 0);
+    }
+
+    #[test]
+    fn disk_store_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("licensing.db");
+        {
+            let store = Store::open(&db).expect("open");
+            store
+                .insert_tenant(&Tenant::new(
+                    "t-persist".into(),
+                    "持久化租户".into(),
+                    "ops@x".into(),
+                    1_700_000_000,
+                ))
+                .expect("insert");
+        }
+        let reopened = Store::open(&db).expect("reopen");
+        assert_eq!(
+            reopened
+                .get_tenant("t-persist")
+                .expect("get")
+                .expect("some")
+                .name,
+            "持久化租户"
+        );
+    }
+
+    #[test]
+    fn store_debug_only_shows_path() {
+        let store = Store::open_in_memory().expect("open");
+        let rendered = format!("{store:?}");
+        assert!(rendered.contains(":memory:"), "{rendered}");
+        assert!(rendered.contains("Store"), "{rendered}");
+    }
+
+    #[test]
+    fn insert_code_duplicate_value_is_storage_error() {
+        let (store, _) = fixture();
+        store
+            .insert_code(&sample_code("c-1", "CODE-DUP"))
+            .expect("c1");
+        let err = store
+            .insert_code(&sample_code("c-2", "CODE-DUP"))
+            .expect_err("dup code value");
+        assert!(matches!(err, LicenseError::Storage(_)), "{err:?}");
+        // 错误信息不含码值原文。
+        assert!(!err.to_string().contains("CODE-DUP"), "{err}");
+    }
+
+    #[test]
+    fn now_ns_id_ids_are_storable_as_primary_keys() {
+        let (store, _) = fixture();
+        let id = now_ns_id("dev");
+        let mut device = sample_device(&id, "mc-gen", DeviceStatus::Active);
+        device.device_id = id.clone();
+        store.insert_device(&device).expect("insert");
+        assert_eq!(
+            store.get_device(&id).expect("get").expect("some").device_id,
+            id
+        );
+    }
+}

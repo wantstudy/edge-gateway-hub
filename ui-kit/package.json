@@ -1,0 +1,22 @@
+{
+  "name": "@iot-daq/ui-kit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "IoT-DAQ 两端（web-console / admin-console）共用设计 token 与业务组件包",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vue/test-utils": "^2.4.6",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

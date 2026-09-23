@@ -26,6 +26,7 @@ pub mod offline_queue;
 pub mod pipeline;
 pub mod rules;
 pub mod scheduler;
+pub mod telemetry_store;
 
 /// 便捷再导出：`daemon::modbus` ≡ `daemon::driver::modbus`（task 9）。
 pub use driver::modbus;

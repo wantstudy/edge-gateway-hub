@@ -393,10 +393,7 @@ impl KeyRing {
         let updated = KeyEntry {
             kid: old.kid.clone(),
             status,
-            signing: match &old.signing {
-                Some(s) => Some(s.clone()),
-                None => None,
-            },
+            signing: old.signing.clone(),
             verifying: old.verifying,
             public_key_b64: old.public_key_b64.clone(),
             hsm_ref: old.hsm_ref.clone(),

@@ -13,6 +13,8 @@ pub const ERR_LICENSE_HEARTBEAT: u16 = 1020;
 pub const ERR_LICENSE_QUOTA: u16 = 1030;
 /// 授权域错误码：激活码状态机。
 pub const ERR_LICENSE_KEYSTATE: u16 = 1040;
+/// 授权域错误码：存储层（SQLite / 迁移 / 约束冲突）。
+pub const ERR_LICENSE_STORAGE: u16 = 1050;
 
 /// licensing-server 主错误枚举。
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +38,13 @@ pub enum LicenseError {
     /// 激活码状态非法（状态机不允许的迁移，如废弃码重发被拒）。
     #[error("LicenseError: key state illegal: {0}")]
     KeyStateIllegal(String),
+
+    /// 存储层错误（SQLite 打开 / 迁移 / 约束冲突 / 事务失败）。
+    ///
+    /// 该变体**不承载任何敏感值**：调用方在拼装消息时不得把激活码、私钥、
+    /// 指纹原文塞进字符串（错误会被写日志与审计）。
+    #[error("LicenseError: storage: {0}")]
+    Storage(String),
 }
 
 impl LicenseError {
@@ -47,7 +56,14 @@ impl LicenseError {
             LicenseError::HeartbeatRejected(_) => ERR_LICENSE_HEARTBEAT,
             LicenseError::QuotaExceeded(_) => ERR_LICENSE_QUOTA,
             LicenseError::KeyStateIllegal(_) => ERR_LICENSE_KEYSTATE,
+            LicenseError::Storage(_) => ERR_LICENSE_STORAGE,
         }
+    }
+}
+
+impl From<rusqlite::Error> for LicenseError {
+    fn from(e: rusqlite::Error) -> Self {
+        LicenseError::Storage(e.to_string())
     }
 }
 
@@ -82,6 +98,10 @@ mod tests {
                 LicenseError::KeyStateIllegal("reissue on active".into()),
                 ERR_LICENSE_KEYSTATE,
             ),
+            (
+                LicenseError::Storage("migration failed".into()),
+                ERR_LICENSE_STORAGE,
+            ),
         ];
         let mut seen = std::collections::HashSet::new();
         for (err, code) in cases {
@@ -91,5 +111,13 @@ mod tests {
             assert!(seen.insert(code), "duplicate code {code}");
             assert_eq!(err.error_code(), code);
         }
+    }
+
+    /// `rusqlite::Error` 经 `From` 归一为 `Storage` 变体（错误码 1050）。
+    #[test]
+    fn rusqlite_error_maps_to_storage_variant() {
+        let err: LicenseError = rusqlite::Error::QueryReturnedNoRows.into();
+        assert_eq!(err.error_code(), ERR_LICENSE_STORAGE);
+        assert!(err.to_string().contains("LicenseError: storage"), "{err}");
     }
 }
