@@ -52,8 +52,12 @@
 //! 2. **派生密钥绝不落盘**：`enc_key` / `mac_key` 仅内存持有；`Debug` 实现脱敏。
 //! 3. **单写线程 + WAL + synchronous=NORMAL**：与 task 17 同构，所有 SQL 经**一个专用
 //!    OS 写线程**串行执行，对外只暴露 `&self` 接口。
-//! 4. **`seq` 主键**：`INSERT OR IGNORE`，天然幂等（重复 seq 静默忽略，`write_batch`
-//!    只计真实插入数）。
+//! 4. **`seq` 主键 + `uq_telemetry_nonce` 唯一索引**：`seq` 幂等（重复 `seq` 静默跳过）；
+//!    而 `(device_id, point_key, ts_ns)` 上的**唯一索引**是**加密正确性的结构保证**——
+//!    它阻断「nonce/keystream 复用」（XOR 流加密下 `C1⊕C2=P1⊕P2`）。
+//!    冲突处理**逐条隔离**：单条冲突被**跳过并经由 [`WriteOutcome::skipped_nonce_conflict`]
+//!    上报**（可见、不静默），其余合法条照常写入（**不整批回滚**，避免丢失现场合法遥测）；
+//!    非唯一约束的真存储故障仍中止整批。详见 `derive_nonce` / `is_nonce_conflict` / `write`。
 //! 5. **双重裁剪**：`prune` 先按 `retention_ns`（注入时钟，测试零 sleep）淘汰过期点，
 //!    再按 `max_db_bytes` 从最旧开始淘汰，二者可叠加。
 //! 6. **零 panic**：所有 rusqlite / io / 解密错误收敛为 `DaemonError::StorageError`（4000），
@@ -185,7 +189,7 @@ impl Clock for ManualClock {
 // ---- 配置 ----
 
 /// 遥测库配置（非法值在 `open` 时转 `ConfigError`，错误码 2000）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TelemetryStoreConfig {
     /// 遥测库路径（文件名**必须**是 `telemetry.db`，禁止写成 `queue.db`）。
     pub db_path: PathBuf,
@@ -197,6 +201,27 @@ pub struct TelemetryStoreConfig {
     pub max_db_bytes: u64,
     /// 保留期（纳秒，> 0，默认 30 天）。
     pub retention_ns: i64,
+}
+
+impl fmt::Debug for TelemetryStoreConfig {
+    /// 手写 Debug：**只显示文件名，不显示目录**。
+    ///
+    /// 路径本身不敏感（敏感的是「在哪个目录」）；显示文件名可在排障时区分
+    /// 「配错文件」与「配错目录」，而全站统一打成 `<configured>` 会丧失该能力。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let file_name = self
+            .db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<no-file-name>");
+        f.debug_struct("TelemetryStoreConfig")
+            .field("db_file_name", &file_name)
+            .field("gateway_id", &self.gateway_id)
+            .field("machine_code", &"<redacted>")
+            .field("max_db_bytes", &self.max_db_bytes)
+            .field("retention_ns", &self.retention_ns)
+            .finish()
+    }
 }
 
 impl TelemetryStoreConfig {
@@ -259,9 +284,14 @@ impl TelemetryStoreConfig {
 // ---- 数据模型 ----
 
 /// 一条遥测历史点（`value` 敏感，落盘前加密）。
+///
+/// ⚠️ **关于 `Debug`（勿「统一脱敏」）**：`StoredPoint` 是**解密后的明文结构**，
+/// 其 `value` 在内存里本就是明文，`Debug` 直接打印 f64 值是**正确且必要**的调试能力。
+/// 需要脱敏的是**未解密的密文结构** `RawRow`（仅持有 `value_enc`，从不打印明文）。
+/// **请勿**因为「项目要求脱敏」而把本结构的 `value` 也打码——那会阉掉排障所需的明文可见性。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredPoint {
-    /// 行序号（主键，`INSERT OR IGNORE` 幂等键）。
+    /// 行序号（主键，幂等键：重复 `seq` 静默跳过）。
     pub seq: i64,
     /// 设备标识。
     pub device_id: String,
@@ -273,6 +303,45 @@ pub struct StoredPoint {
     pub value: f64,
     /// 质量码（明文，便于检索）。
     pub quality: String,
+}
+
+/// 批量写入的结果：**区分「成功插入」与「因 nonce 冲突被跳过」**。
+///
+/// ## 为什么需要它（而非只返回一个数）
+/// 单一 `usize` 无法区分「本来就没这条」与「因 `uq_telemetry_nonce` 冲突被跳过」。
+/// 而「跳过」是**安全事件**（nonce/keystream 复用被拦截），必须**可见**——
+/// 既不静默吞掉，也**不拖累整批**。调用方据此可告警 / 落审计。
+///
+/// ## 语义
+/// - `inserted`：真实写入的行数。
+/// - `skipped_nonce_conflict`：因 `(device_id, point_key, ts_ns)` 撞唯一索引被跳过的行数
+///   （> 0 时应告警：说明存在同设备同点位同纳秒的采样，可能是点位配重 / 设备时钟不精确）。
+/// - `skipped_duplicate_seq`：因 `seq` 已存在被静默跳过的行数（幂等重放，非异常）。
+///
+/// 注意：**非唯一约束**的存储错误（磁盘 / SQL 语法等真故障）**不会**被计入跳过——
+/// 它们仍会让整个批次返回 `Err`（详见 `write`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteOutcome {
+    /// 真实写入的行数。
+    pub inserted: usize,
+    /// 因 `uq_telemetry_nonce` 唯一索引冲突被跳过的行数（**安全事件，应告警**）。
+    pub skipped_nonce_conflict: usize,
+    /// 因 `seq` 已存在被静默跳过的行数（幂等重放，非异常）。
+    pub skipped_duplicate_seq: usize,
+}
+
+impl WriteOutcome {
+    /// 总计处理（含插入 + 跳过）的行数。
+    #[must_use]
+    pub fn total_processed(&self) -> usize {
+        self.inserted + self.skipped_nonce_conflict + self.skipped_duplicate_seq
+    }
+
+    /// 是否有 nonce 冲突被跳过（调用方据此决定告警 / 审计）。
+    #[must_use]
+    pub fn has_nonce_conflict(&self) -> bool {
+        self.skipped_nonce_conflict > 0
+    }
 }
 
 // ---- 加密原语（HKDF + 认证 XOR 流加密） ----
@@ -390,11 +459,26 @@ fn compute_tag(
 /// 由 `seq` / `device_id` / `point_key` / `ts_ns` / `gateway_id` 确定性派生 nonce。
 ///
 /// **说明**：`enc_key` 固定（由机器码派生），若 nonce 随机则 `no_std` 下无处取加密 RNG。
-/// 这里用「行标识的哈希」作 nonce —— **同一行 (seq) 的 nonce 确定且唯一**，
-/// `seq` 是主键，故 nonce 在同一库里**不重复**；配合 `enc_key` 全局唯一的事实，
-/// 「(key, nonce) 不重复」成立，无需外部随机源。
-/// **局限**：同一行重复写入（`seq` 相同）会复用 nonce —— 但 `INSERT OR IGNORE`
-/// 使同 `seq` 只写一次，且本表为「一次采集写一次」的 append-only 归档，不构成风险。
+/// 这里用「行标识的哈希」作 nonce。
+///
+/// ## ⚠️ nonce 唯一性的真正保证 —— 表上的唯一索引，**不是 `seq`**
+///
+/// nonce 的唯一性**由 `telemetry` 表上的 `uq_telemetry_nonce(device_id, point_key, ts_ns)`
+/// 唯一索引在结构层面保证**，而非 `seq` 主键。`seq` 参数保留在哈希输入里仅为兼容
+/// **已落盘数据的可解密性**（改哈希输入会使历史密文永久无法解密），它**不**承担唯一性职责。
+///
+/// ## ⚠️ 绝不允许放宽唯一性
+///
+/// 本模块是 XOR 流加密：keystream = `HMAC(enc_key, nonce || counter)`，**只依赖 `(key, nonce)`**。
+/// 一旦 `(device_id, point_key, ts_ns)` 上出现重复行（即 nonce 复用），两条密文满足
+/// `C1 ⊕ C2 = P1 ⊕ P2`——**keystream 被完全消去、明文暴露**。
+/// 因此**任何情况下都不得**删除 / 放宽 `uq_telemetry_nonce`，也不得让两行共用同一 nonce。
+///
+/// ## 冲突如何被上报（**不静默吞掉**）
+///
+/// 冲突**不会被静默吞掉**——它经 [`WriteOutcome::skipped_nonce_conflict`] 上报，
+/// 并在 `write` 内同时打一条 `tracing::warn!`。作用是**逐条隔离**：冲突条被跳过、其余条
+/// 照常写入（避免整批回滚丢失合法遥测），但**该冲突始终可见**（供调用方告警 / 审计）。
 fn derive_nonce(
     gateway_id: &str,
     seq: i64,
@@ -482,12 +566,12 @@ type Resp<T> = Sender<DaemonResult<T>>;
 
 /// 写线程指令（全部经单一写连接串行执行）。
 enum Cmd {
-    /// 批量落盘（一个事务），返回真实插入行数。
+    /// 批量落盘（一个事务），返回 [`WriteOutcome`]（区分插入 / nonce 冲突跳过 / seq 幂等跳过）。
     Write {
         /// 待写入点位。
         points: Vec<StoredPoint>,
         /// 响应通道。
-        resp: Resp<usize>,
+        resp: Resp<WriteOutcome>,
     },
     /// 时间范围查询（`from_ns <= ts_ns <= to_ns`，按 ts 升序，最多 `limit` 条）。
     QueryRange {
@@ -536,6 +620,14 @@ enum Cmd {
 // ---- 写线程 ----
 
 /// 建表语句（`seq` 主键 → 幂等；`value_enc` 为加密后的 hex 文本）。
+///
+/// ⚠️ **`uq_telemetry_nonce` 是加密正确性的前提，不是可选优化**：
+/// nonce 由 `(gateway_id, seq, device_id, point_key, ts_ns)` 确定性派生，
+/// 而 keystream 只依赖 `(enc_key, nonce, counter)`。若表中存在两条
+/// `(device_id, point_key, ts_ns)` 相同的行，则它们共用同一段 keystream，
+/// XOR 流加密下 `C1 ⊕ C2 = P1 ⊕ P2`，**keystream 被完全消去、明文暴露**。
+/// 该唯一索引把「密钥流复用」从**静默的安全事故**转为**响亮的写入失败**——
+/// 违反唯一性在结构层面不可达。**任何情况下都不得放宽此约束**（详见 `derive_nonce`）。
 const SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS telemetry (
     seq       INTEGER PRIMARY KEY,
@@ -545,6 +637,7 @@ CREATE TABLE IF NOT EXISTS telemetry (
     value_enc TEXT    NOT NULL,
     quality   TEXT    NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_telemetry_nonce ON telemetry(device_id, point_key, ts_ns);
 CREATE INDEX IF NOT EXISTS idx_telemetry_device_ts ON telemetry(device_id, ts_ns);
 CREATE INDEX IF NOT EXISTS idx_telemetry_device_point ON telemetry(device_id, point_key, ts_ns);
 ";
@@ -642,21 +735,42 @@ impl DbWriter {
         }
     }
 
-    /// 批量落盘（一个事务）：逐条加密后 `INSERT OR IGNORE`，返回真实插入行数。
-    fn write(&mut self, points: Vec<StoredPoint>) -> DaemonResult<usize> {
+    /// 批量落盘（一个事务）：逐条加密后写入，返回 [`WriteOutcome`]。
+    ///
+    /// ## 语义（与 `uq_telemetry_nonce` 唯一索引协同）—— **逐条隔离，不拖累整批**
+    /// - **`seq` 已存在** → 静默跳过（幂等重放），计入 `skipped_duplicate_seq`。
+    /// - **`(device_id, point_key, ts_ns)` 已存在但 `seq` 不同** → 该条**跳过**、计入
+    ///   `skipped_nonce_conflict`，并**继续处理后续记录**（这正是 nonce 复用被拦截的
+    ///   **可见**上报；不静默、也不让整批回滚）。
+    /// - **其它 SQLite 存储错误**（磁盘 / SQL 故障等真错误）→ **仍 `?` 中止整批**
+    ///   （真故障不得被吞）。
+    ///
+    /// ⚠️ 之所以不整批 `?`：工业现场「同点位同纳秒」是**正常现象**（点位配重 / 设备时钟不
+    /// 精确），若一条冲突即整批回滚，会**丢失数十条合法遥测**，违背「断网继续采集」契约。
+    /// 故把 nonce 冲突的作用域从「整批」收窄到「单条」，同时保留其**可见性**。
+    fn write(&mut self, points: Vec<StoredPoint>) -> DaemonResult<WriteOutcome> {
+        let mut outcome = WriteOutcome::default();
         if points.is_empty() {
-            return Ok(0);
+            return Ok(outcome);
         }
         let tx = self.conn.transaction().map_err(map_sqlite)?;
-        let mut inserted = 0usize;
         {
-            let mut stmt = tx
+            let mut seq_exists = tx
+                .prepare("SELECT 1 FROM telemetry WHERE seq = ?1")
+                .map_err(map_sqlite)?;
+            let mut insert = tx
                 .prepare(
-                    "INSERT OR IGNORE INTO telemetry(seq, device_id, point_key, ts_ns, value_enc, quality) \
+                    "INSERT INTO telemetry(seq, device_id, point_key, ts_ns, value_enc, quality) \
                      VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
                 )
                 .map_err(map_sqlite)?;
             for point in &points {
+                // 1) seq 幂等：已存在则静默跳过（重放同一批不报错、不重复计）。
+                let already = seq_exists.exists(params![point.seq]).map_err(map_sqlite)?;
+                if already {
+                    outcome.skipped_duplicate_seq += 1;
+                    continue;
+                }
                 let nonce = derive_nonce(
                     &self.gateway_id,
                     point.seq,
@@ -666,21 +780,36 @@ impl DbWriter {
                 );
                 let aad = build_aad(point.seq, point.ts_ns, &point.device_id, &point.point_key);
                 let value_enc = encrypt_value(&self.keys, &nonce, &aad, point.value);
-                let affected = stmt
-                    .execute(params![
-                        point.seq,
-                        point.device_id.as_str(),
-                        point.point_key.as_str(),
-                        point.ts_ns,
-                        value_enc,
-                        point.quality.as_str(),
-                    ])
-                    .map_err(map_sqlite)?;
-                inserted += affected;
+                // 2) 普通 INSERT：`(device_id, point_key, ts_ns)` 冲突会被唯一索引拦下。
+                //    逐条隔离：冲突 → 跳过该条并计数；其它错误 → 中止整批。
+                match insert.execute(params![
+                    point.seq,
+                    point.device_id.as_str(),
+                    point.point_key.as_str(),
+                    point.ts_ns,
+                    value_enc,
+                    point.quality.as_str(),
+                ]) {
+                    Ok(_) => outcome.inserted += 1,
+                    Err(err) if is_nonce_conflict(&err) => {
+                        outcome.skipped_nonce_conflict += 1;
+                        // 逐条失败仅记日志、不泄漏明文；整批提交后由返回值/调用方决定告警。
+                        tracing::warn!(
+                            target: "daemon::telemetry_store",
+                            device_id = %point.device_id,
+                            point_key = %point.point_key,
+                            ts_ns = point.ts_ns,
+                            seq = point.seq,
+                            "telemetry nonce uniqueness conflict skipped (keystream reuse blocked)"
+                        );
+                    }
+                    // 非唯一约束的真故障：不吞，中止整批（事务回滚）。
+                    Err(err) => return Err(map_sqlite(err)),
+                }
             }
         }
         tx.commit().map_err(map_sqlite)?;
-        Ok(inserted)
+        Ok(outcome)
     }
 
     /// 时间范围查询：`from <= ts <= to`，按 ts 升序，最多 `limit` 条。
@@ -982,16 +1111,20 @@ impl TelemetryStore {
         })
     }
 
-    /// 批量写入（一个事务），返回**真实插入**行数（重复 `seq` 因 `INSERT OR IGNORE` 不计）。
+    /// 批量写入（一个事务），返回 [`WriteOutcome`]。
+    ///
+    /// **逐条隔离**：单条 `(device_id, point_key, ts_ns)` 唯一冲突**不会**拖累整批——
+    /// 冲突条被跳过并计入 `skipped_nonce_conflict`，其余合法条仍写入。
     ///
     /// # Errors
-    /// 已关闭 / SQLite 写失败 → `StorageError`（4000）。
-    pub fn write_batch(&self, points: &[StoredPoint]) -> DaemonResult<usize> {
+    /// - 已关闭 → `StorageError`（4000）；
+    /// - **非唯一约束**的真存储故障（磁盘 / SQL 等）→ `StorageError`（4000），整批回滚。
+    pub fn write_batch(&self, points: &[StoredPoint]) -> DaemonResult<WriteOutcome> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(storage_err("write rejected: telemetry store is closed"));
         }
         if points.is_empty() {
-            return Ok(0);
+            return Ok(WriteOutcome::default());
         }
         let points = points.to_vec();
         self.send_cmd(|resp| Cmd::Write { points, resp })
@@ -1135,6 +1268,24 @@ fn map_sqlite(err: rusqlite::Error) -> DaemonError {
     DaemonError::StorageError(format!("sqlite: {err}"))
 }
 
+/// 判定 rusqlite 错误是否为 **`uq_telemetry_nonce` 唯一约束冲突**（nonce 复用被拦截）。
+///
+/// `write` 已按 `seq` 预检幂等，故唯一可能的约束冲突即来自
+/// `uq_telemetry_nonce(device_id, point_key, ts_ns)`。
+///
+/// 判定方式：结构化错误码 + 文本兜底（不同 SQLite 版本可能上报
+/// `SQLITE_CONSTRAINT` / `SQLITE_CONSTRAINT_UNIQUE`，均归一为 `ConstraintViolation`）。
+/// **仅为识别「可安全跳过的单条冲突」**；返回 `false` 的错误会被视为真故障、中止整批，
+/// 故这里的判定宁可**保守**（无法确认是唯一冲突就当作真故障，不吞）。
+fn is_nonce_conflict(err: &rusqlite::Error) -> bool {
+    if err.sqlite_error_code() != Some(rusqlite::ErrorCode::ConstraintViolation) {
+        return false;
+    }
+    // 仅放行「唯一性/主键」类约束；外键/非空/CHECK 等约束冲突仍按真故障处理。
+    let text = err.to_string();
+    text.contains("UNIQUE constraint failed") || text.contains("uq_telemetry_nonce")
+}
+
 /// 构造 `StorageError`（4000）。
 fn storage_err(msg: impl fmt::Display) -> DaemonError {
     DaemonError::StorageError(msg.to_string())
@@ -1203,6 +1354,16 @@ mod tests {
             .expect("query_range")
     }
 
+    /// 写一批并返回 [`WriteOutcome`]（失败即 panic，测试语义）。
+    fn write(store: &TelemetryStore, points: &[StoredPoint]) -> WriteOutcome {
+        store.write_batch(points).expect("write")
+    }
+
+    /// 写一批并返回 `inserted`（多数测试只关心真实插入数）。
+    fn inserted(store: &TelemetryStore, points: &[StoredPoint]) -> usize {
+        write(store, points).inserted
+    }
+
     /// QA Happy：写入 / 查询往返，值精确还原（f64 位相等）。
     #[test]
     #[allow(clippy::approx_constant)] // `3.14159` 是任取的历史采样值，并非 π 常量。
@@ -1217,7 +1378,7 @@ mod tests {
             point(3, "dev-1", "humid", T0_NS + 3, 0.0),
             point(4, "dev-2", "temp", T0_NS + 4, 1234.5678),
         ];
-        assert_eq!(store.write_batch(&points).expect("write"), 4);
+        assert_eq!(inserted(&store, &points), 4);
         assert_eq!(store.count().expect("count"), 4);
 
         let got = one_range(&store, "dev-1", T0_NS, T0_NS + 10);
@@ -1428,7 +1589,7 @@ mod tests {
         );
         assert_eq!(store.disk_bytes().expect("bytes"), 0);
         // 空批写入返回 0。
-        assert_eq!(store.write_batch(&[]).expect("empty write"), 0);
+        assert_eq!(inserted(&store, &[]), 0);
         store.close().expect("close");
     }
 
@@ -1546,7 +1707,7 @@ mod tests {
         drop(store); // Drop 不 panic。
     }
 
-    /// `count` 准确：批量写入 + 幂等重复写（`INSERT OR IGNORE`）不重复计。
+    /// `count` 准确：批量写入 + 幂等重复写（同 `seq` 静默跳过）不重复计。
     #[test]
     fn count_is_accurate_and_write_is_idempotent_by_seq() {
         let dir = tempdir();
@@ -1558,25 +1719,304 @@ mod tests {
             point(2, "d", "k", T0_NS + 2, 2.0),
             point(3, "d", "k", T0_NS + 3, 3.0),
         ];
-        assert_eq!(store.write_batch(&batch).expect("write"), 3);
+        assert_eq!(inserted(&store, &batch), 3);
         assert_eq!(store.count().expect("count"), 3);
 
-        // 重复写同 seq（不同 value）→ 被忽略，计数不变，原值不变。
+        // 重复写同 seq（不同 value）→ 被忽略（计入 skipped_duplicate_seq），计数不变，原值不变。
         let dup = vec![
             point(2, "d", "k", T0_NS + 2, 999.0),
             point(4, "d", "k", T0_NS + 4, 4.0),
         ];
-        assert_eq!(
-            store.write_batch(&dup).expect("write dup"),
-            1,
-            "只新增 seq=4"
-        );
+        let outcome = write(&store, &dup);
+        assert_eq!(outcome.inserted, 1, "只新增 seq=4");
+        assert_eq!(outcome.skipped_duplicate_seq, 1, "seq=2 幂等跳过");
+        assert_eq!(outcome.skipped_nonce_conflict, 0, "同 seq 不算 nonce 冲突");
         assert_eq!(store.count().expect("count"), 4);
 
         let got = one_range(&store, "d", T0_NS, T0_NS + 10);
         let seq2 = got.iter().find(|p| p.seq == 2).expect("seq2");
         assert_eq!(seq2.value, 2.0, "幂等：原 seq 的值不得被覆盖");
         store.close().expect("close");
+    }
+
+    /// 🔒 nonce 唯一性结构保证（任务 A.2）：同一 `(device_id, point_key, ts_ns)`
+    /// 但不同 `seq` 的第二行 → **写入返回 Err**（而非静默成功 / 复用 keystream）。
+    #[test]
+    fn duplicate_device_point_ts_is_rejected_at_write() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let store = open(dir.path(), "gw-uniq", MACHINE_A, &clock);
+
+        // 第一行成功。
+        assert_eq!(
+            inserted(&store, &[point(1, "dev-u", "temp", T0_NS + 100, 1.0)]),
+            1
+        );
+        assert_eq!(store.count().expect("count"), 1);
+
+        // 第二行：(device_id, point_key, ts_ns) 与第一行完全相同，但 seq 不同。
+        // 逐条隔离语义：该条被**跳过并可见上报**（不再整批 Err、也不静默吞）。
+        let outcome = write(&store, &[point(2, "dev-u", "temp", T0_NS + 100, 2.0)]);
+        assert_eq!(outcome.inserted, 0, "冲突条不得写入");
+        assert_eq!(outcome.skipped_nonce_conflict, 1, "冲突必须被计入可见上报");
+        assert!(outcome.has_nonce_conflict(), "必须可通过返回值感知冲突");
+        assert_eq!(outcome.total_processed(), 1);
+        // 该批次未落任何新行；既有行未被覆盖。
+        assert_eq!(store.count().expect("count"), 1, "冲突条不得落盘");
+        let latest = store
+            .query_latest("dev-u", "temp")
+            .expect("latest")
+            .expect("some");
+        assert_eq!(latest.value, 1.0, "冲突条不得覆盖既有值");
+
+        // 换一个不同的 ts → 允许（唯一性只针对三元组相同的情况）。
+        assert_eq!(
+            inserted(&store, &[point(3, "dev-u", "temp", T0_NS + 101, 3.0)]),
+            1
+        );
+        // 换一个不同的 device_id（其余同）→ 也允许。
+        assert_eq!(
+            inserted(&store, &[point(4, "dev-u2", "temp", T0_NS + 100, 4.0)]),
+            1
+        );
+        // 换一个不同的 point_key（其余同）→ 也允许。
+        assert_eq!(
+            inserted(&store, &[point(5, "dev-u", "temp2", T0_NS + 100, 5.0)]),
+            1
+        );
+        assert_eq!(store.count().expect("count"), 4);
+        store.close().expect("close");
+    }
+
+    /// 🔒 nonce 不复用守护（任务 A.4）：两行除 `ts_ns` 外全同 → 都能正确解密，
+    /// 且两行的 `value_enc` **前 12 字节（nonce）不相等**。
+    ///
+    /// 这把「nonce 必须唯一」写成**可执行断言**，而不是注释。
+    #[test]
+    fn distinct_keys_never_reuse_keystream() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let store = open(dir.path(), "gw-ks", MACHINE_A, &clock);
+
+        // 除 ts_ns 外全同（同 device / point / gateway / machine），seq 不同。
+        store
+            .write_batch(&[
+                point(1, "dev-ks", "temp", T0_NS + 1000, 11.0),
+                point(2, "dev-ks", "temp", T0_NS + 2000, 22.0),
+            ])
+            .expect("write");
+
+        // 直读两行原始密文，比较 nonce（前 12 字节）。
+        let db_path = store.db_path();
+        let ro = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open ro");
+        let enc1: String = ro
+            .query_row("SELECT value_enc FROM telemetry WHERE seq = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("enc1");
+        let enc2: String = ro
+            .query_row("SELECT value_enc FROM telemetry WHERE seq = 2", [], |r| {
+                r.get(0)
+            })
+            .expect("enc2");
+        drop(ro);
+
+        let b1 = hex::decode(&enc1).expect("hex1");
+        let b2 = hex::decode(&enc2).expect("hex2");
+        assert_ne!(
+            &b1[..NONCE_LEN],
+            &b2[..NONCE_LEN],
+            "两行 nonce 必须不同（否则 keystream 复用）"
+        );
+        // keystream 未复用 ⇒ 密文主体也不该相同。
+        assert_ne!(
+            &b1[NONCE_LEN..NONCE_LEN + 8],
+            &b2[NONCE_LEN..NONCE_LEN + 8],
+            "密文主体不得相同"
+        );
+
+        // 两行都能精确解密回正确的明文值。
+        let got = one_range(&store, "dev-ks", T0_NS, T0_NS + 10_000);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].value, 11.0);
+        assert_eq!(got[1].value, 22.0);
+        store.close().expect("close");
+    }
+
+    /// 任务 B：两个 `TelemetryStore` 指向**同一个 db 文件**，写「同设备同点位同 ts」。
+    ///
+    /// **实际观察到的行为（重要）**：两个实例都能 `open` 成功——写线程各自持有
+    /// 独立连接 + WAL，SQLite 允许多进程/多连接；但第二个实例写入同一
+    /// `(device_id, point_key, ts_ns)` 时会撞上 `uq_telemetry_nonce` 唯一索引，
+    /// **该条被跳过并计入 `skipped_nonce_conflict`（可见）**，而**不是**第二个 open 失败。
+    /// 即：**冲突在 write 阶段被拦截且可见上报**。
+    #[test]
+    fn two_instances_on_same_file_cannot_reuse_nonce() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let cfg_a = cfg(dir.path(), "gw-share", MACHINE_A);
+
+        let store_a = TelemetryStore::open(cfg_a.clone(), Arc::new(clock.clone())).expect("open A");
+        // 第二个实例指向同一文件：WAL 下允许打开。
+        let store_b = match TelemetryStore::open(cfg_a, Arc::new(clock.clone())) {
+            Ok(opened) => {
+                // 观察：open 成功（冲突推迟到 write）。
+                assert_eq!(opened.count().expect("count B"), 0);
+                opened
+            }
+            Err(e) => {
+                // 若某些平台独占打开失败，也接受——但需明确记录。
+                assert_eq!(e.error_code(), ERR_STORAGE);
+                store_a.close().expect("close A");
+                return;
+            }
+        };
+
+        // A 先写一行。
+        assert_eq!(
+            inserted(&store_a, &[point(1, "shared", "temp", T0_NS + 7, 1.0)]),
+            1
+        );
+
+        // B 写「同设备同点位同 ts」但不同 seq → 该条被**跳过并可见上报**（不落盘）。
+        let outcome = write(&store_b, &[point(2, "shared", "temp", T0_NS + 7, 2.0)]);
+        assert_eq!(outcome.inserted, 0, "跨实例冲突条不得写入");
+        assert_eq!(outcome.skipped_nonce_conflict, 1, "跨实例冲突必须可见上报");
+        // 数据未被破坏：仍是 A 写入的那一行。
+        assert_eq!(store_a.count().expect("count A"), 1);
+        let got = store_a
+            .query_latest("shared", "temp")
+            .expect("latest")
+            .expect("some");
+        assert_eq!(got.value, 1.0);
+
+        store_b.close().expect("close B");
+        store_a.close().expect("close A");
+    }
+
+    /// 🛡️ 批内单条冲突**不拖累整批**：一批 3 条，中间一条与批内前一条撞
+    /// `(device_id, point_key, ts_ns)` → 合法两条必须落盘（**不整批回滚**）。
+    #[test]
+    fn batch_with_one_conflict_keeps_other_rows() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let store = open(dir.path(), "gw-b1", MACHINE_A, &clock);
+
+        let batch = vec![
+            point(1, "b", "k", T0_NS + 5, 1.0),
+            // 与上一条 (device, key, ts) 完全相同，但 seq 不同 → 该条冲突被跳过。
+            point(2, "b", "k", T0_NS + 5, 2.0),
+            point(3, "b", "k", T0_NS + 6, 3.0),
+        ];
+        let outcome = write(&store, &batch);
+
+        assert_eq!(outcome.inserted, 2, "两条合法必须保留");
+        assert_eq!(outcome.skipped_nonce_conflict, 1, "一条冲突被跳过");
+        assert_eq!(outcome.skipped_duplicate_seq, 0);
+        assert_eq!(outcome.total_processed(), 3);
+        // **关键**：合法数据没有整批丢失。
+        assert_eq!(store.count().expect("count"), 2);
+
+        let got = one_range(&store, "b", T0_NS, T0_NS + 100);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].seq, 1, "批内前一条（合法）必须落盘");
+        assert_eq!(got[0].value, 1.0);
+        assert_eq!(got[1].seq, 3, "批内后一条（合法）必须落盘");
+        assert_eq!(got[1].value, 3.0);
+        store.close().expect("close");
+    }
+
+    /// 🛡️ 批内一条与**库中既有行**冲突 → 其余合法条仍落盘。
+    #[test]
+    fn batch_conflict_against_existing_row_keeps_others() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let store = open(dir.path(), "gw-b2", MACHINE_A, &clock);
+
+        // 先写一条进库。
+        assert_eq!(inserted(&store, &[point(1, "c", "k", T0_NS + 50, 10.0)]), 1);
+
+        // 再用一批：含与既有行冲突的一条 + 两条合法。
+        let batch = vec![
+            point(2, "c", "k", T0_NS + 50, 20.0), // 冲突（同 device/key/ts，seq 不同）
+            point(3, "c", "k", T0_NS + 51, 30.0), // 合法
+            point(4, "c", "k", T0_NS + 52, 40.0), // 合法
+        ];
+        let outcome = write(&store, &batch);
+
+        assert_eq!(outcome.inserted, 2, "两条合法必须保留");
+        assert_eq!(outcome.skipped_nonce_conflict, 1);
+        assert_eq!(store.count().expect("count"), 3, "1 既有 + 2 新增");
+
+        // 既有行的值未被覆盖。
+        let got = one_range(&store, "c", T0_NS, T0_NS + 100);
+        let seq1 = got.iter().find(|p| p.seq == 1).expect("seq1");
+        assert_eq!(seq1.value, 10.0, "既有值不得被冲突条覆盖");
+        assert!(got.iter().any(|p| p.seq == 3));
+        assert!(got.iter().any(|p| p.seq == 4));
+        store.close().expect("close");
+    }
+
+    /// 🛡️ **非唯一约束**的真存储错误**仍整批中止**（证明冲突隔离没有把真故障吞掉）。
+    ///
+    /// 构造方式：用独立的可写连接 `DROP TABLE telemetry`，再让写线程写一批 →
+    /// `INSERT`/预检会以 `SQLITE_ERROR: no such table`（**非** `ConstraintViolation`）
+    /// 失败 → 必须 `Err`（而非被当作「可跳过的冲突」）。
+    #[test]
+    fn non_nonce_storage_error_still_aborts_batch() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let store = open(dir.path(), "gw-b3", MACHINE_A, &clock);
+        assert_eq!(inserted(&store, &[point(1, "e", "k", T0_NS + 1, 1.0)]), 1);
+
+        // 从外部连接把表删掉，模拟真存储故障（非唯一约束）。
+        {
+            let rw = Connection::open(store.db_path()).expect("open rw");
+            rw.execute_batch("DROP TABLE telemetry")
+                .expect("drop table");
+        }
+
+        let err = store
+            .write_batch(&[point(2, "e", "k", T0_NS + 2, 2.0)])
+            .expect_err("真存储故障必须整批失败，不得被吞成‘跳过’");
+        assert_eq!(err.error_code(), ERR_STORAGE);
+        assert!(matches!(err, DaemonError::StorageError(_)), "err: {err}");
+        store.close().expect("close");
+    }
+
+    /// 任务 C：`Debug for TelemetryStoreConfig` 只显示文件名、不显示目录；密钥脱敏。
+    #[test]
+    fn config_debug_hides_directory_and_machine_code() {
+        let dir = tempdir();
+        let config = cfg(dir.path(), "gw-dbg", MACHINE_A);
+        let rendered = format!("{config:?}");
+
+        assert!(
+            rendered.contains(TELEMETRY_DB_FILE_NAME),
+            "必须显示文件名: {rendered}"
+        );
+        // 不得泄露目录路径。
+        let dir_str = dir.path().to_string_lossy().to_string();
+        assert!(!rendered.contains(&dir_str), "不得显示目录路径: {rendered}");
+        // 机器码必须脱敏。
+        assert!(!rendered.contains(MACHINE_A), "机器码必须脱敏: {rendered}");
+        assert!(rendered.contains("<redacted>"), "应含脱敏占位: {rendered}");
+        // 网关 id 保留（非敏感，便于排障）。
+        assert!(rendered.contains("gw-dbg"));
+    }
+
+    /// 任务 C：`StoredPoint` 的 Debug 显示明文 `value`（解密后结构，明文可见是正确行为）。
+    #[test]
+    fn stored_point_debug_shows_plaintext_value() {
+        let p = point(1, "dev-dbg", "temp", T0_NS, 123.5);
+        let rendered = format!("{p:?}");
+        assert!(
+            rendered.contains("123.5"),
+            "StoredPoint 是解密后明文结构，Debug 必须显示 value: {rendered}"
+        );
+        assert!(rendered.contains("dev-dbg"));
+        assert!(rendered.contains("temp"));
     }
 
     /// `query_latest`：同点位多时刻 → 返回 ts 最大；不同点位互不干扰。
