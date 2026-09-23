@@ -26,11 +26,14 @@
 >
 > ✅ **阶段状态（2026-09-23）：Wave 0 设计已定稿（用户 explicit 确认），项目进入开发阶段。当前执行 Wave 1（task 1-7：Monorepo / Protobuf schema / 机器码指纹 / 配置 / 日志 / 错误类型 / 测试基建）。** 本机环境约束：Rust 工具链未预装，采用 rustup `stable-x86_64-pc-windows-gnu`（自包含 MinGW 链接器，无需 VS Build Tools），`CARGO_HOME=D:\rust\cargo`、`RUSTUP_HOME=D:\rust\rustup`；protoc 不依赖系统安装（构建脚本经 `protoc-bin-vendored` 或 prost derive 规避）。
 >
-> **Wave 1 实施记录（团队 software-iotdaq 执行中）**：
+> **Wave 1 实施记录（团队 software-iotdaq）**：
 > - ✅ task 1（M1）：workspace 三 crate + 双平台 CI + 占位目录 + .gitignore 密钥黑名单，`cargo build --workspace` 通过。
 > - ✅ task 2（M2）：prost-build + `protoc-bin-vendored`（.proto 唯一 schema 源）；TelemetryBatch/DataPoint/AuthBlock + 4 项往返测试。
 > - ✅ task 3（M2，**已批准偏差**）：以「AnchorProvider trait + fake 测试 + 平台锚点接线清单」替代 mid 5.0.1 crate 集成——理由：mid 依赖 WMI/COM 违背 Wave 1 纯 Rust 约束；真实注册表/sysfs/DMI 采集归 Wave 6 接线任务。N-of-M 容错 + HMAC-SHA256 聚合逻辑完整可测（12 单测）。
-> - ⚠️ 工具链坑（已记录进 README 构建节）：① PATH 须追加 rustup gnu 工具链 `...\x86_64-pc-windows-gnu\bin\self-contained`（raw-dylib 的 dlltool 依赖）；② `cargo update -p tempfile --precise 3.14.0` 钉版。③ mingw-w64 独立工具链（含 gcc，为 Wave 2b rusqlite bundled 铺路）待装至 `D:\rust\mingw64`，装不上则 notify 降级旧版 windows-sys（技术债，README 标注）。
+> - ✅ task 4/5/6/7（M3）：配置解析（toml，6 测试）、tracing 日志（7 测试）、thiserror 错误体系（5 测试）、测试基建 + CI 门禁（fmt→build→test→clippy -D warnings）。**Wave 1 全量 36 测试通过，三道门禁绿，工作区 clean**。
+> - ✅ 提交：`44e7f2b` chore(wave1): monorepo scaffold（69 文件）；`f411069` feat(wave1): protobuf schema + machine fingerprint + config + logging + error（16 文件）。
+> - ⚠️ 工具链坑（已记录进 README 构建节）：① PATH 中 `/d/rust/mingw64/bin` **必须排在** rustup gnu `self-contained` 之前（工程师实测，顺序错则 raw-dylib/dlltool 构建失败）；② mingw-w64 独立工具链已装至 `D:\rust\mingw64`（为 Wave 2b rusqlite bundled 铺路）；③ tempfile 钉版 3.14.0 已随 mingw64 就绪**解除**（3.27.0 回浮）。另：task 7 前端 vitest 未实施（前端尚无工程，归 Wave 5 UI 基建补齐，已批准偏差）。
+> - ⏳ QA 独立回归进行中（团队任务 #12，software-qa-engineer 严过关）。
 > **Linux 交付形态**: **Docker 容器为主**（可选原生 deb/rpm + systemd）。容器化直接冲击「一机一码 + 试用期」两条防破解主线——**机器码必须锚定宿主机、试用与授权状态必须落宿主机持久卷**，否则 `docker rm && docker run` 即可重置试用、授权也会失效。
 > **二次校验与北向编码（本轮定案）**: 二次校验**按 A/B/C 三档并存、默认 B**——B 档下业务数据直连客户 Broker（不经厂商），厂商只收**审计回执**（心跳 + 序号区间 + 条数 + 摘要哈希，**不含业务数值**）。北向编码为**每路出口独立可选**（`protobuf` 默认 / `json`），JSON 路径**超 2^53−1 的整数必须转字符串**。防破解力度定案 **Tier-1**（预算 控制面 7 : 客户端 3）。
 
@@ -426,7 +429,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
 
 ### Wave 0 — 设计图先行（★ 最高优先级，唯一允许先于设计确认的动作）
 
-- [ ] 40. 授权与防破解总体设计图（架构 / 信任边界 / 攻击面 / 防御矩阵）
+- [x] 40. 授权与防破解总体设计图（架构 / 信任边界 / 攻击面 / 防御矩阵）
 
   **What to do**:
   - 产出 `docs/design/auth-architecture.svg`：授权体系总体架构图，必须画清四类参与方（**设备/网关进程**、**本地授权模块**、**云端授权服务 licensing-server**、**厂商总管理后台 admin-console**）及其信任边界（虚线标注「本地可信区 / 客户可篡改区 / 厂商可控区」）
@@ -455,7 +458,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: `.omo/evidence/task-40-auth-architecture.svg`, `.omo/evidence/task-40-threat-model.md`
   **Commit**: YES — `docs(design): auth & anti-crack architecture blueprint`
 
-- [ ] 41. 一机一码：机器码指纹与绑定设计图
+- [x] 41. 一机一码：机器码指纹与绑定设计图
 
   **What to do**:
   - 产出 `docs/design/machine-binding.svg`：一机一码绑定关系图，明确「**一个激活码 ↔ 一台设备机器码**」的实体关系（activation_code 1:1 device，device 1:N lease）
@@ -485,7 +488,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: `.omo/evidence/task-41-machine-binding.svg`, `.omo/evidence/task-41-machine-fingerprint.md`
   **Commit**: YES — `docs(design): machine fingerprint & one-code-one-machine binding`
 
-- [ ] 42. 激活流程与激活码生命周期状态机设计图（含换机废弃/重发）
+- [x] 42. 激活流程与激活码生命周期状态机设计图（含换机废弃/重发）
 
   **What to do**:
   - 产出 `docs/design/activation-state-machine.svg`：两张状态机图
@@ -521,7 +524,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: `.omo/evidence/task-42-activation-state-machine.svg`, `.omo/evidence/task-42-activation-reissue.svg`, `.omo/evidence/task-42-activation-rules.md`
   **Commit**: YES — `docs(design): activation flow & activation-code lifecycle state machine`
 
-- [ ] 43. 安装程序防破解设计图（安装包签名 / 完整性 / 反篡改 / 试用标记）
+- [x] 43. 安装程序防破解设计图（安装包签名 / 完整性 / 反篡改 / 试用标记）
 
   **What to do**:
   - 产出 `docs/design/installer-hardening.svg`：安装与启动阶段的安全链路图（**下载/交付 → 安装包签名校验 → 安装 → 首次启动 → 运行时完整性自检 → 授权判定**），逐环节标注校验点与失败后的行为
@@ -566,7 +569,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: `.omo/evidence/task-43-installer-hardening.svg`, `.omo/evidence/task-43-installer-hardening.md`
   **Commit**: YES — `docs(design): installer anti-crack & tamper-resistance blueprint`
 
-- [ ] 44. 云端授权服务与总管理后台设计图（数据模型 / API 契约 / 后台交互 / 密钥轮换）
+- [x] 44. 云端授权服务与总管理后台设计图（数据模型 / API 契约 / 后台交互 / 密钥轮换）
 
   **What to do**:
   - 产出 `docs/design/licensing-server-and-admin-console.svg`：部署与组件图（admin-console → licensing-server API → 数据库 → 签名私钥保管），含鉴权边界与审计入口；同时画出与网关侧的交互（激活 / 心跳 / Token 校验）
@@ -602,7 +605,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: `.omo/evidence/task-44-licensing-server-and-admin-console.svg`, `.omo/evidence/task-44-licensing-data-model.md`, `.omo/evidence/task-44-licensing-api.md`, `.omo/evidence/task-44-admin-console-wireframe.md`
   **Commit**: YES — `docs(design): licensing server & admin console blueprint`
 
-- [ ] 59. Linux 容器化交付设计图（宿主机指纹锚点 / 持久卷 / 镜像签名 / 离线分发）
+- [x] 59. Linux 容器化交付设计图（宿主机指纹锚点 / 持久卷 / 镜像签名 / 离线分发）
 
   **What to do**:
   - 产出 `docs/design/container-delivery.svg`：容器化部署拓扑与运行时视图，必须画清 **宿主 Docker 引擎 → 容器内 iot-daq 进程 → 宿主只读锚点挂载（`/etc/machine-id`、`/sys/class/dmi/id/product_uuid`、宿主指纹文件）→ 宿主读写持久卷（`/var/lib/iot-daq`）→ 南向设备（局域网 / 串口）→ 北向 MQTT（宿主网络出口）**；并标注三个区域：宿主可篡改区 / 容器运行区 / **镜像供应链区**；明确标注 **不挂载 `/var/run/docker.sock`**（避免放大逃逸面与控制面）
@@ -646,7 +649,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: `.omo/evidence/task-59-container-delivery.svg`, `.omo/evidence/task-59-container-machine-binding.md`, `.omo/evidence/task-59-container-persistence-layout.md`, `.omo/evidence/task-59-container-supply-chain.md`, `.omo/evidence/task-59-container-deploy.md`
   **Commit**: YES — `docs(design): container delivery & host-anchored licensing blueprint`
 
-- [ ] 63. 客户端界面设计（设计系统 / 信息架构 / 页面清单 / 线框 / 交互 / 授权触点）
+- [x] 63. 客户端界面设计（设计系统 / 信息架构 / 页面清单 / 线框 / 交互 / 授权触点）
 
   **What to do**:
   - **设计系统与 token**：产出 `docs/design/ui-design-system.md`，定色彩（品牌 + 语义状态色：`ok/warn/danger/info/unknown`，工业设备语境）、尺度（间距 / 圆角 / 字号 / 行高 / 表格密度 / 侧栏与顶栏尺寸）、布局骨架（侧栏 + 顶栏 + 全局横幅槽 + 页头 + 内容区）、共享业务组件清单（落地为 `ui-kit/`）
@@ -686,7 +689,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: `docs/design/ui-design-system.md`, `docs/design/ui-gateway-console.md`, `docs/design/prototype/gateway-console.html`, `.omo/evidence/ui-prototype-gateway.png`, `.omo/evidence/ui-prototype-gateway-verify.log`
   **Commit**: YES — `docs(design): gateway console UI design system & clickable prototype`
 
-- [ ] 64. 总管理后台界面设计（后台信息架构 / 激活码与设备页 / 危险操作约束 / 回执异常页）
+- [x] 64. 总管理后台界面设计（后台信息架构 / 激活码与设备页 / 危险操作约束 / 回执异常页）
 
   **What to do**:
   - 产出 `docs/design/ui-admin-console.md`：后台信息架构（运营 / 授权运营 / 风控 / 系统四组，10 个页面）+ 每页「目标 / 元素 / 交互 / 依赖 API / 验收」
@@ -731,7 +734,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   > 定稿口径：客户端界面 = `gateway-v2a-glacier.html`（唯一实现基准，九轮反馈迭代，178 项断言 / 36 张截图）；管理后台 = `admin-console.html`；设计决策以本计划 task 40-44 / 59 规格章节为准。
   > ⚠️ 6 张设计图的 SVG 源文件此前在会话内交付、未落盘——本日由架构师按规格章节补绘归档至 `docs/design/*.svg`（含 `activation-reissue.svg`），作为定稿基线文件。
 
-- [ ] 1. Monorepo 初始化 + Cargo workspace + CI 骨架
+- [x] 1. Monorepo 初始化 + Cargo workspace + CI 骨架
 
   **What to do**:
   - 创建 Cargo workspace root（iot-daq/Cargo.toml），声明 crates/daemon, crates/licensing-server, crates/protocol-proto, tauri-shell, headless, web-console, admin-console, **ui-kit**（`deploy/` 为容器与部署资产目录，非 Cargo 成员，由任务 60 填充）
@@ -794,7 +797,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence to Capture**: [ ] task-1-workspace-build.log [ ] task-1-ci-syntax.yml
   **Commit**: YES — `feat(ci): init monorepo workspace and CI pipeline`
 
-- [ ] 2. Protobuf 数据模型 schema（TelemetryBatch/DataPoint/AuthBlock）
+- [x] 2. Protobuf 数据模型 schema（TelemetryBatch/DataPoint/AuthBlock）
 
   **What to do**:
   - 在 crates/protocol-proto 中定义 Protobuf schema（proto/telemetry.proto），包含：
@@ -865,7 +868,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence to Capture**: [ ] task-2-proto-roundtrip.log [ ] task-2-authblock-structure.log
   **Commit**: YES — `feat(proto): add TelemetryBatch/DataPoint/AuthBlock schema`
 
-- [ ] 3. 机器码指纹模块（mid 5.0，多源 + HMAC）
+- [x] 3. 机器码指纹模块（mid 5.0，多源 + HMAC）
 
   **What to do**:
   - 在 crates/daemon 中创建 auth/machine_id.rs
@@ -925,7 +928,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence to Capture**: [ ] task-3-fingerprint-consistency.log [ ] task-3-hardware-source.log
   **Commit**: YES — `feat(auth): implement machine-code fingerprint with mid`
 
-- [ ] 4. 配置管理框架（TOML/YAML 序列化 + 热重载）
+- [x] 4. 配置管理框架（TOML/YAML 序列化 + 热重载）
 
   **What to do**:
   - 创建 crates/daemon/src/config.rs
@@ -990,7 +993,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence to Capture**: [ ] task-4-config-parse.log [ ] task-4-hot-reload.log
   **Commit**: YES — `feat(config): add GatewayConfig with TOML and hot-reload`
 
-- [ ] 5. 日志与可观测性（tracing + 分级日志 + 结构化）
+- [x] 5. 日志与可观测性（tracing + 分级日志 + 结构化）
 
   **What to do**:
   - 在 crates/daemon/src/logging.rs 中集成 `tracing` + `tracing-subscriber`
@@ -1038,7 +1041,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence to Capture**: [ ] task-5-log-level.log
   **Commit**: YES — `feat(logging): add tracing-based structured logging`
 
-- [ ] 6. 核心错误类型 + 统一 Result + 错误码
+- [x] 6. 核心错误类型 + 统一 Result + 错误码
 
   **What to do**:
   - 创建 crates/daemon/src/error.rs
@@ -1085,7 +1088,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence to Capture**: [ ] task-6-error-display.log
   **Commit**: YES — `feat(error): define DaemonError enum and DaemonResult`
 
-- [ ] 7. 测试基础设施（cargo test + vitest + protobuf 校验工具）
+- [x] 7. 测试基础设施（cargo test + vitest + protobuf 校验工具）
 
   **What to do**:
   - 配置 workspace-level cargo test（workspace default-features 不影响）

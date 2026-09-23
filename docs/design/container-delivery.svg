@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1560 960" font-family="system-ui,'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#475569"/></marker>
+  </defs>
+  <style>
+    .h1{font-size:25px;font-weight:700;fill:#0f172a}
+    .h2{font-size:13px;fill:#64748b}
+    .zl{font-size:13px;font-weight:700}
+    .zt{font-size:12.5px;font-weight:700}
+    .bt{font-size:11.5px;font-weight:700;fill:#1e293b}
+    .bd{font-size:10px;fill:#475569}
+    .sm{font-size:9.5px;fill:#475569}
+    .rf{font-size:9.5px;fill:#b91c1c}
+    .tn{font-size:8.5px;fill:#64748b}
+  </style>
+  <rect x="0" y="0" width="1560" height="960" fill="#ffffff"/>
+
+  <!-- ===== 标题 ===== -->
+  <text class="h1" x="28" y="42">iot-daq Linux 容器化交付：部署拓扑与运行时视图</text>
+  <text class="h2" x="28" y="70">宿主 → 容器 → 设备 → 云端四层 · 三区域（宿主可篡改 / 容器运行 / 镜像供应链）· 对应计划 task 59 · Wave 0 设计基线（2026-09-23 定稿）</text>
+
+  <!-- ===== 云端层 ===== -->
+  <rect x="20" y="100" width="1140" height="90" rx="10" fill="#eff6ff" fill-opacity="0.55" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="zl" x="36" y="124" fill="#1e40af">云端 · 厂商可控区</text>
+  <text class="sm" x="36" y="148">licensing-server 控制通道：① 激活 + 绑定 · ② 24h 心跳（携带审计序号区间）· ④ B 档审计回执（断网延迟补报）</text>
+  <text class="tn" x="36" y="170">业务数据（北向 MQTT）不经厂商云（B 档默认）；详见 task 40 / 44</text>
+
+  <line x1="560" y1="216" x2="560" y2="194" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="tn" x="570" y="208" fill="#475569">① 激活 · ② 心跳 · ④ 回执（仅控制通道出网）</text>
+  <line x1="840" y1="194" x2="840" y2="216" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="tn" x="850" y="208" fill="#475569">Lease Token（verify_mode 档位随 Token 下发）</text>
+
+  <!-- ===== 宿主层 ===== -->
+  <rect x="20" y="220" width="1140" height="540" rx="10" fill="#fffbeb" fill-opacity="0.6" stroke="#d97706" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="zl" x="36" y="244" fill="#92400e">宿主机层 · 宿主可篡改区（客户现场 Linux）</text>
+
+  <rect x="40" y="262" width="340" height="66" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="52" y="284">Docker 引擎（宿主）</text>
+  <text class="sm" x="52" y="304">restart: unless-stopped · --memory/--cpus 资源限制</text>
+  <text class="sm" x="52" y="320">日志驱动：本地轮转（json-file，max-size）</text>
+
+  <line x1="210" y1="328" x2="210" y2="346" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="40" y="350" width="620" height="330" rx="10" fill="#f0fdf4" fill-opacity="0.7" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="zt" x="56" y="372" fill="#166534">容器运行区（容器内标识不可作信任锚）</text>
+
+  <rect x="60" y="384" width="580" height="150" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="72" y="406">iot-daq 容器（单容器 · 非 privileged）</text>
+  <rect x="72" y="416" width="556" height="58" rx="6" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text class="sm" x="84" y="436" font-weight="700">数据面</text>
+  <text class="sm" x="84" y="452">· 南向采集：Modbus / OPC UA / PLC（局域网 + 串口）</text>
+  <text class="sm" x="84" y="468">· 北向 MQTT → 宿主网络出口 → 客户 Broker</text>
+  <rect x="72" y="480" width="556" height="48" rx="6" fill="#f0fdf4" stroke="#86efac"/>
+  <text class="sm" x="84" y="498" font-weight="700" fill="#166534">本地授权模块（Rust）</text>
+  <text class="sm" x="84" y="514">指纹 = 宿主锚点组合哈希 · Token 验签 · 租约状态机 · 心跳/回执缓存；SQLCipher（HKDF 机器码派生密钥，task 34）</text>
+
+  <rect x="60" y="548" width="580" height="116" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-dasharray="6 4"/>
+  <text class="rf" x="72" y="570" font-weight="700">✗ 容器内锚点禁用（红线）</text>
+  <text class="rf" x="72" y="590">· 容器 /etc/machine-id（runtime 生成）· veth MAC（随机）· 容器主机名（= 容器 ID）</text>
+  <text class="rf" x="72" y="608">· docker rm 后重建三者全变 → 授权立即失效</text>
+  <text class="rf" x="72" y="626">· 且 SQLCipher 本地库（HKDF 机器码派生密钥）直接解不开</text>
+  <text class="rf" x="72" y="644">· 故机器码只取宿主锚点（右侧只读挂载源），容器内标识一律禁用</text>
+
+  <rect x="690" y="262" width="450" height="150" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="702" y="284">宿主只读锚点（挂载源）</text>
+  <text class="sm" x="702" y="308">· /etc/machine-id</text>
+  <text class="sm" x="702" y="326">· /sys/class/dmi/id/product_uuid</text>
+  <text class="sm" x="702" y="344">· host-fingerprint.json（安装脚本采集宿主 MAC，</text>
+  <text class="sm" x="702" y="360">   HMAC 签名；锚点缺失降级用）</text>
+  <text class="tn" x="702" y="386">均以 --mount type=bind,readonly 只读挂载进容器</text>
+  <text class="tn" x="702" y="402">容器重建 / 升级 → 宿主锚点不变 → 机器码不变</text>
+
+  <rect x="690" y="432" width="450" height="120" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="702" y="454">宿主持久卷（读写）</text>
+  <text class="sm" x="702" y="476">/var/lib/iot-daq/{queue.db, telemetry.db,</text>
+  <text class="sm" x="702" y="492">  config/, logs/, license/, trial/, host-fingerprint.json}</text>
+  <text class="sm" x="702" y="512">· 授权 / 试用 / 队列 / 配置 / 日志五类全落宿主卷</text>
+  <text class="rf" x="702" y="530" font-weight="700">· 镜像可写层承载业务 / 授权数据清单 =「空」</text>
+  <text class="tn" x="702" y="546">命名卷或宿主绑定挂载；docker rm 重建不重置授权 / 试用</text>
+
+  <rect x="690" y="572" width="450" height="88" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="702" y="594">宿主网络出口（--network host）</text>
+  <text class="sm" x="702" y="616">· 北向：MQTT → 客户 Broker（宿主网络栈直接出网）</text>
+  <text class="sm" x="702" y="632">· 南向：局域网直连 + 广播发现（无需端口映射）</text>
+  <text class="sm" x="702" y="648">· 管理界面端口仅本机 / 局域网暴露（经宿主防火墙）</text>
+
+  <line x1="686" y1="320" x2="664" y2="320" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="tn" x="675" y="308" text-anchor="middle">ro 挂载 ×3</text>
+  <line x1="686" y1="480" x2="664" y2="480" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="tn" x="675" y="468" text-anchor="middle">读写卷</text>
+  <line x1="686" y1="616" x2="664" y2="616" stroke="#475569" stroke-width="1.5" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text class="tn" x="675" y="604" text-anchor="middle">net host</text>
+
+  <rect x="40" y="696" width="1100" height="52" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+  <text class="rf" x="56" y="716" font-weight="700">✗ 硬性禁令（部署红线）</text>
+  <text class="rf" x="56" y="736">不挂载 /var/run/docker.sock（避免放大逃逸面与控制面）· 不用 --privileged · 串口走 --device /dev/ttyUSBx + --group-add dialout · 不做 Windows 容器（Windows 走 Tauri 原生安装包）</text>
+
+  <line x1="300" y1="760" x2="300" y2="776" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="tn" x="310" y="774" fill="#475569">南向采集</text>
+
+  <!-- ===== 南向设备层 ===== -->
+  <rect x="20" y="780" width="1140" height="90" rx="10" fill="#f8fafc" stroke="#94a3b8" stroke-dasharray="6 4"/>
+  <text class="zt" x="36" y="804" fill="#334155">南向设备层（现场）</text>
+  <text class="sm" x="36" y="826">Modbus RTU/TCP · OPC UA · PLC 设备；串口 RS485 / RS232 → 宿主 /dev/ttyUSBx（--device + --group-add dialout，非 privileged）</text>
+  <text class="sm" x="36" y="846">局域网直连与广播发现（--network host，无需端口映射）；采集数据经容器数据面入本地库，再按北向出口转发</text>
+
+  <!-- ===== 镜像供应链区 ===== -->
+  <rect x="1180" y="100" width="360" height="770" rx="10" fill="#faf5ff" fill-opacity="0.7" stroke="#4f46e5" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="zl" x="1196" y="124" fill="#3730a3">镜像供应链区</text>
+  <text class="tn" x="1196" y="142">厂商 CI → 现场导入（镜像 = 分发物，task 43）</text>
+
+  <rect x="1196" y="156" width="328" height="96" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="1208" y="178">① 构建（厂商 CI）</text>
+  <text class="sm" x="1208" y="200">· buildx 多架构：linux/amd64 + arm64</text>
+  <text class="sm" x="1208" y="216">· 基础镜像 digest pin（Dockerfile FROM）</text>
+  <text class="sm" x="1208" y="232">· SBOM 随镜像产出</text>
+
+  <line x1="1360" y1="252" x2="1360" y2="268" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="1196" y="272" width="328" height="96" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="1208" y="294">② 签名与固定</text>
+  <text class="sm" x="1208" y="316">· cosign 签名 + cosign verify</text>
+  <text class="sm" x="1208" y="332">· compose 以 digest 引用（不用可变 tag）</text>
+  <text class="sm" x="1208" y="348">· 私有 registry 可选</text>
+
+  <line x1="1360" y1="368" x2="1360" y2="384" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="1196" y="388" width="328" height="96" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="1208" y="410">③ 离线分发</text>
+  <text class="sm" x="1208" y="432">· 离线 tar 包 + 哈希清单</text>
+  <text class="sm" x="1208" y="448">· 校验脚本（导入前核对）</text>
+  <text class="sm" x="1208" y="464">· 现场无外网亦可交付</text>
+
+  <line x1="1360" y1="484" x2="1360" y2="500" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="1196" y="504" width="328" height="130" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="bt" x="1208" y="526">④ 现场一键导入</text>
+  <text class="sm" x="1208" y="548">1  docker load 载入镜像</text>
+  <text class="sm" x="1208" y="564">2  校验哈希清单</text>
+  <text class="sm" x="1208" y="580">3  注入宿主指纹（安装脚本采集 MAC）</text>
+  <text class="sm" x="1208" y="596">4  docker compose up -d（digest 固定）</text>
+  <text class="sm" x="1208" y="612">5  健康检查 → 联网激活（① 激活）</text>
+  <text class="tn" x="1208" y="630">宿主锚点在导入时即确定，激活绑定后不变</text>
+
+  <line x1="1192" y1="562" x2="1166" y2="562" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text class="tn" x="1176" y="550" text-anchor="middle">载入</text>
+
+  <rect x="1196" y="654" width="328" height="90" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+  <text class="rf" x="1208" y="674" font-weight="700">✗ 镜像可写层清单 =「空」</text>
+  <text class="rf" x="1208" y="694">镜像内不含敏感物：无私钥 · 无激活码</text>
+  <text class="rf" x="1208" y="710">无宿主指纹 · 无默认口令 · 无客户配置</text>
+  <text class="rf" x="1208" y="726">无授权 / 试用 / 租约状态（落宿主持久卷）</text>
+
+  <rect x="1196" y="764" width="328" height="90" rx="8" fill="#f8fafc" stroke="#94a3b8"/>
+  <text class="bt" x="1208" y="784" font-size="10.5">不做清单（首期）</text>
+  <text class="tn" x="1208" y="804">· 无 Kubernetes / Helm · 无镜像内自更新（OTA 走 task 35 应用层）</text>
+  <text class="tn" x="1208" y="820">· 不挂 Docker socket · 无 --privileged</text>
+  <text class="tn" x="1208" y="836">· 无 Windows 容器（Windows 走 Tauri 原生安装包）</text>
+
+  <text class="tn" x="28" y="912">口径对齐：task 41（宿主锚点指纹）· task 42（宿主重装系统 → 后台废弃 + 重发）· task 43（镜像 = 分发物：cosign / digest / 哈希清单）· task 44（device.deploy_mode + image_digest）· task 34（SQLCipher HKDF 机器码派生密钥）· task 35（OTA 应用层）</text>
+  <text class="tn" x="28" y="932">Windows 桌面端走 Tauri 原生安装包（installer-hardening.svg）；Docker 交付仅面向 Linux，非 Windows 替代品。</text>
+</svg>
