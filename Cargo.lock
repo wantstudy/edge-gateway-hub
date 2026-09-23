@@ -118,6 +118,7 @@ dependencies = [
  "hex",
  "hmac",
  "notify",
+ "protocol-proto",
  "serde",
  "sha2",
  "tempfile",

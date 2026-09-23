@@ -27,6 +27,9 @@ tracing-appender = "0.2"
 # task 8 南向驱动抽象：`#[async_trait]` 异步 trait（纯 Rust 栈红线合规）。
 async-trait = "0.1"
 
+# task 15 数据处理层：复用北向 schema 的 Quality 枚举（单一数据源，禁止两套质量码定义）。
+protocol-proto = { path = "../protocol-proto" }
+
 # task 9 Modbus TCP/RTU 驱动：tokio-modbus 0.17（纯 Rust；默认特性已含 rtu+tcp，
 # tcp-server 供单测 mock 服务器；不启用 tokio-serial —— 真串口接入留待后续 wave）。
 tokio-modbus = { version = "0.17", features = ["tcp-server"] }
