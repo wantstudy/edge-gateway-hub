@@ -3075,3 +3075,68 @@ cargo test --package daemon formula        # Expected: all pass（含环检测�
 - `licensing-server` 156 测试（本轮 +6）
 - 待办：`engineer-rules-2` 的 `http.rs`（11 端点）尚未提交，需在其完成后单独复核
   `/audit/receipt` 是否把 `TokenInvalid` 正确映射为 HTTP 401
+
+---
+
+## 实施记录 · 第五轮（HTTP 层入库 + 空白字段加固，commit `fc6befb`）
+
+### `http.rs`（engineer-rules-2 交付）已入库
+
+11 端点 axum 路由层：设备侧 `/activation` `/heartbeat` `/verify` `/audit/receipt`；
+管理侧 `/admin/codes/{issue,revoke,reissue}`、`GET codes/devices`、keys 轮换、审计查询。
+含 business code → HTTP status 双重表达、管理端点门控、统一错误映射（不泄露 SQL/密钥）。
+
+**主理人独立复核**（未采信工程师自述）：
+- 实跑 `cargo test -p licensing-server` → 157 passed（复核时点）
+- 逐行读 `audit_receipt_bad_signature_is_401_token_expired`，确认覆盖**双场景**：
+  ① 合法 base64 + 64 字节但非有效签名 → 401；② 非 base64 垃圾串 → 401。
+  确认是 `assert_eq!(status, 401)` 精确断言，非 `!200`。
+
+### 主理人发现并修复的加固缺口：空白字段蒙过白名单
+
+**发现路径**：`engineer-rules-2` 主动提出「空 `sig` 走 422 而非 401，请裁决」。
+裁决过程中主理人追问**空白串**边界，发现真缺口：
+
+`proto.rs::validate_whitelist` 原用 `is_empty()` → `"   "` / `"\t"` 长度非零即算「已提供」
+→ **蒙过白名单**。实测确认（加探针跑真实 HTTP 请求）：
+
+```
+PROBE sig="   "   -> status=401 body={"code":"TOKEN_EXPIRED",...}
+PROBE sig="\t"    -> status=401 ...
+PROBE sig=" \t \n " -> status=401 ...
+```
+
+即：该绕过路径**真实存在**，只因 `decode_signature` 内部恰好也做 `trim()` 才被拦住。
+**不能依赖下游兜底来补上游的存在性判定** —— 下游一放松即完整绕过。
+
+**修法**：`validate_whitelist` 统一改 `trim().is_empty()`，四个字段（device_mid /
+lease_id / payload_digest / sig）走同一个 `missing()` 辅助，空白一律视同「未提供」→ 422。
+
+**契约依据**：`licensing-api.md` §1.4 只为「字段白名单 / 存在性」违规规定
+`422 FIELD_WHITELIST_VIOLATION`，**未给 `/audit/receipt` 定义 401**；
+401 是 `/verify` 的 `VERIFY_FAIL` 语义。故 422 定位正确。
+
+### 变异实验（两条，均通过）
+
+| 变异 | 结果 |
+|---|---|
+| `service.rs` 跳过签名有效性校验（等价修复前行为） | **5 条测试 FAILED** |
+| `proto.rs::missing()` 退回 `is_empty()` | **2 条测试 FAILED** |
+
+还原后 397 passed / 0 failed。→ 新增测试对两类缺陷均有真实捕获能力。
+
+**诚实标注**：主理人第一版空白签名测试只断言 `status != 200`，施加变异后**仍通过**
+（因 `decode_signature` 的 trim 兜底），属**弱断言**。已收紧为精确 422 +
+业务码断言，变异后立即失败。
+
+### 当前状态
+
+- workspace 三门禁：fmt OK / clippy 零 warning / **397 passed, 0 failed**
+  - daemon 233（1 ignored）/ licensing-server **159** / protocol-proto 1 / 集成 4
+- 已提交：`9e167c2`（回执验签）、`8f6baa7`（第四轮记录）、`fc6befb`（HTTP + 加固）
+
+### 并行推进：web-console（客户端控制台）
+
+`engineer-webcore` 已交付工程骨架（package.json / vite.config / tsconfig / router /
+App.vue / store / mock + 17 个页面占位）；`engineer-webmon` 已启动实现监控组 3 页。
+页面基线 = `docs/design/prototype/gateway-v2a-glacier.html:1384-2136`（内联原型，二选一不可行）。
