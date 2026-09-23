@@ -70,3 +70,6 @@ export { default as UiRadio } from './components/UiRadio.vue';
 export type { RadioOption } from './components/UiRadio.vue';
 export { default as UiTable } from './components/UiTable.vue';
 export type { TableColumn } from './components/UiTable.vue';
+
+// ---------- 应用级复合组件（分页条等）----------
+export { default as UiPager } from './components/UiPager.vue';

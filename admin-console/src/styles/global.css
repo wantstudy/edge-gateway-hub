@@ -94,6 +94,27 @@ body {
   font-size: var(--fs-caption);
   font-weight: 600;
 }
+
+/* 双人复核开关（顶栏）：开启后高危弹窗要求第二审批人 */
+.ac-dual {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-caption);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ac-dual:hover {
+  border-color: var(--brand);
+}
+.ac-dual input {
+  margin: 0;
+  cursor: pointer;
+}
 .ac-pill {
   display: inline-flex;
   align-items: center;

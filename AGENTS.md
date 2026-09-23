@@ -71,6 +71,14 @@ export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' \
 2. **设计先行红线**：凡任务要求「先出设计图 / 界面设计」，必须等用户 explicit 确认后才允许写实现代码
 3. 小步提交：每完成一个 task 跑三道门禁 → 单独 commit
    （`feat(scope): desc` / `docs(design): desc` / `chore(waveN): desc`），提交信息风格参照 git log
+   - ⚠️ **提交纪律（血泪教训，2026-09-24）**：**禁止用 `git add -A` / `git add .`**。多 agent 并行时，
+     工作区里随时存在**其它成员尚未完成的中途文件**，`add -A` 会把它们一并提交，
+     使「HEAD 的内容」与「成员心中的最新版本」不一致；此后任何 `git checkout <file>`
+     都会**静默丢失成员未提交的工作**（本机已发生一次：`service.rs` 42 行测试辅助函数被卷走）。
+     **正确做法：只 `git add <本次实际交付的显式路径>`**（逐个文件或逐个目录列出），
+     提交前用 `git status --short` 复核暂存区，确认不含非本次交付的文件。
+   - 同理，**撤回临时改动时禁止 `git checkout <file>`**（会回退到 HEAD 而非「改之前」）。
+     改用：先 `cp <file> <file>.bak` 再改；或改完只删自己加的那几行。
 4. 完成自检：逐条对照该 task 的 Acceptance Criteria；如实际实现与计划有偏差，先向用户说明理由获批，
    再把偏差记入计划文档对应任务段
 5. 全局不做清单：不硬编码激活码/私钥；不直接签 Protobuf 序列化字节（签业务语义确定性哈希）；

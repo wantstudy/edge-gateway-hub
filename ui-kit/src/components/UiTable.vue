@@ -22,8 +22,13 @@
             :class="{ 'is-right': col.align === 'right', 'uik-mono': col.mono }"
           >
             <!-- 优先使用具名插槽自定义渲染，否则直接输出字段值 -->
-            <slot v-if="$slots[`cell-${col.key}`]" :name="`cell-${col.key}`" :row="row" :value="row[col.key]" />
-            <template v-else>{{ display(row[col.key]) }}</template>
+            <slot
+              v-if="$slots[`cell-${col.key}`]"
+              :name="`cell-${col.key}`"
+              :row="row"
+              :value="readField(row, col.key)"
+            />
+            <template v-else>{{ display(readField(row, col.key)) }}</template>
           </td>
           <td v-if="$slots.actions" class="is-right">
             <div class="uik-table__actions">
@@ -37,11 +42,15 @@
   </div>
 </template>
 
-<script setup lang="ts" generic="T extends Record<string, unknown>">
+<script setup lang="ts" generic="T extends object">
 /**
  * @file UiTable.vue
  * @module ui-kit/components/UiTable
  * @description 泛型表格。行高紧凑、表头浅底、支持右侧操作列插槽与底部说明。
+ *
+ * 泛型约束说明：`T extends object` 而非 `Record<string, unknown>`，
+ * 以便业务侧可直接传入**具名接口类型**（如 `CodeRecord`）而不必额外加索引签名。
+ * 字段读取统一走 `readField()` 做安全取值。
  */
 
 /** 列定义。 */
@@ -76,8 +85,18 @@ const props = withDefaults(defineProps<Props>(), {
  * 计算行 key：优先取 rowKeyField，缺失时回退下标（保证渲染稳定）。
  */
 function rowKey(row: T, index: number): string {
-  const value = row[props.rowKeyField];
+  const value = readField(row, props.rowKeyField);
   return value === undefined || value === null ? `row-${index}` : String(value);
+}
+
+/**
+ * 按字段名安全读取行字段。
+ *
+ * 因为泛型 `T` 是具名接口（无索引签名），模板里不能直接 `row[col.key]`，
+ * 这里用一次显式的 `Record` 断言集中处理，避免在模板中散布 `any`。
+ */
+function readField(row: T, key: string): unknown {
+  return (row as Record<string, unknown>)[key];
 }
 
 /**
@@ -85,7 +104,7 @@ function rowKey(row: T, index: number): string {
  * 用于「异常行左侧色条」这类高优先级视觉信号。
  */
 function rowClass(row: T): string {
-  const cls = row._rowClass;
+  const cls = readField(row, '_rowClass');
   return typeof cls === 'string' ? cls : '';
 }
 
@@ -96,6 +115,9 @@ function display(value: unknown): string {
   }
   return String(value);
 }
+
+/** 暴露给模板的字段读取器（插槽内也直接可用）。 */
+defineExpose({ readField });
 </script>
 
 <style scoped>

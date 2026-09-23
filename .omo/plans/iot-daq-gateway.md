@@ -2956,3 +2956,64 @@ cargo test --package daemon formula        # Expected: all pass（含环检测�
 - Rust 环境前缀：`export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' PATH="/d/rust/cargo/bin:/d/rust/mingw64/bin:$PATH"`；**`/d/rust/mingw64/bin` 必须在 rustup 目录之前**，否则 windows-sys raw-dylib 构建失败。
 - `.topic` 是 `RoutedMessage` 的**字段**（不是方法），测试断言里别写 `m.topic()`。
 - `RawSample` 只有 4 个字段：`source_id` / `value` / `quality` / `device_ts_ns: Option<i64>`；**没有** `point_id`（`point_id` 是 `ProcessedSample` 的字段，由 transform 映射产生）。
+
+### task 45 数据层与业务层（licensing-server 四文件到位）
+
+`engineer-licensing-2` 交付 `model.rs`（1069 行 / 16 测试）+ `store.rs`（2339 行 / 23 测试）；
+`engineer-rules-2` 交付 `proto.rs` + `service.rs`。crate 级 **121 测试**。
+
+#### 已批准的两处契约级偏差（涉及数据模型语义，主理人复核通过）
+
+**① `lease.kid` 不建硬外键**（设计与 ER 图声明 `SIGNING_KEY ||--o{ LEASE`）。
+
+理由：service 层用 `KeyRing`（私钥经环境变量注入）签发租约，**从不调用 `insert_signing_key`**；
+而 `signing_key` 表按设计 §5 只存公钥 + `hsm_ref`。硬外键会让「租约签发」耦合到
+「公钥已落库」这一前置动作，与轮换语义冲突（新 kid 完全可以**先签发、后登记**——
+轮换第 1 步就是「新 kid 在隔离区生成，私钥不出隔离区」，业务库并不立即知道它）。
+现状以 `idx_lease_kid` 索引 + 应用层校验表达该关系。
+
+**② `activation_code.idempotency_key` 不建唯一索引**（原拟 `WHERE idempotency_key IS NOT NULL` 唯一）。
+
+理由：该 key 标识**一次发放批次**而非单行——`issue_codes(count=3)` 会产生 3 行共享同一 key，
+行级唯一约束会让批量发放**直接失败**。幂等语义由 service 按 key 查批次实现。
+
+> ⚠️ **由此引入的强制约束（service 层必须满足）**：非唯一索引意味着「同 key 重放返回同一批码」
+> **不能靠数据库唯一约束保证**。若实现为「先 SELECT 再 INSERT」，则**并发重放会产生两个批次**
+> ——违反 §2.1 幂等语义（「同 key 重放返回首次结果，不产生第二个实体」）。
+> 已要求 `engineer-rules-2` 回答该问题的实际实现方式；若确为 SELECT-then-INSERT，
+> 需改为「同 key 的 INSERT 走单一事务 + 冲突检测」或加「批次表 + 唯一约束」的间接方案。
+
+#### 其它已记录偏差（工程细节，无需设计回退）
+
+- `CodeFilter` = `{tenant_id, status, tier, order_id}`；`order_id` 映射列 `source_order_id`
+- `AuditFilter` = `{actor_type, action, entity_type, entity_id}`（时间区间过滤后续补）
+- `ActivationCode.source_order_id: Option<String>`
+- `count_devices(Option<&str>)` / `list_devices(Option<&str>, page, page_size)`（`None` = 跨租户）
+- 所有 `list_*` 统一 `ORDER BY rowid`（插入顺序）——同批次多码 `created_at` 同秒，
+  用 `created_at, code_id` 排序会因**随机主键后缀**产生不稳定顺序，使「同幂等键重放逐位一致」无法成立
+
+#### 激活流程的 nonce 占位（曾疑为缺口，已确认覆盖完整）
+
+`service.rs` 中 nonce 占位有**两条路径**，因 `nonce_cache.device_id` 是 `device` 的硬外键
+（首次激活时设备尚未建库，FK 无法满足），故：
+
+- `pre_device == Some`（设备已存在）→ 在规则 2 处立即占位
+- `pre_device == None`（首次激活）→ 推迟到 `insert_device` 之后、`bind_code_to_device` 之前占位
+
+**两条路径互斥且穷尽**（设备存在与否），且都在「绑定 + 签发」之前，防重放语义完整。
+已交由 `engineer-rules-2` 二次确认。
+
+#### 流程事故与根因治理
+
+**事故**：主理人为撤回一个临时探针执行 `git checkout crates/licensing-server/src/service.rs`，
+但该文件此前被 `git add -A` 卷入了提交 `20fb369`，HEAD 内是**中途版本** → 回退导致
+`engineer-rules-2` 的 **42 行未提交新增（测试辅助函数）丢失**，crate 从 121 测试掉到 99 passed / 22 failed
+（失败的**全是测试脚手架编译问题，业务逻辑无损**）。
+
+**根因**：`git add -A` 在多 agent 并行工作区里会提交他人中途文件，破坏「HEAD = 成员最新版」的假设。
+
+**治理（已写入 `AGENTS.md` 提交纪律）**：
+1. **禁止 `git add -A` / `git add .`** —— 只 `git add <本次交付的显式路径>`，提交前 `git status --short` 复核暂存区
+2. **禁止用 `git checkout <file>` 撤回临时改动** —— 会回退到 HEAD 而非「改之前」；改用先备份再改
+
+**恢复**：已派 `engineer-rules-2` 重建辅助函数（其知识在手），要求恢复 121 passed。

@@ -1,7 +1,7 @@
 /**
  * @file rbac.ts
  * @module ui-kit/rbac
- * @description 管理后台 RBAC 的**页面级 + 操作级**权限矩阵。
+ * @description 管理后台 RBAC 的**页面级 + 操作级**权限矩阵（**唯一真源 / single source of truth**）。
  *
  * 权威来源：`docs/design/licensing-api.md` §4「RBAC 四角色」与 `ui-admin-console.md` §2 页面清单。
  *
@@ -9,6 +9,22 @@
  * 本模块**仅用于前端可见性/可用性控制**，不承担授权判定。真正的判定在 Rust 侧与管理 API。
  * 因此 `can()` 返回 false 时前端要**不渲染或禁用**（而非「点了才报 403」），
  * 但后端必须独立再校验一次（前端可控）。
+ *
+ * ── 契约：四角色命名与后端鉴权角色的映射（single point of change）──────────────
+ * 后端（licensing-api §4）用「鉴权角色名」，前端沿用同一套 id，避免两处维护：
+ *   - 后端 `admin`   →  前端 `system`   （系统管理员：密钥轮换 / 租户策略 / 账号）
+ *   - 后端 `viewer`  →  前端 `risk`     （风控只读者：回执异常 + 审计只读）
+ *   - 前端 `ops`     （运营：日常发码与查询，只读 + 发放）
+ *   - 前端 `lic_ops` （授权运营：执行废弃 / 重发 / 换机等**高危**操作）
+ * 若后端改名，**只改这张表 + `ROLE_META`**，消费方（路由守卫 / 侧边菜单 / RoleGate）零改动。
+ *
+ * ── 契约：`audit.export` 为何仅授予 `system` ────────────────────────────────
+ * 审计日志的**导出**会把全量操作记录（含 actor / ip / 原因明细）落盘为可外传文件，
+ * 属高敏感数据外带面。设计上：
+ *   - `risk` 与 `system` 都能 `audit.view`（在线只读审计，用于风控核查）；
+ *   - 但只有 `system` 额外持有 `audit.export` —— 导出是「数据出境」动作，
+ *     收敛到系统管理员单一角色，便于追责与合规审计。
+ *   - `ops` / `lic_ops` 既不可 `audit.view` 也不可 `audit.export`（最小权限原则）。
  */
 
 import type { Component } from 'vue';
