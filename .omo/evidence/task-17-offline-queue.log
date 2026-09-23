@@ -1,0 +1,36 @@
+# task 17 断网续传 SQLite 持久化队列 — 证据
+
+## 交付
+- crates/daemon/src/offline_queue.rs（1560+ 行，含 14 个单测）
+- 独立库文件 queue.db（WAL），与 task 18 的 telemetry.db 物理隔离（测试断言文件名 + 无 telemetry.db）
+
+## 单写线程架构
+- std::thread + std::sync::mpsc 单写者；对外只暴露 &self（Cmd 指令 + oneshot 响应）
+- 选型理由：rusqlite Connection 非 Sync，专用 OS 线程持有连接天然满足"SQLite 单写者"，
+  且不阻塞 tokio 运行时（queue 操作走 blocking 线程而非 runtime worker）
+
+## 门禁（EXIT）
+- cargo fmt -p daemon -- --check → 0
+- cargo clippy -p daemon --all-targets -- -D warnings → 0
+- cargo test -p daemon offline_queue → 0（14 passed / 0 failed）
+- cargo test -p daemon → 0（169 passed / 0 failed / 1 ignored）
+
+## QA 场景落点
+- Happy 断网 100 条→恢复→按序补发无重复：qa_happy_offline_100_rows_replayed_in_order_without_duplicates
+- 7 天/10GB 环形覆盖：retention_eviction_after_clock_advances_past_seven_days /
+  ring_overwrite_when_db_bytes_exceed_limit
+- 硬上限丢弃最旧 + 审计（不静默）：hard_limit_drops_oldest_with_audit_and_keeps_newest
+- 重启后按 high-water mark 续传：restart_after_partial_ack_resumes_from_high_water_mark
+
+## 主理人收口修复（429 中断后续修）
+被平台频率限制打断在收尾前，主理人接续修复 6 处：
+1. cfg_for_writer_max_db_bytes 未定义 → 改为克隆 cfg 后取 cfg.max_db_bytes/retention_ns
+2. self.maintain(&tx) 触发 E0502（conn 已可变借出）→ 拆成自由函数 maintain(tx, ...) + 薄包装
+3. maintain 迁移时残留多余右花括号 → 补回 impl DbWriter 块头
+4. push_audit_to 遗留旧名 → 统一为 push_audit
+5. flush() 中 batches move 后复用 → send_persist(batches.clone())
+6. close() 返回 Result<usize> 与签名不符 → .map(|_| ())
+7. **写线程 spawn 尾部的指令循环缺失**（run(cmd_rx) 从未调用，Cmd 字段全 "never read"）
+   → 在 bootstrap 成功后调用 writer.run(cmd_rx)；handle 存入结构体（原为 None，Drop/close 无法 join）
+8. enqueue seq 偏移 1（fetch_add(1).saturating_add(1) 重复 +1）→ 直接取 fetch_add 旧值
+9. 高水位字段被硬编码为 0 → 改用 self.cfg.high_water_rows()/high_water_bytes()（原 0 使每批都强制落盘）

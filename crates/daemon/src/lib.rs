@@ -22,6 +22,7 @@ pub mod driver;
 pub mod error;
 pub mod logging;
 pub mod north;
+pub mod offline_queue;
 pub mod pipeline;
 pub mod rules;
 pub mod scheduler;
