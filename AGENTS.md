@@ -8,8 +8,15 @@ Windows = Tauri 桌面；Linux = Docker 容器（主推）+ headless；前端 Vu
 - **Wave 0 设计已定稿**（用户确认）：全部设计资产在 `docs/design/`，入口索引 = `docs/design/README.md`
   （每份资产标注对应计划任务号）。客户端界面实现基准 = `docs/design/prototype/gateway-v2a-glacier.html`，
   管理后台基准 = `docs/design/prototype/admin-console.html`。
-- **Wave 1（task 1-7）已完成**：36 测试全绿，fmt/clippy/test 三道门禁绿，master 5 笔 commit，工作区 clean。
-- **下一步**：Wave 2a（task 8+ 数据模型 / 驱动 trait）；task 45-48（licensing-server 实现）与 60/61（容器工程）已解锁。
+- **Wave 1（task 1-7）已完成**：36 测试全绿。
+- **Wave 2 / 2b 已完成**：task 8/9（驱动 trait + Modbus TCP/RTU）、task 15（数据处理内核 DataProcessor）。
+- **Wave 3 已完成并入库**（commit `bdabb6e` / `96e0d2a` / `150d148` / `fd3800f`）：
+  task 16 组轮询调度器、task 19 MQTT 客户端（rumqttc+rustls）、task 20 声明式 JSON 规则引擎、
+  task 21 Ed25519 AuthBlock 签名。daemon 143 测试全绿，clippy `--all-targets -D warnings` 零告警。
+- **进行中（Wave 3 尾 / Wave 6）**：task 62 北向双编码器（`north/encoder.rs`）、
+  task 17 断网续传队列（`offline_queue.rs`）、task 45 云授权服务（`crates/licensing-server/`）。
+- **下一步**：task 18 加密存储（依赖 17）、task 46 激活码生命周期（依赖 45）、
+  task 22 云授权客户端（依赖 45）、task 23/24 试用与降级、task 25/26 安全。
 
 ## 唯一计划契约（按需读取，禁止整读）
 
@@ -38,7 +45,12 @@ export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' \
 
 ## 依赖红线（违反即返工）
 
-1. **纯 Rust 依赖栈**：禁 rusqlite / openssl-sys 等 C 编译依赖（Wave 2b 引入前需确认 mingw 编译可行性）
+1. **纯 Rust 依赖栈（口径已澄清 2026-09-23）**：红线禁的是**需要系统 C 库 / 系统构建工具链**的依赖
+   （openssl-sys 非 vendored、paho-mqtt、aws-lc-rs 需 cmake+NASM）。**vendored C 源**（随 crate 一起编译、
+   不链接系统库）不在禁止之列，但引入前必须实测 mingw 构建通过：
+   - ✅ `rusqlite 0.40.2 + bundled`（libsqlite3-sys 0.38.2，task 17/18 用）—— 已实测 `cargo check` EXIT=0
+   - ❌ `aws-lc-rs`（cmake/NASM）；rustls 的 crypto provider 统一选 **`ring`**（已显式启用）
+   - ❌ `paho-mqtt`（C 库）→ 用 `rumqttc`；❌ `openssl-sys` → 用 rustls 系
 2. **raw-dylib 敏感**：`windows-sys 0.60+` / `getrandom 0.4` 走 raw-dylib，须 mingw dlltool 链接；
    mingw 已就绪（`D:\rust\mingw64`），tempfile 无需钉版
 3. **密钥红线**：仓库不提交激活码 / 私钥 / 真实机器码；HMAC key 从配置 / env 注入；

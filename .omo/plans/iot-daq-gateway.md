@@ -34,6 +34,28 @@
 > - ✅ 提交：`44e7f2b` chore(wave1): monorepo scaffold（69 文件）；`f411069` feat(wave1): protobuf schema + machine fingerprint + config + logging + error（16 文件）。
 > - ⚠️ 工具链坑（已记录进 README 构建节）：① PATH 中 `/d/rust/mingw64/bin` **必须排在** rustup gnu `self-contained` 之前（工程师实测，顺序错则 raw-dylib/dlltool 构建失败）；② mingw-w64 独立工具链已装至 `D:\rust\mingw64`（为 Wave 2b rusqlite bundled 铺路）；③ tempfile 钉版 3.14.0 已随 mingw64 就绪**解除**（3.27.0 回浮）。另：task 7 前端 vitest 未实施（前端尚无工程，归 Wave 5 UI 基建补齐，已批准偏差）。
 > - ⏳ QA 独立回归进行中（团队任务 #12，software-qa-engineer 严过关）。
+> **Wave 2 / 2b / 3 实施记录（2026-09-23，主理人 + 并行工程师团队）**：
+>
+> - ✅ task 8/9 南向驱动（opencode 产出，已审查合格）：Driver trait + PointAddressParser + 地址偏移正确
+>   （mock server 侧断言 `ReadHoldingRegisters(0,2)` 证明 40001→PDU 地址 0）+ Modbus TCP / RTU-over-TCP。
+> - ✅ task 15 数据处理内核 `DataProcessor`（映射 / 单位换算 / 死区 / 时间戳统一，14 单测）。
+> - ✅ task 16 组轮询调度器（907 行 / 11 测试）：一组一 task 一 interval + `tokio::time::pause/advance`
+>   零真实等待；QA 场景「组 A 10 拍 vs 组 B 1 拍」精确成立；故障组仍被调度且不拖慢健康组。
+> - ✅ task 19 MQTT 客户端（1862 行 / 24 测试）：rumqttc + rustls，回环 mock broker 上的真实
+>   PUBACK/SUBACK 往返 + 断线重连 `session_present` 断言（含 clean_session=true 对照实验）；
+>   encoding 只声明不实现（序列化归 task 62）。
+> - ✅ task 20 规则引擎（1426 行 / 16 测试）：SELECT/WHERE/DO + JSONPath 重映射；数值变换与死区
+>   **严格委托 task 15 的 DataProcessor**；畸形规则一律 ConfigError(2000)。
+> - ✅ task 21 AuthBlock 签名（1002 行 / 20 测试）：签**业务语义哈希**（排序 + 长度前缀），
+>   签名域 `iotdaq.authblock.v1|ph|mid|ts|nonce`；授权闸门关闭时**不产出签名**；私钥不落盘。
+> - ⚠️ 新坑：rumqttc/tokio-rustls 引入的 rustls **未启用任何 crypto provider**（`get_default()` = None，
+>   mqtts 握手会失败）→ 已在 daemon 依赖显式启用 rustls `ring` 特性（不用 aws-lc-rs：cmake/NASM），
+>   并在 `to_transport()` 内 `ensure_rustls_provider()` + 回归测试 `tls_crypto_provider_is_installed` 双重守护。
+> - ✅ 依赖口径拍板：**vendored C 源可用**（rusqlite 0.40.2 bundled 已实测 mingw 构建 EXIT=0），
+>   红线禁的只是需要系统 C 库/工具链的依赖（openssl-sys 非 vendored / paho-mqtt / aws-lc-rs）。
+> - 提交：`47c54dc` 数据处理、`bdabb6e` 调度器、`96e0d2a` 规则引擎、`150d148` 签名、`fd3800f` MQTT。
+>   daemon 143 测试全绿，clippy `--all-targets -D warnings` 零告警。
+>
 > **Linux 交付形态**: **Docker 容器为主**（可选原生 deb/rpm + systemd）。容器化直接冲击「一机一码 + 试用期」两条防破解主线——**机器码必须锚定宿主机、试用与授权状态必须落宿主机持久卷**，否则 `docker rm && docker run` 即可重置试用、授权也会失效。
 > **二次校验与北向编码（本轮定案）**: 二次校验**按 A/B/C 三档并存、默认 B**——B 档下业务数据直连客户 Broker（不经厂商），厂商只收**审计回执**（心跳 + 序号区间 + 条数 + 摘要哈希，**不含业务数值**）。北向编码为**每路出口独立可选**（`protobuf` 默认 / `json`），JSON 路径**超 2^53−1 的整数必须转字符串**。防破解力度定案 **Tier-1**（预算 控制面 7 : 客户端 3）。
 
@@ -1322,7 +1344,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: .omo/evidence/task-15-processing.log
   **Commit**: YES — `feat(processing): implement data processor`
 
-- [ ] 16. 组轮询调度器（Neuron group_timer 模式）
+- [x] 16. 组轮询调度器（Neuron group_timer 模式）
 
   **What to do**:
   - 实现 `GroupScheduler`，按组（group）独立轮询
@@ -1399,7 +1421,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: .omo/evidence/task-18-local-storage.log
   **Commit**: YES — `feat(storage): implement SQLCipher encrypted local storage`
 
-- [ ] 19. MQTT 客户端（rumqttc-next 0.33，rustls，QoS 0/1/2）
+- [x] 19. MQTT 客户端（rumqttc-next 0.33，rustls，QoS 0/1/2）
 
   **What to do**:
   - 实现 `MqttClient` 结构体
@@ -1422,7 +1444,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: .omo/evidence/task-19-mqtt-client.log
   **Commit**: YES — `feat(mqtt): implement MQTT client with rustls`
 
-- [ ] 20. MQTT 转发规则引擎（声明式 JSON 规则）
+- [x] 20. MQTT 转发规则引擎（声明式 JSON 规则）
 
   **边界声明（与 15/37 互斥）**: 本任务交付**规则引擎框架**——规则 JSON schema、解析器、SELECT/WHERE/DO 求值、Topic 路由与 JSONPath 字段重映射，**动作集限于 P0 子集（过滤 + 路由 + 字段重映射）**。`点位映射 / 单位换算 / 死区过滤` **一律复用任务 15 的 `DataProcessor`，不得在本任务重复实现**；完整动作集、规则版本管理、规则间组合与循环依赖检测归任务 37。
 
@@ -1446,7 +1468,7 @@ Max Concurrent: 8 (Wave 7；Wave 6 可与 Wave 3/4 并行；**Wave 7b 于任务 
   **Evidence**: .omo/evidence/task-20-rules.log
   **Commit**: YES — `feat(rules): implement declarative JSON rule engine`
 
-- [ ] 21. AuthBlock 签名模块（Ed25519，业务语义哈希）
+- [x] 21. AuthBlock 签名模块（Ed25519，业务语义哈希）
 
   **What to do**:
   - 实现 `AuthSigner` 结构体
