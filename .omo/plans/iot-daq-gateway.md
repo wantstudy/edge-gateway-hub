@@ -3017,3 +3017,61 @@ cargo test --package daemon formula        # Expected: all pass（含环检测�
 2. **禁止用 `git checkout <file>` 撤回临时改动** —— 会回退到 HEAD 而非「改之前」；改用先备份再改
 
 **恢复**：已派 `engineer-rules-2` 重建辅助函数（其知识在手），要求恢复 121 passed。
+
+---
+
+## 实施记录 · 第四轮（B 档回执验签安全红线，commit `9e167c2`）
+
+### 缺陷：`audit_receipt` 完全无验签（项目最严重缺陷）
+
+**发现路径**：`engineer-licensing-2` 在实现服务端侧验签时发现，并**同时纠正了主理人的描述错误**
+——主理人先前告诉该工程师「重建域串后直接验签」，漏了 `SHA-256("iotdaq.receipt.semantic.v1|" ++ 域串)`
+这层预哈希；照该描述实现会**全部验签失败**。主理人独立复核确认工程师全对。
+
+**缺陷事实**：`service.rs::audit_receipt` 中 `req.sig` 唯一出现处是 `sig: req.sig.clone()`（原样落库），
+从未参与校验。任何人构造 `sig="x"` 的回执 → `accepted=true` → 污染 `audit_receipt` 表 →
+推进序号窗口 → **真实跳空告警被掩盖**。B 档（默认拓扑）信任链形同虚设。
+
+### 处置（主理人亲自实现）
+
+`engineer-licensing-2` 会话故障（Bash 输出全空，跑 2m27s 后 completed 但未交付任何文件），
+主理人接手实现。
+
+**新增 `crates/licensing-server/src/receipt.rs`（15 测试）**：
+- 确定性签名域串（无 nonce）+ 二级域预哈希
+- `verify_receipt_signature` 校验顺序：数值解析 → 区间方向 → **时序窗先于验签**（省 CPU）→
+  空签名快速拒绝 → `ring.verify_any(&payload_hash, &sig)`
+- `decode_signature` 只接受 STANDARD base64；`parse_receipt_ints` 溢出拒绝而非截断
+
+**`service.rs::audit_receipt` 插入规则 2.5**：位置 = 租约校验后、幂等/跳空前。
+「不可信数据不得参与业务判定或短路返回」—— 若放在幂等之后，伪造回执可借
+「与上一条同区间」路径拿到 `accepted=true`。失败 → 拒收（`TokenInvalid`）+ 记审计
+（`receipt_signature_invalid`，entity 锚定 lease）。
+
+**测试 4 条安全红线 + 2 条补报语义澄清**（详见 `.omo/evidence/task-receipt-verify.log`）。
+
+### 关键澄清：补报 ≠ 绕过时序窗
+
+原测试 `audit_receipt_allows_late_backfill` 用「30 天前 ts」断言被接受，与新增时序窗冲突。
+核实设计 §1.4 第 5 条后确认：**「延迟补报」指网关侧队列积压（分钟~小时量级），
+时序窗仍然适用**（它防的是重放旧回执）。拆为「窗内接受（落后 4 分钟）」+
+「超窗拒绝（30 天）」两条，语义边界比原来更清晰。
+
+### 变异实验结论
+
+以「只解析字段格式、不校验签名有效性」的替身替换真实验签（**精确等价于修复前行为**）→
+**5 条测试失败**（forged 系列 3 条 + tampered + 超窗）；还原后 394 passed / 0 failed。
+→ 新增测试对「跳过验签」具有**真实捕获能力**，非空跑。
+
+### 环境陷阱（新增）
+
+`cargo test` 报 `Blocking waiting for file lock on build directory` 时，
+**该次运行的测试结果不可信**（可能执行了源文件最新改动落盘前的旧二进制）。
+本轮首次全量测试的 1 failed 即由此产生：单独跑通过、连续 6 轮全量通过，确认为构建竞争而非真实缺陷。
+
+### 当前状态
+
+- workspace 三门禁：fmt OK / clippy 零 warning / **394 passed, 0 failed**
+- `licensing-server` 156 测试（本轮 +6）
+- 待办：`engineer-rules-2` 的 `http.rs`（11 端点）尚未提交，需在其完成后单独复核
+  `/audit/receipt` 是否把 `TokenInvalid` 正确映射为 HTTP 401
