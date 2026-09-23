@@ -28,7 +28,8 @@ export RUSTUP_HOME='D:\rust\rustup' CARGO_HOME='D:\rust\cargo' \
 1. **纯 Rust 依赖栈**：禁止 rusqlite / openssl-sys 等 C 编译依赖（Wave 2b/3 前提下；
    引入前确认 mingw 工具链与 `cargo deny`）。
 2. **raw-dylib 敏感**：`windows-sys 0.60+` / `getrandom 0.4` 走 raw-dylib，必须经
-   mingw dlltool 链接；若 mingw 不可用，依赖树需钉旧版（tempfile 已钉 3.14.0，见根 README）。
+   mingw dlltool 链接；mingw-w64 已就绪（`D:\rust\mingw64`），tempfile **无需钉版**
+   （3.27.0 正常解析）；仅当 mingw 不可用时才回退「依赖树钉旧版」方案（如 tempfile 3.14.0）。
 3. **密钥红线**：仓库不提交激活码 / 私钥 / 真实机器码；HMAC key 从配置 / env 注入；
    测试专用 key 以 `TEST_ONLY_` 前缀命名并在注释标注 test-only。
 4. **客户端语义**：客户端代码不得出现「解绑 / 重置试用」入口（换机由厂商后台执行）。
