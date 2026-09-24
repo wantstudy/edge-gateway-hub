@@ -24,11 +24,16 @@
 //!    `NaN` 永不被死区吞掉（比较恒为 false），由 quality 表达其有效性。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol_proto::Quality;
 
+use crate::backpressure::{enqueue_with_backpressure, AdmitOutcome, AuditLog};
+use crate::codec::Quality as CodecQuality;
 use crate::error::{DaemonError, DaemonResult};
+use crate::formula::{DerivedResult, FormulaEngine, InputValue, PointValues};
+use crate::offline_queue::{Clock, OfflineQueue};
 
 // ---- 配置 ----
 
@@ -221,6 +226,129 @@ impl DataProcessor {
     /// 清除某点位的死区基准（配置热重载 / 点位删除后调用）。
     pub fn reset(&mut self, point_id: &str) {
         self.last_reported.remove(point_id);
+    }
+
+    /// 按源点位标识查配置（编排层据此把采样映射为工程单位值 + 目标 `point_id`，
+    /// 供公式输入使用；只读，不改变死区基准）。
+    pub fn lookup(&self, source_id: &str) -> Option<&PointConfig> {
+        self.configs.get(source_id)
+    }
+}
+
+// ---- 采集 → 分发编排器（codec / formula / backpressure 接线点）----
+
+/// 采集→分发编排器：把已建好的三个基础原语（codec 质量码归一、formula 周期屏障、
+/// backpressure 入队背压）编排进「采集 → 归一化 → 数据处理器 → 公式周期求值 → 背压入队」。
+///
+/// ## 红线（来自任务书，不可逾越）
+/// - **质量码归一**：物理点进入管线时，其 `protocol_proto::Quality`（线路码）经
+///   [`CodecQuality::from_wire`] 归一为统一 [`CodecQuality`]，供公式引擎消费；
+///   [`RawSample`] / [`ProcessedSample`] 的 `quality` 字段类型（线路码）**不得改动**
+///   （被 `rules.rs` / `north/encoder.rs` / `north/mqtt.rs` 消费，改动即返工）。
+/// - **缺失点不污染 `worst()`**：缺失物理点只以 [`InputValue::missing`] 进入公式输入，
+///   其携带的 `Bad` 仅作展示、不参与 `Quality::worst` 合并（由公式引擎
+///   `InputValue::inheritable_quality` 保证）；本编排器**不替缺失点合成 `Bad` / `Timeout`**。
+/// - **公式周期屏障**：每个采集周期所有物理点更新对公式可见**之后**，才调用
+///   [`FormulaEngine::eval_cycle`] 统一求值（引擎内部拓扑排序 + 整周期后下移历史快照）。
+/// - **入队背压**：写入离线队列一律走 [`enqueue_with_backpressure`]，水位超限时该入口
+///   自行拒绝 / 降级并交还负载，**绝不静默丢数据**。
+pub struct AcquisitionPipeline {
+    /// 逐点数据处理器（换算 + 死区）。
+    processor: DataProcessor,
+    /// 公式引擎（派生点求值；`None` = 不配置公式）。
+    formula: Option<FormulaEngine>,
+    /// 离线队列（背压入队目标；`None` = 不入队，仅做处理 / 求值）。
+    queue: Option<Arc<OfflineQueue>>,
+    /// 背压审计（入队拒绝 / 降级记录）。
+    audit: Arc<AuditLog>,
+    /// 可注入时钟（入队审计时间戳）。
+    clock: Arc<dyn Clock>,
+    /// 本采集周期已更新的物理点输入（周期屏障用，求值后清空）。
+    cycle_inputs: PointValues,
+}
+
+impl AcquisitionPipeline {
+    /// 构建编排器。
+    ///
+    /// # Arguments
+    /// - `processor`：数据处理器（持有点位表）。
+    /// - `formula`：公式引擎（可选，未配置公式时传 `None`）。
+    /// - `queue`：离线队列（可选，仅做处理 / 求值时传 `None`）。
+    /// - `audit`：背压审计器。
+    /// - `clock`：可注入时钟。
+    pub fn new(
+        processor: DataProcessor,
+        formula: Option<FormulaEngine>,
+        queue: Option<Arc<OfflineQueue>>,
+        audit: Arc<AuditLog>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            processor,
+            formula,
+            queue,
+            audit,
+            clock,
+            cycle_inputs: HashMap::new(),
+        }
+    }
+
+    /// 摄入一个物理点样本（采集周期内的一次更新）。
+    ///
+    /// 流程：
+    /// 1. 线路质量码经 [`CodecQuality::from_wire`] 归一为统一质量码；
+    /// 2. 以**最新工程单位值**（不受死区过滤影响）写入本周期公式输入；
+    /// 3. 走数据处理器（换算 + 死区），返回北向发射用的 [`ProcessedSample`]
+    ///    （被死区过滤时返回 `Ok(None)`）。
+    pub fn ingest_physical(
+        &mut self,
+        raw: RawSample,
+        ts_ns: i64,
+    ) -> DaemonResult<Option<ProcessedSample>> {
+        let normalized = CodecQuality::from_wire(raw.quality);
+        // 公式输入始终用最新工程单位值，与死区过滤解耦：
+        // 死区只决定「是否北向发射」，不改变公式本周期的输入真值。
+        if let Some(cfg) = self.processor.lookup(&raw.source_id) {
+            let engineering = raw.value * cfg.scale + cfg.offset;
+            self.cycle_inputs.insert(
+                cfg.point_id.clone(),
+                InputValue::Numeric(engineering, normalized),
+            );
+        }
+        // 死区过滤后的工程单位输出（北向发射 / 编码用）。
+        self.processor.process_at(raw, ts_ns)
+    }
+
+    /// 周期屏障：本周期内所有物理点已 [`Self::ingest_physical`] 后调用，统一对派生点求值。
+    ///
+    /// 缺失物理点不在此显式补 [`InputValue::missing`]——公式引擎对 `cycle_inputs` 中缺失的
+    /// 键自动按缺失处理，且其 `Bad` 不参与 `Quality::worst` 合并（见模块红线）。
+    ///
+    /// 返回本轮派生结果（供北向发射；`emitted == false` 的条目调用方可按需忽略）。
+    pub fn finish_cycle(&mut self, ts_ns: i64) -> Vec<DerivedResult> {
+        let derived = match self.formula.as_mut() {
+            Some(engine) => engine.eval_cycle(&self.cycle_inputs, ts_ns),
+            None => Vec::new(),
+        };
+        self.cycle_inputs.clear();
+        derived
+    }
+
+    /// 带背压地将已编码负载写入离线队列。
+    ///
+    /// 委托 [`enqueue_with_backpressure`]：水位超限时该入口自行拒绝 / 降级并交还负载，
+    /// 返回 [`AdmitOutcome::Admitted { seq }`] 或 [`AdmitOutcome::Rejected { .. }]。
+    /// 未配置队列时返回 `Rejected`（调用方据此告警，不静默丢弃）。
+    pub fn enqueue(&self, payload: Vec<u8>) -> AdmitOutcome {
+        match &self.queue {
+            Some(queue) => {
+                enqueue_with_backpressure(queue, payload, &self.audit, self.clock.as_ref())
+            }
+            None => AdmitOutcome::Rejected {
+                payload,
+                reason: "acquisition pipeline: offline queue not configured".to_string(),
+            },
+        }
     }
 }
 
@@ -545,5 +673,217 @@ mod tests {
                 .is_some(),
             "deadband 0 means no filtering"
         );
+    }
+}
+
+// ---- 接线测试：codec 归一 / formula 周期屏障 / backpressure 入队 ----
+
+#[cfg(test)]
+mod pipeline_wire_tests {
+    use super::*;
+    use crate::backpressure::{AdmitOutcome, AuditLog};
+    use crate::codec::Quality as CodecQuality;
+    use crate::formula::{CalcFailure, DerivedPointConfig, FormulaEngine};
+    use crate::offline_queue::{Clock, ManualClock, OfflineQueue, QueueConfig};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const TS: i64 = 1_700_000_000_000_000_000;
+
+    fn raw(source_id: &str, value: f64) -> RawSample {
+        raw_with(source_id, value, Quality::Good)
+    }
+
+    fn raw_with(source_id: &str, value: f64, quality: Quality) -> RawSample {
+        RawSample {
+            source_id: source_id.to_string(),
+            value,
+            quality,
+            device_ts_ns: None,
+        }
+    }
+
+    /// 构建「仅处理 + 公式」的管线（不入队）。
+    fn pipeline_with_formula(
+        points: Vec<PointConfig>,
+        derived: Vec<DerivedPointConfig>,
+    ) -> AcquisitionPipeline {
+        let formula = FormulaEngine::new(derived).expect("formula compiles");
+        AcquisitionPipeline::new(
+            DataProcessor::new(points).expect("point config"),
+            Some(formula),
+            None,
+            Arc::new(AuditLog::new(8)),
+            Arc::new(ManualClock::new(0)),
+        )
+    }
+
+    /// 唯一临时目录（避免并行测试抢同一 db 文件）。
+    fn temp_queue_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("iot_daq_wire_{}_{}", std::process::id(), n));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    // ---- 公式周期屏障：所有物理点更新可见后才求值 ----
+
+    #[test]
+    fn formula_cycle_barrier_evaluates_after_all_physical() {
+        let mut pipe = pipeline_with_formula(
+            vec![
+                PointConfig::passthrough("s_a", "a", "m1", "°C"),
+                PointConfig::passthrough("s_b", "b", "m1", "°C"),
+            ],
+            vec![DerivedPointConfig::new("sum", "[a] + [b]")],
+        );
+        // 摄入两个物理点（a=3, b=4）后再求值。
+        assert!(pipe
+            .ingest_physical(raw("s_a", 3.0), TS)
+            .expect("ok")
+            .is_some());
+        assert!(pipe
+            .ingest_physical(raw("s_b", 4.0), TS)
+            .expect("ok")
+            .is_some());
+        let derived = pipe.finish_cycle(TS);
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].point_id, "sum");
+        assert!(!derived[0].failed, "both inputs present → success");
+        assert!(
+            (derived[0].value.unwrap() - 7.0).abs() < 1e-9,
+            "got {:?}",
+            derived[0].value
+        );
+
+        // `finish_cycle` 清空本周期输入：再求值（无新摄入）→ 全部缺失 → 失败。
+        let empty = pipe.finish_cycle(TS);
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].failed, "no physical update this cycle → missing");
+    }
+
+    // ---- 质量码归一：线路码 → 统一码 ----
+
+    #[test]
+    fn quality_normalization_keeps_good() {
+        let mut pipe = pipeline_with_formula(
+            vec![PointConfig::passthrough("s_p", "p", "m1", "°C")],
+            vec![DerivedPointConfig::new("f", "[p]")],
+        );
+        pipe.ingest_physical(raw("s_p", 2.5), TS).expect("ok");
+        let derived = pipe.finish_cycle(TS);
+        assert_eq!(derived.len(), 1);
+        assert!(!derived[0].failed);
+        assert!((derived[0].value.unwrap() - 2.5).abs() < 1e-9);
+        assert_eq!(
+            derived[0].quality,
+            CodecQuality::Good,
+            "Good wire → Good codec"
+        );
+    }
+
+    /// 红线 1：存在的「坏」物理点其 Bad 质量码**参与**继承（有读数），不会被判为缺失失败。
+    #[test]
+    fn present_bad_point_inherits_into_result() {
+        let mut pipe = pipeline_with_formula(
+            vec![PointConfig::passthrough("s_p", "p", "m1", "°C")],
+            vec![DerivedPointConfig::new("f", "[p]")],
+        );
+        pipe.ingest_physical(raw_with("s_p", 9.0, Quality::Bad), TS)
+            .expect("ok");
+        let derived = pipe.finish_cycle(TS);
+        assert_eq!(derived.len(), 1);
+        assert!(
+            !derived[0].failed,
+            "present-but-Bad still computes (has a reading)"
+        );
+        assert_eq!(
+            derived[0].quality,
+            CodecQuality::Bad,
+            "Bad wire → Bad codec, inherited"
+        );
+    }
+
+    /// 红线 2：缺失物理点**不**合成 Bad 进入 `worst()`——结果是「缺失输入失败」，而非伪装好值。
+    #[test]
+    fn missing_point_triggers_missing_input_failure() {
+        // 公式依赖 a、b；本周期只更新 a，b 缺失。
+        let mut pipe = pipeline_with_formula(
+            vec![PointConfig::passthrough("s_a", "a", "m1", "°C")],
+            vec![DerivedPointConfig::new("sum", "[a] + [b]")],
+        );
+        pipe.ingest_physical(raw("s_a", 5.0), TS).expect("ok");
+        let derived = pipe.finish_cycle(TS);
+        assert_eq!(derived.len(), 1);
+        assert!(
+            derived[0].failed,
+            "missing input must fail the derived point (not a fake good)"
+        );
+        assert_eq!(derived[0].reason, Some(CalcFailure::MissingInput));
+    }
+
+    /// 公式输入与死区解耦：死区吞掉北向发射，但不影响本周期公式输入真值。
+    #[test]
+    fn formula_input_decoupled_from_deadband() {
+        let cfg = PointConfig {
+            deadband: 1.0,
+            ..PointConfig::passthrough("s_p", "p", "m1", "°C")
+        };
+        let mut pipe = pipeline_with_formula(vec![cfg], vec![DerivedPointConfig::new("f", "[p]")]);
+        let first = pipe.ingest_physical(raw("s_p", 10.0), TS).expect("ok");
+        assert!(first.is_some(), "first emission passes");
+        let second = pipe.ingest_physical(raw("s_p", 10.0), TS).expect("ok");
+        assert!(second.is_none(), "deadband suppresses emission");
+        // 公式仍见最新值 10.0（未因死区而使用过期值）。
+        let derived = pipe.finish_cycle(TS);
+        assert_eq!(derived.len(), 1);
+        assert!(!derived[0].failed);
+        assert!((derived[0].value.unwrap() - 10.0).abs() < 1e-9);
+    }
+
+    // ---- 入队背压：enqueue_with_backpressure ----
+
+    #[test]
+    fn enqueue_with_backpressure_admits_when_queue_low() {
+        let dir = temp_queue_dir();
+        let db = dir.join("queue.db");
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(0));
+        let queue = Arc::new(
+            OfflineQueue::open(
+                QueueConfig::new(db.clone(), "gw-wire").expect("queue cfg"),
+                clock.clone(),
+            )
+            .expect("queue"),
+        );
+        let audit = Arc::new(AuditLog::new(64));
+        let pipe = AcquisitionPipeline::new(
+            DataProcessor::new(vec![PointConfig::passthrough("x", "p", "m1", "°C")]).expect("cfg"),
+            None,
+            Some(queue.clone()),
+            audit,
+            clock,
+        );
+        let outcome = pipe.enqueue(b"payload-1".to_vec());
+        assert!(
+            matches!(outcome, AdmitOutcome::Admitted { seq } if seq >= 1),
+            "got {outcome:?}"
+        );
+        drop(pipe);
+        drop(queue);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enqueue_without_queue_is_rejected_not_dropped() {
+        let pipe = AcquisitionPipeline::new(
+            DataProcessor::new(vec![PointConfig::passthrough("x", "p", "m1", "°C")]).expect("cfg"),
+            None,
+            None,
+            Arc::new(AuditLog::new(8)),
+            Arc::new(ManualClock::new(0)),
+        );
+        let outcome = pipe.enqueue(b"x".to_vec());
+        assert!(matches!(outcome, AdmitOutcome::Rejected { .. }));
     }
 }

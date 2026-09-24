@@ -334,10 +334,13 @@ pub fn digest_of_encoded(enc: Encoding, bytes: &[u8]) -> DaemonResult<[u8; 32]> 
 /// - `!value.is_finite()`（NaN / ±Infinity）→ quality **强制降为 `BAD`**
 ///   （两条编码路径同一规则，故语义哈希一致；这不是单位换算也不是死区过滤）。
 pub fn sample_to_data_point(sample: &ProcessedSample) -> DataPoint {
+    // 质量码经 codec 归一：原始 protobuf 质量码 → 统一 Quality → 回写 WireQuality。
+    // 这样非法 / 未知码值（如 SIMULATED / UNSPECIFIED）被规范到已知区间，
+    // 线路上的质量码一致（目标 4）。
     let quality = if sample.value.is_finite() {
-        sample.quality as i32
+        crate::codec::Quality::from_wire(sample.quality).to_wire() as i32
     } else {
-        Quality::Bad as i32
+        crate::codec::Quality::Bad.to_wire() as i32
     };
     DataPoint {
         device_id: sample.device_id.clone(),

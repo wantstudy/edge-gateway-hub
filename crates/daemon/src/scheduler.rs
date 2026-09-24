@@ -38,6 +38,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
+use crate::backpressure::AcquisitionGovernor;
 use crate::error::{DaemonError, DaemonResult};
 
 // ---- 配置 ----
@@ -363,7 +364,7 @@ impl<H: PollHandler + 'static> GroupScheduler<H> {
                     .get(&config.name)
                     .cloned()
                     .unwrap_or_else(|| Arc::new(GroupStats::default()));
-                Self::spawn_group(handler.clone(), config, group_stats)
+                Self::spawn_group(handler.clone(), config, group_stats, None, None)
             })
             .collect();
         RunningScheduler {
@@ -373,12 +374,61 @@ impl<H: PollHandler + 'static> GroupScheduler<H> {
         }
     }
 
-    /// 单组任务主循环：等拍 → 轮询 → 记账 → 继续（失败不退出）。
-    fn spawn_group(handler: Arc<H>, config: GroupConfig, stats: Arc<GroupStats>) -> JoinHandle<()> {
+    /// 启动全部组的独立轮询任务，并接入**自适应节流调控器**（task 54 背压）。
+    ///
+    /// 与 [`Self::start`] 行为一致，但每组循环在每轮 `poll` 后调用
+    /// [`AcquisitionGovernor::observe`] 观测内存队列行数（`rows_provider` 提供），
+    /// 持续高位时逐级**放大轮询周期**（降采样），持续低位时恢复——带迟滞，不抖动。
+    ///
+    /// 该路径**默认不启用**：仅当显式调用本方法并传入调控器时才生效；不调用即与
+    /// [`Self::start`] 完全等价（既有测试不受影响）。
+    pub fn start_adaptive(
+        self,
+        governor: Arc<Mutex<AcquisitionGovernor>>,
+        rows_provider: Arc<dyn Fn() -> usize + Send + Sync>,
+    ) -> RunningScheduler {
+        let Self {
+            handler,
+            groups,
+            stats,
+        } = self;
+        let names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+        let handles: Vec<JoinHandle<()>> = groups
+            .into_iter()
+            .map(|config| {
+                let group_stats = stats
+                    .get(&config.name)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(GroupStats::default()));
+                Self::spawn_group(
+                    handler.clone(),
+                    config,
+                    group_stats,
+                    Some(governor.clone()),
+                    Some(rows_provider.clone()),
+                )
+            })
+            .collect();
+        RunningScheduler {
+            names,
+            handles,
+            stats,
+        }
+    }
+
+    /// 单组任务主循环：等拍 → 轮询 → 记账 → （可选）观测水位节流 → 继续（失败不退出）。
+    fn spawn_group(
+        handler: Arc<H>,
+        config: GroupConfig,
+        stats: Arc<GroupStats>,
+        governor: Option<Arc<Mutex<AcquisitionGovernor>>>,
+        rows_provider: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
             // 首拍推迟一个周期（设计决策 2）+ 阻塞后不补采（设计决策 3）。
             let mut ticker = interval_at(Instant::now() + config.interval, config.interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut current_interval = config.interval;
             info!(
                 "scheduler: group {} started with interval {}ms, {} point(s)",
                 config.name,
@@ -389,6 +439,21 @@ impl<H: PollHandler + 'static> GroupScheduler<H> {
                 // 等拍 → 轮询（返回值仅用于日志路径；失败已在 `execute_poll` 内记账）。
                 ticker.tick().await;
                 let _ = execute_poll(handler.as_ref(), &config, &stats).await;
+
+                // 自适应节流（仅启用调控器时生效）：观测内存队列水位，持续高位则
+                // 放大轮询周期（降采样），低位则恢复；迟滞防抖。
+                if let (Some(gov), Some(provider)) = (&governor, &rows_provider) {
+                    if let Ok(mut guard) = gov.lock() {
+                        let decision = guard.observe(provider());
+                        let next = Duration::from_millis(decision.poll_interval_ms);
+                        if next != current_interval {
+                            current_interval = next;
+                            // 重建 interval（首拍同样推迟一个周期，避免瞬间爆发）。
+                            ticker = interval_at(Instant::now() + next, next);
+                            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                        }
+                    }
+                }
             }
         })
     }
@@ -445,7 +510,10 @@ impl Drop for RunningScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backpressure::{AcquisitionGovernorConfig, AuditLog};
     use crate::error::ERR_CONFIG;
+    use crate::offline_queue::{Clock, ManualClock};
+    use std::sync::Mutex;
 
     // ---- 测试用 handler：计数器 + 故障注入 + 卡死注入 ----
 
@@ -903,5 +971,72 @@ mod tests {
         running.shutdown().await;
         advance_steps(Duration::from_millis(100), 5).await;
         assert_eq!(stats.polls(), 3, "no polling after shutdown");
+    }
+
+    // ---- 自适应节流（背压 Governor） ----
+
+    /// 构造一个「高位即立即降采样」的调控器（基准 100ms，降采样后周期翻倍）。
+    fn high_water_governor() -> Arc<Mutex<AcquisitionGovernor>> {
+        let cfg = AcquisitionGovernorConfig {
+            high_water_rows: 2,
+            low_water_rows: 1,
+            sustain_samples: 1,
+            recover_samples: 1,
+            reduce_step_permille: 500,
+            min_factor_permille: 250,
+            base_poll_interval_ms: 100,
+        };
+        let audit = Arc::new(AuditLog::new(64));
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(0));
+        Arc::new(Mutex::new(AcquisitionGovernor::new(cfg, audit, clock)))
+    }
+
+    /// 水位持续高位 → 调度器被降采样（采集次数少于无调控基线）。
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_governor_throttles_polling_when_queue_high() {
+        let governor = high_water_governor();
+        // 内存队列行数始终高于高水位（2）→ 应触发降采样。
+        let rows_provider: Arc<dyn Fn() -> usize + Send + Sync> = Arc::new(|| 100);
+
+        let handler = FakeHandler::new(&[("A", &["a1"])]);
+        let scheduler =
+            GroupScheduler::new(handler, vec![group("A", 100, &["a1"])]).expect("valid scheduler");
+        let running = scheduler.start_adaptive(governor.clone(), rows_provider);
+        settle().await;
+        advance_steps(Duration::from_millis(100), 10).await;
+
+        // 基准 100ms 在 1s 内本应采 10 次；持续高位**逐级**降采样（100→200→250ms）→ 采集次数明显减少。
+        let polls = running.polls("A");
+        assert!(polls < 10, "governor must reduce polling, got {polls}");
+        assert!(polls > 0, "still some polling, got {polls}");
+        assert_eq!(
+            governor.lock().ok().map(|g| g.factor_permille()),
+            Some(250),
+            "factor reduced to the floor after sustained high water"
+        );
+        running.shutdown().await;
+    }
+
+    /// 水位持续低位 → 不降采样，行为与 `start()` 完全一致（既有的 10 次）。
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_governor_does_not_throttle_when_queue_low() {
+        let governor = high_water_governor();
+        // 内存队列行数始终为 0（远低于低水位）→ 不应降采样。
+        let rows_provider: Arc<dyn Fn() -> usize + Send + Sync> = Arc::new(|| 0);
+
+        let handler = FakeHandler::new(&[("A", &["a1"])]);
+        let scheduler =
+            GroupScheduler::new(handler, vec![group("A", 100, &["a1"])]).expect("valid scheduler");
+        let running = scheduler.start_adaptive(governor.clone(), rows_provider);
+        settle().await;
+        advance_steps(Duration::from_millis(100), 10).await;
+
+        assert_eq!(running.polls("A"), 10, "low water → no throttling");
+        assert_eq!(
+            governor.lock().ok().map(|g| g.factor_permille()),
+            Some(1_000),
+            "factor stays at 1000 permille"
+        );
+        running.shutdown().await;
     }
 }

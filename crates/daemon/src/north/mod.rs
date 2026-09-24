@@ -2,3 +2,4 @@
 
 pub mod encoder;
 pub mod mqtt;
+pub mod reliable;
