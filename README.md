@@ -11,7 +11,7 @@
 | `crates/daemon` | 核心守护进程库（驱动 + 处理 + 缓存 + MQTT + 授权 + 管理 API） | Wave 1 骨架 |
 | `crates/licensing-server` | 云授权服务（激活 / 心跳 / Token 签发 / 激活码生命周期） | Wave 1 骨架 |
 | `crates/protocol-proto` | 北向 Protobuf schema（TelemetryBatch / DataPoint / AuthBlock） | Wave 1 骨架 |
-| `tauri-shell/` | Windows Tauri 桌面壳（含安装包签名与防篡改） | 占位（按计划 Wave 4/5 task 32/38，尚未开工） |
+| `tauri-shell/` | Windows Tauri 2.x 桌面壳（承载 web-console + 拉起 daemon 侧车，产出 NSIS 签名安装包 `.exe`） | **工程已搭（独立 Cargo 工程，CI 就绪）；daemon 侧车待 `crates/daemon` 增二进制入口后启用** |
 | `headless/` | Linux headless 服务（AppImage/deb/rpm + systemd，容器运行体） | 占位（按计划 Wave 4 task 33，尚未开工） |
 | `web-console/` | 网关侧 Vue 3 管理界面（ui-kit + Arco Design Vue） | **已实现（16 页，CDP 真机验证 23/23）** |
 | `admin-console/` | 厂商总管理后台（激活码 / 设备 / 租约 / 租户管理） | **已实现（Vue 3 + ui-kit，12 页）** |
@@ -58,6 +58,16 @@ npm run preview        # 本地预览（hash 路由，无需服务端 rewrite）
 > self-contained 目录之前（或直接省略 self-contained）——否则 self-contained 的 ld 与
 > mingw gcc 不匹配，报 `cannot find -lmsvcrt`。新增依赖时仍需确认
 > 纯 Rust 约束与 `cargo deny`（Wave 7 起）。
+
+## Windows 桌面壳（tauri-shell）
+
+`tauri-shell/` 是独立 Cargo 工程（脱离根 workspace，保持 `cargo build --workspace` 在 Linux/macOS CI 绿灯），承载 `web-console` 进 WebView 并按需拉起 `daemon` 侧车，产出 **NSIS 安装包 `.exe`**。
+
+- **CI 自动出包**：`.github/workflows/release-windows.yml` 在 `windows-latest` 上装 Rust（MSVC target）+ Node 22 → 构建 web-console → `tauri build` 产出 NSIS 包；勾选 `sign` 并经仓库 Secrets（`WINDOWS_CERTIFICATE` / `WINDOWS_CERTIFICATE_PASSWORD`）做 Authenticode 签名（缺证书自动跳过）。
+- **授权判定始终在 Rust 侧**：WebView/JS 只展示，壳经 `127.0.0.1:8080` 与 daemon 通信；缺失 daemon 二进制时以「纯 UI 模式」降级（不影响安全红线）。
+- **防逆向 Tier-1**：release 产物 `strip + LTO + panic=abort`（已在 `src-tauri/Cargo.toml` 落实），代码签名经 CI 完成。
+- **本地构建前提**：Windows + Rust(MSVC target) + Node 22 + NSIS(`makensis`) + WebView2；详见 `tauri-shell/README.md`。开发沙箱未预装 `tauri-cli`/`makensis`/签名证书，故本机不出包，以「CI 就绪」方式交付。
+- **daemon 侧车**：当前 `crates/daemon` 仍是库 crate（尚无二进制入口 / 管理 API 服务端），默认不打包；待其增加 `[[bin]]` 后按 `tauri-shell/README.md` 的「启用侧车」步骤接入。
 
 ## 约束
 

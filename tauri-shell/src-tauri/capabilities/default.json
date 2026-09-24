@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "web-console 桌面壳默认权限（仅承载 UI，无授权判定）",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

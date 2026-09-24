@@ -1,0 +1,114 @@
+name: Release Windows Installer
+
+# 在 windows-latest 上构建并（可选）Authenticode 签名 IoT-DAQ 网关桌面壳 NSIS 安装包（.exe）。
+# - 触发：推送 v* 标签，或手动 workflow_dispatch（可勾选 sign 进行签名）
+# - 产出：actions  artifact `iot-daq-gateway-windows-installer`（未签名/已签名取决于是否提供证书密钥）
+#
+# 本地无法出包时的替代：本工程为 CI 就绪设计；详见 tauri-shell/README.md。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: '使用仓库密钥中的代码签名证书对安装包做 Authenticode 签名'
+        type: boolean
+        default: false
+
+jobs:
+  build-windows:
+    name: Build NSIS installer (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (stable, MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache cargo & tauri target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tauri-shell/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('tauri-shell/src-tauri/Cargo.lock') }}
+
+      - name: Install web-console dependencies
+        run: npm --prefix web-console ci
+
+      - name: Install tauri-shell dependencies (tauri-cli)
+        run: npm --prefix tauri-shell ci
+
+      # 用源 PNG 重新生成全平台图标，确保 icon.ico / icns 等完整。
+      - name: Regenerate icons
+        run: npm --prefix tauri-shell run icon
+
+      # ── 可选：构建 daemon 侧车并放入资源目录 ──
+      # 当前 daemon 为库 crate、尚未暴露管理 API 服务端二进制入口，故默认跳过。
+      # 当 crates/daemon 增加 `[[bin]] iot-daq-daemon` 后，将下方 if 改为条件判断即可激活：
+      #   cargo build --release --target x86_64-pc-windows-msvc -p daemon
+      #   cp target/.../iot-daq-daemon.exe tauri-shell/src-tauri/resources/iot-daq-daemon.exe
+      # 同时取消 tauri.conf.json 中 `bundle.resources` 对该文件的映射，壳会自动拉起它。
+      - name: Build daemon sidecar (optional, disabled until bin target exists)
+        if: false
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc -p daemon
+          mkdir -p tauri-shell/src-tauri/resources
+          cp target/x86_64-pc-windows-msvc/release/iot-daq-daemon.exe tauri-shell/src-tauri/resources/iot-daq-daemon.exe
+
+      - name: Build Tauri installer (NSIS)
+        run: npm --prefix tauri-shell run tauri build
+
+      - name: Locate installer
+        id: locate
+        shell: bash
+        run: |
+          SETUP=$(ls tauri-shell/src-tauri/target/release/bundle/nsis/*.exe | head -n1)
+          echo "setup=$SETUP" >> "$GITHUB_OUTPUT"
+          echo "Installer: $SETUP"
+
+      # ── Authenticode 签名（仅在显式 sign=true 且提供证书密钥时）──
+      - name: Import code-signing certificate
+        if: ${{ github.event.inputs.sign == 'true' }}
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) { Write-Host "::warning::未配置 WINDOWS_CERTIFICATE，跳过签名"; exit 0 }
+          $bytes = [System.Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($bytes, $env:WINDOWS_CERTIFICATE_PASSWORD, 'Exportable,PersistKeySet')
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("My","CurrentUser")
+          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
+          $cert.Thumbprint | Out-File -FilePath thumb.txt
+
+      - name: Sign installer (Authenticode)
+        if: ${{ github.event.inputs.sign == 'true' }}
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) { Write-Host "::warning::未配置 WINDOWS_CERTIFICATE，跳过签名"; exit 0 }
+          $thumb = (Get-Content thumb.txt).Trim()
+          $cert = Get-Item "Cert:\CurrentUser\My\$thumb"
+          $setup = (Get-ChildItem tauri-shell/src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1).FullName
+          Set-AuthenticodeSignature -FilePath $setup -Certificate $cert -TimestampServer "http://timestamp.digicert.com" -HashAlgorithm SHA256
+          Get-AuthenticodeSignature $setup | Format-List Status, StatusMessage, SignerCertificate
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iot-daq-gateway-windows-installer
+          path: tauri-shell/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

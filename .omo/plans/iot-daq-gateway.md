@@ -3168,10 +3168,22 @@ App.vue / store / mock + 17 个页面占位）；`engineer-webmon` 已启动实�
 - **ui-kit（两端共用）**：设计 token + 共享业务组件 + RBAC（admin 侧）+ 状态映射。
 - **Rust 核心**：daemon / licensing-server / protocol-proto（397 passed）。
 
+### 已实现（本轮新增）
+
+- **tauri-shell（Windows Tauri 2.x 桌面壳）工程已搭（CI 就绪）**：
+  - 独立 Cargo 工程（`tauri-shell/src-tauri/Cargo.toml` 顶部 `[workspace]` 脱离根 workspace，保 `cargo build --workspace` 在 Linux/macOS 绿灯）；release 产物 `strip + LTO + panic=abort`（Tier-1 防逆向基线）。
+  - `src/main.rs`：建 WebView 窗口加载 `web-console`（`frontendDist = ../../web-console/dist`）；启动时从 `resource_dir()` 尝试拉起 `daemon` 侧车（`std::process::Command`），缺失则「纯 UI 模式」降级（授权判定本就不在 UI 层，不破红线）。
+  - `tauri.conf.json`：NSIS 打包（SimpChinese / perMachine / 可改安装目录）、CSP（放行 `127.0.0.1:8080` 连接 daemon）、图标；`capabilities/default.json` 仅 `core:default`。
+  - 图标：`icons/`（手建 PNG + ICO，含 `source-icon.png`，CI 用 `tauri icon` 重生成全平台图标）。
+  - **CI**：`.github/workflows/release-windows.yml`（`windows-latest`）装 Rust(MSVC target)+Node22 → `npm ci`（web-console/tauri-cli）→ `tauri icon` → `tauri build` 产出 NSIS `.exe`；勾选 `sign` + 仓库 Secrets（`WINDOWS_CERTIFICATE`/`WINDOWS_CERTIFICATE_PASSWORD`）做 Authenticode 签名，缺证书自动跳过。
+  - `tauri-shell/README.md` 由占位改为真实工程说明（本地构建前提 / 降级行为 / 启用 daemon 侧车步骤 / 签名 / CI）。
+  - **限制说明（诚实）**：开发沙箱未预装 `tauri-cli`/`makensis`/签名证书，本机无法亲手打签名 `.exe`；故交付「CI 就绪」工程而非伪造二进制。`crates/daemon` 当前仍是库 crate（无二进制入口 / 管理 API 服务端），daemon 侧车默认不打包，待其增 `[[bin]]` 后按 README 步骤启用。
+
 ### 按计划延期（非缺陷）
 
-- `tauri-shell/`、`headless/`：仅 README 占位。计划明确「本阶段不创建 Cargo 工程，避免空壳干扰 workspace」
-  （Wave 4 task 32/33/38/60 容器化交付资产在 deploy/）。属计划内有意延期，非遗漏。
+- `headless/`：仅 README 占位。计划明确「本阶段不创建 Cargo 工程，避免空壳干扰 workspace」
+  （Wave 4 task 33 容器化交付资产已由 deploy/ 覆盖）。属计划内有意延期，非遗漏。
+- `tauri-shell/` 的 **daemon 侧车打包**：因 `crates/daemon` 尚无二进制入口，默认不打包；已在 `tauri-shell/README.md` 写明启用步骤，待 daemon 暴露 `[[bin]]` 后激活。
 
 ### 口径澄清（设计 → 实现 偏差与定调）
 
