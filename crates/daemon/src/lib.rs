@@ -21,6 +21,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod driver;
 pub mod error;
+pub mod hardening;
 pub mod logging;
 pub mod mgmt;
 pub mod north;

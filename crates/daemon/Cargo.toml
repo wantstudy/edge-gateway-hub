@@ -72,3 +72,19 @@ tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "sync"
 [[bin]]
 name = "iot-daq-daemon"
 path = "src/bin/iot-daq-daemon.rs"
+
+# ── task 50 Tier-1 二进制硬化 profile（登记说明）─────────────────────────────
+# 硬化目标口径：strip = true / lto = true / panic = "abort" / codegen-units = 1
+# （opt-level 保持默认 3）。
+#
+# 现状与冲突说明：workspace 根 Cargo.toml 的 [profile.release] 已全局声明
+#   strip = true、lto = "thin"、codegen-units = 1、panic = "abort"、opt-level = 3，
+# 并对 daemon 的 release 产物（iot-daq-daemon bin）直接生效。
+# Cargo 规则：[profile.*] 仅在 workspace 根 Cargo.toml 有效，非根成员内声明会被
+# 忽略并产生告警，因此 daemon 侧不重复声明 profile，仅在此登记差异与后续动作：
+#   1. lto = "thin"（根）弱于目标口径 lto = true（fat LTO）；如需最强加固，
+#      应由 workspace 根统一升级（task 50 红线：禁改根文件，留待后续任务）。
+#   2. panic = "abort" 已满足；strip = true / codegen-units = 1 已满足。
+#   3. cargo test 走 dev profile，不受上述 release 配置影响（单测可正常断言 panic）。
+#   4. 代码签名（CI）+ 段哈希自检（src/hardening.rs，task 58 manifest 注入 expected）
+#      与本 profile 配合构成 Tier-1 完整基线；禁 Tier-2/3（壳/驱动/加密狗）。
