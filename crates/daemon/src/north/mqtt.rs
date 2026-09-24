@@ -59,6 +59,9 @@ pub const CLIENT_ID_PREFIX: &str = "iot-daq";
 pub const DEFAULT_TOPIC_PREFIX: &str = "telemetry";
 /// 默认请求通道容量（背压：通道满时 `publish` 等待事件循环消费）。
 pub const DEFAULT_REQUEST_CHANNEL_CAPACITY: usize = 64;
+/// 默认慢消费者发送水位（未确认积压阈值；task 54。必须 < 请求通道容量，
+/// 使水位降级先于通道阻塞生效）。
+pub const DEFAULT_SEND_HIGH_WATER: usize = 32;
 /// 默认最大并发 inflight 报文数。
 pub const DEFAULT_INFLIGHT: u16 = 100;
 /// 默认重连初始退避。
@@ -331,6 +334,12 @@ pub struct EndpointConfig {
     pub tls: Option<TlsConfig>,
     /// 请求通道容量（背压阈值）。
     pub request_channel_capacity: usize,
+    /// 慢消费者发送水位（未确认积压阈值；task 54）。
+    ///
+    /// 积压达到该值时，[`MqttClient::publish_backpressured`] 不再提交到发送通道，
+    /// 改为调用注入的 [`SlowConsumerSink`]（调用方在此走离线落盘降级）。
+    /// 必须满足 `1 <= send_high_water <= request_channel_capacity`。
+    pub send_high_water: usize,
     /// 最大并发 inflight 报文数。
     pub inflight: u16,
     /// 重连初始退避。
@@ -359,6 +368,7 @@ impl EndpointConfig {
             keep_alive: DEFAULT_KEEP_ALIVE,
             tls: None,
             request_channel_capacity: DEFAULT_REQUEST_CHANNEL_CAPACITY,
+            send_high_water: DEFAULT_SEND_HIGH_WATER,
             inflight: DEFAULT_INFLIGHT,
             reconnect_initial: DEFAULT_RECONNECT_INITIAL,
             reconnect_max: DEFAULT_RECONNECT_MAX,
@@ -416,6 +426,16 @@ impl EndpointConfig {
     /// 设置主题前缀。
     pub fn with_topic_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.topic_prefix = prefix.into();
+        self
+    }
+
+    /// 设置请求通道容量与慢消费者发送水位（`high` 必须落在 `1..=capacity`）。
+    ///
+    /// # Errors
+    /// `high == 0` 或 `high > capacity` → [`DaemonError::ConfigError`]（validate 时拦截）。
+    pub fn with_send_watermarks(mut self, capacity: usize, high: usize) -> Self {
+        self.request_channel_capacity = capacity;
+        self.send_high_water = high;
         self
     }
 
@@ -486,6 +506,16 @@ impl EndpointConfig {
         if self.request_channel_capacity == 0 {
             return Err(bad("request_channel_capacity", "must be at least 1"));
         }
+        if self.send_high_water == 0 {
+            return Err(bad("send_high_water", "must be at least 1"));
+        }
+        if self.send_high_water > self.request_channel_capacity {
+            return Err(bad(
+                "send_high_water",
+                "must not exceed request_channel_capacity (the watermark must degrade \
+                 before the channel can block the producer)",
+            ));
+        }
         if self.inflight == 0 {
             return Err(bad("inflight", "must be at least 1"));
         }
@@ -536,6 +566,31 @@ pub trait PayloadEncoder: Send + Sync {
     fn encode(&self, sample: &ProcessedSample) -> DaemonResult<Vec<u8>>;
 }
 
+// ---- 慢消费者保护（task 54：发送通道水位 + 落盘降级回调） ----
+
+/// 慢消费者降级回调（task 54）：发送积压超水位时被调用。
+///
+/// 实现方应在该回调里把报文转入**离线落盘降级**路径（如 [`crate::offline_queue::
+/// OfflineQueue`]），绝不阻塞——回调约定为同步、快速、无网络 IO。
+pub trait SlowConsumerSink: Send + Sync {
+    /// 未确认积压达到水位阈值时触发。
+    ///
+    /// `outstanding`：触发时的未确认积压数（已提交未收到 PUBACK/PUBCOMP 的报文数）。
+    fn on_slow_consumer(&self, outstanding: usize);
+}
+
+/// 带水位保护的发布结果（task 54）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// 已提交到发送通道（等待事件循环投递与确认）。
+    Sent,
+    /// 积压超水位 → 已回调降级，本条**未发送**（由调用方落盘兜底）。
+    Degraded {
+        /// 触发时的未确认积压数。
+        outstanding: usize,
+    },
+}
+
 // ---- 单路客户端 ----
 
 /// 单路 MQTT 客户端（持有 rumqttc [`AsyncClient`] + [`EventLoop`]）。
@@ -559,6 +614,10 @@ pub struct MqttClient {
     connect_count: u64,
     /// 待重连退避间隔（`Some` 表示上次 poll 失败，调用方应先 `backoff()`）。
     retry_after: Option<Duration>,
+    /// 累计已提交的报文数（慢消费者水位记账；task 54）。
+    submitted: u64,
+    /// 累计已确认的报文数（PUBACK / PUBCOMP；task 54）。
+    acked: u64,
 }
 
 impl MqttClient {
@@ -584,6 +643,8 @@ impl MqttClient {
             connected: false,
             connect_count: 0,
             retry_after: None,
+            submitted: 0,
+            acked: 0,
         })
     }
 
@@ -625,6 +686,44 @@ impl MqttClient {
     /// 会话恢复后待重发的报文数（`EventLoop::pending` 长度）。
     pub fn pending_requests(&self) -> usize {
         self.eventloop.pending.len()
+    }
+
+    /// 未确认积压（task 54）：已提交但尚未收到 PUBACK / PUBCOMP 的报文数。
+    ///
+    /// 慢消费者水位的观测量：`submit` 时 +1，`poll_event` 收到确认时 -1。
+    /// QoS 0 报文不记账（无确认语义，broker 即时消费）。
+    pub fn outstanding(&self) -> usize {
+        self.submitted.saturating_sub(self.acked) as usize
+    }
+
+    /// 带慢消费者水位保护的发布（task 54）。
+    ///
+    /// 水位判定只是一次整数比较（O(1)，无 IO、无 await 前置阻塞）：
+    /// - 未确认积压 `outstanding >= send_high_water` → **不提交**到发送通道，
+    ///   调用注入的 [`SlowConsumerSink`]（调用方在此走离线落盘降级），返回
+    ///   [`PublishOutcome::Degraded`]；
+    /// - 否则正常发布并返回 [`PublishOutcome::Sent`]。
+    ///
+    /// 水位 < 请求通道容量（构建期校验），保证降级先于通道阻塞生效——
+    /// 发送侧永不阻塞超过水位判断所需时间。
+    ///
+    /// # Errors
+    /// 发布失败（通道关闭）→ [`DaemonError::MqttError`]（此时不计入积压）。
+    pub async fn publish_backpressured(
+        &mut self,
+        topic: &str,
+        payload: impl Into<Vec<u8>>,
+        degrade: &dyn SlowConsumerSink,
+    ) -> DaemonResult<PublishOutcome> {
+        let outstanding = self.outstanding();
+        if outstanding >= self.endpoint.send_high_water {
+            degrade.on_slow_consumer(outstanding);
+            return Ok(PublishOutcome::Degraded { outstanding });
+        }
+        self.publish_with_qos(topic, payload, self.endpoint.qos)
+            .await?;
+        self.submitted = self.submitted.saturating_add(1);
+        Ok(PublishOutcome::Sent)
     }
 
     /// 按该路连接的默认 QoS 发布一条原始报文。
@@ -735,7 +834,16 @@ impl MqttClient {
                 self.reconnector.reset();
                 Ok(Event::Incoming(Packet::ConnAck(ack)))
             }
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                // 慢消费者记账（task 54）：收到确认 → 未确认积压减一。
+                if matches!(
+                    &event,
+                    Event::Incoming(Packet::PubAck(_)) | Event::Incoming(Packet::PubComp(_))
+                ) {
+                    self.acked = self.acked.saturating_add(1);
+                }
+                Ok(event)
+            }
             Err(err) => {
                 self.connected = false;
                 self.retry_after = Some(self.reconnector.next_delay());
@@ -775,6 +883,7 @@ impl fmt::Debug for EndpointConfig {
             .field("encoding", &self.encoding)
             .field("clean_session", &self.clean_session)
             .field("keep_alive", &self.keep_alive)
+            .field("send_high_water", &self.send_high_water)
             .field("tls", &self.tls.as_ref().map(|_| "<configured>"))
             .finish_non_exhaustive()
     }
@@ -788,6 +897,7 @@ impl fmt::Debug for MqttClient {
             .field("connected", &self.connected)
             .field("connect_count", &self.connect_count)
             .field("retry_after", &self.retry_after)
+            .field("outstanding", &self.outstanding())
             .finish_non_exhaustive()
     }
 }
@@ -1936,6 +2046,206 @@ mod tests {
         ensure_rustls_provider().expect("first ensure");
         ensure_rustls_provider().expect("second ensure");
         assert!(CryptoProvider::get_default().is_some());
+    }
+
+    // ---- 慢消费者保护（task 54：发送水位 + 落盘降级回调） ----
+
+    /// 记录型降级回调（测试替身）：记录每次触发时的积压数。
+    struct RecordingDegrade {
+        calls: Mutex<Vec<usize>>,
+    }
+
+    impl RecordingDegrade {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<usize> {
+            self.calls
+                .lock()
+                .expect("degrade calls lock")
+                .clone()
+        }
+    }
+
+    impl SlowConsumerSink for RecordingDegrade {
+        fn on_slow_consumer(&self, outstanding: usize) {
+            self.calls
+                .lock()
+                .expect("degrade calls lock")
+                .push(outstanding);
+        }
+    }
+
+    /// QA: 积压达到水位 → 触发降级回调、不再发送（broker 只见水位内的报文），
+    /// 返回 `Degraded` 携带触发时的积压数。
+    #[tokio::test]
+    async fn watermark_triggers_degrade_callback_and_skips_send() {
+        let broker = spawn_mock_broker(BrokerOptions::default()).await;
+        let mut client = MqttClient::new(
+            endpoint_for(broker.port, "iot-daq-wm")
+                .with_send_watermarks(64, 3),
+        )
+        .expect("client");
+        client.poll_event().await.expect("connect");
+
+        // 水位以内：正常发送（不轮询确认 → outstanding 持续增长）。
+        for i in 0..3 {
+            let outcome = client
+                .publish_backpressured(&format!("telemetry/dev-1/p{i}"), b"ok".to_vec(), &RecordingDegrade::new())
+                .await
+                .expect("publish under watermark");
+            assert_eq!(outcome, PublishOutcome::Sent);
+        }
+        assert_eq!(client.outstanding(), 3);
+
+        // 第 4 条：积压 3 >= 水位 3 → 降级（未发送），回调收到积压数 3。
+        let degrade = RecordingDegrade::new();
+        let outcome = client
+            .publish_backpressured("telemetry/dev-1/p3", b"degraded".to_vec(), &degrade)
+            .await
+            .expect("degraded publish must not error");
+        assert_eq!(outcome, PublishOutcome::Degraded { outstanding: 3 });
+        assert_eq!(degrade.calls(), vec![3], "降级回调必须收到触发时的积压数");
+        assert_eq!(client.outstanding(), 3, "被降级的报文不计入积压");
+
+        // 推进事件循环把水位内的 3 条投出去并等 broker 确认（PUBACK 保证
+        // broker 侧已完成记录——Outgoing 事件不保证对端已处理）。
+        let mut pubacks = 0;
+        for _ in 0..24 {
+            if pubacks >= 3 {
+                break;
+            }
+            let event = tokio::time::timeout(Duration::from_secs(3), client.poll_event())
+                .await
+                .expect("poll timeout")
+                .expect("poll error");
+            if matches!(event, Event::Incoming(Packet::PubAck(_))) {
+                pubacks += 1;
+            }
+        }
+        assert_eq!(pubacks, 3, "水位内的 3 条必须全部投出并被确认");
+
+        // broker 只见水位内的 3 条；被降级的「degraded」报文绝不出现在网络上。
+        let observed = broker.publishes();
+        assert_eq!(observed.len(), 3, "超水位的报文不得发往 broker");
+        assert!(
+            observed
+                .iter()
+                .all(|p| p.payload == b"ok".to_vec() && p.topic.starts_with("telemetry/dev-1/p")),
+            "broker 只应收到水位内报文: {observed:?}"
+        );
+    }
+
+    /// QA: 收到 PUBACK 后积压回落 → 水位恢复可用（降级是暂态，不是熔断）。
+    #[tokio::test]
+    async fn watermark_recovers_after_pubacks() {
+        let broker = spawn_mock_broker(BrokerOptions::default()).await;
+        let mut client = MqttClient::new(
+            endpoint_for(broker.port, "iot-daq-wm-rec")
+                .with_send_watermarks(64, 1),
+        )
+        .expect("client");
+        client.poll_event().await.expect("connect");
+
+        let degrade = RecordingDegrade::new();
+        // outstanding=0 < 水位 1 → Sent；outstanding=1 >= 水位 1 → Degraded。
+        assert_eq!(
+            client
+                .publish_backpressured("telemetry/a", b"1".to_vec(), &degrade)
+                .await
+                .expect("first"),
+            PublishOutcome::Sent
+        );
+        assert_eq!(
+            client
+                .publish_backpressured("telemetry/a", b"2".to_vec(), &degrade)
+                .await
+                .expect("second"),
+            PublishOutcome::Degraded { outstanding: 1 }
+        );
+        assert_eq!(degrade.calls(), vec![1]);
+
+        // 推进事件循环直到 PUBACK → 积压归零 → 再次可发送。
+        drive_until(&mut client, 8, |event| {
+            matches!(event, Event::Incoming(Packet::PubAck(_)))
+        })
+        .await
+        .expect("puback");
+        assert_eq!(client.outstanding(), 0, "PUBACK 后积压必须回落");
+        assert_eq!(
+            client
+                .publish_backpressured("telemetry/a", b"3".to_vec(), &degrade)
+                .await
+                .expect("third"),
+            PublishOutcome::Sent,
+            "积压回落后水位必须恢复放行"
+        );
+        assert_eq!(degrade.calls(), vec![1], "第二次发送不得再触发降级");
+    }
+
+    /// QA: 降级路径零网络依赖、零阻塞——积压只靠「提交」累积（事件循环未推进、
+    /// 连接未建立），水位判定 + 回调同步完成，绝不等待网络。
+    #[tokio::test]
+    async fn degrade_path_never_blocks_or_touches_network() {
+        // 从未 poll（未建立任何连接）——publish 只是入请求通道（容量 64）。
+        let mut client = MqttClient::new(
+            endpoint_for(DEFAULT_MQTT_PORT, "iot-daq-wm-off")
+                .with_send_watermarks(64, 4),
+        )
+        .expect("client");
+        let degrade = RecordingDegrade::new();
+
+        for i in 0..4 {
+            let outcome = client
+                .publish_backpressured(&format!("telemetry/q/{i}"), b"x".to_vec(), &degrade)
+                .await
+                .expect("queued publish must not error without connection");
+            assert_eq!(outcome, PublishOutcome::Sent, "水位内提交不得依赖连接");
+        }
+        assert_eq!(client.outstanding(), 4);
+        assert_eq!(degrade.calls(), Vec::<usize>::new(), "水位内不得触发降级");
+
+        // 第 5 条：超水位 → 同步降级（无连接、无阻塞、无错误）。
+        let outcome = client
+            .publish_backpressured("telemetry/q/4", b"y".to_vec(), &degrade)
+            .await
+            .expect("degraded publish");
+        assert_eq!(outcome, PublishOutcome::Degraded { outstanding: 4 });
+        assert_eq!(degrade.calls(), vec![4]);
+        assert!(!client.is_connected(), "全程不得建立连接");
+    }
+
+    /// QA: 水位参数构建期校验——0 或超过通道容量 → ConfigError（2000）。
+    #[test]
+    fn send_watermark_above_channel_capacity_is_rejected() {
+        let zero = EndpointConfig::new("o", "127.0.0.1", 1883).with_send_watermarks(64, 0);
+        assert_eq!(
+            zero.validate().expect_err("zero watermark").error_code(),
+            ERR_CONFIG
+        );
+        let over = EndpointConfig::new("o", "127.0.0.1", 1883).with_send_watermarks(64, 65);
+        assert_eq!(
+            over.validate().expect_err("watermark > capacity").error_code(),
+            ERR_CONFIG
+        );
+        let ok = EndpointConfig::new("o", "127.0.0.1", 1883).with_send_watermarks(64, 64);
+        ok.validate().expect("watermark == capacity is allowed");
+        assert_eq!(ok.send_high_water, 64);
+        assert_eq!(DEFAULT_SEND_HIGH_WATER, 32, "默认水位决议值 32");
+    }
+
+    /// QA: `EndpointConfig` Debug 不得泄露口令（回归守卫，新增字段后仍需打码）。
+    #[test]
+    fn endpoint_config_debug_still_redacts_after_watermark_field() {
+        const TEST_ONLY_PW: &str = "TEST_ONLY_WatermarkPw!";
+        let mut endpoint = EndpointConfig::new("wm-leak", "broker.local", 1883);
+        endpoint.password = Some(TEST_ONLY_PW.to_string());
+        let dbg = format!("{endpoint:?}");
+        assert!(!dbg.contains(TEST_ONLY_PW), "口令泄露: {dbg}");
+        assert!(dbg.contains("send_high_water"), "水位字段应可观测: {dbg}");
     }
 
     /// QA: 主题拼接与地址文本（日志用，不含凭证）。

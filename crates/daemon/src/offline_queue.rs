@@ -14,15 +14,25 @@
 //!    选型理由见「偏差说明 1」。
 //! 2. **WAL + synchronous=NORMAL**。打开即 `PRAGMA journal_mode=WAL`，`synchronous=NORMAL`
 //!    在 WAL 下已保证「提交后不丢事务」（仅崩溃时可能丢最后几笔），兼顾吞吐与持久性。
-//! 3. **水位三级**：高水位（默认硬上限的 4/5）触发强制落盘；硬上限（行数 / 字节）在**落盘失败
-//!    或落盘后仍超限**时丢弃最旧批次，并记 [`QueueAudit::DroppedOldest`]——**绝不静默丢弃**。
+//! 3. **水位三级 + 溢出拒绝（task 54 修订）**：内存高水位（默认 8192 行，可配置，且
+//!    不超过硬上限的 4/5）触发**降级**——新数据直接走离线落盘路径（不进内存、不阻塞
+//!    生产者）；硬上限（默认 65536 行）触达后**拒绝入队**并返回溢出标记，同时记
+//!    [`QueueAudit::Overflow`]——**绝不静默、绝不阻塞采集**（数据交还调用方，由其
+//!    决定重试 / 告警，绝不在这里丢）。磁盘侧仍有保留期淘汰 + 环形覆盖
+//!    （[`QueueAudit::Evicted`]）。
 //! 4. **环形覆盖**：每个落盘事务末尾做一次维护——先按 `retention_ns`（注入时钟，测试零 sleep）
 //!    淘汰过期批次，再按 `max_db_bytes` 从最旧开始逐条淘汰，均记 [`QueueAudit::Evicted`]。
-//! 5. **幂等键 = (gateway_id, batch_seq)**。`batch_seq` 由原子计数器单调递增分配，并在
+//! 5. **幂等键 = (gateway_id, batch_seq)**。`batch_seq` 由可注入的
+//!    [`BatchSeqSource`]（默认 [`AtomicSeqSource`]，原子单调递增）分配；分配结果在
 //!    `queue_meta.last_seq` 持久化，保证进程重启后不回退、不复用。
-//! 6. **续传**：`ack_up_to(seq)` 推进 high-water mark 并落盘（`queue_meta.ack_seq`）＋删除
-//!    `seq <= ack` 的行；`open` 时读回两者，重启后从 `ack_seq + 1` 继续补发——无重复、无空洞。
-//! 7. **顺序**：`take_batch` 合并磁盘与内存结果后按 `seq` 升序排序去重，同设备内严格有序。
+//!    幂等键辅助见 [`QueuedBatch::idempotency_key`]；跨进程 JSON 传输时
+//!    `batch_seq` **一律字符串**（大数红线，见 [`batch_meta_json`]）。
+//! 6. **续传（Ack 先落后推）**：`ack_up_to(seq)` **先持久化确认记录**（默认写
+//!    `queue_meta.ack_seq`，可注入 [`AckSink`]），持久化成功**后才**推进内存位点并删除
+//!    `seq <= ack` 的行；`open` 时读回两者，重启后从 `ack_seq + 1` 继续补发——
+//!    无重复、无空洞；「落 Ack 后崩溃」恢复位点，「崩溃在落 Ack 前」则靠幂等键重放去重。
+//! 7. **顺序**：`take_batch` / `replay_batch` 合并磁盘与内存结果后按 `seq` 升序排序去重，
+//!    同设备内严格有序；补发先读 high-water mark，跳过已确认位点之前的条目。
 //! 8. **零 panic**：所有 rusqlite / io 错误收敛为 `DaemonError::StorageError`（4000），
 //!    配置非法为 `ConfigError`（2000）；锁中毒时取回内部数据而非 unwrap。
 
@@ -47,8 +57,14 @@ pub const QUEUE_DB_FILE_NAME: &str = "queue.db";
 /// task 18 遥测库文件名（仅用于配置校验时的显式拦截，本模块不读写）。
 pub const TELEMETRY_DB_FILE_NAME: &str = "telemetry.db";
 
-/// 默认内存队列行数硬上限（10 万条）。
-pub const DEFAULT_MAX_MEM_ROWS: usize = 100_000;
+/// 默认内存队列行数硬上限（task 54：65536 条，拒绝入队阈值）。
+pub const DEFAULT_MAX_MEM_ROWS: usize = 65_536;
+
+/// 默认内存队列行数高水位（task 54：8192 条；超过后新数据直接走落盘降级路径）。
+///
+/// 依据见 `docs/design/capacity-estimation.md`：2000 条/秒的上行下约 4 秒缓冲，
+/// 既有降级余量又不至于让内存常驻过大。
+pub const DEFAULT_MEM_HIGH_WATER_ROWS: usize = 8_192;
 
 /// 默认内存队列字节硬上限（256MB）。
 pub const DEFAULT_MAX_MEM_BYTES: usize = 256 * 1024 * 1024;
@@ -149,6 +165,72 @@ impl Clock for ManualClock {
     }
 }
 
+// ---- 注入点：batch_seq 来源 / Ack 持久化（task 54） ----
+
+/// `batch_seq` 来源（可注入，测试可控；task 54）。
+///
+/// 契约：`next_batch_seq` 必须**单调递增且进程内唯一**（幂等键
+/// `gateway_id + batch_seq` 的正确性依赖于此）；默认实现 [`AtomicSeqSource`]
+/// 以持久化的 `last_seq + 1` 为起点。注入自定义来源时由调用方负责单调性。
+pub trait BatchSeqSource: Send + Sync {
+    /// 分配下一个 `batch_seq`。
+    fn next_batch_seq(&self) -> u64;
+
+    /// 最近一次分配的 `batch_seq`（诊断用；从未分配过返回 0）。
+    fn current_batch_seq(&self) -> u64;
+}
+
+/// 默认 `batch_seq` 来源：原子计数器（单调递增，线程安全）。
+#[derive(Debug)]
+pub struct AtomicSeqSource {
+    /// 下一个待分配的 seq。
+    next: AtomicU64,
+}
+
+impl AtomicSeqSource {
+    /// 以 `start_seq` 为第一个分配值构造。
+    #[must_use]
+    pub fn new(start_seq: u64) -> Self {
+        Self {
+            next: AtomicU64::new(start_seq.max(1)),
+        }
+    }
+}
+
+impl BatchSeqSource for AtomicSeqSource {
+    fn next_batch_seq(&self) -> u64 {
+        // fetch_add 返回旧值：即本批 seq；并发下全局单调且唯一。
+        self.next.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn current_batch_seq(&self) -> u64 {
+        self.next.load(Ordering::SeqCst).saturating_sub(1)
+    }
+}
+
+/// Ack 持久化（可注入；task 54「先落 Ack 后推位点」语义的持久化端点）。
+///
+/// 契约：`persist_ack` 成功返回后，该确认记录**必须已持久化**（进程崩溃后可恢复）；
+/// 返回 `Err` 时调用方**不得**推进内存位点（数据继续保留、后续重放由幂等键去重）。
+/// 默认（未注入）走内置 SQLite 写线程（`queue_meta.ack_seq` + 删除已确认行）。
+pub trait AckSink: Send + Sync {
+    /// 持久化一条确认记录（确认到 `seq` 为止）。
+    ///
+    /// # Errors
+    /// 持久化失败返回 `StorageError`（4000）——内存位点保持不动。
+    fn persist_ack(&self, seq: u64) -> DaemonResult<()>;
+}
+
+/// 队列装配钩子（`open_with_hooks` 注入；缺省字段走内置实现）。
+#[derive(Default)]
+pub struct QueueHooks {
+    /// 自定义 `batch_seq` 来源（`None` = 内置 [`AtomicSeqSource`]，起点取持久化
+    /// `last_seq + 1`）。注入来源时起点由调用方管理。
+    pub seq_source: Option<Arc<dyn BatchSeqSource>>,
+    /// 自定义 Ack 持久化（`None` = 内置 SQLite 写线程路径）。
+    pub ack_sink: Option<Arc<dyn AckSink>>,
+}
+
 // ---- 配置 ----
 
 /// 队列配置（非法值在 `open` 时转 `ConfigError`，错误码 2000）。
@@ -158,8 +240,12 @@ pub struct QueueConfig {
     pub db_path: PathBuf,
     /// 网关标识（幂等键组成之一，非空）。
     pub gateway_id: String,
-    /// 内存队列行数硬上限（> 0）。
+    /// 内存队列行数硬上限（> 0；触达后拒绝入队并返回溢出标记，task 54）。
     pub max_mem_rows: usize,
+    /// 内存队列行数高水位（> 0；超过后新数据直接走落盘降级路径，task 54）。
+    ///
+    /// 实际生效值会被夹紧到硬上限的 4/5 以内（见 [`Self::high_water_rows`]）。
+    pub mem_high_water_rows: usize,
     /// 内存队列字节硬上限（> 0）。
     pub max_mem_bytes: usize,
     /// 磁盘队列字节上限（> 0，环形覆盖阈值）。
@@ -178,6 +264,7 @@ impl QueueConfig {
             db_path: db_path.into(),
             gateway_id: gateway_id.into(),
             max_mem_rows: DEFAULT_MAX_MEM_ROWS,
+            mem_high_water_rows: DEFAULT_MEM_HIGH_WATER_ROWS,
             max_mem_bytes: DEFAULT_MAX_MEM_BYTES,
             max_db_bytes: DEFAULT_MAX_DB_BYTES,
             retention_ns: DEFAULT_RETENTION_NS,
@@ -211,6 +298,9 @@ impl QueueConfig {
         if self.max_mem_rows == 0 {
             return Err(config_err("max_mem_rows must be greater than 0"));
         }
+        if self.mem_high_water_rows == 0 {
+            return Err(config_err("mem_high_water_rows must be greater than 0"));
+        }
         if self.max_mem_bytes == 0 {
             return Err(config_err("max_mem_bytes must be greater than 0"));
         }
@@ -223,10 +313,14 @@ impl QueueConfig {
         Ok(())
     }
 
-    /// 高水位行数（硬上限的 4/5，至少 1）。
+    /// 生效的内存高水位行数（task 54）。
+    ///
+    /// 取 `min(配置值, 硬上限的 4/5)` 且至少 1：高水位必须严格低于硬上限，
+    /// 否则降级路径没有存在的意义（直接顶到硬上限拒绝）。
     #[must_use]
     pub fn high_water_rows(&self) -> usize {
-        (self.max_mem_rows.saturating_mul(HIGH_WATER_NUM) / HIGH_WATER_DEN).max(1)
+        let cap = (self.max_mem_rows.saturating_mul(HIGH_WATER_NUM) / HIGH_WATER_DEN).max(1);
+        self.mem_high_water_rows.max(1).min(cap)
     }
 
     /// 高水位字节数（硬上限的 4/5，至少 1）。
@@ -257,16 +351,37 @@ impl QueuedBatch {
     pub fn payload_len(&self) -> usize {
         self.payload.len()
     }
+
+    /// 幂等键（task 54）：`gateway_id + batch_seq`。
+    ///
+    /// 在补发 / 重放全过程中保持稳定（同一条目两次 `take_batch` 得到相同键），
+    /// 接收端按此键去重即可保证断网重放不产生重复数据。
+    #[must_use]
+    pub fn idempotency_key(&self) -> String {
+        idempotency_key(&self.gateway_id, self.seq)
+    }
 }
 
-/// 审计事件：丢弃 / 淘汰 / 落盘**必须留痕**，绝不静默。
+/// 幂等键生成（task 54）：`{gateway_id}:{batch_seq}`。
+///
+/// `:` 作为分隔符——`gateway_id` 若含 `:` 仍可由右侧最后一段还原 `batch_seq`，
+/// 但建议网关标识避免使用该字符。
+#[must_use]
+pub fn idempotency_key(gateway_id: &str, batch_seq: u64) -> String {
+    format!("{gateway_id}:{batch_seq}")
+}
+
+/// 审计事件：丢弃 / 淘汰 / 溢出 / 落盘**必须留痕**，绝不静默。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueAudit {
-    /// 触达硬上限且落盘无法缓解 → 丢弃最旧的队首批次。
-    DroppedOldest {
-        /// 被丢弃的批次序号。
+    /// 触达内存硬上限：拒绝入队并返回溢出标记（task 54）。
+    ///
+    /// 数据**不丢**——随 `enqueue` 的 `Err` 交还调用方，由其计数告警 / 重试；
+    /// 本审计保证溢出「绝不静默」。
+    Overflow {
+        /// 被拒绝的批次序号（单调性保留，允许空洞）。
         seq: u64,
-        /// 丢弃原因（可诊断）。
+        /// 拒绝原因（可诊断）。
         reason: String,
     },
     /// 环形覆盖 / 保留期淘汰了一批磁盘批次。
@@ -713,7 +828,10 @@ pub struct OfflineQueue {
     cfg: QueueConfig,
     clock: Arc<dyn Clock>,
     mem: Mutex<MemState>,
-    next_seq: AtomicU64,
+    /// `batch_seq` 来源（可注入；默认起点 = 持久化 last_seq + 1）。
+    seq_source: Arc<dyn BatchSeqSource>,
+    /// Ack 持久化端点（可注入；`None` 表示走内置 SQLite 写线程）。
+    ack_sink: Option<Arc<dyn AckSink>>,
     ack_seq: AtomicU64,
     online: AtomicBool,
     fail_writes: Arc<AtomicBool>,
@@ -730,7 +848,7 @@ impl std::fmt::Debug for OfflineQueue {
             .field("gateway_id", &self.cfg.gateway_id)
             .field("db_path", &self.cfg.db_path)
             .field("ack_seq", &self.ack_seq.load(Ordering::SeqCst))
-            .field("next_seq", &self.next_seq.load(Ordering::SeqCst))
+            .field("last_batch_seq", &self.seq_source.current_batch_seq())
             .field("online", &self.online.load(Ordering::SeqCst))
             .field("pending_mem", &self.mem().rows.len())
             .field("closed", &self.closed.load(Ordering::SeqCst))
@@ -739,12 +857,24 @@ impl std::fmt::Debug for OfflineQueue {
 }
 
 impl OfflineQueue {
-    /// 打开（或创建）队列库并启动单写线程。
+    /// 打开（或创建）队列库并启动单写线程（内置 seq 来源与 Ack 持久化）。
     ///
     /// # Errors
     /// - 配置非法 → `ConfigError`（2000）；
     /// - 目录创建 / SQLite 打开 / WAL 启用 / 建表失败 → `StorageError`（4000）。
     pub fn open(cfg: QueueConfig, clock: Arc<dyn Clock>) -> DaemonResult<Self> {
+        Self::open_with_hooks(cfg, clock, QueueHooks::default())
+    }
+
+    /// 打开队列并注入装配钩子（task 54：自定义 `batch_seq` 来源 / Ack 持久化）。
+    ///
+    /// # Errors
+    /// 同 [`Self::open`]。
+    pub fn open_with_hooks(
+        cfg: QueueConfig,
+        clock: Arc<dyn Clock>,
+        hooks: QueueHooks,
+    ) -> DaemonResult<Self> {
         cfg.validate()?;
 
         if let Some(parent) = cfg.db_path.parent() {
@@ -798,11 +928,18 @@ impl OfflineQueue {
             .recv()
             .map_err(|_| storage_err("queue writer thread died during init"))??;
 
+        // batch_seq 来源：未注入则用内置原子计数器（起点 = 持久化 last_seq + 1，
+        // 保证重启后不回退、不复用）。
+        let seq_source: Arc<dyn BatchSeqSource> = hooks.seq_source.unwrap_or_else(|| {
+            Arc::new(AtomicSeqSource::new(init.last_seq.saturating_add(1)))
+        });
+
         Ok(Self {
             cfg,
             clock,
             mem: Mutex::new(MemState::default()),
-            next_seq: AtomicU64::new(init.last_seq.saturating_add(1)),
+            seq_source,
+            ack_sink: hooks.ack_sink,
             ack_seq: AtomicU64::new(init.ack_seq),
             online: AtomicBool::new(true),
             fail_writes,
@@ -815,18 +952,23 @@ impl OfflineQueue {
 
     /// 入队：返回分配的 `batch_seq`（单调递增，构成幂等键）。
     ///
-    /// - 在线：先进内存队列；达高水位强制落盘；落盘失败且触达硬上限 → 丢弃最旧 + 审计。
-    /// - 离线：**直接落盘**（保证断电也不丢），落盘失败即返回 `StorageError`。
+    /// 背压水位策略（task 54，**绝不阻塞生产者、绝不静默丢数据**）：
+    /// - 离线：直接落盘（保证断电也不丢），落盘失败即返回 `StorageError`；
+    /// - 在线且内存 < 高水位：进内存；推入后达高水位 → 整队列落盘（失败则留内存）；
+    /// - 在线且内存 ≥ 高水位：**降级**——本批直接走离线落盘路径（不进内存）；
+    /// - 触达硬上限：**拒绝入队**并返回溢出标记（`Err`），同时记
+    ///   [`QueueAudit::Overflow`]——数据交还调用方计数告警，绝不在这里丢弃。
     ///
     /// # Errors
-    /// 队列已关闭、或离线且落盘失败 → `StorageError`（4000）。
+    /// - 队列已关闭 → `StorageError`（4000）；
+    /// - 离线且落盘失败 → `StorageError`（4000）；
+    /// - 在线且内存触硬上限 → `StorageError`（4000，含溢出标记语义，见审计）。
     pub fn enqueue(&self, payload: Vec<u8>) -> DaemonResult<u64> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(storage_err("enqueue rejected: queue is closed"));
         }
-        // `next_seq` 初值 = 持久化 last_seq + 1，故直接取当前值即为本批 seq，
-        // 再自增给下一批（fetch_add 返回旧值）。首次入队 seq == last_seq + 1。
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        // seq 来源可注入（测试可控）；默认原子计数器，起点 = 持久化 last_seq + 1。
+        let seq = self.seq_source.next_batch_seq();
         let batch = QueuedBatch {
             seq,
             gateway_id: self.cfg.gateway_id.clone(),
@@ -834,25 +976,59 @@ impl OfflineQueue {
             enqueued_ns: self.clock.now_ns(),
         };
 
-        if self.online.load(Ordering::SeqCst) {
-            let high_rows = self.cfg.high_water_rows();
-            let high_bytes = self.cfg.high_water_bytes();
-            let over_high_water = {
-                let mut mem = self.mem();
-                mem.rows.push_back(batch);
-                mem.bytes = mem
-                    .bytes
-                    .saturating_add(mem.rows.back().map_or(0, |b| b.payload_len()));
-                mem.rows.len() >= high_rows || mem.bytes >= high_bytes
-            };
-            // 高水位：先尝试落盘（能落盘就绝不丢数据）。
-            if over_high_water {
-                let _ = self.flush();
-            }
-            // 落盘失败 / 落盘后仍超限 → 丢弃最旧并留审计（绝不静默）。
-            self.enforce_mem_cap("memory hard limit reached");
-        } else {
+        if !self.online.load(Ordering::SeqCst) {
+            // 离线：直接落盘（磁盘有自己的环形覆盖 + Evicted 审计兜底）。
             self.send_persist(vec![batch])?;
+            return Ok(seq);
+        }
+
+        // 容量判定在锁内只做**读判定**（绝不持锁做 IO → 慢盘不阻塞采集线程）。
+        let over_high_water = {
+            let mem = self.mem();
+            if mem.rows.len() >= self.cfg.max_mem_rows || mem.bytes >= self.cfg.max_mem_bytes {
+                // 硬上限：拒绝入队 + 溢出审计（绝不静默；数据交还调用方）。
+                push_audit(
+                    &self.audit,
+                    QueueAudit::Overflow {
+                        seq,
+                        reason: format!(
+                            "memory hard limit reached (rows {}/{}, bytes {}/{}); \
+                             enqueue rejected, data returned to caller",
+                            mem.rows.len(),
+                            self.cfg.max_mem_rows,
+                            mem.bytes,
+                            self.cfg.max_mem_bytes
+                        ),
+                    },
+                );
+                return Err(storage_err(format!(
+                    "enqueue rejected: memory queue at hard limit \
+                     (batch_seq {seq} overflowed, data returned to caller)"
+                )));
+            }
+            mem.rows.len() >= self.cfg.high_water_rows()
+                || mem.bytes >= self.cfg.high_water_bytes()
+        };
+
+        // 超高水位 → 降级：新数据直接走离线落盘路径（不进内存）。
+        // （负载克隆仅发生在降级分支；常规路径零克隆。失败则继续收内存保数据。）
+        let payload_len = batch.payload_len();
+        if over_high_water && self.send_persist(vec![batch.clone()]).is_ok() {
+            return Ok(seq);
+        }
+        // 未超高水位，或降级落盘不可用（此时内存必然仍有硬上限余量，见上方守卫）：
+        // 收进内存保数据。
+
+        let now_over_high_water = {
+            let mut mem = self.mem();
+            mem.rows.push_back(batch);
+            mem.bytes = mem.bytes.saturating_add(payload_len);
+            mem.rows.len() >= self.cfg.high_water_rows()
+                || mem.bytes >= self.cfg.high_water_bytes()
+        };
+        // 达高水位 → 整队列落盘；失败则数据留内存（后续入队走硬上限拒绝路径）。
+        if now_over_high_water {
+            let _ = self.flush();
         }
         Ok(seq)
     }
@@ -919,18 +1095,41 @@ impl OfflineQueue {
         Ok(merged)
     }
 
-    /// 推进 high-water mark：持久化位点并删除 `seq <= seq` 的批次。
+    /// 补发批次（task 54）：先读 high-water mark，返回 `seq > ack_seq` 的未确认
+    /// 批次（严格升序，最多 `max` 条）。
     ///
-    /// 位点只增不减；重启后从 `ack_seq + 1` 续传 —— 无重复、无空洞。
+    /// 与 [`Self::take_batch`] 同一实现（补发语义命名）：重复调用（模拟重启后重放）
+    /// 会再次返回同一批条目——其幂等键 `gateway_id + batch_seq` 保持稳定，接收端
+    /// 按键去重即可保证重放不产生重复数据。确认后调用 [`Self::ack_up_to`] 推进位点。
     ///
     /// # Errors
-    /// 位点持久化失败 → `StorageError`（4000）；失败时内存位点**不推进**，避免丢数据。
+    /// 写线程不可用时返回 `StorageError`（4000）。
+    pub fn replay_batch(&self, max: usize) -> DaemonResult<Vec<QueuedBatch>> {
+        self.take_batch(max)
+    }
+
+    /// 推进 high-water mark（task 54 Ack 语义：**先落 Ack，后推位点**）。
+    ///
+    /// 第一步：持久化确认记录（默认写 `queue_meta.ack_seq` 并删除已确认行；可注入
+    /// [`AckSink`]）。持久化失败 → 内存位点**不推进**、数据不删，避免丢数据。
+    /// 第二步：持久化成功后才推进内存位点并移除内存中已确认批次。
+    ///
+    /// 位点只增不减；重启后从 `ack_seq + 1` 续传 —— 无重复、无空洞；「崩溃在落 Ack
+    /// 前」则该批会在重启后被重放，由幂等键 `gateway_id + batch_seq` 在接收端去重。
+    ///
+    /// # Errors
+    /// 位点持久化失败 → `StorageError`（4000）；失败时内存位点**不推进**。
     pub fn ack_up_to(&self, seq: u64) -> DaemonResult<()> {
         let current = self.ack_seq.load(Ordering::SeqCst);
         if seq <= current {
             return Ok(());
         }
-        self.send_cmd(|resp| Cmd::Ack { seq, resp })?;
+        // 第一步（先落 Ack）：持久化确认记录。
+        match &self.ack_sink {
+            Some(sink) => sink.persist_ack(seq)?,
+            None => self.send_cmd(|resp| Cmd::Ack { seq, resp })?,
+        }
+        // 第二步（后推位点）：持久化成功后才动内存。
         self.ack_seq.store(seq, Ordering::SeqCst);
         // 内存侧同步移除已确认批次。
         let mut mem = self.mem();
@@ -993,7 +1192,8 @@ impl OfflineQueue {
     }
 
     /// 故障注入开关（默认 `false`）：置 `true` 后所有磁盘写入返回 `StorageError`，
-    /// 用于验证「落盘不可写 → 硬上限丢弃最旧并留审计」的降级路径（计划 QA Error 场景）。
+    /// 用于验证「落盘不可写 → 高水位降级失败 → 硬上限拒绝入队并留溢出审计」
+    /// 的背压路径（task 54；QA Error 场景）。
     pub fn set_persist_failure(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::SeqCst);
     }
@@ -1050,36 +1250,6 @@ impl OfflineQueue {
         mem.bytes = mem.bytes.saturating_add(restored_bytes);
     }
 
-    /// 硬上限守卫：超出即丢弃最旧批次并留审计（至少保留最新一条）。
-    fn enforce_mem_cap(&self, reason: &str) {
-        let mut dropped = Vec::new();
-        {
-            let mut mem = self.mem();
-            while mem.rows.len() > self.cfg.max_mem_rows || mem.bytes > self.cfg.max_mem_bytes {
-                if mem.rows.len() <= 1 {
-                    // 单条负载即超过上限：保留最新一条，避免清空后无数据可传。
-                    break;
-                }
-                match mem.rows.pop_front() {
-                    Some(oldest) => {
-                        mem.bytes = mem.bytes.saturating_sub(oldest.payload_len());
-                        dropped.push(oldest.seq);
-                    }
-                    None => break,
-                }
-            }
-        }
-        for seq in dropped {
-            push_audit(
-                &self.audit,
-                QueueAudit::DroppedOldest {
-                    seq,
-                    reason: reason.to_string(),
-                },
-            );
-        }
-    }
-
     /// 发送指令并等待响应。
     fn send_cmd<T>(&self, make: impl FnOnce(Resp<T>) -> Cmd) -> DaemonResult<T> {
         let (resp_tx, resp_rx) = channel::<DaemonResult<T>>();
@@ -1126,6 +1296,40 @@ impl Drop for OfflineQueue {
 /// `u64` seq → SQLite `INTEGER`（i64 域内位模式一致，取回时转回 `u64`）。
 fn seq_to_i64(seq: u64) -> i64 {
     seq as i64
+}
+
+/// 批次元信息 JSON（task 54，供北向 JSON 出口 / 落盘信封复用）。
+///
+/// **大数红线**：`batch_seq` / `payload_bytes` 一律编码为**字符串**——
+/// JavaScript `Number` 只能安全表示 2^53 以内的整数，`u64` 序号超过后若按
+/// 数值编码会静默丢失精度，破坏幂等键去重。
+#[must_use]
+pub fn batch_meta_json(batch: &QueuedBatch) -> String {
+    format!(
+        "{{\"gateway_id\":\"{}\",\"batch_seq\":\"{}\",\"payload_bytes\":\"{}\"}}",
+        json_escape(&batch.gateway_id),
+        batch.seq,
+        batch.payload.len()
+    )
+}
+
+/// JSON 字符串转义（最少实现：反斜杠与双引号；控制字符按 JSON 规范转义）。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// SQLite `INTEGER` → `u64` seq。
@@ -1194,17 +1398,6 @@ mod tests {
     /// 打开队列（手工时钟）。
     fn open(dir: &Path, gateway: &str, clock: &ManualClock) -> OfflineQueue {
         OfflineQueue::open(cfg(dir, gateway), Arc::new(clock.clone())).expect("open queue")
-    }
-
-    /// 断言审计中存在被丢弃的 seq 列表（按发生顺序）。
-    fn dropped_seqs(audit: &[QueueAudit]) -> Vec<u64> {
-        audit
-            .iter()
-            .filter_map(|event| match event {
-                QueueAudit::DroppedOldest { seq, .. } => Some(*seq),
-                _ => None,
-            })
-            .collect()
     }
 
     /// QA Happy：断网写入 100 条 → 恢复 → 全部按序补发且无重复。
@@ -1317,52 +1510,61 @@ mod tests {
         queue.close().expect("close");
     }
 
-    /// QA Error：硬上限 → 丢弃最旧 + 审计留痕，且保留最新数据。
+    /// QA Error（task 54）：硬上限 → **拒绝入队** + 溢出审计留痕，且已收数据零丢失。
+    ///
+    /// 场景：max_mem_rows=5（高水位=4）+ 落盘故障注入 → 高水位降级也失败，
+    /// 数据只能收内存；第 6 条触硬上限被拒（Overflow 审计），前 5 条原样可补发。
     #[test]
-    fn hard_limit_drops_oldest_with_audit_and_keeps_newest() {
+    fn hard_limit_rejects_enqueue_with_overflow_audit_and_no_data_loss() {
         let dir = tempdir();
         let clock = ManualClock::new(T0_NS);
         let mut config = cfg(dir.path(), "gw-hard-limit");
         config.max_mem_rows = 5;
         let queue = OfflineQueue::open(config, Arc::new(clock.clone())).expect("open");
-        // 模拟「落盘不可写」：高水位落盘必定失败，只能按策略丢弃最旧。
+        assert_eq!(queue.config().high_water_rows(), 4);
+        // 模拟「落盘不可写」：高水位降级路径也必然失败，数据只能收内存。
         queue.set_persist_failure(true);
 
-        for i in 0..20u32 {
-            let seq = queue
-                .enqueue(format!("p-{i:02}").into_bytes())
-                .expect("enqueue");
-            assert_eq!(seq, u64::from(i) + 1);
+        let mut accepted = Vec::new();
+        for i in 0..6u32 {
+            match queue.enqueue(format!("p-{i:02}").into_bytes()) {
+                Ok(seq) => accepted.push(seq),
+                Err(err) => {
+                    // 第 6 条必须被拒：溢出标记 + StorageError(4000)。
+                    assert_eq!(u64::from(i), 5, "只有第 6 条被拒，实际第 {} 条", i + 1);
+                    assert_eq!(err.error_code(), ERR_STORAGE, "err: {err}");
+                    assert!(
+                        err.to_string().contains("overflowed"),
+                        "错误信息必须携带溢出标记: {err}"
+                    );
+                }
+            }
         }
-        assert_eq!(queue.pending_mem(), 5, "硬上限后只保留 5 条最新数据");
-        assert_eq!(queue.pending().expect("pending"), 5);
+        assert_eq!(accepted, vec![1, 2, 3, 4, 5], "前 5 条正常接收");
+        assert_eq!(queue.pending_mem(), 5, "被拒的数据不得挤占内存");
+        assert_eq!(queue.pending().expect("pending"), 5, "总数 = 已收 5 条");
 
+        // 溢出必须留审计（绝不静默）：Overflow{seq: 6, reason 含 hard limit}。
         let audit = queue.drain_audit();
-        let dropped = dropped_seqs(&audit);
-        assert_eq!(dropped.len(), 15, "丢弃 15 条最旧数据且全部留痕");
-        assert_eq!(
-            dropped,
-            (1..=15u64).collect::<Vec<u64>>(),
-            "丢弃顺序应为从最旧开始"
-        );
         assert!(
             audit.iter().any(|event| matches!(
                 event,
-                QueueAudit::DroppedOldest { reason, .. } if reason.contains("hard limit")
+                QueueAudit::Overflow { seq: 6, reason } if reason.contains("hard limit")
             )),
-            "审计 reason 需可诊断: {audit:?}"
+            "必须产生溢出审计: {audit:?}"
         );
 
-        let survivors = queue.take_batch(10).expect("take_batch");
-        assert_eq!(
-            survivors.iter().map(|b| b.seq).collect::<Vec<_>>(),
-            vec![16, 17, 18, 19, 20],
-            "保留的必须是最新数据"
-        );
-        assert_eq!(
-            survivors.last().map(|b| b.payload.clone()),
-            Some(b"p-19".to_vec())
-        );
+        // 已收数据零丢失、零重复：幂等键完整可补发。
+        let batch = queue.take_batch(10).expect("take_batch");
+        let keys: Vec<String> = batch.iter().map(|b| b.idempotency_key()).collect();
+        assert_eq!(keys.len(), 5);
+        {
+            let mut seen = std::collections::HashSet::new();
+            for key in &keys {
+                assert!(seen.insert(key.clone()), "幂等键重复: {key}");
+            }
+        }
+        assert_eq!(batch.last().map(|b| b.payload.clone()), Some(b"p-04".to_vec()));
         queue.set_persist_failure(false);
         queue.close().expect("close");
     }
@@ -1682,5 +1884,347 @@ mod tests {
         let err = queue.enqueue(b"y".to_vec()).expect_err("must fail");
         assert_eq!(err.error_code(), ERR_STORAGE);
         drop(queue);
+    }
+
+    // ---- task 54：幂等去重 + 背压水位 ----
+
+    /// 模拟接收端：按幂等键去重（服务端幂等校验的测试替身）。
+    struct MockServer {
+        /// 收到的投递总次数（含重放）。
+        delivered: usize,
+        /// 命中已处理键的重复投递次数。
+        duplicates: usize,
+        /// 已处理的幂等键集合（净效果）。
+        processed: HashSet<String>,
+    }
+
+    impl MockServer {
+        fn new() -> Self {
+            Self {
+                delivered: 0,
+                duplicates: 0,
+                processed: HashSet::new(),
+            }
+        }
+
+        fn deliver(&mut self, key: &str) {
+            self.delivered += 1;
+            if !self.processed.insert(key.to_string()) {
+                self.duplicates += 1;
+            }
+        }
+    }
+
+    /// 记录型 AckSink：成功持久化并记录调用顺序。
+    struct RecordingAckSink {
+        acks: Mutex<Vec<u64>>,
+    }
+
+    impl AckSink for RecordingAckSink {
+        fn persist_ack(&self, seq: u64) -> DaemonResult<()> {
+            self.acks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(seq);
+            Ok(())
+        }
+    }
+
+    /// 失败型 AckSink：模拟「落 Ack 时崩溃」（持久化失败 → 位点不得推进）。
+    struct FailingAckSink;
+
+    impl AckSink for FailingAckSink {
+        fn persist_ack(&self, _seq: u64) -> DaemonResult<()> {
+            Err(storage_err("ack persist failed (fault injection)"))
+        }
+    }
+
+    /// 默认水位参数：硬上限 65536、高水位 8192（task 54 决议值）。
+    #[test]
+    fn default_water_marks_are_8192_high_and_65536_hard() {
+        let dir = tempdir();
+        let config = cfg(dir.path(), "gw-default");
+        assert_eq!(config.max_mem_rows, 65_536, "硬上限默认 65536");
+        assert_eq!(config.mem_high_water_rows, 8_192, "高水位默认 8192");
+        assert_eq!(config.high_water_rows(), 8_192);
+
+        // 高水位可配置（且必须 > 0）。
+        let dir2 = tempdir();
+        let mut config2 = cfg(dir2.path(), "gw-override");
+        config2.mem_high_water_rows = 4_096;
+        config2.validate().expect("valid");
+        assert_eq!(config2.high_water_rows(), 4_096);
+        config2.mem_high_water_rows = 0;
+        assert_eq!(
+            config2.validate().expect_err("zero high water").error_code(),
+            ERR_CONFIG
+        );
+    }
+
+    /// 高水位必须被夹紧到硬上限的 4/5 以内（保证降级路径先于拒绝路径生效）。
+    #[test]
+    fn high_water_rows_is_clamped_to_four_fifths_of_hard_cap() {
+        let dir = tempdir();
+        let mut config = cfg(dir.path(), "gw-clamp");
+        config.max_mem_rows = 10;
+        config.mem_high_water_rows = 100;
+        assert_eq!(config.high_water_rows(), 8, "夹紧到 4/5");
+        config.max_mem_rows = 1;
+        assert_eq!(config.high_water_rows(), 1, "至少为 1");
+    }
+
+    /// 幂等键 = gateway_id + batch_seq；u64 全域不丢精度。
+    #[test]
+    fn idempotency_key_is_gateway_plus_seq() {
+        assert_eq!(idempotency_key("gw-1", 42), "gw-1:42");
+        let batch = QueuedBatch {
+            seq: 7,
+            gateway_id: "gw-2".to_string(),
+            payload: Vec::new(),
+            enqueued_ns: 0,
+        };
+        assert_eq!(batch.idempotency_key(), "gw-2:7");
+        assert_eq!(idempotency_key("gw", u64::MAX), format!("gw:{}", u64::MAX));
+    }
+
+    /// seq 来源可注入（测试可控）；补发全程幂等键稳定。
+    #[test]
+    fn seq_source_is_injectable_and_idempotency_keys_stay_stable() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let hooks = QueueHooks {
+            seq_source: Some(Arc::new(AtomicSeqSource::new(1_000_000))),
+            ack_sink: None,
+        };
+        let queue = OfflineQueue::open_with_hooks(
+            cfg(dir.path(), "gw-seq"),
+            Arc::new(clock.clone()),
+            hooks,
+        )
+        .expect("open with injected seq source");
+        queue.set_online(false);
+        let s1 = queue.enqueue(b"a".to_vec()).expect("enqueue 1");
+        let s2 = queue.enqueue(b"b".to_vec()).expect("enqueue 2");
+        assert_eq!((s1, s2), (1_000_000, 1_000_001), "seq 必须来自注入来源");
+
+        // 两次补发（重放）得到完全相同的幂等键。
+        let first: Vec<String> = queue
+            .replay_batch(10)
+            .expect("replay 1")
+            .iter()
+            .map(|b| b.idempotency_key())
+            .collect();
+        let second: Vec<String> = queue
+            .replay_batch(10)
+            .expect("replay 2")
+            .iter()
+            .map(|b| b.idempotency_key())
+            .collect();
+        assert_eq!(first, second, "补发全程幂等键必须稳定");
+        assert_eq!(first, vec!["gw-seq:1000000", "gw-seq:1000001"]);
+
+        queue.ack_up_to(s2).expect("ack");
+        queue.close().expect("close");
+    }
+
+    /// 重放无重复键：崩溃（未 ack）后重启重放同一批，接收端按幂等键去重后净效果
+    /// = 每键只处理一次（mock 发送端见到的幂等键集合无重复）。
+    #[test]
+    fn replay_after_crash_without_ack_dedups_by_idempotency_key() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let mut server = MockServer::new();
+
+        // 第一次补发（不确认任何批次）。
+        let queue = open(dir.path(), "gw-replay", &clock);
+        queue.set_online(false);
+        for i in 0..10u32 {
+            queue
+                .enqueue(format!("r-{i}").into_bytes())
+                .expect("enqueue offline");
+        }
+        for batch in queue.replay_batch(100).expect("replay 1") {
+            server.deliver(&batch.idempotency_key());
+        }
+        assert_eq!(server.processed.len(), 10);
+        // 模拟进程崩溃：不调用 close，直接 drop（位点停在 0）。
+        drop(queue);
+
+        // 重启后重放：HWM 仍为 0 → 同一批条目再次出现，幂等键逐条相同。
+        let reopened = open(dir.path(), "gw-replay", &clock);
+        assert_eq!(reopened.ack_seq(), 0, "未落 Ack，重启后位点必须保持 0");
+        for batch in reopened.replay_batch(100).expect("replay 2") {
+            server.deliver(&batch.idempotency_key());
+        }
+        assert_eq!(server.delivered, 20, "重放确实发生了第二次投递");
+        assert_eq!(server.duplicates, 10, "重复投递由接收端按键吸收");
+        assert_eq!(
+            server.processed.len(),
+            10,
+            "mock 接收端见到的幂等键集合无重复（净效果 = 只处理一次）"
+        );
+        reopened.close().expect("close");
+    }
+
+    /// HWM 跳过：已确认位点之前的条目不再出现在补发结果里。
+    #[test]
+    fn replay_batch_skips_entries_before_high_water_mark() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let queue = open(dir.path(), "gw-hwm", &clock);
+        queue.set_online(false);
+        for i in 0..8u32 {
+            queue.enqueue(format!("h-{i}").into_bytes()).expect("e");
+        }
+        queue.ack_up_to(5).expect("ack");
+        let batch = queue.replay_batch(100).expect("replay");
+        let seqs: Vec<u64> = batch.iter().map(|b| b.seq).collect();
+        assert_eq!(seqs, vec![6, 7, 8], "必须跳过 seq <= HWM 的条目");
+        assert!(
+            batch.iter().all(|b| b.seq > queue.ack_seq()),
+            "补发条目必须全部在位点之后"
+        );
+        queue.close().expect("close");
+    }
+
+    /// Ack 语义（注入 AckSink）：持久化失败 → 内存位点不推进、数据不删。
+    #[test]
+    fn failing_ack_sink_blocks_memory_pointer_advance() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let hooks = QueueHooks {
+            seq_source: None,
+            ack_sink: Some(Arc::new(FailingAckSink)),
+        };
+        let queue = OfflineQueue::open_with_hooks(
+            cfg(dir.path(), "gw-ack-fail"),
+            Arc::new(clock.clone()),
+            hooks,
+        )
+        .expect("open with failing ack sink");
+        queue.set_online(false);
+        for i in 0..3u32 {
+            queue.enqueue(format!("f-{i}").into_bytes()).expect("e");
+        }
+
+        let err = queue.ack_up_to(2).expect_err("落 Ack 失败必须报错");
+        assert_eq!(err.error_code(), ERR_STORAGE);
+        assert_eq!(queue.ack_seq(), 0, "持久化失败 → 内存位点不得推进");
+        assert_eq!(queue.pending().expect("pending"), 3, "数据不得删除");
+        assert_eq!(
+            queue.replay_batch(10).expect("replay").len(),
+            3,
+            "失败后数据仍完整可补发（重放由幂等键兜底）"
+        );
+        queue.close().expect("close");
+    }
+
+    /// Ack 语义（注入 AckSink）：确认记录先落（sink 收到持久化调用），
+    /// 持久化成功后内存位点才推进、HWM 之前的条目被跳过。
+    #[test]
+    fn ack_sink_persists_before_memory_pointer_advances() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let sink = Arc::new(RecordingAckSink {
+            acks: Mutex::new(Vec::new()),
+        });
+        let hooks = QueueHooks {
+            seq_source: None,
+            ack_sink: Some(Arc::clone(&sink) as Arc<dyn AckSink>),
+        };
+        let queue = OfflineQueue::open_with_hooks(
+            cfg(dir.path(), "gw-ack-ok"),
+            Arc::new(clock.clone()),
+            hooks,
+        )
+        .expect("open with recording ack sink");
+        queue.set_online(false);
+        for i in 0..3u32 {
+            queue.enqueue(format!("a-{i}").into_bytes()).expect("e");
+        }
+
+        queue.ack_up_to(2).expect("ack");
+        assert_eq!(
+            sink.acks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[2],
+            "确认记录必须先持久化（sink 收到调用且仅一次）"
+        );
+        assert_eq!(queue.ack_seq(), 2, "持久化成功后才推进内存位点");
+        let seqs: Vec<u64> = queue
+            .replay_batch(10)
+            .expect("replay")
+            .iter()
+            .map(|b| b.seq)
+            .collect();
+        assert_eq!(seqs, vec![3], "已确认位点之前的条目必须被跳过");
+        queue.close().expect("close");
+    }
+
+    /// 高水位降级路径：内存超水位后数据流向磁盘（降级），生产者不阻塞、零丢失，
+    /// 内存永不突破硬上限。
+    #[test]
+    fn high_water_degradation_keeps_producer_unblocked_and_no_data_loss() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let mut config = cfg(dir.path(), "gw-degrade");
+        config.max_mem_rows = 4; // 高水位 = 3
+        let queue = OfflineQueue::open(config, Arc::new(clock.clone())).expect("open");
+        queue.set_online(true);
+
+        for i in 0..20u32 {
+            queue
+                .enqueue(format!("d-{i:02}").into_bytes())
+                .expect("enqueue 绝不阻塞、绝不失败");
+        }
+        assert_eq!(queue.pending().expect("pending"), 20, "零丢失");
+        assert!(
+            queue.pending_mem() <= 4,
+            "内存不得超过硬上限: {}",
+            queue.pending_mem()
+        );
+        assert!(
+            queue.pending_disk().expect("disk") > 0,
+            "超水位数据必须已降级落盘"
+        );
+
+        let batch = queue.replay_batch(100).expect("replay");
+        assert_eq!(batch.len(), 20);
+        for (i, b) in batch.iter().enumerate() {
+            assert_eq!(b.seq, i as u64 + 1, "按序、无重复、无空洞");
+        }
+        queue.close().expect("close");
+    }
+
+    /// 大数红线：JSON 元信息里 `batch_seq` / `payload_bytes` 一律字符串编码。
+    #[test]
+    fn batch_meta_json_encodes_large_batch_seq_as_string() {
+        // 2^53 + 1：超出 JavaScript Number 安全整数域的边界。
+        let big = 9_007_199_254_740_993u64;
+        let batch = QueuedBatch {
+            seq: big,
+            gateway_id: "gw\"big\\".to_string(),
+            payload: vec![0u8; 512],
+            enqueued_ns: 0,
+        };
+        let json = batch_meta_json(&batch);
+        assert!(
+            json.contains("\"batch_seq\":\"9007199254740993\""),
+            "batch_seq 必须字符串编码: {json}"
+        );
+        assert!(
+            json.contains("\"payload_bytes\":\"512\""),
+            "count 类字段一律字符串: {json}"
+        );
+        assert!(
+            json.contains("\"gateway_id\":\"gw\\\"big\\\\\""),
+            "gateway_id 必须 JSON 转义: {json}"
+        );
+        assert!(
+            !json.contains("\"batch_seq\":9"),
+            "禁止把 batch_seq 编码为数值: {json}"
+        );
     }
 }
