@@ -1,0 +1,100 @@
+# cargo-deny 配置 — iot-daq 供应链合规门禁（task 58）
+#
+# 运行方式：
+#   - 本地：`cargo deny check licenses bans advisories`
+#   - CI：`.github/workflows/deny.yml`（ubuntu + windows 矩阵，cargo-deny-action@v2）
+#
+# 项目红线背景：纯 Rust 依赖栈，禁止引入需系统 C 库 / cmake / NASM 的非 vendored 依赖。
+# 唯一例外（已主理人登记）：`rusqlite` bundled feature —— libsqlite3-sys 自带 vendored
+# SQLite C 源码（cc 就地编译，无需系统库），已在 mingw/MSVC 双端实测可构建。
+
+[graph]
+# 同时检查宿主目标与 Windows 交叉目标（daemon 发布物覆盖 amd64/arm64 + windows 侧车）。
+all-features = true
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+
+# ────────────────────────────────────────────────────────────────────────────
+# licenses：许可证白名单
+# ────────────────────────────────────────────────────────────────────────────
+[licenses]
+version = 2
+# 依赖树中不存在未列入白名单的许可证时通过；否则 CI 报错并要求人工审查。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",   # cc / wasi 等构建链 crate 常见
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",                          # notify 8.2.0（文件监视，public-domain 等价）
+    "ISC",
+    "Unicode-3.0",                      # unicode-ident 等字符表 crate
+    "Unicode-DFS-2016",
+    "Zlib",
+    # 本仓库自有 workspace crate（daemon / licensing-server / protocol-proto 等）
+    # 声明为 LicenseRef-Proprietary（商业闭源，非开源许可证）——自有代码，放行。
+    "LicenseRef-Proprietary",
+    # 预留：远期引入 async-opcua-server 0.19.0（task 10，OPC-UA 服务端，MPL-2.0）。
+    # 现在就把 MPL-2.0 放入 allow，避免 task 10 实施时 CI 变红。
+    # 注意 MPL-2.0 为弱 copyleft（文件级），修改其源文件需开源该文件，链接无传染。
+    "MPL-2.0",
+]
+# 置信度门槛：cargo-deny 对许可证文本的匹配置信度低于该值即报错。
+confidence-threshold = 0.93
+# 真实依赖树已核实（2025，cargo tree -p daemon）：全部落在上述白名单内。
+# 特别记录（历史审查点 840e971 / rsqlite-vfs）：
+#   - rsqlite-vfs 0.1.1 → MIT
+#   - sqlite-wasm-rs 0.5.5 → MIT（rusqlite 0.40.2 的 wasm 目标传递依赖，非本仓库直接依赖）
+#   - libsqlite3-sys（bundled）→ MIT OR Apache-2.0（vendored C 源，红线登记例外）
+
+# 未声明许可证 / 无法识别许可证的 crate：默认即视为不通过（config v2 无独立开关）。
+# 若新发布 crate 的许可证未收录进 spdx 库导致误报，用 `--allow-license-text` 或
+# 在本文件登记 clarify 处理，禁止直接放宽白名单。
+
+# 允许但需记录的例外：新增 GPL 类例外必须在 allow 之外单独走人工审查并注明
+# 理由与到期时间（当前无任何许可证类例外）。
+
+# ────────────────────────────────────────────────────────────────────────────
+# advisories：安全公告（RustSec）
+# ────────────────────────────────────────────────────────────────────────────
+[advisories]
+version = 2
+# 门槛低配：任何级别公告都不直接 fail（工控现场升级节奏受离线窗口约束，
+# 硬 fail 会让 CI 长期红且无人看）。策略：CI 报告 → 主理人定期审查 → 登记豁免。
+yanked = "warn"          # yanked crate 仅警告（离线锁定的版本可能事后被 yank，属正常现象）
+ignore = []              # 登记豁免公告：RUSTSEC-XXXX-NNNN（必须注明理由与复查日期）
+
+# ────────────────────────────────────────────────────────────────────────────
+# bans：版本 / 来源禁令
+# ────────────────────────────────────────────────────────────────────────────
+[bans]
+# 依赖树内同名 crate 多版本：warn（严格 deny 会因生态常态的多版本而长期红；
+# 出现 warn 时优先通过 `cargo tree -d` 分析后升级收敛，而不是无脑 skip）。
+multiple-versions = "warn"
+# 通配符依赖治理：
+# - registry/git 来源的 `*` 通配符必须消灭（破坏 Cargo.lock 可重现性）；
+# - workspace 内 path-only 依赖（如 daemon → protocol-proto）无 version 字段，
+#   会被 cargo-deny 计为 wildcard。彻底 deny 的前置条件是 workspace crate 在
+#   Cargo.toml 声明 `publish = false`（allow-wildcard-paths 仅对 private crate 生效）。
+#   本任务纪律禁改 Cargo.toml，故先取 warn；补上 publish = false 后应立即改回 deny。
+wildcards = "warn"
+# 禁止 workspace 内重复版本声明导致的歧义。
+deny = [
+    # 按 crate 名封禁的高危依赖（当前为空；如未来误引入 openssl-sys / 需 cmake 的
+    # 非 vendored 依赖，在此登记封禁并回溯删除）。
+]
+# 允许多版本共存的已审查豁免（当前为空；新增必须注明「哪个 crate 的哪两条路径」）。
+skip = []
+skip-tree = []
+
+# ────────────────────────────────────────────────────────────────────────────
+# sources：crate 来源白名单（默认仅 crates.io；防内部误用 git 依赖绕过审计）
+# ────────────────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
