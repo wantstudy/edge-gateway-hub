@@ -25,6 +25,7 @@ pub mod logging;
 pub mod mgmt;
 pub mod north;
 pub mod offline_queue;
+pub mod ota;
 pub mod pipeline;
 pub mod rules;
 pub mod scheduler;
