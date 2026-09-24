@@ -29,6 +29,8 @@ pub mod mc;
 pub mod modbus;
 pub mod mqtt_in;
 pub mod s7;
+/// S7 统一 [`Driver`] trait 适配层（薄壳：类型转换 + 错误映射，task 11 收尾切片）。
+pub mod s7_adapter;
 
 // ---- Driver trait ----
 
