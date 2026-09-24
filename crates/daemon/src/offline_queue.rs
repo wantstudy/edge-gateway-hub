@@ -89,6 +89,22 @@ const WRITER_THREAD_NAME: &str = "offline-queue-writer";
 /// 写线程忙等超时（毫秒，避免瞬时锁冲突直接失败）。
 const BUSY_TIMEOUT_MS: i64 = 3_000;
 
+/// 维护（保留期淘汰 + 环形覆盖）摊销周期：每累计 `MAINTAIN_EVERY_N` 次**入队落盘**
+/// 才真正跑一次全表维护。
+///
+/// ## 为什么需要摊销（性能红线，离线路径 O(n²) 根因之二）
+/// 离线断网时 `enqueue` 对**每条**记录单独落盘一个事务；若每个事务都跑维护，则维护里
+/// 的保留期聚合（`WHERE enqueued_ns < ?`）与环形覆盖判定会随表增长反复全表扫描，
+/// 令整段入队退化为 `O(n²)`（实测 16,000 行 30.9 s、每翻倍 ≈ 3.6×，外推 1.8M 行需百小时）。
+///
+/// ## 取值 256 的依据
+/// 默认内存高水位 8,192 条：256 次落盘 ≈ 高水位的 1/32，把维护成本摊薄到 ≈0.4%；
+/// 同时保证「环形覆盖 / 保留期」在正常上行（每批 1 条）下最多滞后 256 条即生效 —— 远小于
+/// 高水位，故**不削弱任何背压 / 淘汰保证**。`flush()` / `take_batch()` / `replay_batch()` /
+/// 关闭则**强制**立即维护（见 `Persist::force_maintain` 与 `DbWriter::maintain_now`），
+/// 保证对外可观测的淘汰时机不变。
+const MAINTAIN_EVERY_N: u64 = 256;
+
 // ---- 时钟 ----
 
 /// 可注入时钟（测试要模拟 7 天保留期，**禁止真 sleep**）。
@@ -434,6 +450,11 @@ enum Cmd {
     Persist {
         /// 待写入批次（按 seq 升序）。
         batches: Vec<QueuedBatch>,
+        /// 是否**强制**在本次事务内跑一次维护（保留期 + 环形覆盖）。
+        ///
+        /// `false`（入队路径）：维护按 `MAINTAIN_EVERY_N` 摊销，避免逐条落盘时的 O(n²)。
+        /// `true`（`flush` / 关闭）：无条件维护，保证对外可观测的淘汰时机不变。
+        force_maintain: bool,
         /// 响应通道。
         resp: Resp<usize>,
     },
@@ -470,6 +491,13 @@ enum Cmd {
 // ---- 写线程 ----
 
 /// 建表语句。
+///
+/// 说明：`CREATE INDEX idx_queue_enqueued_ns` 与建表同批、同为 `IF NOT EXISTS` 幂等语句，
+/// 在 `bootstrap()`（每次 `open` 必跑）中执行 —— 因此对**新建库**与**已存在的旧库**都会
+/// 补建该索引（旧库首次 `open` 时一次性建索引，之后幂等 no-op）。这是本模块处理 schema
+/// 演进的既有机制（`execute_batch(SCHEMA_SQL)` 幂等 DDL），无需改动版本号：
+/// - 保留期淘汰的聚合查询 `WHERE enqueued_ns < ?` 由**全表扫描**降为**索引区间查找**
+///   （无过期行时退化为 O(log n) 的空区间探测），这是离线 O(n²) 根因之一。
 const SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS queue (
     seq         INTEGER PRIMARY KEY,
@@ -477,6 +505,7 @@ CREATE TABLE IF NOT EXISTS queue (
     payload     BLOB    NOT NULL,
     enqueued_ns INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_queue_enqueued_ns ON queue(enqueued_ns);
 CREATE TABLE IF NOT EXISTS queue_meta (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -491,6 +520,17 @@ struct DbWriter {
     retention_ns: i64,
     audit: Arc<Mutex<VecDeque<QueueAudit>>>,
     fail_writes: Arc<AtomicBool>,
+    /// 磁盘 `queue` 表内全部行的**逻辑字节总量**（`SUM(LENGTH(payload))`）运行累计值。
+    ///
+    /// 由 insert（+）/ ack 删除（-）/ 保留期与环形淘汰（-）同步维护，使 `maintain` 的
+    /// 字节上限判定为 **O(1)**，无需每次事务都做 `SUM(LENGTH(payload))` 全表扫描
+    /// （离线 O(n²) 根因之一）。该值**只可能高估、绝不低估**（见 `persist` 注释），
+    /// 故「超限才淘汰」的门控不会漏判；环形淘汰时以扫描结果**精确回写**，误差自愈。
+    disk_bytes: u64,
+    /// 落盘事务计数器（自 `open` 起累计）。用于把维护摊销到每 `MAINTAIN_EVERY_N` 次
+    /// 落盘一次，避免逐条落盘时的 O(n²)。写线程单线程串行，用 `Relaxed` 自增即可；
+    /// 采用 `AtomicU64` 以便 `&self` 视角下也可读写（与结构体其余字段风格一致）。
+    persist_ticks: AtomicU64,
     ack_seq: u64,
     last_seq: u64,
 }
@@ -530,6 +570,16 @@ impl DbWriter {
                 row.get(0)
             })
             .map_err(map_sqlite)?;
+        // 初始化磁盘逻辑字节累计值（仅 `open` 时做一次全表扫描；之后增量维护）。
+        let total_bytes: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM queue",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+        self.disk_bytes = total_bytes.max(0) as u64;
         let meta_last = self.read_meta_i64("last_seq")?.unwrap_or(0);
         let meta_ack = self.read_meta_i64("ack_seq")?.unwrap_or(0);
         self.last_seq = max_row_seq.max(meta_last).max(0) as u64;
@@ -558,8 +608,12 @@ impl DbWriter {
     /// 处理单条指令（错误一律回传，绝不 panic、绝不退出循环）。
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Persist { batches, resp } => {
-                let result = self.persist(batches);
+            Cmd::Persist {
+                batches,
+                force_maintain,
+                resp,
+            } => {
+                let result = self.persist(batches, force_maintain);
                 let _ = resp.send(result);
             }
             Cmd::Take {
@@ -584,14 +638,18 @@ impl DbWriter {
         }
     }
 
-    /// 批量落盘：一个事务写完所有批次，再跑一次维护（保留期 + 环形覆盖）。
-    fn persist(&mut self, batches: Vec<QueuedBatch>) -> DaemonResult<usize> {
+    /// 批量落盘：一个事务写完所有批次，再**按需**跑维护（保留期 + 环形覆盖）。
+    ///
+    /// `force_maintain = false` 时按 `MAINTAIN_EVERY_N` 摊销 —— 离线逐条落盘场景下
+    /// 这是把整段入队从 O(n²) 拉回线性的关键；`true`（`flush` / 关闭）时无条件维护。
+    fn persist(&mut self, batches: Vec<QueuedBatch>, force_maintain: bool) -> DaemonResult<usize> {
         if self.fail_writes.load(Ordering::SeqCst) {
             return Err(storage_err(
                 "persist failed: disk backend is not writable (fault injection)",
             ));
         }
         let tx = self.conn.transaction().map_err(map_sqlite)?;
+        let mut inserted_bytes: u64 = 0;
         {
             let mut stmt = tx
                 .prepare(
@@ -607,18 +665,32 @@ impl DbWriter {
                     batch.enqueued_ns,
                 ])
                 .map_err(map_sqlite)?;
+                inserted_bytes = inserted_bytes.saturating_add(batch.payload.len() as u64);
             }
         }
+        // 字节累计：正常路径每条 seq 都是**新行**（seq 单调且唯一），故 +len 精确；
+        // 极少数 `INSERT OR REPLACE` 命中已存在 seq 时会**高估**（未减被覆盖行的字节），
+        // 但高估只会让环形淘汰的触发门更保守（多做一次无害扫描），绝不漏判超限；
+        // 环形淘汰路径以扫描结果精确回写，误差随即自愈。
+        self.disk_bytes = self.disk_bytes.saturating_add(inserted_bytes);
+
         // 维护（保留期淘汰 + 环形覆盖）在同一事务内完成，保证淘汰与写入原子生效。
         // 以静态函数形式调用：`maintain` 只读 `&self` 的配置与审计句柄，但此处
         // `self.conn` 已被 `tx` 可变借出（E0502），故把所需字段显式传参。
-        maintain(
-            &tx,
-            self.clock.as_ref(),
-            self.retention_ns,
-            self.max_db_bytes,
-            &self.audit,
-        )?;
+        // 摊销门控：仅在强制（flush / 关闭）时无条件维护；否则计数每满 MAINTAIN_EVERY_N
+        // 才维护一次。计数以 `Relaxed` 自增即可（写线程单线程串行）。
+        let tick = self.persist_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        if force_maintain || tick % MAINTAIN_EVERY_N == 0 {
+            let new_total = maintain(
+                &tx,
+                self.clock.as_ref(),
+                self.retention_ns,
+                self.max_db_bytes,
+                &self.audit,
+                self.disk_bytes,
+            )?;
+            self.disk_bytes = new_total;
+        }
         for batch in &batches {
             self.last_seq = self.last_seq.max(batch.seq);
         }
@@ -641,6 +713,9 @@ impl DbWriter {
             // 读路径不受写故障注入影响（上传侧仍需能读到内存中的存量数据）。
             return Ok(Vec::new());
         }
+        // 取批 / 补发是天然的「周期边界」：强制维护一次，保证保留期 / 环形覆盖的
+        // 淘汰时机对外可观测地不变（不因入队路径的摊销而滞后）。
+        self.maintain_now()?;
         let limit = seq_to_i64(max.min(i64::MAX as usize) as u64);
         let mut stmt = self
             .conn
@@ -694,6 +769,14 @@ impl DbWriter {
         }
         self.ack_seq = seq;
         let tx = self.conn.transaction().map_err(map_sqlite)?;
+        // 先统计将被删除行的逻辑字节（用于同步磁盘字节累计值），再删除。
+        let removed_bytes: i64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM queue WHERE seq <= ?1",
+                params![seq_to_i64(seq)],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
         tx.execute(
             "DELETE FROM queue WHERE seq <= ?1",
             params![seq_to_i64(seq)],
@@ -702,33 +785,49 @@ impl DbWriter {
         write_meta_i64(&tx, "ack_seq", seq_to_i64(seq))?;
         write_meta_i64(&tx, "last_seq", seq_to_i64(self.last_seq.max(seq)))?;
         tx.commit().map_err(map_sqlite)?;
+        self.disk_bytes = self.disk_bytes.saturating_sub(removed_bytes.max(0) as u64);
         Ok(())
     }
 
-    /// 维护：保留期淘汰 + 环形覆盖（均在调用方事务内）。
-    /// 维护（保留期淘汰 + 环形覆盖）——委托给同名自由函数，仅作可读性入口。
-    #[allow(dead_code)]
-    fn maintain(&self, tx: &Transaction<'_>) -> DaemonResult<()> {
-        maintain(
-            tx,
+    /// 在**独立事务**内强制维护一次（保留期 + 环形覆盖），并同步磁盘字节累计值。
+    ///
+    /// 供 `take`（取批 / 补发）等「周期边界」调用，保证淘汰时机不因入队路径的摊销而滞后。
+    fn maintain_now(&mut self) -> DaemonResult<()> {
+        let tx = self.conn.transaction().map_err(map_sqlite)?;
+        let new_total = maintain(
+            &tx,
             self.clock.as_ref(),
             self.retention_ns,
             self.max_db_bytes,
             &self.audit,
-        )
+            self.disk_bytes,
+        )?;
+        tx.commit().map_err(map_sqlite)?;
+        self.disk_bytes = new_total;
+        Ok(())
     }
 }
 
 /// 维护（保留期淘汰 + 环形覆盖）的静态实现：只依赖显式传入的配置与审计句柄，
 /// 不借用 `&self`，因此可在 `self.conn` 被事务可变借出时调用（规避 E0502）。
+///
+/// 入参 `disk_bytes` 是调用方维护的磁盘逻辑字节**运行累计值**（见 [`DbWriter::disk_bytes`]）；
+/// 返回值是淘汰后的新累计值（由调用方回写）。用它把「是否需要环形覆盖」的判定做到
+/// **O(1)**，从而避免每次事务都对整表 `SUM(LENGTH(payload))` 做全表扫描
+/// （离线逐条落盘时退化为 O(n²) 的根因之一）。
 fn maintain(
     tx: &Transaction<'_>,
     clock: &dyn Clock,
     retention_ns: i64,
     max_db_bytes: u64,
     audit: &Arc<Mutex<VecDeque<QueueAudit>>>,
-) -> DaemonResult<()> {
+    disk_bytes: u64,
+) -> DaemonResult<u64> {
+    let mut current = disk_bytes;
+
     // 1) 保留期：删除 enqueued_ns 早于 (now - retention_ns) 的批次。
+    //    该 `WHERE enqueued_ns < ?` 走 `idx_queue_enqueued_ns` 索引区间；无过期行时
+    //    退化为 O(log n) 的空区间探测（不再全表扫描）。
     let cutoff = clock.now_ns().saturating_sub(retention_ns);
     let (old_rows, old_bytes): (i64, i64) = tx
         .query_row(
@@ -740,6 +839,7 @@ fn maintain(
     if old_rows > 0 {
         tx.execute("DELETE FROM queue WHERE enqueued_ns < ?1", params![cutoff])
             .map_err(map_sqlite)?;
+        current = current.saturating_sub(old_bytes.max(0) as u64);
         push_audit(
             audit,
             QueueAudit::Evicted {
@@ -750,44 +850,102 @@ fn maintain(
         );
     }
 
-    // 2) 环形覆盖：超过 max_db_bytes 时从最旧批次开始逐条淘汰。
-    //    至少保留最新一条（单条负载就超过上限时不做无意义的全清）。
-    let mut evicted_rows = 0usize;
-    let mut evicted_bytes = 0u64;
-    loop {
-        let (total_rows, total_bytes): (i64, i64) = tx
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) FROM queue",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .map_err(map_sqlite)?;
-        if total_rows <= 1 || (total_bytes.max(0) as u64) <= max_db_bytes {
-            break;
+    // 2) 环形覆盖：仅当累计字节**超上限**时才做一次升序扫描 + 单条 DELETE
+    //    （O(scan + evicted)，取代旧实现「每淘汰一行重扫全表」的 O(k·n)）。
+    //    未超限时此判定为 O(1)，与旧实现「总量 ≤ 上限 → 不淘汰任何行」严格等价。
+    if current > max_db_bytes {
+        let outcome = evict_byte_cap(tx, max_db_bytes)?;
+        current = outcome.remaining_bytes;
+        if outcome.evicted_rows > 0 {
+            push_audit(
+                audit,
+                QueueAudit::Evicted {
+                    rows: outcome.evicted_rows,
+                    bytes: outcome.evicted_bytes,
+                    reason: format!("max_db_bytes exceeded (limit {max_db_bytes})"),
+                },
+            );
         }
-        let (oldest_seq, payload_len): (i64, i64) = tx
-            .query_row(
-                "SELECT seq, LENGTH(payload) FROM queue ORDER BY seq ASC LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .map_err(map_sqlite)?;
-        tx.execute("DELETE FROM queue WHERE seq = ?1", params![oldest_seq])
-            .map_err(map_sqlite)?;
-        evicted_rows += 1;
-        evicted_bytes += payload_len.max(0) as u64;
     }
-    if evicted_rows > 0 {
-        push_audit(
-            audit,
-            QueueAudit::Evicted {
-                rows: evicted_rows,
-                bytes: evicted_bytes,
-                reason: format!("max_db_bytes exceeded (limit {max_db_bytes})"),
-            },
-        );
+    Ok(current)
+}
+
+/// 环形覆盖的一次成型结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EvictOutcome {
+    /// 被淘汰的批次数。
+    evicted_rows: usize,
+    /// 被淘汰的字节数。
+    evicted_bytes: u64,
+    /// 淘汰后 `queue` 表的**精确**逻辑字节总量（用于回写运行累计值，消除历史高估）。
+    remaining_bytes: u64,
+}
+
+/// 环形覆盖：**一次**升序扫描累计字节、定位最小淘汰前缀，再以**单条**
+/// `DELETE FROM queue WHERE seq <= :threshold_seq` 原子完成。
+///
+/// 语义与旧实现（逐条淘汰直到总量 ≤ 上限）严格一致：
+/// - **至少保留最新一条**（单条负载超上限时不做无意义的全清）—— 通过 `max_remove = len - 1`
+///   实现，对应旧实现循环里的 `total_rows <= 1` 短路；
+/// - 只淘汰**从最旧开始的连续前缀**，故一次区间 DELETE 即等价于旧实现的逐条 DELETE；
+/// - 淘汰行数 / 字节数与旧实现完全一致。
+///
+/// # Errors
+/// SQLite 扫描 / 删除失败 → `StorageError`（4000）。
+fn evict_byte_cap(tx: &Transaction<'_>, max_db_bytes: u64) -> DaemonResult<EvictOutcome> {
+    // 一次升序扫描：累计总字节，并保留每条 `(seq, len)` 供前缀定位。
+    let (entries, total): (Vec<(i64, u64)>, u64) = {
+        let mut stmt = tx
+            .prepare("SELECT seq, LENGTH(payload) FROM queue ORDER BY seq ASC")
+            .map_err(map_sqlite)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(map_sqlite)?;
+        let mut entries: Vec<(i64, u64)> = Vec::new();
+        let mut total: u64 = 0;
+        for row in rows {
+            let (seq, len) = row.map_err(map_sqlite)?;
+            let len = len.max(0) as u64;
+            total = total.saturating_add(len);
+            entries.push((seq, len));
+        }
+        (entries, total)
+    };
+
+    // 至少保留最新一条；总量未超上限则无淘汰。
+    if entries.len() <= 1 || total <= max_db_bytes {
+        return Ok(EvictOutcome {
+            evicted_rows: 0,
+            evicted_bytes: 0,
+            remaining_bytes: total,
+        });
     }
-    Ok(())
+
+    // 需移除的字节数 = 总量 - 上限；从最旧开始累加，直到移除足够（且至少留 1 条）。
+    let target_removal = total - max_db_bytes;
+    let max_remove = entries.len() - 1;
+    let mut removed_bytes: u64 = 0;
+    let mut remove_count: usize = 0;
+    while remove_count < max_remove && removed_bytes < target_removal {
+        removed_bytes = removed_bytes.saturating_add(entries[remove_count].1);
+        remove_count += 1;
+    }
+    if remove_count == 0 {
+        return Ok(EvictOutcome {
+            evicted_rows: 0,
+            evicted_bytes: 0,
+            remaining_bytes: total,
+        });
+    }
+
+    let threshold_seq = entries[remove_count - 1].0;
+    tx.execute("DELETE FROM queue WHERE seq <= ?1", params![threshold_seq])
+        .map_err(map_sqlite)?;
+    Ok(EvictOutcome {
+        evicted_rows: remove_count,
+        evicted_bytes: removed_bytes,
+        remaining_bytes: total - removed_bytes,
+    })
 }
 
 impl DbWriter {
@@ -912,6 +1070,8 @@ impl OfflineQueue {
                         retention_ns: cfg_for_writer.retention_ns,
                         audit: audit_for_writer,
                         fail_writes: fail_for_writer,
+                        disk_bytes: 0,
+                        persist_ticks: AtomicU64::new(0),
                         ack_seq: 0,
                         last_seq: 0,
                     };
@@ -1154,7 +1314,8 @@ impl OfflineQueue {
 
     /// 强制把内存队列全部落盘（**一个事务**），返回写入行数。
     ///
-    /// 即使内存为空也会跑一次维护（保留期 / 环形覆盖）。落盘失败时数据**回灌内存**，绝不静默丢弃。
+    /// 即使内存为空也会跑一次维护（保留期 / 环形覆盖）—— `flush` 走**强制**维护路径，
+    /// 保证对外可观测的淘汰时机不受入队路径摊销影响。落盘失败时数据**回灌内存**，绝不静默丢弃。
     ///
     /// # Errors
     /// 写线程不可用 / SQLite 失败 → `StorageError`（4000）。
@@ -1165,7 +1326,7 @@ impl OfflineQueue {
             mem.bytes = 0;
             taken
         };
-        match self.send_persist(batches.clone()) {
+        match self.send_persist_forced(batches.clone()) {
             Ok(rows) => Ok(rows),
             Err(err) => {
                 // 落盘失败：数据回灌到内存队首（顺序不变），交由水位策略处理。
@@ -1268,9 +1429,22 @@ impl OfflineQueue {
         }
     }
 
-    /// 落盘指令。
+    /// 落盘指令（**摊销**维护；入队路径用）。
     fn send_persist(&self, batches: Vec<QueuedBatch>) -> DaemonResult<usize> {
-        self.send_cmd(|resp| Cmd::Persist { batches, resp })
+        self.send_cmd(|resp| Cmd::Persist {
+            batches,
+            force_maintain: false,
+            resp,
+        })
+    }
+
+    /// 落盘指令（**强制**立即维护；`flush` / 关闭路径用）。
+    fn send_persist_forced(&self, batches: Vec<QueuedBatch>) -> DaemonResult<usize> {
+        self.send_cmd(|resp| Cmd::Persist {
+            batches,
+            force_maintain: true,
+            resp,
+        })
     }
 
     /// 磁盘统计指令。
@@ -2280,5 +2454,129 @@ mod tests {
             !json.contains("\"batch_seq\":9"),
             "禁止把 batch_seq 编码为数值: {json}"
         );
+    }
+
+    // ---- 性能回归（离线队列 O(n²) 缺陷） ----
+
+    /// 度量：断网逐条落盘 `rows` 条，按每 `block` 条切块记录**每块耗时**，
+    /// 返回各块耗时（**只计 enqueue**，不含 open / close / 正确性校验）。
+    ///
+    /// 断网路径对**每条** `enqueue` 单独落盘一个事务，是 `maintain()` 摊销缺陷的暴露面：
+    /// 若每个事务都全表扫描，整段入队为 O(n²)（后段单行成本随 n 线性增大）。
+    /// 采用**单次运行内的分块对比**（而非跨规模两次独立运行）以抵消构建 / 机器噪声：
+    /// 同一进程内相邻块之间，线性实现与二次方实现判然有别（见 `per_row_growth`）。
+    fn measure_offline_blocks(rows: usize, block: usize) -> Vec<std::time::Duration> {
+        assert!(
+            block > 0 && rows % block == 0,
+            "rows 必须是 block 的正整数倍"
+        );
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let queue = open(dir.path(), "gw-perf", &clock);
+        queue.set_online(false);
+        let payload = vec![7u8; 128];
+
+        let mut blocks: Vec<std::time::Duration> = Vec::with_capacity(rows / block);
+        let mut prev = std::time::Instant::now();
+        for i in 0..rows {
+            queue.enqueue(payload.clone()).expect("enqueue offline");
+            if (i + 1) % block == 0 {
+                let now = std::time::Instant::now();
+                blocks.push(now - prev);
+                prev = now;
+            }
+        }
+
+        // 计时区间外做一次正确性校验（`pending_disk` 是 O(n) 统计，不得计入耗时）。
+        assert_eq!(
+            queue.pending_disk().expect("pending_disk"),
+            rows,
+            "断网逐条落盘不得丢数据"
+        );
+        queue.close().expect("close");
+        blocks
+    }
+
+    /// 由分块耗时计算「前段 vs 后段」的单行成本增长比。
+    ///
+    /// 取前 `window` 块与后 `window` 块分别聚合（各 `window*block` 行）再比单行成本，
+    /// 聚合窗口可平滑单块抖动：
+    /// - **线性**（修复后）：单行成本近似常数 → 增长比 ≈ 1；
+    /// - **O(n²)**（旧实现）：单行成本 ∝ n → 后段/前段 ≈ (后段平均 n)/(前段平均 n)，
+    ///   对 `rows=20k, block=500, window=8` 约为 `(18k)/(2k) ≈ 9`，远超阈值 3。
+    fn per_row_growth(blocks: &[std::time::Duration], block: usize, window: usize) -> f64 {
+        assert!(blocks.len() >= 2 * window, "块数不足以切出前/后两段");
+        let early: std::time::Duration = blocks[..window].iter().sum();
+        let late: std::time::Duration = blocks[blocks.len() - window..].iter().sum();
+        let rows_win = (block * window) as f64;
+        let early_per_row = early.as_secs_f64() / rows_win;
+        let late_per_row = late.as_secs_f64() / rows_win;
+        late_per_row / early_per_row.max(1e-12)
+    }
+
+    /// 性能回归（**默认运行**）：断网逐条落盘必须**线性**扩展 + 持续吞吐达标。
+    ///
+    /// 旧实现 `maintain()` 每个落盘事务对整表 `SUM(LENGTH(payload))` 全表扫描
+    /// （且环形覆盖每淘汰一行再重扫），令离线入队退化为 O(n²)——实测
+    /// 8,000→8.43s、16,000→30.9s（每翻倍 ≈ 3.6×），外推断网 1 小时 1,800,000 行需百小时量级。
+    ///
+    /// 断言两条：
+    /// 1. **持续吞吐** ≥ 2,000 行/秒（容量红线：1h 断网 = 1,800,000 行）；
+    /// 2. **单行成本线性**：一次 20k 运行内，后段（4k 行）单行成本 < 3× 前段（4k 行）。
+    ///    线性 ≈ 1×，O(n²) ≈ 9× —— 阈值 3× 既宽松又能硬拦二次方；**同进程内**且**聚合窗口**
+    ///    的对比方式对并发构建 / CPU 竞争的鲁棒性远优于跨规模两次独立运行。
+    #[test]
+    fn offline_enqueue_scales_linearly_and_sustains_throughput() {
+        let rows = 20_000usize;
+        let block = 500usize;
+        let window = 8usize; // 前/后各 8 块 × 500 = 4,000 行
+        let blocks = measure_offline_blocks(rows, block);
+        assert_eq!(blocks.len(), rows / block);
+
+        let total: std::time::Duration = blocks.iter().sum();
+        let rate = rows as f64 / total.as_secs_f64().max(1e-12);
+        let growth = per_row_growth(&blocks, block, window);
+
+        println!(
+            "offline_enqueue_scale: rows={rows} block={block} total={total:?} \
+             rate={rate:.0} rows/s per_row_growth={growth:.2}"
+        );
+
+        assert!(
+            rate >= 2_000.0,
+            "断网持续入队吞吐必须 ≥ 2000 行/秒（容量红线），实测 {rate:.0} rows/s (total={total:?})"
+        );
+        assert!(
+            growth < 3.0,
+            "断网单行成本必须近似常数（线性扩展）：后段/前段单行成本比应 < 3，实测 \
+             {growth:.2}（total={total:?}）"
+        );
+    }
+
+    /// 性能回归（重型，#[ignore]）：更大尺度（80k 行）的线性证明，供 `--ignored` 产出证据。
+    // heavy: 80k rows; run with `--ignored` for stronger scaling evidence
+    #[test]
+    #[ignore = "heavy: 80k rows; run with --ignored for stronger scaling evidence"]
+    fn offline_enqueue_scales_linearly_at_scale() {
+        let rows = 80_000usize;
+        let block = 2_000usize;
+        let window = 4usize; // 前/后各 4 块 × 2,000 = 8,000 行
+        let blocks = measure_offline_blocks(rows, block);
+        assert_eq!(blocks.len(), rows / block);
+
+        let total: std::time::Duration = blocks.iter().sum();
+        let rate = rows as f64 / total.as_secs_f64().max(1e-12);
+        let growth = per_row_growth(&blocks, block, window);
+
+        println!(
+            "offline_enqueue_scale_ignored: rows={rows} block={block} total={total:?} \
+             rate={rate:.0} rows/s per_row_growth={growth:.2}"
+        );
+
+        assert!(
+            rate >= 2_000.0,
+            "断网持续入队吞吐必须 ≥ 2000 行/秒，实测 {rate:.0} rows/s"
+        );
+        assert!(growth < 3.0, "后段/前段单行成本比应 < 3，实测 {growth:.2}");
     }
 }
