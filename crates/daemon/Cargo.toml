@@ -59,8 +59,17 @@ axum = "0.7.9"
 tokio-stream = "0.1"
 # task 52 SSE：Sse<S> 的 TryStream 约束来自 futures-core（0.3.34 已在 Cargo.lock，零下载）。
 futures-core = "0.3"
+# task 10 OPC UA 驱动：async-opcua 0.19 拆分 crate（MPL-2.0，deny.toml 已白名单）。
+# 南向驱动为客户端角色 → async-opcua-client；不修改上游源码。
+async-opcua-client = "0.19"
+# task 10 驱动直接使用 types 层类型（NodeId / Variant / 服务请求结构等）。
+async-opcua-types = "0.19"
 
 [dev-dependencies]
+# task 10 单测内嵌示例 OPC UA 服务器（connect / browse / read / write 全链路）。
+async-opcua-server = "0.19"
+# task 10 测试节点管理器实现 InMemoryNodeManagerImpl::write 需要 core 的 RwLock 类型。
+async-opcua-core = "0.19"
 # 热重载/日志轮转测试用临时目录。
 tempfile = "3"
 
