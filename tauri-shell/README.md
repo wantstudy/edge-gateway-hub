@@ -56,13 +56,22 @@ npm run build
 
 设计上 daemon 以**侧车**形式随包分发，由壳在启动时从 `resource_dir()` 拉起，UI 经 `127.0.0.1:8080` 与其通信。
 
-- **当前状态**：`crates/daemon` 仍是**库 crate**（尚无 `[[bin]]` 二进制入口 / 管理 API 服务端），因此默认**不打包 daemon**。
-- **降级行为**：`src/main.rs` 在 `resource_dir()` 下找不到 `iot-daq-daemon(.exe)` 时，仅打印警告并以「纯 UI 模式」运行——`web-console` 走其内置 mock / 受限后端（授权判定本就不在 UI 层，故不影响安全红线）。
-- **启用侧车（待 daemon 就绪）**：
-  1. 在 `crates/daemon/Cargo.toml` 增加 `[[bin]] name = "iot-daq-daemon" path = "src/bin/iot-daq-daemon.rs"`，并实现一个拉起完整网关（管理 API、驱动、北向）的 `main`。
-  2. 在 CI `release-windows.yml` 中把「Build daemon sidecar」步骤的 `if: false` 改为条件判断，使其 `cargo build ... -p daemon` 并把 `iot-daq-daemon.exe` 拷到 `src-tauri/resources/`。
-  3. 在 `tauri.conf.json` 的 `bundle.resources` 增加映射 `"resources/iot-daq-daemon.exe": "iot-daq-daemon.exe"`。
-  4. 壳会自动检测到并拉起它（无需改 `main.rs`）。
+- **当前状态**：**已启用**。`crates/daemon` 提供 `[[bin]] iot-daq-daemon`（task 33，thin main：
+  预加载配置 → 管理面 REST/SSE/静态服务 → `bootstrap::run` 全权接管），CI 每次打包都会
+  构建并随 NSIS 安装包分发（`Build daemon sidecar` 步骤）。
+- **降级行为**：`src/main.rs` 在 `resource_dir()` 下找不到 `iot-daq-daemon.exe` 时，仅打印
+  警告并以「纯 UI 模式」运行——`web-console` 走其内置 mock / 受限后端（授权判定本就不在
+  UI 层，故不影响安全红线）。
+- **本地构建注意**：`tauri.conf.json` 已声明 `resources/iot-daq-daemon.exe` 映射，本地
+  `npm run build` 前**必须先产出侧车**，否则打包缺资源失败：
+  ```bash
+  cargo build --release -p daemon --bin iot-daq-daemon
+  mkdir -p src-tauri/resources
+  cp ../../target/release/iot-daq-daemon.exe src-tauri/resources/
+  ```
+- **daemon 运行参数**（`resource_dir()` 拉起时走默认值；需要定制时经壳内环境变量注入）：
+  `IOT_DAQ_CONFIG`（默认 `./config.toml`）、`IOT_DAQ_MGMT_BIND`（默认 `127.0.0.1:8080`）、
+  `IOT_DAQ_WEB_DIST`（默认 `./web-dist`）。
 
 ## 安装包签名（Authenticode）
 

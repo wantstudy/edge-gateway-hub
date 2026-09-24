@@ -24,7 +24,9 @@
       "icons/icon.png",
       "icons/icon.ico"
     ],
-    "resources": {},
+    "resources": {
+      "resources/iot-daq-daemon.exe": "iot-daq-daemon.exe"
+    },
     "category": "Utility",
     "shortDescription": "工业边缘数据汇聚网关 · 桌面控制台",
     "longDescription": "IoT-DAQ 工业边缘数据汇聚与统一分发网关的 Windows 桌面控制台，承载网关侧 web-console（设备 / 点位 / 北向 / 监控 / 授权 / 运维）。",

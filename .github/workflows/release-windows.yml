@@ -65,18 +65,15 @@ jobs:
       - name: Regenerate icons
         run: npm --prefix tauri-shell run icon
 
-      # ── 可选：构建 daemon 侧车并放入资源目录 ──
-      # 当前 daemon 为库 crate、尚未暴露管理 API 服务端二进制入口，故默认跳过。
-      # 当 crates/daemon 增加 `[[bin]] iot-daq-daemon` 后，将下方 if 改为条件判断即可激活：
-      #   cargo build --release --target x86_64-pc-windows-msvc -p daemon
-      #   cp target/.../iot-daq-daemon.exe tauri-shell/src-tauri/resources/iot-daq-daemon.exe
-      # 同时取消 tauri.conf.json 中 `bundle.resources` 对该文件的映射，壳会自动拉起它。
-      - name: Build daemon sidecar (optional, disabled until bin target exists)
-        if: false
+      # ── 构建 daemon 侧车并放入资源目录（task 33 bin 已就绪）──
+      # 产物随 NSIS 包进入 resource_dir，壳启动时自动拉起；失败即终止（不让
+      # 安装包悄悄降级成纯 UI 模式）。
+      - name: Build daemon sidecar
         run: |
           cargo build --release --target x86_64-pc-windows-msvc -p daemon
           mkdir -p tauri-shell/src-tauri/resources
           cp target/x86_64-pc-windows-msvc/release/iot-daq-daemon.exe tauri-shell/src-tauri/resources/iot-daq-daemon.exe
+          ls -l tauri-shell/src-tauri/resources/
 
       - name: Build Tauri installer (NSIS)
         run: npm --prefix tauri-shell run tauri build
