@@ -70,9 +70,13 @@ cp deploy/.env.example deploy/.env
 # 在厂商 CI 构建机执行（需 QEMU/binfmt 以支持跨架构构建）
 docker buildx create --use --name iot-daq-builder 2>/dev/null || true
 
+# ① 基础镜像 digest 注入：Dockerfile 的 FROM 为占位 token，需先从 lock 渲染
+#    （lock 中任一 digest 为空 → 脚本非零退出 = fail-closed，未 pin 的构建不会静默成功）
+./deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
+
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  --file deploy/docker/Dockerfile \
+  --file deploy/docker/Dockerfile.rendered \
   --tag registry.vendor-internal.example/iot-daq/iot-daq-gateway:v1.0.0 \
   --provenance=true --sbom=true \
   --push \
@@ -184,7 +188,16 @@ sudo ./deploy/scripts/install.sh \
   - key-pair：`cosign sign --key <kms/key> -a git-sha=<sha> <image@digest>`
   - keyless（仅在线 CI，离线现场不可用）：`cosign sign --yes <image@digest>`
 - **验签命令**（现场，`sign-and-verify.sh --verify`）：见 §3.3。
-- **基础镜像同样 digest pin**：`Dockerfile` 内 `FROM` 一律 `@sha256:`，由 CI 从 `deploy/base-images.lock.yaml` 注入（supply-chain §3）。
+- **基础镜像同样 digest pin**：`Dockerfile` 内 `FROM` 一律 `@sha256:` 形式，**digest 不手写**——由 `deploy/scripts/render-dockerfile-digests.sh` 从 `deploy/base-images.lock.yaml` 渲染注入（supply-chain §3）。
+  - lock 文件记录「基础镜像 tag ↔ digest ↔ 锁定日期 ↔ 审批人」，digest 变更视为受审变更；
+  - Dockerfile 的 `FROM` digest 段为**占位 token**（`__BUILDER_DIGEST__` / `__RUNTIME_DIGEST__`），因此**不是可直接构建物**；直接 `docker build -f deploy/docker/Dockerfile` 会因占位非法而失败（**fail-closed**，让未 pin 的构建无法静默成功）；
+  - 构建前先渲染（CI / 本机均可）：
+    ```bash
+    deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
+    # 再看 health message：lock 中任一 digest 为空 → 脚本非零退出（fail-closed）
+    deploy/scripts/render-dockerfile-digests.sh --check   # CI 门禁：仅校验结构/格式
+    ```
+  - `deploy/scripts/build-offline-bundle.sh` 已内置该渲染步骤（从 lock 注入 digest 后再 buildx）。
 - **`latest` 禁止出现在任何交付物中**（supply-chain §2.2）。
 
 ---
@@ -334,6 +347,7 @@ logging:
 | `cosign verify` 失败 | 镜像被篡改/来源不可信，或公钥与签名不匹配。整包作废，从厂商渠道重取；核对公钥指纹（R6）。 |
 | 缺 cosign 二进制无法校验 | `IOT_DAQ_ALLOW_VERIFY_DEGRADE=0` 默认失败；需部署 cosign。仅在应急且明确残余风险时置 1（§3.3 / §4）。 |
 | `IOT_DAQ_IMAGE` 用 `:latest`/可变 tag 报错 | R1 红线。`build-offline-bundle.sh` / `sign-and-verify.sh` 主动拒绝；改为 `@sha256:` digest。 |
+| 构建报「基础镜像 digest 未锁定 / render fail-closed」 | `deploy/base-images.lock.yaml` 中对应 image 的 `digest` 为空。在具备网络的环境解析真实 digest（`docker buildx imagetools inspect <repo>:<tag> --format '{{.Manifest.Digest}}'`）填入后重试；此即「未 pin 的构建不可能静默成功」的设计意图。 |
 | 健康检查 `/healthz` 返回非 200 | 看 `docker compose logs`；多为授权模块/挂载问题，**不要**改参数绕过（会被自检判为环境变更）。 |
 | 卸载后授权丢失 | `uninstall.sh` 默认保留数据；只有 `--purge-data` 才删卷。误删需从备份恢复（§10）。 |
 
@@ -344,6 +358,8 @@ logging:
 | 文件 | 作用 |
 |------|------|
 | `deploy/docker/Dockerfile` | 多阶段构建（digest pin 基础镜像，非 root，镜像层无敏感物） |
+| `deploy/base-images.lock.yaml` | **本手册新增**：基础镜像 tag ↔ digest 锁文件（digest 由 CI 渲染注入，禁手写） |
+| `deploy/scripts/render-dockerfile-digests.sh` | **本手册新增**：从 lock 渲染 Dockerfile 的 `FROM ...@sha256:` 行；digest 未锁定即 fail-closed |
 | `deploy/docker/docker-compose.yml` | 随包唯一事实源（digest 镜像、陷阱 1/2 固化、host 网络、资源限制） |
 | `deploy/docker/entrypoint.sh` | 宿主锚定 + 持久卷可写性前置校验（fail-fast） |
 | `deploy/docker/config/gateway.default.toml` | 默认配置模板（占位值，无凭据） |

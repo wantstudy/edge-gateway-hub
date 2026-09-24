@@ -186,6 +186,34 @@ if [[ ! -d "${CONTEXT}" ]]; then
     die "构建上下文目录不存在：${CONTEXT}"
 fi
 
+# -----------------------------------------------------------------------------
+# 基础镜像 digest 注入（supply-chain §3.1）—— fail-closed
+# -----------------------------------------------------------------------------
+# deploy/docker/Dockerfile 的 FROM 使用占位 token（__BUILDER_DIGEST__ /
+# __RUNTIME_DIGEST__），真实 digest 由 lock 文件渲染注入；lock 中 digest 未锁定时
+# 渲染脚本非零退出 → 本脚本据此拒绝构建，使「未 pin 的构建」不可能静默成功。
+RENDERED_DOCKERFILE=""
+cleanup_rendered() {
+    if [[ -n "${RENDERED_DOCKERFILE}" && -f "${RENDERED_DOCKERFILE}" ]]; then
+        rm -f "${RENDERED_DOCKERFILE}" || true
+    fi
+}
+trap cleanup_rendered EXIT
+
+if grep -q '__BUILDER_DIGEST__\|__RUNTIME_DIGEST__' "${DOCKERFILE}"; then
+    RENDER_SCRIPT="${SCRIPT_DIR}/render-dockerfile-digests.sh"
+    if [[ ! -f "${RENDER_SCRIPT}" ]]; then
+        die "Dockerfile 含 digest 占位 token，但缺少渲染脚本：${RENDER_SCRIPT}"
+    fi
+    RENDERED_DOCKERFILE="$(mktemp "${TMPDIR:-/tmp}/iot-daq-dockerfile.XXXXXX")"
+    log "检测到基础镜像 digest 占位 token → 调用 render-dockerfile-digests.sh 注入真实 digest"
+    if ! bash "${RENDER_SCRIPT}" --template "${DOCKERFILE}" --output "${RENDERED_DOCKERFILE}"; then
+        die "基础镜像 digest 渲染失败（多为 deploy/base-images.lock.yaml 中 digest 为空，fail-closed）。见上方原因后填入真实 digest 重试。"
+    fi
+    DOCKERFILE="${RENDERED_DOCKERFILE}"
+    log "已改用渲染后的 Dockerfile：${RENDERED_DOCKERFILE}"
+fi
+
 # 幂等：重建输出目录（保留父目录，避免误删其它内容）
 mkdir -p "${OUT_DIR}"
 # 仅清理本脚本可能产出的文件，避免误删用户文件

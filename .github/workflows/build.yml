@@ -43,6 +43,27 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # 部署资产静态门禁（task 60）：脚本语法自检 + 基础镜像 digest 锁文件结构校验。
+  # 说明：digest 锁文件在 CI 联网前可能仍为空（未 pin），故此处只校验「结构 / 格式」，
+  # 空 digest 仅告警不判红；真正 fail-closed 发生在构建前渲染步骤
+  # （render-dockerfile-digests.sh 遇空 digest 非零退出），详见 deploy/README.md §4。
+  deploy:
+    name: deploy / supply-chain static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n（部署脚本静态语法自检）
+        run: |
+          set -euo pipefail
+          for f in deploy/scripts/*.sh deploy/docker/entrypoint.sh; do
+            echo "bash -n ${f}"
+            bash -n "${f}"
+          done
+
+      - name: 基础镜像 digest 锁文件校验（结构 / 格式；空 digest 仅告警）
+        run: bash deploy/scripts/render-dockerfile-digests.sh --check
+
   # 后续 Wave 接入说明（本阶段不建，避免空跑）：
   # - Wave 5 task 38：Tauri 桌面打包（tauri-action，NSIS/MSI），仅在 tag/手动触发时执行；
   # - Wave 5 task 60：Docker 多架构镜像构建（linux/amd64 + linux/arm64）+ cosign 签名。

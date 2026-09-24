@@ -10,26 +10,38 @@
 #
 # 硬约束（违反即视为缺陷）：
 #   1) 基础镜像一律 `FROM <image>@sha256:<digest>`，禁 `:latest` / 可变 tag。
-#      示例 digest 为占位；实际由 CI 从 deploy/base-images.lock.yaml 注入（supply-chain §3.1）。
+#      digest 不手写：由 `deploy/scripts/render-dockerfile-digests.sh` 从
+#      `deploy/base-images.lock.yaml` 渲染注入（supply-chain §3.1）。
+#
+#   ★ 本文件不是「可直接构建物」：下方两处 FROM 的 digest 段为**占位 token**
+#     （__BUILDER_DIGEST__ / __RUNTIME_DIGEST__），保留 `@sha256:` 形式。
+#     构建前必须先用 render 脚本渲染出带真实 digest 的 Dockerfile：
+#       deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
+#       docker buildx build -f deploy/docker/Dockerfile.rendered ...
+#     直接 `docker build -f deploy/docker/Dockerfile` 会因占位非法而失败
+#     （fail-closed —— 让「未 pin 的构建」不可能静默成功）。
 #   2) runtime 阶段只拷二进制 + Web 静态资源 + 默认配置模板，
 #      绝不 COPY 源码、.git、密钥、激活码、宿主指纹（persistence-layout §2）。
 #   3) 以非 root 用户运行；容器内进程不申请任何 capability。
 #   4) 目标架构 amd64 / arm64（buildx --platform linux/amd64,linux/arm64）。
 #
 # 构建示例（CI，勿在本机跑，见任务说明盘空间紧张）：
+#   先渲染基础镜像 digest（本文件含占位 token，不可直接构建）：
+#     deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
 #   docker buildx build --platform linux/amd64,linux/arm64 \
-#     -f deploy/docker/Dockerfile -t iot-daq-gateway:v1.0.0 --push .
-# 离线单架构导出：
-#   docker buildx build --platform linux/arm64 -f deploy/docker/Dockerfile \
+#     -f deploy/docker/Dockerfile.rendered -t iot-daq-gateway:v1.0.0 --push .
+# 离线单架构导出（build-offline-bundle.sh 已内置渲染步骤）：
+#   docker buildx build --platform linux/arm64 -f deploy/docker/Dockerfile.rendered \
 #     -o type=docker,dest=deploy/out/iot-daq-gateway_v1.0.0_arm64.tar .
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # 阶段 1：builder —— 编译 daemon（Rust workspace 唯一运行体 crate）
 # -----------------------------------------------------------------------------
-# 说明：digest 为占位格式示例，CI 打包时会替换为 lock 文件中的实际值。
+# 说明：digest 段为占位 token，由 deploy/scripts/render-dockerfile-digests.sh
+# 从 deploy/base-images.lock.yaml 渲染（保留 @sha256: 形式，禁可变 tag）。
 # 选择 -slim 变体：体积更小、攻击面更小；musl 静态链接决策见 headless/README.md。
-FROM rust:1.85-slim-bookworm@sha256:0000000000000000000000000000000000000000000000000000000000000001 AS builder
+FROM rust:1.85-slim-bookworm@sha256:__BUILDER_DIGEST__ AS builder
 
 # TARGETARCH 由 buildx 注入（amd64 / arm64），用于：
 #   - Rust target triple 校验
@@ -85,7 +97,7 @@ RUN set -eux; \
 # gcr.io/distroless/static-debian12：无 shell、无包管理器、无 libc 动态依赖，
 # 攻击面最小；要求二进制为 musl 静态链接（headless/README.md 构建期决策）。
 # 若采用 glibc 动态二进制，改用 gcr.io/distroless/cc-debian12 同款 digest pin 方案。
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:0000000000000000000000000000000000000000000000000000000000000002 AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:__RUNTIME_DIGEST__ AS runtime
 
 # 镜像元数据（便于现场 docker inspect 记录安装单）
 ARG TARGETARCH

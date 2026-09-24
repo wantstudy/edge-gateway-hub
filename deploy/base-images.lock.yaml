@@ -1,0 +1,48 @@
+# =============================================================================
+# iot-daq 基础镜像 digest 锁文件（task 60 · supply-chain §3.1）
+# =============================================================================
+# 定位：**基础镜像 tag ↔ digest ↔ 锁定元数据**的唯一事实源。
+#   Dockerfile 内**不手写 digest**；CI / 构建前由
+#   `deploy/scripts/render-dockerfile-digests.sh` 读取本文件渲染出
+#   `FROM <repo>:<tag>@sha256:<hex>` 行（禁可变 tag，supply-chain §3）。
+#
+# 红线（container-supply-chain.md §3 / §9）：
+#   - 基础镜像必须 digest pin；`latest` / 可变 tag 禁止出现在任何交付物；
+#   - digest 变更 = 一次受审变更（填 locked_at / approver / reason 后方可合入）；
+#   - **digest 为空即「未锁定」**：render 脚本遇空 digest 会 fail-closed（非零退出），
+#     使「未 pin 的构建」不可能静默成功。
+#
+# ⚠️ 当前状态：digest 字段为空（有意为之，非占位假值）。
+#   本仓库所处的离线/受限构建环境无法可靠地解析上游 registry 的真实 digest
+#   （Docker 未运行、registry 访问受限）。按「绝不伪造 digest」原则，
+#   在 CI 具备网络后由依赖升级流水线填入真实 64 位十六进制值。
+#   在此之前任何构建都会因 render 脚本 fail-closed 而被拒绝 —— 这正是预期行为。
+#
+# 填写规范：
+#   digest: "sha256:<64位小写十六进制>"   # 含 sha256: 前缀
+#   locked_at / approver / reason：升级审批留痕（可留空，但 digest 变更时应填写）。
+# =============================================================================
+version: 1
+
+images:
+  # ---- 构建阶段基础镜像（rust 编译环境）----
+  - name: builder-rust
+    repository: docker.io/library/rust
+    tag: 1.85-slim-bookworm
+    digest: ""
+    stage: builder
+    locked_at: ""
+    approver: ""
+    reason: ""
+
+  # ---- 运行阶段基础镜像（distroless 静态、非 root）----
+  # 要求二进制为 musl 静态链接（headless/README.md 构建期决策）。
+  # 若改用 glibc 动态二进制，换成 gcr.io/distroless/cc-debian12（同款 digest 方案）。
+  - name: runtime-distroless
+    repository: gcr.io/distroless/static-debian12
+    tag: nonroot
+    digest: ""
+    stage: runtime
+    locked_at: ""
+    approver: ""
+    reason: ""
