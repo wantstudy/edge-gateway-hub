@@ -8,11 +8,16 @@
 //! - 本模块只解决「值怎么算」，**不做**转发规则引擎（task 20/37）；
 //! - **不重复** task 15 的映射 / 单位换算 / 死区：公式求值跑在 task 15 换算**之后**，
 //!   [`FormulaEngine::eval_cycle`] 收到的就是工程单位值；
-//! - **不定义质量码语义**：`calc_failed` 的枚举与「最差质量继承」精确口径由 **task 53**（`codec.rs`）定义。
+//! - **不定义质量码语义**：质量码枚举、严重度顺序与「最差质量继承」精确口径
+//!   全部由 **task 53**（`codec.rs`）定义，本模块**只做使用**（[`crate::codec::Quality`]）。
 //!   本模块只输出 [`CalcOutcome::failed`] / [`CalcFailure`]（自有类型）与
-//!   [`CalcOutcome::quality`]（复用 `protocol_proto::Quality`，既有枚举，未新增定义）；
-//!   上层接线时 `failed == true` ⇒ `quality = calc_failed`，**`hold_last` 保留值但 `failed` 仍为 true，
-//!   不得伪装成 GOOD**。
+//!   [`CalcOutcome::quality`]（引用 `codec::Quality`，零新增定义）；
+//!   上层接线时 `failed == true` ⇒ `quality` 取 [`Quality::CalcFailed`]，
+//!   **`hold_last` 保留值但 `failed` 仍为 true，不得伪装成 GOOD**。
+//!   质量码与接线的转换一律走 `codec::Quality::to_wire()` / `from_wire()`（唯一边界），
+//!   本模块不直接依赖 `protocol_proto` 的枚举。
+//!   **失败映射表**（见下方「失败 → 质量码映射」）是唯一口径。
+
 //! - **不实现 HTTP 接口**：`/api/points/formula/validate` 与 `dry-run` 属 mgmt 层，
 //!   本模块只交付库层 API [`validate`] / [`dry_run_expr`] / [`FormulaEngine::dry_run`] / [`FormulaEngine::eval_cycle`]。
 //!
@@ -48,6 +53,34 @@
 //! 并按 [`OnFailure`] 处理：`hold_last`（默认，保留上次有效值但**仍标记 failed**）、`null`（置空）、
 //! `skip`（本周期不产出）。失败计数与最近原因见 [`FormulaEngine::failure_stat`]。
 //!
+//! ## 失败 → 质量码映射（唯一口径，口径本身属 task 53）
+//!
+//! | [`CalcFailure`] | 映射后的 [`Quality`] | 说明 |
+//! |---|---|---|
+//! | `MissingInput` | [`Quality::CalcFailed`] | 输入点缺失 / 超时 / 本周期未更新 |
+//! | `NonNumeric` | [`Quality::CalcFailed`] | 输入有值但非数值（bool / 字符串 / 字节） |
+//! | `DivideByZero` | [`Quality::CalcFailed`] | 除数为 0 |
+//! | `NonFinite` | [`Quality::CalcFailed`] | 结果为 NaN / ±Inf |
+//! | `OutputOutOfRange` | [`Quality::CalcFailed`] | 输出类型转换或限幅区间非法 |
+//! | `Timeout` | [`Quality::CalcFailed`] | 超出求值步数预算 |
+//! | `Cycle` | [`Quality::CalcFailed`] | 依赖成环（保存期即拒绝，运行期兜底） |
+//! | `ResourceLimit` | [`Quality::CalcFailed`] | 资源超限 |
+//!
+//! **`OutOfRange` 留给物理点工程量程**（plan task 70 第 2686 行：计算点的「输出越界」归
+//! `calc_failed`），因此本模块的 `OutputOutOfRange` **不映射**为 [`Quality::OutOfRange`]。
+//!
+//! ### 为什么「缺失输入不进 `worst()`」（关键，勿改）
+//!
+//! codec 的严重度是 `CalcFailed=3 < Bad=4 < Timeout=5`。
+//! **只有真正取到可用数值的输入**（[`InputValue::Numeric`]）才以其自身 `quality` 参与
+//! `worst()` 合并；[`InputValue::Missing`] 与 [`InputValue::NonNumeric`] 没有向公式提供
+//! 可用数值，其携带的 `quality` **仅用于入口甄别与界面回显，绝不进 `worst()`**。
+//! 否则一旦某个缺失输入携带 `Bad` / `Timeout`，`worst()` 就会选出它们，
+//! 让严重度更低的 `CalcFailed` **永远浮不出来**，静默违背上表。
+//! 求值失败时取 `Quality::worst(继承到的最差, Quality::CalcFailed)`。
+//! dry-run 未命中与错误态 outcome 的展示兜底用 [`Quality::Bad`]，
+//! 同样标注为**仅展示值，不进 `worst()`**。
+//!
 //! # 资源保护（防 DoS）
 //!
 //! 表达式长度上限 512 字节、AST 节点数上限 256、解析深度上限 32、单次求值步数预算 4096
@@ -64,8 +97,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 
-use protocol_proto::Quality;
-
+use crate::codec::Quality;
 use crate::error::DaemonError;
 
 /// 点位值表（`point_id` → 本周期值）。
@@ -345,8 +377,12 @@ pub struct CalcOutcome {
     pub failed: bool,
     /// 失败原因。
     pub reason: Option<CalcFailure>,
-    /// 继承到的最差输入质量码（复用既有 `protocol_proto::Quality`；
-    /// 与 `calc_failed` 的合并口径由 task 53 定义）。
+    /// 质量码（**引用 task 53 的 [`crate::codec::Quality`]，本模块零定义**）。
+    ///
+    /// 取值规则：
+    /// - 成功：`worst()` 合并**所有真正取到可用数值的输入**各自的 `quality`；
+    /// - 失败：`Quality::worst(继承到的最差, Quality::CalcFailed)`；
+    /// - 具体映射见模块文档「失败 → 质量码映射」。
     pub quality: Quality,
 }
 
@@ -372,34 +408,28 @@ impl CalcOutcome {
     }
 }
 
-/// 质量码严重度（仅用于「最差质量继承」排序，**不构成 task 53 的语义定义**）。
-pub fn quality_severity(quality: Quality) -> u8 {
-    match quality {
-        Quality::Good => 0,
-        Quality::Simulated => 1,
-        Quality::Uncertain => 2,
-        Quality::Bad => 3,
-        Quality::Unspecified => 4,
-    }
-}
-
-/// 取两者中更差的质量码（严重度更大者）。
-pub fn worst_quality(a: Quality, b: Quality) -> Quality {
-    if quality_severity(a) >= quality_severity(b) {
-        a
-    } else {
-        b
-    }
-}
-
-/// 质量码数值编码（`quality(x)` 返回值；对齐 `telemetry.proto` 的枚举序号）。
-pub fn quality_code(quality: Quality) -> f64 {
-    f64::from(quality as i32)
+/// 严重度序号数值编码（`quality([p])` 的返回值）。
+///
+/// # 口径（重要）
+///
+/// 返回的是 **codec 的 severity 序号**（`Good=0 … CommError=6`，见
+/// [`crate::codec::Quality::severity`]），**不是 Rust 枚举的 discriminants**，
+/// 也与旧 `telemetry.proto` 的枚举序号（GOOD=1 / UNCERTAIN=2 / BAD=3 / SIMULATED=4）不同。
+/// 严重度序号是本模块的记录口径，取值由 task 53 定义，本模块只是引用。
+/// 序号 0..6 的取值由测试 `severity_ordinal_is_stable_and_locked` 固化。
+pub fn severity_code(quality: Quality) -> f64 {
+    f64::from(quality.severity())
 }
 
 // ---- 输入值 ----
 
 /// 参与求值的点位输入值（区分「缺失」与「非数值」两种失败语义）。
+///
+/// # `worst()` 参与度（关键，见模块文档「为什么缺失输入不进 `worst()`」）
+///
+/// 只有 [`Self::Numeric`]（真正取到可用数值）才参与最差质量继承；
+/// [`Self::Missing`] 与 [`Self::NonNumeric`] 携带的 `quality`
+/// **仅用于入口甄别与界面回显，不进 `worst()`**。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputValue {
     /// 数值（已解码 + 已换算的工程单位值）。
@@ -417,6 +447,9 @@ impl InputValue {
     }
 
     /// 缺失（离线 / 未更新）。
+    ///
+    /// 携带的 [`Quality::Bad`] 是**仅展示值**（缺失本身没有读数质量可言），
+    /// **不参与 `worst()` 合并**——见模块文档。
     pub fn missing() -> Self {
         InputValue::Missing(Quality::Bad)
     }
@@ -435,6 +468,19 @@ impl InputValue {
             InputValue::Numeric(_, q) | InputValue::Missing(q) | InputValue::NonNumeric(q) => *q,
         }
     }
+
+    /// **参与 `worst()` 合并的质量码**：只有取到可用数值的输入才有资格。
+    ///
+    /// `Missing` / `NonNumeric` 返回 `None`，即**不参与**最差质量继承；
+    /// 它们转为试探性失败原因（[`CalcFailure::MissingInput`] /
+    /// [`CalcFailure::NonNumeric`]），最终由
+    /// `Quality::worst(继承到的最差, Quality::CalcFailed)` 决定输出。
+    pub fn inheritable_quality(&self) -> Option<Quality> {
+        match self {
+            InputValue::Numeric(_, q) => Some(*q),
+            InputValue::Missing(_) | InputValue::NonNumeric(_) => None,
+        }
+    }
 }
 
 // ---- 白名单函数 ----
@@ -450,7 +496,7 @@ pub enum Builtin {
     Floor,
     /// `round(x)`
     Round,
-    /// `clamp(x, lo, hi)`（`lo > hi` 时返回 `hi`，不 panic）
+    /// `clamp(x, lo, hi)`（`lo > hi` 属配置错误 ⇒ **判为失败**，不 panic、不静默兜底）
     Clamp,
     /// `min(a, b, ...)`
     Min,
@@ -476,7 +522,7 @@ pub enum Builtin {
     Rate,
     /// `hold([p], n)`：取当前或最近 n 个周期内最近一次有效值
     Hold,
-    /// `quality([p])`：取质量码数值（对齐 proto 枚举序号）
+    /// `quality([p])`：取 **codec severity 序号**（`Good=0 … CommError=6`）
     Quality,
 }
 
@@ -725,7 +771,7 @@ pub fn function_whitelist() -> Vec<FunctionDoc> {
             signature: "quality([p])",
             summary: "质量码数值（GOOD=1 / UNCERTAIN=2 / BAD=3 / SIMULATED=4）",
             example: "quality([X])",
-            example_value: 1.0,
+            example_value: 0.0,
         },
     ]
 }
@@ -1605,7 +1651,8 @@ impl EvalState {
     }
 
     fn observe(&mut self, quality: Quality) {
-        self.worst = worst_quality(self.worst, quality);
+        // 「最差质量继承」的唯一实现：直接用 task 53 的 `worst()`，本模块不自造规则。
+        self.worst = Quality::worst(self.worst, quality);
     }
 
     fn fail(&mut self, reason: CalcFailure) {
@@ -1627,16 +1674,19 @@ fn finite_or_fail(v: f64, st: &mut EvalState) -> Option<f64> {
 fn current_value(id: &str, ctx: &EvalContext<'_>, st: &mut EvalState) -> Option<f64> {
     match ctx.current.get(id) {
         Some(InputValue::Numeric(v, q)) => {
+            // 真正取到可用数值 ⇒ 以其自身 quality 参与最差质量继承。
             st.observe(*q);
             Some(*v)
         }
-        Some(InputValue::Missing(q)) => {
-            st.observe(*q);
+        Some(InputValue::Missing(_)) => {
+            // **不 observe**：缺失输入没有可用数值，其携带的 quality 仅用于甄别与回显。
+            // 若在此处 `observe(Bad)`，codec 下 `Bad=4 > CalcFailed=3` 会把
+            // `calc_failed` 永久掩盖（测试 `missing_input_does_not_mask_calc_failed` 固化）。
             st.fail(CalcFailure::MissingInput);
             None
         }
-        Some(InputValue::NonNumeric(q)) => {
-            st.observe(*q);
+        Some(InputValue::NonNumeric(_)) => {
+            // 同上：有值但不可用于计算，不参与 `worst()`。
             st.fail(CalcFailure::NonNumeric);
             None
         }
@@ -1806,8 +1856,11 @@ fn eval_call(
             }
             Builtin::Quality => match ctx.current.get(id) {
                 Some(input) => {
-                    st.observe(input.quality());
-                    Some(quality_code(input.quality()))
+                    // 与 `current_value` 同口径：只有取到可用数值才进 `worst()`。
+                    if let Some(q) = input.inheritable_quality() {
+                        st.observe(q);
+                    }
+                    Some(severity_code(input.quality()))
                 }
                 None => {
                     st.fail(CalcFailure::MissingInput);
@@ -1835,7 +1888,15 @@ fn eval_call(
         Builtin::Clamp => {
             let lo = values.get(1).copied()?;
             let hi = values.get(2).copied()?;
-            // `lo > hi` 时不 panic（Rust 的 `f64::clamp` 会 panic），按「取 hi」处理。
+            // `lo > hi` 是表达式自身的**配置错误**（限幅区间非法）。**不做静默兜底**：
+            // 既不像 `f64::clamp` 那样 panic（红线：非测试代码零 panic），
+            // 也不交换边界或返回 `hi`（那会静默产出一个反直觉的错误值，
+            // 违反「不得静默输出错误数值」），而是判为失败，
+            // 交由 `Quality::CalcFailed` 在监控页与诊断页暴露，让配置者自行修正区间。
+            if lo > hi {
+                st.fail(CalcFailure::OutputOutOfRange);
+                return None;
+            }
             v0.max(lo).min(hi)
         }
         Builtin::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
@@ -2600,7 +2661,7 @@ impl DryRunOutput {
     fn failure(error: impl Into<String>) -> Self {
         Self {
             ok: false,
-            outcome: CalcOutcome::failed(CalcFailure::ResourceLimit, Quality::Unspecified),
+            outcome: CalcOutcome::failed(CalcFailure::ResourceLimit, Quality::CalcFailed),
             value: None,
             intermediates: Vec::new(),
             order: Vec::new(),
@@ -2628,7 +2689,7 @@ pub fn dry_run_expr(
     for dep in program.deps() {
         let (value, quality) = match inputs.get(dep) {
             Some(input) => (input.value(), input.quality()),
-            None => (None, Quality::Unspecified),
+            None => (None, Quality::Bad),
         };
         intermediates.push(Intermediate {
             point_id: dep.clone(),
@@ -2895,13 +2956,13 @@ impl FormulaEngine {
                 let held = self.last_good.get(&point_id).copied();
                 let input = match held {
                     Some(v) => InputValue::Numeric(v, Quality::Good),
-                    None => InputValue::Missing(Quality::Unspecified),
+                    None => InputValue::Missing(Quality::Bad),
                 };
                 working.insert(point_id.clone(), input);
                 results.push(DerivedResult {
                     point_id,
                     value: None,
-                    quality: Quality::Unspecified,
+                    quality: Quality::Bad,
                     failed: false,
                     reason: None,
                     emitted: false,
@@ -2950,7 +3011,7 @@ impl FormulaEngine {
                         emitted = false;
                     }
                 }
-                outcome.quality = worst_quality(outcome.quality, Quality::Bad);
+                outcome.quality = Quality::worst(outcome.quality, Quality::CalcFailed);
             }
 
             // 5) 输出死区（以「上次对外产出值」为基准；质量码变化强制输出）。
@@ -3092,7 +3153,7 @@ impl FormulaEngine {
             }
             let (value, quality) = match working.get(dep) {
                 Some(input) => (input.value(), input.quality()),
-                None => (None, Quality::Unspecified),
+                None => (None, Quality::Bad),
             };
             intermediates.push(Intermediate {
                 point_id: dep.clone(),
@@ -3298,7 +3359,7 @@ mod tests {
             Some(CalcFailure::MissingInput)
         );
         assert_eq!(get(&first, "R_Hold").value, Some(5.0));
-        assert_eq!(get(&first, "R_Quality").value, Some(1.0));
+        assert_eq!(get(&first, "R_Quality").value, Some(0.0));
 
         // 周期 2（dt = 1s）：prev=5, delta=3, rate=3。
         let second = engine.eval_cycle(&values(&[("X", 8.0)]), 2_000_000_000);
@@ -3486,8 +3547,9 @@ mod tests {
             Some(CalcFailure::NonNumeric)
         );
         // 失败语义优先于继承质量码：`failed` 表达 calc_failed（口径归 task 53），
-        // 质量码不得优于 BAD；「成功时继承最差质量」见 worst_quality_inherited 用例。
-        assert_eq!(get(&results, "R_NonNumeric").quality, Quality::Bad);
+        // 统一质量码为 `CalcFailed`（不优于、不劣于继承质量，仅表达「计算失败」）；
+        // 「成功时继承最差质量」见 worst_quality_inherited 用例。
+        assert_eq!(get(&results, "R_NonNumeric").quality, Quality::CalcFailed);
         assert_eq!(get(&results, "R_Ok").value, Some(42.0));
     }
 
@@ -3819,11 +3881,11 @@ mod tests {
         assert!(program.node_count() > 0);
         assert_eq!(program.source(), "[B] + [A] * 2 + [B]");
 
-        assert_eq!(quality_code(Quality::Good), 1.0);
-        assert_eq!(quality_code(Quality::Uncertain), 2.0);
-        assert_eq!(quality_code(Quality::Bad), 3.0);
-        assert_eq!(quality_code(Quality::Simulated), 4.0);
-        assert_eq!(worst_quality(Quality::Good, Quality::Bad), Quality::Bad);
+        assert_eq!(severity_code(Quality::Good), 0.0);
+        assert_eq!(severity_code(Quality::Uncertain), 1.0);
+        assert_eq!(severity_code(Quality::Bad), 4.0);
+        assert_eq!(severity_code(Quality::CommError), 6.0);
+        assert_eq!(Quality::worst(Quality::Good, Quality::Bad), Quality::Bad);
     }
 
     /// QA: OnChange 模式下依赖无变化不重算；Static: `^` 右结合与惰性 `if` 避免未选中分支污染。
