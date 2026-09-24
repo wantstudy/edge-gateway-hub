@@ -4,9 +4,10 @@
 //! - **绝不签 Protobuf 序列化字节**：签名对象是 [`semantic_hash`] —— 把批次字段
 //!   （点位按 `(device_id, point_id, ts)` 稳定排序）逐字段写入 SHA-256 得到的
 //!   **业务语义确定性哈希**；序列化字节序/编码差异不会改变语义哈希，跨端一致。
-//! - **私钥不落盘、不在本模块生成**：私钥一律经 [`KeyProvider`] trait 取 in-memory
-//!   句柄（真实托管实现由 task 49 提供）。本模块不含任何生产密钥，测试用私钥常量
-//!   一律 `TEST_ONLY_` 前缀并显式标注「禁止用于真实部署」。
+//! - **私钥不出句柄、不在本模块生成**：私钥一律经 [`HandleSigner`] trait 以
+//!   in-memory 句柄式签名（`sign_message` 不返回任何私钥字节；托管实现由
+//!   task 49 [`crate::auth::keyprovider::KeyHandle`] 提供）。本模块不含任何
+//!   生产密钥，测试用私钥常量一律 `TEST_ONLY_` 前缀并显式标注「禁止用于真实部署」。
 //! - **mid 不自造**：`mid` 必须是 task 3 [`crate::auth::machine_id::MachineIdentity::get_machine_fingerprint`]
 //!   的输出（64 hex），构造 [`AuthSigner`] 时做非空与格式校验。
 //! - **授权闸门**：签名前先经 [`LicenseGate::can_sign`]；闸门关闭返回 `AuthError`
@@ -152,16 +153,23 @@ fn signing_message(payload_hash: &[u8; 32], mid: &str, ts_ns: i64, nonce: &str) 
     msg
 }
 
-/// 密钥托管（真实实现由 task 49 提供；本模块只定义 trait + in-memory 实现）。
+/// 句柄式签名 trait（主理人裁决方案 (a) 落地；旧裸 `SigningKey` trait 已删除）。
 ///
-/// 契约：`signing_key()` 返回**内存态**私钥句柄；实现方与本模块都不得把私钥写入磁盘
-/// 或写进日志（项目红线）。
-pub trait KeyProvider: Send + Sync {
-    /// 返回 in-memory 私钥句柄；**实现方不得把私钥写入磁盘**（本模块也不得落盘）。
+/// 契约：实现方只暴露「签名动作」与「公钥导出」两个入口，**不得提供任何
+/// 导出私钥字节的方法**（与 `keyprovider::KeyHandle` 的编译期红线一致）；
+/// 实现方与本模块都不得把私钥写入磁盘或写进日志（项目红线）。
+pub trait HandleSigner: Send + Sync {
+    /// 对消息签名（私钥常驻实现内部，调用方拿不到任何私钥字节）。
     ///
     /// # Errors
-    /// 密钥不可用（未注入 / 已吊销 / 长度非法）时返回错误，不 panic。
-    fn signing_key(&self) -> DaemonResult<SigningKey>;
+    /// 句柄不可用（未注入 / 未初始化）时返回错误，不 panic。
+    fn sign_message(&self, msg: &[u8]) -> DaemonResult<Signature>;
+
+    /// 导出对应公钥（公钥在私钥红线之外，可自由上传 / 登记）。
+    ///
+    /// # Errors
+    /// 句柄不可用时返回错误，不 panic。
+    fn public_key(&self) -> DaemonResult<VerifyingKey>;
 }
 
 /// 授权闸门（真实实现由 task 22 云授权客户端提供：Token 有效且未降级才允许签名）。
@@ -236,9 +244,10 @@ impl SignedAuthBlock {
     }
 }
 
-/// 静态 in-memory 密钥提供者（测试 / 受控注入场景；生产由 task 49 托管实现替代）。
+/// 静态 in-memory 句柄式签名者（测试 / 受控注入场景；生产由 task 49 托管实现替代）。
 ///
-/// 私钥字节仅存在于内存；`Debug` 输出脱敏，永不进入日志。
+/// 私钥字节仅存在于本结构内部，**不对外导出**（`HandleSigner` 契约：只出签名
+/// 动作与公钥）；`Debug` 输出脱敏，永不进入日志。
 pub struct StaticKeyProvider {
     key: [u8; 32],
 }
@@ -252,9 +261,9 @@ impl StaticKeyProvider {
     /// 对应公钥（接收侧验签 / 公钥登记使用）。
     ///
     /// # Errors
-    /// 私钥句柄获取失败时透传（本实现恒成功）。
+    /// 句柄不可用时透传（本实现恒成功）。
     pub fn verifying_key(&self) -> DaemonResult<VerifyingKey> {
-        Ok(self.signing_key()?.verifying_key())
+        self.public_key()
     }
 }
 
@@ -264,35 +273,29 @@ impl fmt::Debug for StaticKeyProvider {
     }
 }
 
-impl KeyProvider for StaticKeyProvider {
-    fn signing_key(&self) -> DaemonResult<SigningKey> {
-        Ok(SigningKey::from_bytes(&self.key))
+impl HandleSigner for StaticKeyProvider {
+    /// 句柄式签名：私钥字节仅在实现内部瞬时构造 `SigningKey`，**不返回给调用方**。
+    fn sign_message(&self, msg: &[u8]) -> DaemonResult<Signature> {
+        Ok(SigningKey::from_bytes(&self.key).sign(msg))
+    }
+
+    fn public_key(&self) -> DaemonResult<VerifyingKey> {
+        Ok(SigningKey::from_bytes(&self.key).verifying_key())
     }
 }
 
 // ---------------------------------------------------------------------------
-// task 49 → task 21 适配层（集成波次）：KeyHandle ↔ 旧 KeyProvider
+// task 49 → task 21 适配层（句柄式签名，主理人裁决方案 (a)）
 // ---------------------------------------------------------------------------
 
-/// 把 `keyprovider::KeyHandle`（task 49 托管句柄）包装为本模块旧
-/// [`KeyProvider`] trait 的实现 —— **最小适配层，语义冲突显式化，交主理人裁决**。
+/// 把 `keyprovider::KeyHandle`（task 49 托管句柄）接入本模块
+/// [`HandleSigner`] trait —— 句柄式签名的托管实现。
 ///
-/// ## ⚠️ 语义冲突点（勿「顺手」绕过）
-/// 旧 [`KeyProvider`] 契约要求 `signing_key()` 返回裸 [`SigningKey`]——
-/// 等价于把私钥种子字节交出（`SigningKey` 可随时 `to_bytes()` 导出）；
-/// 而 `keyprovider::KeyHandle` 的红线是**不提供任何字节导出 API**
-/// （无 `to_bytes` / `as_bytes`，编译期保证，见其模块文档「私钥红线」）。
-/// 二者**本质冲突**：在不破坏「无字节导出」红线的前提下，本适配层
-/// **不可能**满足旧契约。故 `signing_key()` 走显式 `unimplemented` 错误
-/// （fail-closed：返回 `SecurityError`，绝不 panic、绝不用 `todo!()`），
-/// 错误文本写明冲突点。
-///
-/// ## 后续决策项（裁决前托管场景不可经本适配层签名）
-/// - **(a) 推荐**：把 [`AuthSigner`] 的取钥路径迁移为「句柄式签名」
-///   （`handle.sign(msg) -> Signature`，即本适配层的 [`Self::sign_message`]），
-///   随后删除旧 trait 的裸密钥出口；
-/// - (b) 放宽 `KeyHandle` 红线（破坏 task 49 防克隆 / 防导出防线，**不建议**）；
-/// - (c) 维持双轨：静态注入场景继续用 [`StaticKeyProvider`]，托管场景等 (a)。
+/// ## 红线（与 [`crate::auth::keyprovider::KeyHandle`] 一致）
+/// `KeyHandle` **不提供任何字节导出 API**（无 `to_bytes` / `as_bytes`，
+/// 编译期保证私钥不出句柄）；本适配层只转发 [`Self::sign_message`]（签名动作）
+/// 与 [`Self::public_key`]（公钥导出，红线外），不存在裸 `SigningKey` 出口。
+/// 旧 `KeyProvider::signing_key()`（种子导出）trait 已随方案 (a) 删除。
 pub struct KeyHandleKeyProviderAdapter {
     /// 托管句柄（只能经 `keyprovider::KeyProvider::load_or_create` 取得，
     /// 本模块无法凭空构造——`from_seed` 为 keyprovider 模块私有）。
@@ -306,7 +309,7 @@ impl KeyHandleKeyProviderAdapter {
         Self { handle }
     }
 
-    /// 句柄式签名（**不导出种子**；决策项 (a) 落地后 `AuthSigner` 的目标形态）。
+    /// 句柄式签名（**不导出种子**）。
     ///
     /// # Errors
     /// 句柄未初始化（构造路径保证不会发生）→ `SecurityError`。
@@ -330,27 +333,19 @@ impl fmt::Debug for KeyHandleKeyProviderAdapter {
     }
 }
 
-impl KeyProvider for KeyHandleKeyProviderAdapter {
-    /// 旧契约要求裸 `SigningKey`（种子导出）——与 `KeyHandle` 的「无字节导出」
-    /// 红线本质冲突，**显式 unimplemented 错误**（非 panic、非 `todo!()`）。
-    ///
-    /// # Errors
-    /// 恒返回 `SecurityError`，消息含冲突说明与决策项指引。
-    fn signing_key(&self) -> DaemonResult<SigningKey> {
-        Err(DaemonError::SecurityError(
-            "unimplemented bridging: legacy KeyProvider::signing_key demands a bare \
-             SigningKey (equivalent to exporting the seed bytes), which \
-             keyprovider::KeyHandle forbids by design (no byte-export API, \
-             anti-clone red line). Decision pending: migrate AuthSigner to \
-             handle-based signing (adapter::sign_message) — see adapter docs"
-                .to_string(),
-        ))
+impl HandleSigner for KeyHandleKeyProviderAdapter {
+    fn sign_message(&self, msg: &[u8]) -> DaemonResult<Signature> {
+        Self::sign_message(self, msg)
+    }
+
+    fn public_key(&self) -> DaemonResult<VerifyingKey> {
+        Self::public_key(self)
     }
 }
 
-/// AuthBlock 签名器：密钥托管 + 授权闸门 + 机器码指纹三件套。
+/// AuthBlock 签名器：句柄式密钥托管 + 授权闸门 + 机器码指纹三件套。
 pub struct AuthSigner {
-    keys: Arc<dyn KeyProvider>,
+    keys: Arc<dyn HandleSigner>,
     gate: Arc<dyn LicenseGate>,
     mid: String,
 }
@@ -373,7 +368,7 @@ impl AuthSigner {
     /// # Errors
     /// `mid` 为空或不是 64 字符 hex 时返回 `DaemonError::ConfigError`。
     pub fn new(
-        keys: Arc<dyn KeyProvider>,
+        keys: Arc<dyn HandleSigner>,
         gate: Arc<dyn LicenseGate>,
         mid: String,
     ) -> DaemonResult<Self> {
@@ -405,12 +400,13 @@ impl AuthSigner {
 
     /// 对业务语义哈希签名；**授权闸门关闭时返回 AuthError 且绝不产出签名**。
     ///
-    /// 顺序保证：闸门判定 → 生成 nonce → 取私钥 → 计算签名；
-    /// 闸门关闭时在任何签名材料生成之前即返回，不会泄漏签名输出。
+    /// 顺序保证：闸门判定 → 生成 nonce → 构造签名消息 → 句柄式签名
+    /// （私钥不出 [`HandleSigner`] 句柄）；闸门关闭时在任何签名材料生成之前
+    /// 即返回，不会泄漏签名输出。
     ///
     /// # Errors
     /// - 闸门关闭：`DaemonError::AuthError`（码 3000）；
-    /// - 密钥不可用：透传 `KeyProvider` 的错误。
+    /// - 密钥不可用：透传 `HandleSigner` 的错误。
     pub fn sign_semantic(
         &self,
         payload_hash: &[u8; 32],
@@ -424,9 +420,8 @@ impl AuthSigner {
         }
 
         let nonce = Uuid::new_v4().to_string();
-        let signing_key = self.keys.signing_key()?;
         let message = signing_message(payload_hash, &self.mid, ts_ns, &nonce);
-        let signature: Signature = signing_key.sign(&message);
+        let signature: Signature = self.keys.sign_message(&message)?;
 
         Ok(SignedAuthBlock {
             mid: self.mid.clone(),
@@ -831,13 +826,114 @@ mod tests {
         assert!(guarded.auth.is_none(), "no auth block may be attached");
     }
 
-    // ---- KeyHandle 适配层（集成波次接线，task 49 → 21） ----
+    // ---- 句柄式签名路径（主理人裁决方案 (a)：HandleSigner） ----
 
-    /// QA 接线：适配层 `signing_key()` 必须返回**显式 unimplemented 错误**
-    /// （SecurityError，非 panic、非 todo!()），消息写明「种子导出 vs 无字节
-    /// 导出红线」的冲突点。
+    /// QA 句柄路径：托管 `KeyHandle` 经适配层接入 [`AuthSigner`] ——
+    /// `sign_batch` 产出可被句柄公钥验签的 AuthBlock（全程不导出种子）。
     #[test]
-    fn key_handle_adapter_signing_key_is_explicit_unimplemented_error() {
+    fn handle_based_signer_round_trips_with_key_handle() {
+        use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let handle = FileKeyProvider::new(dir.path().join("gw.key"), &"a1".repeat(32))
+            .expect("valid test fingerprint")
+            .load_or_create()
+            .expect("handle");
+        let adapter = Arc::new(KeyHandleKeyProviderAdapter::new(handle));
+
+        let signer =
+            AuthSigner::new(adapter.clone(), Arc::new(AlwaysLicensed), test_mid())
+                .expect("test mid is 64-hex");
+        let batch = sample_batch();
+
+        let block = signer
+            .sign_batch(&batch, TEST_TS_NS)
+            .expect("licensed: handle-based sign must succeed");
+        assert_eq!(block.mid, test_mid());
+        verify_batch(&block, &batch, &adapter.public_key().expect("public key"))
+            .expect("handle-signed block must verify under handle public key");
+    }
+
+    /// QA 字节一致：句柄式路径（`HandleSigner::sign_message`）与旧裸
+    /// `SigningKey` 路径对同一消息产出**字节级一致**的签名
+    /// （Ed25519 确定性；对照固定测试密钥，等价于既有 golden 向量冻结）。
+    #[test]
+    fn handle_path_signature_bytes_match_legacy_bare_signing_key() {
+        // 旧路径参照实现：直接用裸 SigningKey 签同一消息（仅测试内使用）。
+        let legacy = SigningKey::from_bytes(&TEST_ONLY_KEY_A);
+
+        let hash = semantic_hash(&sample_batch());
+        let msg = signing_message(&hash, "aabb", 42, "nonce-1");
+
+        let via_handle = StaticKeyProvider::new(TEST_ONLY_KEY_A)
+            .sign_message(&msg)
+            .expect("handle sign");
+        let via_legacy = legacy.sign(&msg);
+
+        assert_eq!(
+            via_handle.to_bytes(),
+            via_legacy.to_bytes(),
+            "handle path must be byte-identical to legacy bare-key path"
+        );
+
+        // 全链一致：句柄签名放进 SignedAuthBlock 后经既有 verify_semantic 通过。
+        let block = SignedAuthBlock {
+            mid: "aabb".to_string(),
+            nonce: "nonce-1".to_string(),
+            ts_ns: 42,
+            sig_b64: BASE64_STANDARD.encode(via_handle.to_bytes()),
+        };
+        let pk = StaticKeyProvider::new(TEST_ONLY_KEY_A)
+            .verifying_key()
+            .expect("public key");
+        verify_semantic(&block, &hash, &pk).expect("reconstructed block must verify");
+    }
+
+    /// QA 域分隔：句柄签名绑定签名域前缀 —— 换域（跨协议复用尝试）或换密钥
+    /// 域（另一把句柄的签名）验签均失败，不串签。
+    #[test]
+    fn handle_signature_domain_and_key_separation_prevent_cross_signing() {
+        use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let handle_a = FileKeyProvider::new(dir.path().join("a.key"), &"a1".repeat(32))
+            .expect("valid test fingerprint")
+            .load_or_create()
+            .expect("handle a");
+        let handle_b = FileKeyProvider::new(dir.path().join("b.key"), &"b2".repeat(32))
+            .expect("valid test fingerprint")
+            .load_or_create()
+            .expect("handle b");
+        let signer_a = KeyHandleKeyProviderAdapter::new(handle_a);
+        let signer_b = KeyHandleKeyProviderAdapter::new(handle_b);
+
+        let hash = semantic_hash(&sample_batch());
+        let msg = signing_message(&hash, test_mid().as_str(), TEST_TS_NS, "nonce-sep");
+        let sig_a = signer_a.sign_message(&msg).expect("sign a");
+
+        // 域篡改：去掉域前缀的消息（跨协议复用同一签名）→ 验签失败。
+        let domain_len = SIGNING_DOMAIN_V1.len();
+        let no_domain = &msg[domain_len..];
+        assert!(
+            signer_a
+                .public_key()
+                .expect("pk a")
+                .verify(no_domain, &sig_a)
+                .is_err(),
+            "signature must not verify across signing domains"
+        );
+
+        // 密钥域分离：句柄 B 的公钥验 A 的签名必须失败。
+        assert!(
+            signer_b.public_key().expect("pk b").verify(&msg, &sig_a).is_err(),
+            "foreign-key signature must fail (no cross-key signing)"
+        );
+    }
+
+    /// QA 脱敏：句柄式 `AuthSigner`（托管适配层）的 Debug 输出不含任何
+    /// 密钥材料（指纹派生输入 "a1a1..." 与 "b2b2..." 均不得出现）。
+    #[test]
+    fn handle_based_signer_debug_redacts_key_material() {
         use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
 
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -846,20 +942,84 @@ mod tests {
             .load_or_create()
             .expect("handle");
         let adapter = KeyHandleKeyProviderAdapter::new(handle);
+        let signer = AuthSigner::new(
+            Arc::new(KeyHandleKeyProviderAdapter::new(
+                FileKeyProvider::new(dir.path().join("gw2.key"), &"b2".repeat(32))
+                    .expect("valid test fingerprint")
+                    .load_or_create()
+                    .expect("handle 2"),
+            )),
+            Arc::new(AlwaysLicensed),
+            test_mid(),
+        )
+        .expect("test mid is 64-hex");
 
-        let err = adapter
-            .signing_key()
-            .expect_err("seed export must be refused by design");
+        let adapter_rendered = format!("{adapter:?}");
+        assert!(adapter_rendered.contains("<redacted>"), "{adapter_rendered}");
         assert!(
-            matches!(err, DaemonError::SecurityError(_)),
-            "expected SecurityError, got {err}"
+            !adapter_rendered.contains("a1a1"),
+            "no key material in Debug output: {adapter_rendered}"
         );
-        let msg = err.to_string();
-        assert!(msg.contains("unimplemented"), "须显式声明未接线: {msg}");
-        assert!(msg.contains("KeyHandle"), "须指明冲突对象: {msg}");
+
+        let signer_rendered = format!("{signer:?}");
+        assert!(signer_rendered.contains("<opaque>"), "{signer_rendered}");
         assert!(
-            msg.contains("forbids"),
-            "须写明红线冲突（无字节导出）: {msg}"
+            !signer_rendered.contains("b2b2") && !signer_rendered.contains("a1a1"),
+            "no key material in signer Debug output: {signer_rendered}"
+        );
+    }
+
+    /// QA 闸门顺序：句柄式路径下闸门判定仍**先于**签名 —— 闸门关闭时
+    /// `AuthError`（码 3000），不产出任何签名材料。
+    #[test]
+    fn handle_path_license_gate_refuses_before_signing() {
+        use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let handle = FileKeyProvider::new(dir.path().join("gw.key"), &"a1".repeat(32))
+            .expect("valid test fingerprint")
+            .load_or_create()
+            .expect("handle");
+        let signer = AuthSigner::new(
+            Arc::new(KeyHandleKeyProviderAdapter::new(handle)),
+            Arc::new(DeniedLicense),
+            test_mid(),
+        )
+        .expect("test mid is 64-hex");
+
+        let batch = sample_batch();
+        let err = signer
+            .sign_batch(&batch, TEST_TS_NS)
+            .expect_err("gate closed must refuse to sign");
+        assert!(matches!(err, DaemonError::AuthError(_)), "got {err}");
+        assert_eq!(err.error_code(), ERR_AUTH);
+
+        let mut guarded = batch.clone();
+        assert!(signer.attach(&mut guarded, TEST_TS_NS).is_err());
+        assert!(guarded.auth.is_none(), "no auth block may be attached");
+    }
+
+    /// QA 确定性：同一托管句柄对同一签名消息两次签名结果**字节一致**
+    /// （Ed25519 确定性；防句柄内部引入隐藏随机性破坏可重建验签）。
+    #[test]
+    fn handle_signing_is_deterministic_for_same_message() {
+        use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let handle = FileKeyProvider::new(dir.path().join("gw.key"), &"a1".repeat(32))
+            .expect("valid test fingerprint")
+            .load_or_create()
+            .expect("handle");
+        let signer = KeyHandleKeyProviderAdapter::new(handle);
+
+        let hash = semantic_hash(&sample_batch());
+        let msg = signing_message(&hash, test_mid().as_str(), TEST_TS_NS, "nonce-det");
+        let first = signer.sign_message(&msg).expect("sign 1");
+        let second = signer.sign_message(&msg).expect("sign 2");
+        assert_eq!(
+            first.to_bytes(),
+            second.to_bytes(),
+            "same message must yield byte-identical signatures"
         );
     }
 
@@ -980,7 +1140,7 @@ mod tests {
     /// 非空 / 格式校验：空 mid → ConfigError（码 2000）；非 64 hex 同样拒绝。
     #[test]
     fn invalid_mid_is_rejected() {
-        let keys: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new(TEST_ONLY_KEY_A));
+        let keys: Arc<dyn HandleSigner> = Arc::new(StaticKeyProvider::new(TEST_ONLY_KEY_A));
         let gate: Arc<dyn LicenseGate> = Arc::new(AlwaysLicensed);
 
         let err = AuthSigner::new(Arc::clone(&keys), Arc::clone(&gate), String::new())

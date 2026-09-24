@@ -50,7 +50,7 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::signing::{AuthSigner, KeyProvider, LicenseGate};
+use crate::auth::signing::{AuthSigner, HandleSigner, LicenseGate};
 use crate::error::{DaemonError, DaemonResult};
 
 // ---- 常量（默认值集中声明，避免散落魔法数字） ----
@@ -386,10 +386,10 @@ pub struct LicensingClient {
     transport: Arc<dyn LicenseTransport>,
     /// 回执签名密钥提供者（**可选**；未注入时回执签名置空 → 服务端明确拒绝）。
     ///
-    /// 与 [`AuthSigner`] 使用**同一把设备私钥**（生产由宿主注入同一个 `KeyProvider`）；
+    /// 与 [`AuthSigner`] 使用**同一把设备私钥**（生产由宿主注入同一个 `HandleSigner`）；
     /// 之所以单独持有：回执签名必须是**确定性、可被服务端用设备公钥重建验签**的签名，
     /// 而 [`AuthSigner::sign_semantic`] 会掺入随机 nonce（服务端无法重建），故不经其签名。
-    receipt_signer: Option<Arc<dyn KeyProvider>>,
+    receipt_signer: Option<Arc<dyn HandleSigner>>,
     /// 内置公钥集：`kid → Ed25519 公钥`（支持多 kid 轮换）。
     public_keys: BTreeMap<String, VerifyingKey>,
     /// 状态机内部数据。
@@ -455,7 +455,7 @@ impl LicensingClient {
     ///
     /// 该方法是**新增**的（不改动 [`LicensingClient::new`] / [`LicensingClient::with_transport`]
     /// 签名，避免破坏既有调用方）。
-    pub fn with_receipt_signer(mut self, provider: Arc<dyn KeyProvider>) -> Self {
+    pub fn with_receipt_signer(mut self, provider: Arc<dyn HandleSigner>) -> Self {
         self.receipt_signer = Some(provider);
         self
     }
@@ -701,7 +701,7 @@ impl LicensingClient {
     /// 服务端从回执请求体的 7 个字段（mid/lease_id/seq_from/seq_to/count/payload_digest/ts）
     /// 独立重建同一串并验签，**因此签名可被第三方校验**（这是 B 档二次校验的信任基础）。
     ///
-    /// 私钥不落盘、不日志（由 [`KeyProvider`] 保证）；密钥不可用时返回**空串**——这是明确的
+    /// 私钥不落盘、不日志（由 [`HandleSigner`] 保证）；密钥不可用时返回**空串**——这是明确的
     /// 失败信号（服务端拒绝），**绝不**用「无签名」冒充有效签名；生产路径零 panic。
     fn sign_receipt(
         &self,
@@ -728,12 +728,11 @@ impl LicensingClient {
             // 未注入回执签名密钥：置空（明确失败信号），不伪造签名、不 panic。
             None => return String::new(),
         };
-        let signing_key = match provider.signing_key() {
-            Ok(k) => k,
+        let signature: Signature = match provider.sign_message(&payload_hash) {
+            Ok(s) => s,
             // 密钥不可用：置空（明确失败信号）。
             Err(_) => return String::new(),
         };
-        let signature: Signature = signing_key.sign(&payload_hash);
         B64.encode(signature.to_bytes())
     }
 
