@@ -176,6 +176,12 @@ mod tests {
             topic_prefix: "telemetry".to_string(),
             qos: 1,
             tls: true,
+            // task 25 新增 TLS 字段：本测试夹具不涉及证书文件（仅构造配置）。
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            server_name: None,
+            alpn: Vec::new(),
             encoding: crate::config::OutletEncoding::Protobuf,
         });
         config

@@ -21,6 +21,24 @@ gateway_id = "gw-local-dev"
 # qos = 1
 # tls = false
 # encoding = "json"                     # protobuf（默认）| json
+#
+# ── TLS / mTLS 出口示例（可选；task 25）──
+# 说明：broker scheme 与 tls 开关必须一致（mqtts:// ⇔ tls = true）。
+#       TLS 出口必须提供 ca_cert_path；mTLS 需 client_cert_path + client_key_path 成对。
+#       路径需在网关启动时即存在（不存在则该出口被拒绝并跳过，不静默降级明文）。
+#       切勿配置任何「跳过证书校验」开关——本实现不支持，且校验失败即拒绝。
+# [[outlets]]
+# name = "line1_m1_tls"
+# broker = "mqtts://broker.example.com:8883"   # 端口缺省即 8883
+# topic_prefix = "iotdaq/line1_m1"
+# qos = 1
+# tls = true
+# encoding = "protobuf"                 # protobuf（默认）| json
+# ca_cert_path = "/etc/iot-daq/tls/ca.crt"          # 服务端 CA（TLS 必填）
+# client_cert_path = "/etc/iot-daq/tls/client.crt"  # mTLS 客户端证书（与私钥成对）
+# client_key_path = "/etc/iot-daq/tls/client.key"   # mTLS 客户端私钥（与证书成对）
+# alpn = ["mqtt"]                       # 可选；缺省 = 不协商 ALPN
+# server_name = "broker.example.com"    # 可选；须与 broker host 一致（SNI 覆盖）
 
 # ── 采集点位（本地页面测试可不配）──
 # [[points]]

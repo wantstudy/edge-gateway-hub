@@ -4,6 +4,9 @@
 //! - **做**：单路 [`MqttClient`] 的连接配置 / 选项构建 / 发布订阅 / 事件循环推进 /
 //!   自动重连与会话恢复 / 退避策略；多路连接按名管理的 [`MqttConnectionPool`]；
 //!   **每路连接独立声明 `encoding`**（[`Encoding::Protobuf`] 默认 / [`Encoding::Json`]）。
+//! - **做（task 54 接线）**：北向出站的**背压接线**——有界发送队列（水位 + 落盘降级）、
+//!   **PUBACK 门控**确认回收、补发路径的批次级幂等去重、审计的取走上报出口；
+//!   见 [`NorthOutlet`]。
 //! - **不做**：载荷的 protobuf / JSON 序列化（= task 62，本模块只做配置读取与传递，
 //!   见 [`PayloadEncoder`] 契约）；转发规则与触发时机（= task 20/37）；
 //!   离线缓存与补发（= task 17/18）。
@@ -30,9 +33,22 @@
 //!    [`DaemonError::MqttError`]（5000）。见 [`map_connection_error`]。
 //! 6. **重连退避复用南向 [`crate::driver::Reconnector`]**：纯逻辑无 IO，语义一致，
 //!    避免北向再造一套退避（默认值 1s → 60s、倍率 2，可按 endpoint 调）。
+//! 7. **背压接线（task 54，接入 [`crate::backpressure`] 原语，本模块只编排不改原语）**：
+//!    - [`NorthSendQueue`]：`push` → [`MqttClient::pump_send`]（`take_ready` → 发布）→
+//!      **PUBACK 到达才** `confirm(1)`（见 [`MqttClient::poll_event`]）→ 发布失败
+//!      `requeue_failed` 回灌 `ready` 头部（水位占用不变，不丢数据）。
+//!    - [`NorthReplay`]：`should_send` → 发布 → `ack`；**「先落 Ack 后推位点」的顺序由
+//!      [`ReplayController::ack`] 内部保证，本模块不得颠倒**（颠倒了会丢数据）。
+//!    - [`IngestGate`]：消费端 / 出口入库前用 `IdempotencyLedger::apply_key` 判定，
+//!      仅 `Applied` 才入库（`Duplicate` 跳过 = 计划允许的唯一隐式丢弃）。
+//!    - [`AuditPump`]：`AuditLog::drain()` 的调用点（有界 4096，`dropped()` 可观测
+//!      「审计消费变慢」）。
+//!    - **慢消费者硬红线**：`push` 只做一次水位比较 + 一次有界落盘调用，**绝不阻塞采集路径**。
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use rumqttc::{
@@ -41,8 +57,14 @@ use rumqttc::{
 };
 use rustls::crypto::CryptoProvider;
 
+use crate::backpressure::{
+    AckOutcome, AuditLog, BackpressureAudit, DedupOutcome, IdempotencyLedger, LedgerStats,
+    PendingSend, PushOutcome, QueueAckSink, QueueSpillSink, ReplayController, SendQueue,
+    SendQueueStats, WaterLevel,
+};
 use crate::driver::Reconnector;
 use crate::error::{DaemonError, DaemonResult};
+use crate::offline_queue::{Clock, OfflineQueue, QueuedBatch, DEFAULT_MEM_HIGH_WATER_ROWS};
 use crate::pipeline::ProcessedSample;
 
 // ---- 常量（默认值集中声明，避免散落魔法数字） ----
@@ -591,6 +613,493 @@ pub enum PublishOutcome {
     },
 }
 
+// ==================== 背压接线（task 54） ====================
+//
+// 把 `crate::backpressure` 里「可测但没接线」的原语真正接进北向出站路径。
+// 三个接线点（与 brief 一一对应）：
+//   1. 发送队列水位 + 慢消费者保护（落盘降级）→ `NorthSendQueue` + `MqttClient::pump_send`
+//      + `MqttClient::poll_event` 的 PUBACK→`confirm`
+//   2. 补发路径幂等（先落 Ack 后推位点）→ `NorthReplay` / `IngestGate` + `MqttClient::pump_replay`
+//   3. 审计取走上报出口 → `AuditPump` + `MqttClient::drain_audit`
+
+/// 审计上报出口（task 54 接线点 3）。
+///
+/// 接收 [`AuditLog::drain`] 取走的审计事件（落盘降级 / 溢出拒绝 / 水位进出）。
+/// 约定实现**同步、快速、无阻塞**：审计环本身有界，慢消费由 [`AuditPump::dropped`] 可观测。
+pub trait AuditSink: Send + Sync {
+    /// 上报一批审计事件（`events` 保证非空）。
+    fn emit(&self, events: Vec<BackpressureAudit>);
+}
+
+/// 取锁并在中毒时取回内部数据（**绝不 panic**）。
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => PoisonError::into_inner(poisoned),
+    }
+}
+
+/// 审计取走上报泵：`AuditLog::drain()` 的调用点。
+///
+/// 审计环有界（默认 4096）：若长期无人 [`Self::pump`]，事件会被静默淘汰——
+/// [`Self::dropped`] > 0 即「审计消费变慢」的可观测信号。
+pub struct AuditPump {
+    log: Arc<AuditLog>,
+    sink: Arc<dyn AuditSink>,
+}
+
+impl AuditPump {
+    /// 构造。
+    #[must_use]
+    pub fn new(log: Arc<AuditLog>, sink: Arc<dyn AuditSink>) -> Self {
+        Self { log, sink }
+    }
+
+    /// 底层审计环（供快照 / 运维观测）。
+    #[must_use]
+    pub fn log(&self) -> &Arc<AuditLog> {
+        &self.log
+    }
+
+    /// 取走全部待上报审计并交给 [`AuditSink`]，返回本次上报条数。
+    pub fn pump(&self) -> usize {
+        let events = self.log.drain();
+        let count = events.len();
+        if count > 0 {
+            self.sink.emit(events);
+        }
+        count
+    }
+
+    /// 累计产生条数。
+    #[must_use]
+    pub fn emitted(&self) -> u64 {
+        self.log.emitted()
+    }
+
+    /// 因审计环满被淘汰的条数（> 0 说明审计消费变慢）。
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.log.dropped()
+    }
+}
+
+impl fmt::Debug for AuditPump {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditPump")
+            .field("buffered", &self.log.len())
+            .field("emitted", &self.emitted())
+            .field("dropped", &self.dropped())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 北向发送队列（task 54 接线点 1）：有界内存 + 超限落盘降级 + PUBACK 回收。
+///
+/// **永不阻塞采集路径**：`push` 只做一次水位比较 + 一次有界落盘调用。
+/// 内部以 [`Mutex`] 包住 [`SendQueue`]，使发布侧（`&self`）也能安全推进。
+///
+/// 水位取 [`SendQueue::with_defaults`]（高水位 32 / 硬上限 64，设计文档 §4）；
+/// 落盘降级走 [`QueueSpillSink`] → [`OfflineQueue::enqueue`]（分配新 `batch_seq`）。
+///
+/// ⚠ **入参契约**：`push` 的负载必须是**尚未持久化**的新数据（采集 / 管道出口）。
+/// 不要把 [`OfflineQueue`] 中已存在的批次再 push 进来——落盘降级会再写一行，
+/// 造成重复数据；补发路径请用 [`NorthReplay`]（失败只回灌内存，不落盘）。
+pub struct NorthSendQueue {
+    inner: Mutex<SendQueue>,
+    audit: Arc<AuditLog>,
+    clock: Arc<dyn Clock>,
+}
+
+impl NorthSendQueue {
+    /// 构造（落盘降级与审计环绑定到同一 [`OfflineQueue`] / [`AuditLog`]）。
+    // TODO(接线后续): 配置段接入点 —— 水位当前固定取 with_defaults 的 32/64，
+    // 待 config.rs 提供 `[backpressure] send_high_water / send_hard_limit` 后改为注入。
+    #[must_use]
+    pub fn new(queue: Arc<OfflineQueue>, audit: Arc<AuditLog>, clock: Arc<dyn Clock>) -> Self {
+        let spill = Arc::new(QueueSpillSink::new(queue));
+        let inner = SendQueue::with_defaults(spill, Arc::clone(&audit), Arc::clone(&clock));
+        Self {
+            inner: Mutex::new(inner),
+            audit,
+            clock,
+        }
+    }
+
+    /// 当前时钟读数（构造 [`PendingSend::new`] 的 `enqueued_ns`）。
+    #[must_use]
+    pub fn now_ns(&self) -> i64 {
+        self.clock.now_ns()
+    }
+
+    /// 提交一条待发送负载（**同步、永不阻塞**）。
+    pub fn push(&self, seq: u64, payload: Vec<u8>) -> PushOutcome {
+        let item = PendingSend::new(seq, payload, self.clock.now_ns());
+        self.push_item(item)
+    }
+
+    /// 提交一条已构造的待发送条目。
+    pub fn push_item(&self, item: PendingSend) -> PushOutcome {
+        lock_or_recover(&self.inner).push(item)
+    }
+
+    /// 取出最多 `max` 条交给网络层（`ready` → `sent`，**水位占用不变**）。
+    pub fn take_ready(&self, max: usize) -> Vec<PendingSend> {
+        lock_or_recover(&self.inner).take_ready(max)
+    }
+
+    /// PUBACK / PUBCOMP 到达：从在途窗口移除 `count` 条（按提交顺序），返回实际移除条数。
+    ///
+    /// **只有确认到达才调用**——未确认的条目继续占用水位，因此不会被重复发布。
+    pub fn confirm(&self, count: usize) -> usize {
+        lock_or_recover(&self.inner).confirm(count)
+    }
+
+    /// 发布失败回灌（`sent` → `ready` 头部），水位占用不变。
+    pub fn requeue_failed(&self, items: Vec<PendingSend>) {
+        lock_or_recover(&self.inner).requeue_failed(items);
+    }
+
+    /// 在途（已提交未确认）条数（水位口径 = `ready` + `sent`）。
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        lock_or_recover(&self.inner).pending()
+    }
+
+    /// 在途字节数。
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        lock_or_recover(&self.inner).bytes()
+    }
+
+    /// 当前水位等级。
+    #[must_use]
+    pub fn level(&self) -> WaterLevel {
+        lock_or_recover(&self.inner).level()
+    }
+
+    /// 统计快照（入内存 / 落盘降级 / 拒绝 / 在途）。
+    #[must_use]
+    pub fn stats(&self) -> SendQueueStats {
+        lock_or_recover(&self.inner).stats()
+    }
+
+    /// 共享审计环。
+    #[must_use]
+    pub fn audit(&self) -> &Arc<AuditLog> {
+        &self.audit
+    }
+}
+
+impl fmt::Debug for NorthSendQueue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NorthSendQueue")
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 补发控制器（task 54 接线点 2）：批次级幂等 + 「先落 Ack 后推位点」。
+///
+/// Ack 持久化走 [`QueueAckSink`] → [`OfflineQueue::ack_up_to`]（其内部顺序同样是
+/// **先落地确认记录，成功后才推进内存位点**）；[`ReplayController::ack`] 不得颠倒该顺序。
+pub struct NorthReplay {
+    controller: Mutex<ReplayController>,
+    queue: Arc<OfflineQueue>,
+    audit: Arc<AuditLog>,
+}
+
+impl NorthReplay {
+    /// 构造（起始位点取 `queue.ack_seq()`，即重启后读回的 high-water mark）。
+    #[must_use]
+    pub fn new(
+        gateway_id: impl Into<String>,
+        queue: Arc<OfflineQueue>,
+        audit: Arc<AuditLog>,
+    ) -> Self {
+        let start = queue.ack_seq();
+        let sink = Arc::new(QueueAckSink::new(Arc::clone(&queue)));
+        Self {
+            controller: Mutex::new(ReplayController::new(gateway_id, sink, start)),
+            queue,
+            audit,
+        }
+    }
+
+    /// 当前 high-water mark（已确认到的最大 `batch_seq`）。
+    #[must_use]
+    pub fn high_water_mark(&self) -> u64 {
+        lock_or_recover(&self.controller).high_water_mark()
+    }
+
+    /// 该 `seq` 是否需要补发（`seq > high_water` 且去重窗口内未发过）。
+    #[must_use]
+    pub fn should_send(&self, seq: u64) -> bool {
+        lock_or_recover(&self.controller).should_send(seq)
+    }
+
+    /// 标记已发送（去重判定）：返回 [`DedupOutcome::Applied`] 才真正发送。
+    pub fn mark_sent(&self, seq: u64) -> DedupOutcome {
+        lock_or_recover(&self.controller).mark_sent(seq)
+    }
+
+    /// 按幂等键 `{gateway_id}:{batch_seq}` 标记已发送。
+    pub fn mark_sent_key(&self, key: &str) -> DedupOutcome {
+        lock_or_recover(&self.controller).mark_sent_key(key)
+    }
+
+    /// 确认：**先落 Ack，成功后才推进位点**（顺序固定，不得颠倒）。
+    ///
+    /// # Errors
+    /// Ack 持久化失败 → 位点与去重窗口均不动，数据继续保留，返回底层 `StorageError`（4000）。
+    pub fn ack(&self, seq: u64) -> DaemonResult<AckOutcome> {
+        lock_or_recover(&self.controller).ack(seq)
+    }
+
+    /// 取一批待补发条目：`seq > high_water` 且去重窗口内未发过（按 `seq` 升序）。
+    ///
+    /// # Errors
+    /// 队列写线程不可用 → `StorageError`（4000）。
+    pub fn next_replay_batch(&self, max: usize) -> DaemonResult<Vec<QueuedBatch>> {
+        let batches = self.queue.replay_batch(max)?;
+        Ok(batches
+            .into_iter()
+            .filter(|b| self.should_send(b.seq))
+            .collect())
+    }
+
+    /// 去重登记簿统计（`applied_rows` / `duplicate_rows` / `high_water`）。
+    #[must_use]
+    pub fn stats(&self) -> LedgerStats {
+        lock_or_recover(&self.controller).ledger().stats()
+    }
+
+    /// 底层离线队列。
+    #[must_use]
+    pub fn queue(&self) -> &Arc<OfflineQueue> {
+        &self.queue
+    }
+
+    /// 共享审计环。
+    #[must_use]
+    pub fn audit(&self) -> &Arc<AuditLog> {
+        &self.audit
+    }
+}
+
+impl fmt::Debug for NorthReplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NorthReplay")
+            .field("high_water", &self.high_water_mark())
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 消费端 / 出口侧幂等闸门（task 54 接线点 2 的消费侧参考接线）。
+///
+/// 入库前调用 [`Self::admit`]：**只有 [`DedupOutcome::Applied`] 才入库**，
+/// [`DedupOutcome::Duplicate`] 直接跳过（忽略重复 = 计划允许的唯一隐式丢弃）。
+pub struct IngestGate {
+    ledger: Mutex<IdempotencyLedger>,
+    audit: Arc<AuditLog>,
+}
+
+impl IngestGate {
+    /// 构造（去重窗口取 [`DEFAULT_MEM_HIGH_WATER_ROWS`]）。
+    #[must_use]
+    pub fn new(gateway_id: impl Into<String>, audit: Arc<AuditLog>) -> Self {
+        let ledger = IdempotencyLedger::new(gateway_id, DEFAULT_MEM_HIGH_WATER_ROWS);
+        Self {
+            ledger: Mutex::new(ledger),
+            audit,
+        }
+    }
+
+    /// 按幂等键 `{gateway_id}:{batch_seq}` 判定是否入库。
+    pub fn admit(&self, key: &str) -> DedupOutcome {
+        lock_or_recover(&self.ledger).apply_key(key)
+    }
+
+    /// 按 `batch_seq` 判定是否入库。
+    pub fn admit_seq(&self, seq: u64) -> DedupOutcome {
+        lock_or_recover(&self.ledger).apply_seq(seq)
+    }
+
+    /// 按批次判定是否入库（复用 [`QueuedBatch::idempotency_key`]）。
+    pub fn admit_batch(&self, batch: &QueuedBatch) -> DedupOutcome {
+        lock_or_recover(&self.ledger).apply_batch(batch)
+    }
+
+    /// 入库成功后推进位点并裁剪去重窗口（**只能在入库成功后调用**）。
+    pub fn confirm_up_to(&self, seq: u64) {
+        lock_or_recover(&self.ledger).confirm_up_to(seq);
+    }
+
+    /// 当前 high-water mark。
+    #[must_use]
+    pub fn high_water_mark(&self) -> u64 {
+        lock_or_recover(&self.ledger).high_water()
+    }
+
+    /// 去重登记簿统计。
+    #[must_use]
+    pub fn stats(&self) -> LedgerStats {
+        lock_or_recover(&self.ledger).stats()
+    }
+
+    /// 共享审计环。
+    #[must_use]
+    pub fn audit(&self) -> &Arc<AuditLog> {
+        &self.audit
+    }
+}
+
+impl fmt::Debug for IngestGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IngestGate")
+            .field("high_water", &self.high_water_mark())
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 北向出口背压接线束（task 54）：把三个接线点组装到一处并挂到 [`MqttClient`]。
+///
+/// 三者共享同一 [`OfflineQueue`] 与同一 [`AuditLog`]，形成闭环：
+/// 发送队列超限 → 落盘降级进队列 → 补发路径按幂等键重放 → 审计统一 [`AuditPump::pump`] 上报。
+pub struct NorthOutlet {
+    send: Arc<NorthSendQueue>,
+    replay: Arc<NorthReplay>,
+    ingest: Arc<IngestGate>,
+    audit: Arc<AuditPump>,
+}
+
+impl NorthOutlet {
+    /// 构造（审计环容量取 [`AuditLog`] 默认 4096）。
+    #[must_use]
+    pub fn new(
+        gateway_id: impl Into<String>,
+        queue: Arc<OfflineQueue>,
+        clock: Arc<dyn Clock>,
+        audit_sink: Arc<dyn AuditSink>,
+    ) -> Self {
+        Self::with_audit_log(
+            gateway_id,
+            queue,
+            clock,
+            Arc::new(AuditLog::default()),
+            audit_sink,
+        )
+    }
+
+    /// 构造并注入审计环（测试可用小容量断言「审计消费变慢」= `dropped() > 0`）。
+    #[must_use]
+    pub fn with_audit_log(
+        gateway_id: impl Into<String>,
+        queue: Arc<OfflineQueue>,
+        clock: Arc<dyn Clock>,
+        audit_log: Arc<AuditLog>,
+        audit_sink: Arc<dyn AuditSink>,
+    ) -> Self {
+        let gateway_id = gateway_id.into();
+        let pump_log = Arc::clone(&audit_log);
+        Self {
+            send: Arc::new(NorthSendQueue::new(
+                Arc::clone(&queue),
+                Arc::clone(&audit_log),
+                clock,
+            )),
+            replay: Arc::new(NorthReplay::new(
+                gateway_id.clone(),
+                queue,
+                Arc::clone(&audit_log),
+            )),
+            ingest: Arc::new(IngestGate::new(gateway_id, audit_log)),
+            audit: Arc::new(AuditPump::new(pump_log, audit_sink)),
+        }
+    }
+
+    /// 接线点 1：有界发送队列（水位 + 落盘降级）。
+    #[must_use]
+    pub fn send(&self) -> &Arc<NorthSendQueue> {
+        &self.send
+    }
+
+    /// 接线点 2：补发 / 幂等控制器。
+    #[must_use]
+    pub fn replay(&self) -> &Arc<NorthReplay> {
+        &self.replay
+    }
+
+    /// 接线点 2（消费侧）：入库前幂等闸门。
+    #[must_use]
+    pub fn ingest(&self) -> &Arc<IngestGate> {
+        &self.ingest
+    }
+
+    /// 接线点 3：审计取走上报泵。
+    #[must_use]
+    pub fn audit(&self) -> &Arc<AuditPump> {
+        &self.audit
+    }
+
+    /// 共享审计环。
+    #[must_use]
+    pub fn audit_log(&self) -> &Arc<AuditLog> {
+        self.audit.log()
+    }
+}
+
+impl fmt::Debug for NorthOutlet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NorthOutlet")
+            .field("send", &self.send)
+            .field("replay", &self.replay)
+            .field("audit", &self.audit)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 发送泵一轮的结果（task 54 接线点 1）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendPumpReport {
+    /// 本轮从 `ready` 取出的条数。
+    pub taken: usize,
+    /// 成功提交到发送通道的条数（等待 PUBACK）。
+    pub published: usize,
+    /// 发布失败被回灌到 `ready` 头部的条数（含未处理的剩余条目）。
+    pub requeued: usize,
+}
+
+/// 补发泵一轮的结果（task 54 接线点 2）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplayPumpReport {
+    /// 通过 `should_send` 的补发候选条数。
+    pub candidates: usize,
+    /// 实际发布成功条数。
+    pub sent: usize,
+    /// 被幂等账本判定为重复而跳过的条数。
+    pub deduped: usize,
+    /// 发布失败条数（该批仍留在离线队列中，位点未推进）。
+    pub failed: usize,
+    /// 是否推进了位点（Ack 已落盘）。
+    pub acked: bool,
+    /// Ack 落盘失败次数（> 0 = 位点未推进，重放将由幂等键去重）。
+    pub ack_errors: usize,
+}
+
+/// 一轮完整泵（发送 + 补发 + 审计上报）的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PumpReport {
+    /// 发送队列一轮。
+    pub send: SendPumpReport,
+    /// 补发一轮。
+    pub replay: ReplayPumpReport,
+    /// 本轮取走并上报的审计条数。
+    pub audit_emitted: usize,
+}
+
 // ---- 单路客户端 ----
 
 /// 单路 MQTT 客户端（持有 rumqttc [`AsyncClient`] + [`EventLoop`]）。
@@ -618,6 +1127,13 @@ pub struct MqttClient {
     submitted: u64,
     /// 累计已确认的报文数（PUBACK / PUBCOMP；task 54）。
     acked: u64,
+    /// 已提交未确认报文的来源标记（task 54）：`true` = 出自发送队列，
+    /// PUBACK 到达时需 `confirm` 回收其水位占用；`false` = 补发 / 水位降级路径直发。
+    ///
+    /// 与 PUBACK **严格 FIFO** 对应（QoS 0 无确认语义，故不入队）。
+    ack_sources: VecDeque<bool>,
+    /// 北向背压接线束（task 54；`None` = 未接线，全部泵为空操作）。
+    outlet: Option<Arc<NorthOutlet>>,
 }
 
 impl MqttClient {
@@ -645,6 +1161,8 @@ impl MqttClient {
             retry_after: None,
             submitted: 0,
             acked: 0,
+            ack_sources: VecDeque::new(),
+            outlet: None,
         })
     }
 
@@ -696,6 +1214,216 @@ impl MqttClient {
         self.submitted.saturating_sub(self.acked) as usize
     }
 
+    // ---- 背压接线（task 54） ----
+
+    /// 挂载北向背压接线束（task 54）。未挂载时全部泵为无操作。
+    #[must_use]
+    pub fn with_outlet(mut self, outlet: Arc<NorthOutlet>) -> Self {
+        self.outlet = Some(outlet);
+        self
+    }
+
+    /// 已挂载的背压接线束（未挂载为 `None`）。
+    #[must_use]
+    pub fn outlet(&self) -> Option<&Arc<NorthOutlet>> {
+        self.outlet.as_ref()
+    }
+
+    /// 发送队列在途（已提交未确认）条数（task 54 水位口径）。
+    #[must_use]
+    pub fn queued_pending(&self) -> usize {
+        self.outlet
+            .as_ref()
+            .map_or(0, |outlet| outlet.send().pending())
+    }
+
+    /// 已提交、正等待 PUBACK / PUBCOMP 的报文的确认来源标记数（可观测）。
+    #[must_use]
+    pub fn ack_tracked(&self) -> usize {
+        self.ack_sources.len()
+    }
+
+    /// 记账一条已提交报文（task 54）。
+    ///
+    /// `from_send_queue` 决定 PUBACK 到达时是否回收 [`NorthSendQueue`] 的在途窗口：
+    /// 只有出自发送队列的报文才占用其水位，补发路径直发的报文不得占用。
+    /// QoS 0 无确认语义 → 不入确认来源队列（避免其无界增长）。
+    fn note_submitted(&mut self, from_send_queue: bool) {
+        self.submitted = self.submitted.saturating_add(1);
+        if self.endpoint.qos != QoS::AtMostOnce {
+            self.ack_sources.push_back(from_send_queue);
+        }
+    }
+
+    /// 提交一条负载到有界发送队列（task 54 接线点 1 入口；**同步、永不阻塞**）。
+    ///
+    /// # Errors
+    /// 未挂载 [`NorthOutlet`] → `ConfigError`（2000）。
+    ///
+    /// 硬上限且落盘也失败**不是错误**：返回 [`PushOutcome::Rejected`] 并交还数据
+    /// （已记审计），由调用方决定计数 / 告警 / 重试——**绝不静默丢**。
+    pub fn submit(&self, seq: u64, payload: Vec<u8>) -> DaemonResult<PushOutcome> {
+        let outlet = self.outlet.as_ref().ok_or_else(|| {
+            DaemonError::ConfigError(
+                "north outlet backpressure not attached (use `with_outlet`)".to_string(),
+            )
+        })?;
+        Ok(outlet.send().push(seq, payload))
+    }
+
+    /// 取走并上报全部背压审计（task 54 接线点 3：`AuditLog::drain()` 的调用点）。
+    #[must_use]
+    pub fn drain_audit(&self) -> usize {
+        self.outlet
+            .as_ref()
+            .map_or(0, |outlet| outlet.audit().pump())
+    }
+
+    /// 推进发送队列一轮：`take_ready` → 发布 → 失败 `requeue_failed`（task 54 接线点 1）。
+    ///
+    /// 水位口径 = 已提交未确认（PUBACK / PUBCOMP）条数；在途达水位时**不发布**，
+    /// 返回空报告（慢消费者保护，绝不阻塞）。
+    ///
+    /// 发布失败属可重试暂态，**不升级为错误**：失败条目与未处理的剩余条目一并
+    /// 回灌 `ready` 头部（水位占用不变，不丢数据），调用方据
+    /// [`SendPumpReport::requeued`] > 0 决定退避。未挂载 [`NorthOutlet`] → 空报告。
+    pub async fn pump_send(&mut self, topic_prefix: &str) -> SendPumpReport {
+        let Some(outlet) = self.outlet.clone() else {
+            return SendPumpReport::default();
+        };
+        let headroom = self
+            .endpoint
+            .send_high_water
+            .saturating_sub(self.outstanding());
+        if headroom == 0 {
+            return SendPumpReport::default();
+        }
+        let qos = self.endpoint.qos;
+        let mut queue: VecDeque<PendingSend> = outlet.send().take_ready(headroom).into();
+        let taken = queue.len();
+        let mut published = 0usize;
+        let mut requeued = 0usize;
+        while let Some(item) = queue.pop_front() {
+            let topic = format!("{topic_prefix}/{}", item.seq);
+            let payload = item.payload.clone();
+            match self.publish_mut(&topic, payload, qos).await {
+                Ok(()) => {
+                    self.note_submitted(true);
+                    published = published.saturating_add(1);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        batch_seq = item.seq,
+                        error = %err,
+                        "north send failed; requeueing unacked batches (no data dropped)"
+                    );
+                    let mut failed: Vec<PendingSend> = Vec::with_capacity(queue.len() + 1);
+                    failed.push(item);
+                    failed.extend(queue.drain(..));
+                    requeued = failed.len();
+                    outlet.send().requeue_failed(failed);
+                    break;
+                }
+            }
+        }
+        SendPumpReport {
+            taken,
+            published,
+            requeued,
+        }
+    }
+
+    /// 推进补发一轮：`should_send` → 去重判定 → 发布 → **发布成功后 `ack`**
+    /// （task 54 接线点 2）。未挂载 [`NorthOutlet`] → 空报告。
+    ///
+    /// 顺序红线：`ack` 内部为「先落 Ack，成功后才推位点」，**不得颠倒**。
+    /// Ack 落盘失败 → 位点不动（`ack_errors` +1），该批仍可重放并由幂等键去重。
+    /// 发布失败 → 该批留在离线队列中不回灌、不落盘（避免重复行）。
+    ///
+    /// # Errors
+    /// 离线队列写线程不可用 → `StorageError`（4000）。
+    pub async fn pump_replay(&mut self, topic_prefix: &str) -> DaemonResult<ReplayPumpReport> {
+        let Some(outlet) = self.outlet.clone() else {
+            return Ok(ReplayPumpReport::default());
+        };
+        let headroom = self
+            .endpoint
+            .send_high_water
+            .saturating_sub(self.outstanding());
+        if headroom == 0 {
+            return Ok(ReplayPumpReport::default());
+        }
+        let batches = outlet.replay().next_replay_batch(headroom)?;
+        let qos = self.endpoint.qos;
+        let mut report = ReplayPumpReport {
+            candidates: batches.len(),
+            ..ReplayPumpReport::default()
+        };
+        let mut last_acked: u64 = 0;
+        for batch in batches {
+            // 幂等去重：只有 `Applied` 才发布（`Duplicate` 跳过，绝不重发）。
+            if outlet.replay().mark_sent(batch.seq).is_duplicate() {
+                report.deduped = report.deduped.saturating_add(1);
+                continue;
+            }
+            let topic = format!("{topic_prefix}/{}", batch.seq);
+            match self.publish_mut(&topic, batch.payload.clone(), qos).await {
+                Ok(()) => {
+                    self.note_submitted(false);
+                    report.sent = report.sent.saturating_add(1);
+                    last_acked = last_acked.max(batch.seq);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        batch_seq = batch.seq,
+                        error = %err,
+                        "north replay publish failed; batch stays unacked in the offline queue"
+                    );
+                    report.failed = report.failed.saturating_add(1);
+                    // 只回灌内存发送队列，**不落盘**（该批仍在离线队列里，落盘会产生重复行）。
+                    outlet.send().requeue_failed(vec![PendingSend::new(
+                        batch.seq,
+                        batch.payload,
+                        outlet.send().now_ns(),
+                    )]);
+                    break;
+                }
+            }
+        }
+        if last_acked > 0 {
+            // 顺序红线：ReplayController::ack 内部「先落 Ack，后推位点」，不得颠倒。
+            match outlet.replay().ack(last_acked) {
+                Ok(AckOutcome::Advanced { .. }) => report.acked = true,
+                Ok(AckOutcome::AlreadyAcked { .. }) => {}
+                Err(err) => {
+                    report.ack_errors = report.ack_errors.saturating_add(1);
+                    tracing::warn!(
+                        batch_seq = last_acked,
+                        error = %err,
+                        "north replay ack not persisted; cursor unchanged \
+                         (replay will be deduped by idempotency key)"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// 一轮完整泵：发送 → 补发 → 审计上报（task 54 三个接线点各推进一次）。
+    ///
+    /// # Errors
+    /// 离线队列不可用（[`Self::pump_replay`]）→ `StorageError`（4000）。
+    pub async fn pump(&mut self, topic_prefix: &str) -> DaemonResult<PumpReport> {
+        let send = self.pump_send(topic_prefix).await;
+        let replay = self.pump_replay(topic_prefix).await?;
+        let audit_emitted = self.drain_audit();
+        Ok(PumpReport {
+            send,
+            replay,
+            audit_emitted,
+        })
+    }
+
     /// 带慢消费者水位保护的发布（task 54）。
     ///
     /// 水位判定只是一次整数比较（O(1)，无 IO、无 await 前置阻塞）：
@@ -720,9 +1448,9 @@ impl MqttClient {
             degrade.on_slow_consumer(outstanding);
             return Ok(PublishOutcome::Degraded { outstanding });
         }
-        self.publish_with_qos(topic, payload, self.endpoint.qos)
-            .await?;
-        self.submitted = self.submitted.saturating_add(1);
+        let qos = self.endpoint.qos;
+        self.publish_mut(topic, payload.into(), qos).await?;
+        self.note_submitted(false);
         Ok(PublishOutcome::Sent)
     }
 
@@ -747,6 +1475,23 @@ impl MqttClient {
     ) -> DaemonResult<()> {
         self.client
             .publish(topic, qos, false, payload.into())
+            .await
+            .map_err(|e| DaemonError::MqttError(format!("publish `{topic}` failed: {e}")))
+    }
+
+    /// 以 `&mut self` 发布一条原始报文（**驱动任务唯一发布入口**）。
+    ///
+    /// 语义与 [`Self::publish_with_qos`] 完全一致；区别仅在借用形式：驱动任务的
+    /// future 必须是 `Send`，而 [`MqttClient`] 因持有 rumqttc `EventLoop`
+    /// （内含 `!Sync` 的传输对象）而为 `!Sync` —— `&self` 跨 `.await` 会让
+    /// future 非 `Send`（无法 `tokio::spawn`）；持 `&mut self` 则只要求
+    /// `MqttClient: Send`（成立），故驱动路径统一走该方法。
+    ///
+    /// # Errors
+    /// 请求通道关闭 → [`DaemonError::MqttError`]。
+    async fn publish_mut(&mut self, topic: &str, payload: Vec<u8>, qos: QoS) -> DaemonResult<()> {
+        self.client
+            .publish(topic, qos, false, payload)
             .await
             .map_err(|e| DaemonError::MqttError(format!("publish `{topic}` failed: {e}")))
     }
@@ -835,12 +1580,20 @@ impl MqttClient {
                 Ok(Event::Incoming(Packet::ConnAck(ack)))
             }
             Ok(event) => {
-                // 慢消费者记账（task 54）：收到确认 → 未确认积压减一。
+                // 慢消费者记账（task 54 接线点 1）：收到确认 → 未确认积压减一；
+                // 若该报文出自发送队列，则从其在途窗口回收（**只有确认到达才回收**；
+                // 未确认条目继续占用水位，因此不会被重复发布）。
                 if matches!(
                     &event,
                     Event::Incoming(Packet::PubAck(_)) | Event::Incoming(Packet::PubComp(_))
                 ) {
                     self.acked = self.acked.saturating_add(1);
+                    // 该报文的确认来源：`Some(true)` = 出自发送队列 → 回收其水位。
+                    if self.ack_sources.pop_front() == Some(true) {
+                        if let Some(outlet) = &self.outlet {
+                            outlet.send().confirm(1);
+                        }
+                    }
                 }
                 Ok(event)
             }
@@ -898,6 +1651,8 @@ impl fmt::Debug for MqttClient {
             .field("connect_count", &self.connect_count)
             .field("retry_after", &self.retry_after)
             .field("outstanding", &self.outstanding())
+            .field("ack_tracked", &self.ack_sources.len())
+            .field("outlet_attached", &self.outlet.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1065,7 +1820,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    use crate::backpressure::{DedupOutcome, DedupReason, DEFAULT_SEND_HARD_LIMIT};
     use crate::error::{ERR_CONFIG, ERR_MQTT, ERR_NETWORK, ERR_SECURITY};
+    use crate::offline_queue::{AckSink, ManualClock, OfflineQueue, QueueConfig, QueueHooks};
 
     // ---- 模拟 Broker（仅本地回环，不依赖外网） ----
 
@@ -2048,6 +2805,71 @@ mod tests {
         assert!(CryptoProvider::get_default().is_some());
     }
 
+    /// 取一个 `CryptoProvider` 的密码套件标识列表（`SupportedCipherSuite::suite()`）。
+    ///
+    /// 用于逐项比较不同 provider 的套件集合——顺序敏感，与 `CryptoProvider` 文档
+    /// 承诺的「按优先级排序」一致。
+    fn cipher_suite_ids(provider: &CryptoProvider) -> Vec<rustls::CipherSuite> {
+        provider.cipher_suites.iter().map(|cs| cs.suite()).collect()
+    }
+
+    /// QA（依赖红线守护性回归）：**实际生效的进程级 CryptoProvider 必须是 `ring`，而非 `aws-lc-rs`**。
+    ///
+    /// 背景：`aws-lc-rs`（cmake/NASM C 构建）违反「纯 Rust 依赖栈」红线，已从 daemon
+    /// 依赖图移除（`rumqttc` 改 `use-rustls-no-provider`、dev-dep `tokio-rustls` 关闭
+    /// default 特性）。`cargo tree` 只能证明**编译期**依赖图干净；本测试从**运行期**实测
+    /// 证明真正被安装并生效的 provider 是 `ring`。
+    ///
+    /// 断言方式：走 daemon 的 provider 安装路径（[`ensure_rustls_provider`]）后，
+    /// 取进程级 provider 的密码套件列表，与**新建的 ring provider** 的密码套件列表
+    /// **逐项相等**。若外部（宿主 / 误引入的 aws-lc-rs）塞进了不同 provider，两者的
+    /// 套件集合/顺序必然不一致，本测试即失败。
+    ///
+    /// 非空性证明：末尾的「控制实验」故意篡改一份 ring provider 的套件列表，断言比较
+    /// 逻辑能识别差异（`assert_ne!`）。若上面的 `assert_eq!` 是恒真空断言，该控制实验
+    /// 也会一并失败——因此两者共同保证断言有效。
+    #[test]
+    fn runtime_provider_is_ring_not_aws_lc() {
+        // 1) 走 daemon 真实安装路径（幂等；测试并发下可能被他用例先装，仍成立）。
+        ensure_rustls_provider().expect("daemon provider install path must succeed");
+
+        // 2) 进程级 provider 必须存在。
+        let installed = CryptoProvider::get_default()
+            .expect("daemon ensure_rustls_provider must leave a process-level CryptoProvider");
+
+        // 3) 以「新建的 ring provider」为真值来源，逐项比较密码套件。
+        let ring_provider = rustls::crypto::ring::default_provider();
+        let installed_suites = cipher_suite_ids(installed);
+        let ring_suites = cipher_suite_ids(&ring_provider);
+
+        // 非空性：ring 默认 provider 必带套件，排除「两边都空 → 假通过」。
+        assert!(
+            !ring_suites.is_empty(),
+            "ring 默认 provider 的密码套件列表不应为空（否则相等断言无意义）"
+        );
+        // 内容断言：包含一个 ring 必然支持的 TLS1.3 套件（进一步排除空/占位 provider）。
+        assert!(
+            installed_suites.contains(&rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+            "进程级 provider 缺少 TLS13_AES_256_GCM_SHA384 —— 生效 provider 疑似非 ring"
+        );
+        // 逐项相等：生效 provider 与 ring 完全一致 ⇒ 生效 provider 就是 ring。
+        assert_eq!(
+            installed_suites, ring_suites,
+            "进程级 CryptoProvider 的密码套件与 ring 不一致 —— 实际生效的 provider 不是 ring \
+             （疑似被 aws-lc-rs 等替换），违反依赖红线"
+        );
+
+        // ---- 控制实验：证明上面的断言「可失败」而非恒真 ----
+        // 故意篡改一份 ring provider（去掉最高优先级套件），断言比较逻辑能识别差异。
+        let mut tampered = rustls::crypto::ring::default_provider();
+        let _ = tampered.cipher_suites.pop();
+        assert_ne!(
+            cipher_suite_ids(&tampered),
+            ring_suites,
+            "比较逻辑必须能识别 suite 列表差异；否则 provider 一致性断言无意义"
+        );
+    }
+
     // ---- 慢消费者保护（task 54：发送水位 + 落盘降级回调） ----
 
     /// 记录型降级回调（测试替身）：记录每次触发时的积压数。
@@ -2316,5 +3138,414 @@ mod tests {
             "TLS 私钥路径不应出现在 Debug: {dbg}"
         );
         assert!(dbg.contains("<configured>"), "TLS 应标注已配置: {dbg}");
+    }
+
+    // ==================== 背压接线（task 54） ====================
+
+    /// 记录型审计上报出口（接线点 3 的落点）。
+    #[derive(Default)]
+    struct RecordingAuditSink {
+        events: Mutex<Vec<BackpressureAudit>>,
+    }
+
+    impl RecordingAuditSink {
+        fn events(&self) -> Vec<BackpressureAudit> {
+            self.events.lock().expect("audit sink lock").clone()
+        }
+    }
+
+    impl AuditSink for RecordingAuditSink {
+        fn emit(&self, events: Vec<BackpressureAudit>) {
+            self.events.lock().expect("audit sink lock").extend(events);
+        }
+    }
+
+    /// 必定失败的 Ack 持久化（模拟 Ack 丢失 / 落盘不可用）。
+    struct FailingAckSink;
+
+    impl AckSink for FailingAckSink {
+        fn persist_ack(&self, seq: u64) -> DaemonResult<()> {
+            Err(DaemonError::StorageError(format!(
+                "injected ack persistence failure for batch_seq {seq}"
+            )))
+        }
+    }
+
+    /// 临时目录 + 真实离线队列（队列库文件名必须是 `queue.db`）。
+    fn temp_queue(gateway: &str) -> (tempfile::TempDir, Arc<OfflineQueue>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = QueueConfig::new(dir.path().join("queue.db"), gateway).expect("queue cfg");
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(0));
+        let queue = OfflineQueue::open(cfg, clock).expect("open offline queue");
+        (dir, Arc::new(queue))
+    }
+
+    /// 建一个挂好背压接线束的客户端（**不建连**；审计出口由本函数创建）。
+    fn client_with_outlet(
+        port: u16,
+        client_id: &str,
+        gateway: &str,
+        queue: &Arc<OfflineQueue>,
+    ) -> (MqttClient, Arc<NorthOutlet>, Arc<RecordingAuditSink>) {
+        let sink = Arc::new(RecordingAuditSink::default());
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(0));
+        let outlet = Arc::new(NorthOutlet::new(
+            gateway,
+            Arc::clone(queue),
+            clock,
+            sink.clone(),
+        ));
+        let client = MqttClient::new(endpoint_for(port, client_id))
+            .expect("client")
+            .with_outlet(Arc::clone(&outlet));
+        (client, outlet, sink)
+    }
+
+    /// 接线点 1（QA）：消费者人为变慢（**永不确认**）→ 内存必须**有界**、
+    /// 超限**落盘降级**、**审计有记录**，且一条数据都不静默丢。
+    #[test]
+    fn slow_consumer_bounds_memory_spills_to_disk_and_audits() {
+        const TOTAL: usize = 200;
+
+        let (_dir, queue) = temp_queue("gw-slow");
+        let audit = Arc::new(AuditLog::new(256));
+        let sink = Arc::new(RecordingAuditSink::default());
+        let pump = AuditPump::new(Arc::clone(&audit), sink.clone());
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(0));
+        let send = NorthSendQueue::new(Arc::clone(&queue), Arc::clone(&audit), clock);
+
+        // 消费者永不确认（既不 take_ready 也不 confirm）：连推 200 条（远超硬上限 64）。
+        for seq in 1..=TOTAL as u64 {
+            let _ = send.push(seq, vec![0xAB; 64]);
+        }
+
+        let stats = send.stats();
+        assert!(
+            send.pending() <= DEFAULT_SEND_HARD_LIMIT,
+            "内存必须有界（水位口径 = ready + sent）：{stats:?}"
+        );
+        assert!(stats.spilled > 0, "超限必须落盘降级：{stats:?}");
+        assert_eq!(
+            stats.admitted + stats.spilled + stats.rejected,
+            TOTAL as u64,
+            "每条数据都必须被记账（绝不静默丢）：{stats:?}"
+        );
+        assert_eq!(
+            stats.spilled,
+            TOTAL as u64 - stats.admitted,
+            "非入内存的条目必须全部走落盘降级：{stats:?}"
+        );
+        assert!(
+            send.bytes() <= DEFAULT_SEND_HARD_LIMIT * 64,
+            "在途字节必须有界：{}",
+            send.bytes()
+        );
+
+        // 降级数据真的进了离线队列（内存 + 磁盘），而不是被丢弃。
+        let queued = queue.pending().expect("queue pending");
+        assert!(queued > 0, "降级数据必须落到 OfflineQueue，实际 {queued}");
+
+        // 接线点 3：审计留痕 + 有真实「取走上报」调用点。
+        assert!(
+            audit.contains_kind("HighWaterEntered"),
+            "必须记录高水位进入"
+        );
+        assert!(
+            audit.contains_kind("SlowConsumerSpilled"),
+            "必须记录慢消费者落盘降级"
+        );
+        let emitted = pump.pump();
+        assert!(emitted >= 2, "审计必须有取走上报的调用点，实际 {emitted}");
+        assert_eq!(pump.log().len(), 0, "drain 后审计环必须清空");
+        assert!(
+            sink.events()
+                .iter()
+                .any(|e| e.kind() == "SlowConsumerSpilled"),
+            "审计必须真的上报到出口"
+        );
+    }
+
+    /// 接线点 1（QA）：**PUBACK 未到**时条目仍留在 `sent` 在途窗口、**不得被重复取出发布**。
+    #[test]
+    fn unacked_items_stay_inflight_and_are_never_republished() {
+        let (_dir, queue) = temp_queue("gw-inflight");
+        let audit = Arc::new(AuditLog::default());
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(0));
+        let send = NorthSendQueue::new(queue, audit, clock);
+
+        for seq in 1..=5u64 {
+            assert!(
+                send.push(seq, vec![1, 2, 3]).is_admitted(),
+                "水位内必须入内存队列"
+            );
+        }
+        assert_eq!(send.pending(), 5);
+
+        let ready = send.take_ready(5);
+        assert_eq!(
+            ready.iter().map(|i| i.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "必须按提交顺序取回"
+        );
+        assert_eq!(send.pending(), 5, "take_ready 只搬队列，水位占用不变");
+
+        // PUBACK 未到：再取一次必须为空（同一批不得被重复发布）。
+        assert!(
+            send.take_ready(5).is_empty(),
+            "未确认条目不得被重复取出发布"
+        );
+
+        // PUBACK 到达 → 按提交顺序回收。
+        assert_eq!(send.confirm(2), 2);
+        assert_eq!(send.pending(), 3);
+        assert_eq!(send.confirm(99), 3, "confirm 不得超过在途条数");
+        assert_eq!(send.pending(), 0);
+        assert_eq!(send.bytes(), 0);
+    }
+
+    /// 接线点 1（QA，真实链路）：PUBACK 到达前泵不重复发布；PUBACK 到达后水位回收，
+    /// broker 侧条数不多不少。
+    #[tokio::test]
+    async fn puback_gates_pump_and_reclaims_watermark_on_the_wire() {
+        let broker = spawn_mock_broker(BrokerOptions::default()).await;
+        let (_dir, queue) = temp_queue("gw-net");
+        let (mut client, _outlet, _sink) =
+            client_with_outlet(broker.port, "iot-daq-pump1", "gw-net", &queue);
+        client.poll_event().await.expect("connect");
+
+        for seq in 1..=5u64 {
+            let _ = client
+                .submit(seq, format!("payload-{seq}").into_bytes())
+                .expect("submit");
+        }
+
+        let first = client.pump_send("telemetry").await;
+        assert_eq!(first.taken, 5);
+        assert_eq!(first.published, 5);
+        assert_eq!(first.requeued, 0);
+        assert_eq!(
+            client.queued_pending(),
+            5,
+            "PUBACK 未到 → 条目仍留在 sent 在途窗口"
+        );
+
+        // 再泵一次（PUBACK 仍未到）：不得重复发布。
+        let second = client.pump_send("telemetry").await;
+        assert_eq!(second.published, 0, "未确认条目不得重复发布");
+        assert_eq!(client.queued_pending(), 5);
+
+        // 驱动事件循环收齐 PUBACK → 水位回收。
+        for _ in 0..64 {
+            if client.queued_pending() == 0 {
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(3), client.poll_event()).await;
+        }
+        assert_eq!(client.queued_pending(), 0, "PUBACK 后必须回收在途窗口");
+        assert_eq!(client.outstanding(), 0);
+
+        let observed = broker.publishes();
+        assert_eq!(observed.len(), 5, "broker 侧不得出现重复发布：{observed:?}");
+        let mut seen: Vec<String> = observed
+            .iter()
+            .filter_map(|p| String::from_utf8(p.payload.clone()).ok())
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "payload-1".to_string(),
+                "payload-2".to_string(),
+                "payload-3".to_string(),
+                "payload-4".to_string(),
+                "payload-5".to_string()
+            ]
+        );
+    }
+
+    /// 接线点 2（QA）：补发**重复批次**时，幂等账本对同一 `batch_seq` 只 `Applied` 一次。
+    #[test]
+    fn duplicate_replay_batches_are_applied_at_most_once() {
+        let (_dir, queue) = temp_queue("gw-replay");
+        for i in 0..10 {
+            queue
+                .enqueue(format!("row-{i}").into_bytes())
+                .expect("enqueue");
+        }
+        let audit = Arc::new(AuditLog::default());
+        let replay = NorthReplay::new("gw-replay", Arc::clone(&queue), audit);
+
+        let batch = replay.next_replay_batch(10).expect("replay batch");
+        assert_eq!(batch.len(), 10);
+        let mut applied = 0usize;
+        for b in &batch {
+            if replay.mark_sent(b.seq).is_applied() {
+                applied += 1;
+            }
+        }
+        assert_eq!(applied, 10, "首轮必须全部 Applied");
+
+        // 重放同一批（模拟断网重启后重复投递）：不得再次成为候选、不得再次 Applied。
+        let again = replay.next_replay_batch(10).expect("replay batch 2");
+        assert!(again.is_empty(), "已判定过的条目不得再次成为补发候选");
+        let key = batch[0].idempotency_key();
+        assert_eq!(
+            replay.mark_sent_key(&key),
+            DedupOutcome::Duplicate {
+                reason: DedupReason::AlreadyApplied
+            },
+            "同一幂等键的第二次判定必须是 Duplicate"
+        );
+        let stats = replay.stats();
+        assert_eq!(stats.applied_rows, 10, "幂等账本只应 Applied 10 次");
+        assert_eq!(stats.duplicate_rows, 1);
+    }
+
+    /// 接线点 2（QA）：**Ack 丢失**（持久化失败）→ 位点一步不动；重放仍被幂等去重。
+    #[test]
+    fn lost_ack_keeps_cursor_and_replayed_batch_still_dedups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = QueueConfig::new(dir.path().join("queue.db"), "gw-ack").expect("cfg");
+        let hooks = QueueHooks {
+            ack_sink: Some(Arc::new(FailingAckSink)),
+            ..QueueHooks::default()
+        };
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(0));
+        let queue = Arc::new(OfflineQueue::open_with_hooks(cfg, clock, hooks).expect("open queue"));
+        for i in 0..3 {
+            queue
+                .enqueue(format!("d{i}").into_bytes())
+                .expect("enqueue");
+        }
+        let audit = Arc::new(AuditLog::default());
+        let replay = NorthReplay::new("gw-ack", Arc::clone(&queue), audit);
+
+        let batch = replay.next_replay_batch(3).expect("batch");
+        assert_eq!(batch.len(), 3);
+        for b in &batch {
+            assert!(replay.mark_sent(b.seq).is_applied());
+        }
+        let last = batch.last().expect("non-empty batch").seq;
+
+        let before = replay.high_water_mark();
+        assert!(replay.ack(last).is_err(), "Ack 落盘失败必须返回错误");
+        assert_eq!(replay.high_water_mark(), before, "Ack 失败位点不得推进");
+        assert_eq!(queue.ack_seq(), before, "队列位点同样不得推进");
+
+        // 位点未推进 → 该批仍是补发候选；但幂等账本记着 → 重放仍去重。
+        let again = replay.next_replay_batch(3).expect("batch 2");
+        assert!(again.is_empty(), "幂等窗口内的批次不得重复补发");
+        for b in &batch {
+            assert!(
+                matches!(replay.mark_sent(b.seq), DedupOutcome::Duplicate { .. }),
+                "重发必须去重"
+            );
+        }
+        assert_eq!(replay.stats().applied_rows, 3);
+    }
+
+    /// 接线点 3（QA）：审计环有界 → `dropped()` 可观测「审计消费变慢」；
+    /// `drain()` 有真实调用点，事件真的上报到出口。
+    #[test]
+    fn audit_pump_drains_bounded_buffer_and_reports_drops() {
+        let log = Arc::new(AuditLog::new(4));
+        for i in 0..10i64 {
+            log.record(BackpressureAudit::HighWaterCleared {
+                rows: u64::try_from(i).unwrap_or(0),
+                bytes: 0,
+                ts_ns: i,
+            });
+        }
+        assert_eq!(log.dropped(), 6, "有界环必须淘汰最旧并计数");
+
+        let sink = Arc::new(RecordingAuditSink::default());
+        let pump = AuditPump::new(Arc::clone(&log), sink.clone());
+        assert_eq!(pump.pump(), 4, "drain 必须取走缓冲内全部 4 条");
+        assert_eq!(pump.log().len(), 0, "drain 后缓冲必须清空");
+        assert_eq!(sink.events().len(), 4, "审计必须真的上报到出口");
+        assert_eq!(pump.pump(), 0, "空环再泵为 0");
+        assert_eq!(pump.dropped(), 6);
+        assert_eq!(pump.emitted(), 10);
+    }
+
+    /// 接线点 2（消费侧，QA）：只有 `Applied` 才入库；重放 / 跨网关 / 非法键一律跳过。
+    #[test]
+    fn ingest_gate_admits_only_new_keys() {
+        let audit = Arc::new(AuditLog::default());
+        let gate = IngestGate::new("gw-in", audit);
+
+        assert!(gate.admit("gw-in:1").is_applied());
+        assert_eq!(
+            gate.admit("gw-in:1"),
+            DedupOutcome::Duplicate {
+                reason: DedupReason::AlreadyApplied
+            },
+            "同一键重复投递必须跳过（不入库）"
+        );
+        assert!(matches!(
+            gate.admit("gw-other:2"),
+            DedupOutcome::Duplicate {
+                reason: DedupReason::OtherGateway { .. }
+            }
+        ));
+        assert!(matches!(
+            gate.admit("not-a-key"),
+            DedupOutcome::Duplicate {
+                reason: DedupReason::MalformedKey { .. }
+            }
+        ));
+
+        gate.confirm_up_to(1);
+        assert_eq!(gate.high_water_mark(), 1);
+        assert!(matches!(
+            gate.admit("gw-in:1"),
+            DedupOutcome::Duplicate {
+                reason: DedupReason::BelowHighWater { high_water: 1 }
+            }
+        ));
+        assert!(gate.admit("gw-in:2").is_applied());
+        assert_eq!(gate.stats().applied_rows, 2);
+    }
+
+    /// 接线点 2（真实链路，QA）：发布成功后**才**推进位点；位点推进后再次补发不得重复。
+    #[tokio::test]
+    async fn replay_pump_publishes_then_advances_pointer() {
+        let broker = spawn_mock_broker(BrokerOptions::default()).await;
+        let (_dir, queue) = temp_queue("gw-rp");
+        for i in 0..3 {
+            queue
+                .enqueue(format!("r{i}").into_bytes())
+                .expect("enqueue");
+        }
+        let (mut client, outlet, _sink) =
+            client_with_outlet(broker.port, "iot-daq-rp1", "gw-rp", &queue);
+        client.poll_event().await.expect("connect");
+
+        let report = client.pump_replay("replay").await.expect("replay pump");
+        assert_eq!(report.candidates, 3);
+        assert_eq!(report.sent, 3);
+        assert_eq!(report.deduped, 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.ack_errors, 0);
+        assert!(report.acked, "发布成功后必须推进位点");
+        assert_eq!(outlet.replay().high_water_mark(), 3);
+        assert_eq!(queue.ack_seq(), 3, "Ack 已落盘 → 队列位点推进");
+
+        // 位点已推进 → 再次补发无候选，网络上不出现重复数据。
+        let again = client.pump_replay("replay").await.expect("replay pump 2");
+        assert_eq!(again.candidates, 0);
+
+        // 推进事件循环把已提交报文真正写到线路（`publish` 只入请求通道）。
+        for _ in 0..32 {
+            if broker.publishes().len() >= 3 {
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(3), client.poll_event()).await;
+        }
+        let observed = broker.publishes();
+        assert_eq!(observed.len(), 3, "不得重复补发：{observed:?}");
+        let mut seen: Vec<Vec<u8>> = observed.iter().map(|p| p.payload.clone()).collect();
+        seen.sort();
+        assert_eq!(seen, vec![b"r0".to_vec(), b"r1".to_vec(), b"r2".to_vec()]);
     }
 }

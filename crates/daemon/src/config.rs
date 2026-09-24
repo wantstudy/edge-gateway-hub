@@ -189,8 +189,32 @@ pub struct OutletConfig {
     #[serde(default = "default_qos")]
     pub qos: u8,
     /// 是否启用 TLS。
+    ///
+    /// 与 `broker` 的 scheme 必须**一致**：`mqtts://` ⇔ `tls = true`；
+    /// `mqtt://` ⇔ `tls = false`。冲突（如 `tls = true` 配 `mqtt://`）在
+    /// [`crate::north::runtime::endpoint_from_outlet`] 处报错，**绝不猜测意图**。
     #[serde(default)]
     pub tls: bool,
+    /// 服务端 CA 证书 PEM 路径（task 25；启用 TLS 时**必填**，用于校验 broker 证书）。
+    ///
+    /// `None` = 明文出口（不启用 TLS 时忽略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<String>,
+    /// 客户端证书 PEM 路径（task 25；mTLS，与 `client_key_path` **成对**）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert_path: Option<String>,
+    /// 客户端私钥 PEM 路径（task 25；mTLS，与 `client_cert_path` **成对**）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key_path: Option<String>,
+    /// SNI / 服务端名校验覆盖（task 25；缺省用 `broker` 的 host）。
+    ///
+    /// 用途：broker 证书 SAN 与连接地址不同（如经 DNS 别名/负载均衡接入）时，
+    /// 显式声明应校验的服务端名——**不是**「跳过校验」开关。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// ALPN 协议列表（task 25；如 `["mqtt"]`，空 = 不协商）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpn: Vec<String>,
     /// 该路出口的载荷编码（默认 protobuf）。
     #[serde(default)]
     pub encoding: OutletEncoding,
@@ -794,5 +818,63 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         assert!(raw.contains("device_id = \"dev-x\""));
         // mgmt_auth None 不产生空表垃圾。
         assert!(!raw.contains("mgmt_auth"));
+    }
+
+    /// task 25：`[[outlets]]` 的 TLS / mTLS 字段可解析（CA / 客户端证书 / 私钥 /
+    /// SNI / ALPN）。
+    #[test]
+    fn config_outlet_tls_fields_parse() {
+        let raw = r#"
+[[outlets]]
+name = "tls-1"
+broker = "mqtts://broker.local:8883"
+tls = true
+ca_cert_path = "/certs/ca.crt"
+client_cert_path = "/certs/client.crt"
+client_key_path = "/certs/client.key"
+server_name = "broker.local"
+alpn = ["mqtt"]
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse tls outlet");
+        assert_eq!(config.outlets.len(), 1);
+        let outlet = &config.outlets[0];
+        assert!(outlet.tls);
+        assert_eq!(outlet.ca_cert_path.as_deref(), Some("/certs/ca.crt"));
+        assert_eq!(
+            outlet.client_cert_path.as_deref(),
+            Some("/certs/client.crt")
+        );
+        assert_eq!(outlet.client_key_path.as_deref(), Some("/certs/client.key"));
+        assert_eq!(outlet.server_name.as_deref(), Some("broker.local"));
+        assert_eq!(outlet.alpn, vec!["mqtt".to_string()]);
+    }
+
+    /// task 25：无 TLS 字段的旧 `[[outlets]]` 仍可解析（向后兼容），缺省为
+    /// `None` / 空 ALPN；且未设置字段在序列化时省略（旧 daemon 仍可读新文件）。
+    #[test]
+    fn config_outlet_tls_fields_backward_compatible() {
+        let config =
+            GatewayConfig::parse("[[outlets]]\nname = \"legacy\"\nbroker = \"mqtt://h:1883\"\n")
+                .expect("parse legacy outlet");
+        let outlet = &config.outlets[0];
+        assert!(outlet.ca_cert_path.is_none());
+        assert!(outlet.client_cert_path.is_none());
+        assert!(outlet.client_key_path.is_none());
+        assert!(outlet.server_name.is_none());
+        assert!(outlet.alpn.is_empty());
+
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        for absent in [
+            "ca_cert_path",
+            "client_cert_path",
+            "client_key_path",
+            "server_name",
+            "alpn",
+        ] {
+            assert!(
+                !raw.contains(absent),
+                "unset `{absent}` must be omitted when serializing: {raw}"
+            );
+        }
     }
 }
