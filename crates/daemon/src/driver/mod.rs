@@ -28,6 +28,7 @@ pub mod http;
 pub mod mc;
 pub mod modbus;
 pub mod mqtt_in;
+pub mod s7;
 
 // ---- Driver trait ----
 
