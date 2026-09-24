@@ -22,4 +22,9 @@ Thumbs.db
 .vscode/
 
 # ---- 计划工具的会话续跑状态：不入库 ----
-.omo/run-continuation/
+.omo/
+
+# ---- 本地辅助资料：不上传远程 ----
+AGENTS.md
+CLAUDE.md
+docs/
