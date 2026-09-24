@@ -26,21 +26,35 @@
 //!   的 `trim().is_empty()` 归一为 `None`，避免把设备永久锁死在空指纹上。
 //! - **G5 幂等键归一**：存储 / 查询前对 `idempotency_key` 做 `trim()` 归一，避免尾部空白割裂同一逻辑键。
 
+use crate::audit::{BatchOutcome, BatchRecord, ReceiptLedger};
+use crate::device_auth;
 use crate::error::{LicenseError, LicenseResult, PrebindKind};
 use crate::keys::KeyRing;
 use crate::model::{
     now_ns_id, now_unix_secs, ActivationCode, ActorType, AuditLog, CodeStatus, Device,
-    DeviceStatus, Lease, LeaseStatus, VerifyMode,
+    DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, VerifyMode,
 };
 use crate::proto::{
-    ActivationRequest, ActivationResponse, IssueCodesRequest, IssueCodesResponse, IssuedCode,
-    ReissueCodeRequest, ReissueCodeResponse, RevokeCodeRequest,
+    ActivationRequest, ActivationResponse, AuditReceiptRequest, AuditReceiptResponse, GapKind,
+    HeartbeatRequest, HeartbeatResponse, IssueCodesRequest, IssueCodesResponse, IssuedCode,
+    ReceiptCursor, ReissueCodeRequest, ReissueCodeResponse, RevokeCodeRequest, VerifyRequest,
+    VerifyResponse,
 };
+use crate::receipt;
 use crate::store::Store;
-use crate::token::{issue_lease_token, LeaseClaims};
+use crate::token::{issue_lease_token, LeaseClaims, LeaseToken};
 
 /// 心跳周期（小时），随激活响应下发（设计 §1.1）。
 const HEARTBEAT_HOURS: i64 = 24;
+
+/// 心跳周期（秒）。
+const HEARTBEAT_SECS: i64 = HEARTBEAT_HOURS * 3_600;
+
+/// 时钟偏移窗口（±5min，设计 §0 / §1.2 / §1.3）。
+pub const CLOCK_SKEW_SECS: i64 = 300;
+
+/// nonce 缓存有效期（秒）：取时钟窗的两倍，保证「窗口内 nonce 不可复用」。
+pub const NONCE_TTL_SECS: i64 = CLOCK_SKEW_SECS * 2;
 
 /// 授权服务：聚合 [`Store`] 与 [`KeyRing`]，对外暴露激活码生命周期业务方法。
 ///
@@ -51,12 +65,26 @@ pub struct LicensingService {
     store: Store,
     /// 签名密钥环（Ed25519，私钥经环境变量注入，绝不落库）。
     keyring: KeyRing,
+    /// 回执批次账本（task 48：幂等仲裁 + 设备级序号 cursor + 跳空告警）。
+    ledger: ReceiptLedger,
 }
 
 impl LicensingService {
     /// 构造服务（store 与 keyring 由调用方注入；keyring 须持可用签发密钥才能签发 Lease Token）。
+    ///
+    /// 回执账本缺省为**内存库**（幂等记忆随进程生命周期）；生产应改用
+    /// [`LicensingService::with_ledger`] 注入文件库以跨重启保留幂等记忆。
     pub fn new(store: Store, keyring: KeyRing) -> Self {
-        LicensingService { store, keyring }
+        Self::with_ledger(store, keyring, ReceiptLedger::open_in_memory())
+    }
+
+    /// 构造服务并注入回执账本（文件库 → 重启后幂等记忆保留）。
+    pub fn with_ledger(store: Store, keyring: KeyRing, ledger: ReceiptLedger) -> Self {
+        LicensingService {
+            store,
+            keyring,
+            ledger,
+        }
     }
 
     /// 只读访问仓储层（测试与审核用）。
@@ -67,6 +95,11 @@ impl LicensingService {
     /// 只读访问密钥环（测试与轮换用）。
     pub fn keyring(&self) -> &KeyRing {
         &self.keyring
+    }
+
+    /// 只读访问回执账本（测试与运营核查用）。
+    pub fn ledger(&self) -> &ReceiptLedger {
+        &self.ledger
     }
 
     // ----------------------------- 发放（issue） -----------------------------
@@ -161,11 +194,26 @@ impl LicensingService {
 
     // ----------------------------- 激活（activate） -----------------------------
 
-    /// 设备首次激活 + 一机一码绑定。
+    /// 设备激活：首激 + 一机一码绑定，以及**已绑定码的同机冲突检测**。
     ///
-    /// **G1（预绑定强制）**：取码后先校验可激活、有效期，再以
-    /// [`ActivationCode::prebind_matches`] 校验机器码；不匹配即返回结构化
-    /// [`LicenseError::PrebindConflict`]（绝不走 `msg.contains` 反查）。
+    /// # 行为次序（对齐 `docs/design/machine-fingerprint.md` §7 与 `licensing-api.md` §1.1）
+    ///
+    /// 1. **取码 + 状态守卫（④）**：`revoked` / `reissued` 一律拒绝；
+    /// 2. **有效期窗口**：`code.is_valid_at(now)` 不满足 → 拒绝；
+    /// 3. **码已绑定（`status = bound`）** → [`Self::activate_against_binding`] 执行 §7 ①②③：
+    ///    - ① `machine_code` 一致 → 同机（幂等恢复 / 重签租约）；
+    ///    - ② 不一致但锚点命中 ≥4/5 → 同机（重装 / 漂移）→ 自动改绑 + 重签；
+    ///    - ③ 命中 ≤3/5 → **异机** → [`LicenseError::CodeBoundToOtherDevice`]（403），无副作用。
+    /// 4. **码未绑定（`issued`）**：
+    ///    - **G1 预绑定匹配**（`None` = 任意机器）→ 不匹配 [`PrebindKind::ActivationMachineMismatch`]；
+    ///    - 解析 / 创建设备 → **原子绑定**（`bind_code_to_device`）→ 签发 Lease Token。
+    ///
+    /// # 顺序说明（相对既有守卫的**唯一**调整）
+    /// 预绑定校验从「取码后立即判定」**下沉到未绑定分支**：预绑定只约束「谁可**首次**
+    /// 认领该码」；一旦码已绑定，同机判定改由 §7 的锚点 N-of-M 接管。否则一张预绑定码在
+    /// 设备漂移（换网卡 / OS 重装 → `machine_code` 改变）后会被**静态预绑定值**挡在 §7 之前，
+    /// 误杀「合法运维」路径。该调整**不影响**未绑定码的既有语义（回归见
+    /// `t46_prebind_mismatch_still_rejected_as_activation_machine_mismatch`）。
     pub fn activate(&self, req: &ActivationRequest) -> LicenseResult<ActivationResponse> {
         let now = now_unix_secs();
 
@@ -177,7 +225,8 @@ impl LicensingService {
 
         let tenant_id = code.tenant_id.clone();
 
-        if !code.is_activatable() {
+        // ④ 状态守卫：仅 `issued` / `bound` 可进入激活流程；`revoked` / `reissued` 一律拒绝。
+        if !matches!(code.status, CodeStatus::Issued | CodeStatus::Bound) {
             return Err(LicenseError::ActivationRejected(format!(
                 "activation code is not activatable (status={})",
                 code.status.as_str()
@@ -189,7 +238,27 @@ impl LicensingService {
             ));
         }
 
-        // G1：预绑定匹配（None = 任意机器均可；Some = 精确匹配）。
+        // §7 一机一码冲突检测：码**已绑定** → 走 ①②③，绝不新建 device / 新租约
+        // （步骤 ③ 甚至不得有任何 device / lease / 绑定副作用）。
+        if matches!(code.status, CodeStatus::Bound) {
+            let bound_device_id = code.bound_device_id.clone().unwrap_or_default();
+            if bound_device_id.trim().is_empty() {
+                return Err(LicenseError::ActivationRejected(
+                    "activation code is bound but has no bound_device_id".into(),
+                ));
+            }
+            return self.activate_against_binding(&code, &bound_device_id, req, now);
+        }
+
+        // 未绑定：必须是 `issued` 且未绑定（守住「issued 却带 bound_device_id」的脏数据）。
+        if !code.is_activatable() {
+            return Err(LicenseError::ActivationRejected(format!(
+                "activation code is not activatable (status={})",
+                code.status.as_str()
+            )));
+        }
+
+        // G1：预绑定匹配（仅约束首次认领；绑定后由 §7 判定接管）。
         if !code.prebind_matches(&req.machine_code) {
             return Err(LicenseError::prebind_conflict(
                 PrebindKind::ActivationMachineMismatch,
@@ -456,6 +525,330 @@ impl LicensingService {
         })
     }
 
+    // ----------------------------- 心跳（heartbeat） -----------------------------
+
+    /// `POST /heartbeat`：24h 心跳保活（设计 §1.2）。
+    ///
+    /// # 行为次序（安全红线：**验签先于任何可短路分支**）
+    /// 1. 规范化摘要验签（[`device_auth`]，kid 公钥集）；
+    /// 2. ±5min 时间窗（超出 → [`LicenseError::TimestampSkew`]）；
+    /// 3. 租约存在性（未知 → [`LicenseError::LeaseNotFound`]）+ 废弃判定
+    ///    （**废弃语义 = 立即失效** → [`LicenseError::LeaseRevoked`]）；
+    /// 4. 全局 nonce 防重放（同 nonce → [`LicenseError::NonceReplay`]）；
+    /// 5. 副作用：回写 `lease.last_heartbeat_at` 与 `device.status`、落心跳记录、
+    ///    把 `receipt_cursor` 喂入跳空检测游标；
+    /// 6. 签发服务端响应签名。
+    ///
+    /// 心跳本身**可重复**（无害），但当请求携带非空 `nonce` 时，同 nonce 重放被拒——
+    /// 与设计 §1.2「幂等语义」一致。
+    pub fn heartbeat(&self, req: &HeartbeatRequest) -> LicenseResult<HeartbeatResponse> {
+        let now = now_unix_secs();
+
+        // 1) 规范化摘要验签 —— **先于任何可短路分支**（安全红线）。
+        let ts = Self::parse_ts(&req.ts)
+            .map_err(|_| LicenseError::timestamp_skew("heartbeat ts must be integer seconds"))?;
+        let cursor = match &req.receipt_cursor {
+            Some(c) => Some(Self::parse_receipt_cursor(c)?),
+            None => None,
+        };
+        let hash = device_auth::heartbeat_payload_hash(&req.lease_id, ts, &req.nonce, cursor);
+        let _kid = device_auth::verify_device_signature(&self.keyring, &hash, &req.device_sig)?;
+
+        // 2) ±5min 时间窗。
+        if (now - ts).abs() > CLOCK_SKEW_SECS {
+            return Err(LicenseError::timestamp_skew(format!(
+                "heartbeat ts {ts} outside ±{CLOCK_SKEW_SECS}s of server {now}"
+            )));
+        }
+
+        // 3) 租约存在性 + 废弃判定。
+        let lease = self
+            .store
+            .get_lease(req.lease_id.trim())?
+            .ok_or_else(|| LicenseError::lease_not_found("heartbeat lease_id is unknown"))?;
+        if lease.is_revoked() {
+            return Err(LicenseError::lease_revoked(
+                "heartbeat lease is revoked (immediate invalidation)",
+            ));
+        }
+
+        // 4) 全局 nonce 防重放（主键唯一约束仲裁）。
+        if !self
+            .store
+            .insert_nonce_if_absent(&req.nonce, &lease.device_id, now + NONCE_TTL_SECS)?
+        {
+            return Err(LicenseError::nonce_replay("heartbeat nonce already used"));
+        }
+
+        // 5) 服务端副作用。
+        self.store.update_lease_heartbeat(&lease.lease_id, now)?;
+        self.store
+            .update_device_status(&lease.device_id, DeviceStatus::Active)?;
+        self.store.insert_heartbeat(&Heartbeat {
+            id: now_ns_id("hb"),
+            lease_id: lease.lease_id.clone(),
+            device_id: lease.device_id.clone(),
+            client_ts: ts,
+            server_ts: now,
+            result: HeartbeatResult::Ok,
+            receipt_cursor: cursor.map(|(f, t)| format!("{f}-{t}")),
+            created_at: now,
+        })?;
+
+        // 5b) receipt_cursor 喂入跳空检测游标（心跳携带「最近已确认回执区间」）。
+        if let Some((from, to)) = cursor {
+            if from <= to {
+                let device_mid = self.device_mid_of(&lease.device_id)?;
+                // 心跳游标仅用于刷新游标前沿；结果（含告警）由回执端点为权威，
+                // 此处不改变心跳响应形状。
+                let _ = self.ledger.record_batch(&BatchRecord {
+                    device_mid: &device_mid,
+                    lease_id: &lease.lease_id,
+                    seq_from: u64::try_from(from).unwrap_or(0),
+                    seq_to: u64::try_from(to).unwrap_or(0),
+                    count: u64::try_from(to.saturating_sub(from).saturating_add(1)).unwrap_or(0),
+                    payload_digest: "",
+                    ts,
+                    accepted_at: now,
+                })?;
+            }
+        }
+
+        // 6) 响应签名 + 组装。
+        let next_deadline = now + HEARTBEAT_SECS;
+        let sig = self.sign_server_response("heartbeat", &lease.lease_id, &req.nonce, now)?;
+        Ok(HeartbeatResponse {
+            server_time: now.to_string(),
+            next_deadline: next_deadline.to_string(),
+            valid_until: lease.valid_until.to_string(),
+            verify_mode: lease.verify_mode.as_str().to_string(),
+            tier: lease.tier.clone(),
+            sig,
+        })
+    }
+
+    // ----------------------------- A 档二次校验（verify） -----------------------------
+
+    /// `POST /verify`：**仅 A 档**的业务消息级服务端二次校验（设计 §1.3）。
+    ///
+    /// # 校验链（顺序即设计 §1.3，逐级短路）
+    /// 1. Ed25519 验签（kid 公钥集，验签对象为**规范化摘要**，非序列化原始字节）
+    ///    → [`LicenseError::VerifyFailed`]；
+    /// 2. ±5min 时间窗 → [`LicenseError::TimestampSkew`]；
+    /// 3. 租约存在 / 废弃 → [`LicenseError::LeaseNotFound`] / [`LicenseError::LeaseRevoked`]；
+    /// 4. 全局 nonce 防重放 → [`LicenseError::NonceReplay`]；
+    /// 5. 字段白名单 → [`LicenseError::FieldWhitelistViolation`]；
+    /// 6. 计量入账（写审计）。
+    ///
+    /// # 入参
+    /// `raw` 为**原始 JSON**：白名单需在链尾对原始对象做「越界字段」判定
+    /// （serde 默认忽略未知字段，故必须保留原始视图）。
+    pub fn verify(&self, raw: &serde_json::Value) -> LicenseResult<VerifyResponse> {
+        let now = now_unix_secs();
+
+        // 反序列化（未知字段被 serde 忽略，白名单在链尾单独校验）。
+        let req: VerifyRequest = serde_json::from_value(raw.clone()).map_err(|_| {
+            LicenseError::field_whitelist_violation("verify body does not match the field schema")
+        })?;
+
+        // 1) Ed25519 验签（kid 公钥集）。
+        let ts = Self::parse_ts(&req.ts)
+            .map_err(|_| LicenseError::timestamp_skew("verify ts must be integer seconds"))?;
+        let hash = device_auth::verify_payload_hash(
+            &req.device_mid,
+            &req.lease_id,
+            &req.payload_digest,
+            ts,
+            &req.nonce,
+        );
+        let _kid = device_auth::verify_device_signature(&self.keyring, &hash, &req.device_sig)?;
+
+        // 2) ±5min 时间窗。
+        if (now - ts).abs() > CLOCK_SKEW_SECS {
+            return Err(LicenseError::timestamp_skew(format!(
+                "verify ts {ts} outside ±{CLOCK_SKEW_SECS}s of server {now}"
+            )));
+        }
+
+        // 3) 租约存在 / 废弃。
+        let lease = self
+            .store
+            .get_lease(req.lease_id.trim())?
+            .ok_or_else(|| LicenseError::lease_not_found("verify lease_id is unknown"))?;
+        if lease.is_revoked() {
+            return Err(LicenseError::lease_revoked(
+                "verify lease is revoked (immediate invalidation)",
+            ));
+        }
+
+        // 4) 全局 nonce 防重放。
+        if !self
+            .store
+            .insert_nonce_if_absent(&req.nonce, &lease.device_id, now + NONCE_TTL_SECS)?
+        {
+            return Err(LicenseError::nonce_replay("verify nonce already used"));
+        }
+
+        // 5) 字段白名单（越界字段 → 422）。
+        VerifyRequest::validate_whitelist_value(raw)?;
+        req.validate_whitelist()?;
+
+        // 6) 计量入账（A 档：每条业务消息验签 → 计入审计）。
+        self.write_audit(
+            ActorType::Device,
+            &req.device_mid,
+            "verify",
+            "lease",
+            &lease.lease_id,
+            &format!("payload_digest={}", req.payload_digest),
+            now,
+        )?;
+
+        Ok(VerifyResponse {
+            ok: true,
+            server_time: now.to_string(),
+            nonce: req.nonce.clone(),
+        })
+    }
+
+    // ----------------------------- B 档审计回执（audit/receipt） -----------------------------
+
+    /// `POST /audit/receipt`：B 档审计回执（设计 §1.4）。
+    ///
+    /// # 行为次序（**验签 + 白名单必须先于幂等短路**，安全红线 1）
+    /// 1. 原始 JSON 白名单（越界业务字段 → 422，整单拒收 + 记审计）；
+    /// 2. 结构自检（必填字段非空白）+ 数值字段解析 + 区间方向；
+    /// 3. ±5min 时间窗；
+    /// 4. **验签**（[`receipt::verify_receipt_signature`]）；
+    /// 5. 租约存在 / 废弃；
+    /// 6. 幂等落账 + 跳空 / 回退 / 缺失判定（[`crate::audit::ReceiptLedger`]）。
+    ///
+    /// # 幂等 / 补报
+    /// 相同区间重复上报 → 批次键命中 → **幂等接受（去重，不重复告警）**；
+    /// 断网延迟补报（`now` 远晚于 `ts`）按 `ts` 排序评估（`ts` 仍须在 ±5min 窗内——
+    /// 该窗由客户端签名时间保障，见设计 §1.4）。
+    ///
+    /// # `missing` 判定
+    /// 请求级响应只能产出 `none` / `gap` / `overlap`；`missing`（**窗口内无回执**）
+    /// 在此定义为「该设备**无任何已确认回执**（前沿 0）且起始序号 > 1」——
+    /// 即前缀区间 `[1, seq_from-1]` 从未上报。全局性缺失由后续补报收敛。
+    pub fn audit_receipt(&self, raw: &serde_json::Value) -> LicenseResult<AuditReceiptResponse> {
+        let now = now_unix_secs();
+
+        // 1) 原始 JSON 白名单：越界字段 → 整单拒收 + 记审计。
+        if let Err(e) = AuditReceiptRequest::validate_whitelist_value(raw) {
+            self.write_audit(
+                ActorType::Device,
+                "",
+                "audit_receipt_whitelist_violation",
+                "audit_receipt",
+                &Self::entity_hint(raw),
+                &e.to_string(),
+                now,
+            )?;
+            return Err(e);
+        }
+
+        // 2) 反序列化 + 结构自检 + 数值字段解析。
+        let req: AuditReceiptRequest = serde_json::from_value(raw.clone()).map_err(|_| {
+            LicenseError::field_whitelist_violation(
+                "audit receipt body does not match the field schema",
+            )
+        })?;
+        req.validate_whitelist()?;
+
+        let (seq_from, seq_to, count, ts) =
+            receipt::parse_receipt_ints(&req.seq_from, &req.seq_to, &req.count, &req.ts).map_err(
+                |_| {
+                    LicenseError::field_whitelist_violation(
+                        "audit receipt numeric field is not a valid integer",
+                    )
+                },
+            )?;
+        if seq_from < 0 || seq_to < 0 || count < 0 {
+            return Err(LicenseError::field_whitelist_violation(
+                "audit receipt seq_from / seq_to / count must be non-negative",
+            ));
+        }
+        if seq_from > seq_to {
+            return Err(LicenseError::field_whitelist_violation(
+                "audit receipt seq_from must not exceed seq_to",
+            ));
+        }
+
+        // 3) ±5min 时间窗。
+        if (now - ts).abs() > CLOCK_SKEW_SECS {
+            return Err(LicenseError::timestamp_skew(format!(
+                "audit receipt ts {ts} outside ±{CLOCK_SKEW_SECS}s of server {now}"
+            )));
+        }
+
+        // 4) **验签 —— 必须先于幂等短路**（否则伪造回执可借「同区间」路径蒙过验签）。
+        let verified = receipt::verify_receipt_signature(&self.keyring, &req, now, CLOCK_SKEW_SECS)
+            .map_err(|e| LicenseError::verify_failed(e.to_string()))?;
+
+        // 5) 租约存在 / 废弃。
+        let lease = self
+            .store
+            .get_lease(verified.lease_id.trim())?
+            .ok_or_else(|| LicenseError::lease_not_found("audit receipt lease_id is unknown"))?;
+        if lease.is_revoked() {
+            return Err(LicenseError::lease_revoked(
+                "audit receipt lease is revoked (immediate invalidation)",
+            ));
+        }
+
+        // 6) 幂等落账 + 跳空 / 回退 / 缺失判定。
+        let outcome = self.ledger.record_batch(&BatchRecord {
+            device_mid: &verified.device_mid,
+            lease_id: &verified.lease_id,
+            seq_from: u64::try_from(verified.seq_from).unwrap_or(0),
+            seq_to: u64::try_from(verified.seq_to).unwrap_or(0),
+            count: u64::try_from(verified.count).unwrap_or(0),
+            payload_digest: &verified.payload_digest,
+            ts: verified.ts,
+            accepted_at: now,
+        })?;
+
+        let (gap, warnings) = match outcome {
+            // 幂等重放：不重复告警。
+            BatchOutcome::Replay => (GapKind::None, Vec::new()),
+            BatchOutcome::Recorded {
+                gap,
+                warnings,
+                last_seq_to,
+            } => {
+                // 无历史前沿（last_seq_to == 0）且起始 > 1 → 前缀区间缺失 = missing。
+                let normalized = if last_seq_to == 0 && seq_from > 1 {
+                    GapKind::Missing
+                } else {
+                    gap
+                };
+                (normalized, warnings)
+            }
+        };
+
+        // 异常（gap / overlap / missing）写审计 —— **人工核实、不自动封禁**。
+        if gap.is_anomaly() {
+            self.write_audit(
+                ActorType::System,
+                "system",
+                "audit_receipt_anomaly",
+                "audit_receipt",
+                &verified.lease_id,
+                &format!("gap={} device_mid={}", gap.as_str(), verified.device_mid),
+                now,
+            )?;
+        }
+
+        Ok(AuditReceiptResponse {
+            accepted: true,
+            gap,
+            server_time: now.to_string(),
+            warnings,
+        })
+    }
+
     // ----------------------------- 内部辅助 -----------------------------
 
     /// 解析时间戳字符串为 `i64`（JSON 路径一律 String，见设计大整数红线）。
@@ -464,6 +857,35 @@ impl LicensingService {
             .trim()
             .parse::<i64>()
             .map_err(|_| LicenseError::KeyStateIllegal(format!("invalid timestamp: {value}")))
+    }
+
+    /// 解析心跳 `receipt_cursor` 的序号区间（String → `i64`）。
+    ///
+    /// 畸形（非整数）→ [`LicenseError::FieldWhitelistViolation`]（字段不合规，HTTP 422）。
+    fn parse_receipt_cursor(cursor: &ReceiptCursor) -> LicenseResult<(i64, i64)> {
+        let from = cursor.seq_from.trim().parse::<i64>().map_err(|_| {
+            LicenseError::field_whitelist_violation("receipt_cursor.seq_from is not an integer")
+        })?;
+        let to = cursor.seq_to.trim().parse::<i64>().map_err(|_| {
+            LicenseError::field_whitelist_violation("receipt_cursor.seq_to is not an integer")
+        })?;
+        Ok((from, to))
+    }
+
+    /// 由 `device_id` 反查设备机器码（`device_mid`）；设备不存在时回退为 `device_id`。
+    fn device_mid_of(&self, device_id: &str) -> LicenseResult<String> {
+        Ok(match self.store.get_device(device_id)? {
+            Some(device) => device.machine_code,
+            None => device_id.to_string(),
+        })
+    }
+
+    /// 从原始 JSON 中提取 `lease_id`（审计实体提示；缺失返回空串）。
+    fn entity_hint(raw: &serde_json::Value) -> String {
+        raw.get("lease_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     /// 归一化幂等键：trim 头部 / 尾部空白；空键直接拒绝。
@@ -572,6 +994,228 @@ impl LicensingService {
         }
     }
 
+    /// §7 判定：对**已绑定**码执行 ①②③（同机幂等恢复 / 漂移自动改绑 / 异机拒绝）。
+    ///
+    /// 阈值比较**只**经 [`Device::is_same_machine_by_anchors`]（单一来源），
+    /// 本函数不写 `>= 4` 字面量。
+    fn activate_against_binding(
+        &self,
+        code: &ActivationCode,
+        bound_device_id: &str,
+        req: &ActivationRequest,
+        now: i64,
+    ) -> LicenseResult<ActivationResponse> {
+        let device = self.store.get_device(bound_device_id)?.ok_or_else(|| {
+            // 绑定关系指向不存在的设备 = 库不一致（不应由请求触发），如实报内部错误。
+            LicenseError::Storage(format!(
+                "activation code {} is bound to a device that no longer exists",
+                code.code_id
+            ))
+        })?;
+
+        // ① 上报 machine_code 与绑定记录一致 → 同机（幂等恢复 / 重签租约）。
+        if req.machine_code == device.machine_code {
+            return self.activate_same_machine(code, &device, req, now);
+        }
+
+        // ②/③ machine_code 不一致 → 按**锚点命中数**判定（设计 §3：≥4/5 同机、≤3/5 异机）。
+        let hits = device.anchor_match_count(&req.anchor_hashes);
+        let drifts = device.anchor_drift_count(&req.anchor_hashes);
+        if device.is_same_machine_by_anchors(&req.anchor_hashes) {
+            // ② 同机（重装 / 漂移）：自动改绑 + 作废旧租约 + 重签新租约（同一事务）+ 审计留痕。
+            self.auto_rebind_same_machine(code, &device, req, hits, drifts, now)
+        } else {
+            // ③ 异机：拒绝 403（仅写审计，**无任何 device / lease / 绑定副作用**）。
+            self.write_audit(
+                ActorType::System,
+                "system",
+                "activation_rejected_bound_to_other_device",
+                "activation_code",
+                &code.code_id,
+                &format!("hits={hits} drifts={drifts}"),
+                now,
+            )?;
+            Err(LicenseError::code_bound_to_other_device())
+        }
+    }
+
+    /// §7 步骤 ①：**同机**（`machine_code` 一致）→ 幂等恢复 / 重签租约。
+    ///
+    /// 幂等语义（`licensing-api.md` §1.1「返回现存有效租约」）：若该设备存在**仍可用**的
+    /// 租约，直接返回它，**不新建 device、不追加租约行**；无可用租约时复用既有 device 重签一张。
+    /// `Lease Token` 由既有租约载荷**确定性**重签（Ed25519 确定性 → 载荷不变则 Token 逐字节不变）。
+    fn activate_same_machine(
+        &self,
+        code: &ActivationCode,
+        device: &Device,
+        req: &ActivationRequest,
+        now: i64,
+    ) -> LicenseResult<ActivationResponse> {
+        if let Some(lease) = self.find_usable_lease(&device.device_id, &code.code_id, now)? {
+            // 幂等：返回现存有效租约（同码同机重复激活，如凭证丢失重装）。
+            let claims = Self::lease_claims(&lease, &device.machine_code);
+            let token = issue_lease_token(&self.keyring, &claims)?;
+            return self.activation_response(&lease, token, req, now);
+        }
+
+        // 无可用租约 → 复用既有 device **重签**一张（绝不新建设备）。
+        let lease_id = now_ns_id("lease");
+        let claims = LeaseClaims {
+            lease_id: lease_id.clone(),
+            device_id: device.device_id.clone(),
+            mid: device.machine_code.clone(),
+            tier: code.tier.clone(),
+            verify_mode: VerifyMode::B.as_str().to_string(),
+            issued_at: now,
+            valid_until: code.valid_until,
+        };
+        let token = issue_lease_token(&self.keyring, &claims)?;
+        let lease = Lease {
+            lease_id,
+            device_id: device.device_id.clone(),
+            code_id: code.code_id.clone(),
+            kid: token.kid.clone(),
+            token_sig: token.signature_b64.clone(),
+            verify_mode: VerifyMode::B,
+            tier: code.tier.clone(),
+            issued_at: now,
+            valid_until: code.valid_until,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        self.store.insert_lease(&lease)?;
+        self.store
+            .update_device_status(&device.device_id, DeviceStatus::Active)?;
+        self.write_audit(
+            ActorType::System,
+            "system",
+            "activation_same_machine",
+            "activation_code",
+            &code.code_id,
+            "same-machine re-activation: lease re-signed",
+            now,
+        )?;
+        self.activation_response(&lease, token, req, now)
+    }
+
+    /// §7 步骤 ②：**同机（重装 / 漂移）** → 改绑 + 作废旧租约 + 重签新租约（同一事务）+ 审计。
+    ///
+    /// 命中 ≥4/5 说明锚点高度重合，判同机；把绑定记录前移到当前机器
+    /// （`machine_code` + `anchor_hashes` 一起刷新），作废旧租约、签发新租约。全程单事务。
+    fn auto_rebind_same_machine(
+        &self,
+        code: &ActivationCode,
+        device: &Device,
+        req: &ActivationRequest,
+        hits: usize,
+        drifts: usize,
+        now: i64,
+    ) -> LicenseResult<ActivationResponse> {
+        let new_machine_code = req.machine_code.clone();
+
+        let lease_id = now_ns_id("lease");
+        let claims = LeaseClaims {
+            lease_id: lease_id.clone(),
+            device_id: device.device_id.clone(),
+            mid: new_machine_code.clone(),
+            tier: code.tier.clone(),
+            verify_mode: VerifyMode::B.as_str().to_string(),
+            issued_at: now,
+            valid_until: code.valid_until,
+        };
+        let token = issue_lease_token(&self.keyring, &claims)?;
+        let new_lease = Lease {
+            lease_id,
+            device_id: device.device_id.clone(),
+            code_id: code.code_id.clone(),
+            kid: token.kid.clone(),
+            token_sig: token.signature_b64.clone(),
+            verify_mode: VerifyMode::B,
+            tier: code.tier.clone(),
+            issued_at: now,
+            valid_until: code.valid_until,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+
+        // 审计留痕：命中项数 / 漂移项数（**绝不写锚点原文 / `machine_code` / 码值**）。
+        let audit = AuditLog {
+            id: now_ns_id("audit"),
+            actor_type: ActorType::System,
+            actor_id: "system".to_string(),
+            action: "activation_rebind".to_string(),
+            entity_type: "activation_code".to_string(),
+            entity_id: code.code_id.clone(),
+            detail: format!(
+                "auto_rebind device_id={} hits={hits} drifts={drifts}",
+                device.device_id
+            ),
+            ts: now,
+            ip: String::new(),
+        };
+
+        // 改绑 + 作废旧租约 + 写入新租约 + 审计 —— **单事务**，避免中间态。
+        self.store.rebind_device_and_issue_lease(
+            &device.device_id,
+            &new_machine_code,
+            &req.anchor_hashes,
+            &new_lease,
+            &audit,
+        )?;
+
+        self.activation_response(&new_lease, token, req, now)
+    }
+
+    /// 该设备在给定码下**仍可用**的租约（`list_leases_by_device` 已按最新在前排序）。
+    fn find_usable_lease(
+        &self,
+        device_id: &str,
+        code_id: &str,
+        now: i64,
+    ) -> LicenseResult<Option<Lease>> {
+        for lease in self.store.list_leases_by_device(device_id)? {
+            if lease.code_id == code_id && lease.is_usable_at(now) {
+                return Ok(Some(lease));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 由既有租约构造 Lease Token 载荷（`mid` 由调用方给出，其余取自租约记录）。
+    fn lease_claims(lease: &Lease, mid: &str) -> LeaseClaims {
+        LeaseClaims {
+            lease_id: lease.lease_id.clone(),
+            device_id: lease.device_id.clone(),
+            mid: mid.to_string(),
+            tier: lease.tier.clone(),
+            verify_mode: lease.verify_mode.as_str().to_string(),
+            issued_at: lease.issued_at,
+            valid_until: lease.valid_until,
+        }
+    }
+
+    /// 组装激活响应：签发租约 Token（载荷取自既有租约，**确定性**）+ 服务端响应签名。
+    fn activation_response(
+        &self,
+        lease: &Lease,
+        token: LeaseToken,
+        req: &ActivationRequest,
+        now: i64,
+    ) -> LicenseResult<ActivationResponse> {
+        let sig = self.sign_response(&lease.lease_id, &req.nonce, now)?;
+        Ok(ActivationResponse {
+            lease_id: lease.lease_id.clone(),
+            lease_token: token.encode(),
+            verify_mode: lease.verify_mode.as_str().to_string(),
+            tier: lease.tier.clone(),
+            valid_until: lease.valid_until.to_string(),
+            heartbeat_hours: HEARTBEAT_HOURS,
+            server_time: now.to_string(),
+            nonce: req.nonce.clone(),
+            sig,
+        })
+    }
+
     /// 服务端对激活响应的签名（防篡改；密钥来自密钥环）。
     fn sign_response(
         &self,
@@ -579,12 +1223,25 @@ impl LicensingService {
         nonce: &str,
         server_time: i64,
     ) -> LicenseResult<String> {
-        let message = format!("activation|{lease_id}|{nonce}|{server_time}");
+        self.sign_server_response("activation", lease_id, nonce, server_time)
+    }
+
+    /// 通用服务端响应签名：`{domain}|{lease_id}|{nonce}|{server_time}`（密钥来自密钥环）。
+    ///
+    /// 域前缀区分端点（`activation` / `heartbeat`），防止跨端点签名混用。
+    fn sign_server_response(
+        &self,
+        domain: &str,
+        lease_id: &str,
+        nonce: &str,
+        server_time: i64,
+    ) -> LicenseResult<String> {
+        let message = format!("{domain}|{lease_id}|{nonce}|{server_time}");
         let (_kid, sig) = self.keyring.sign(message.as_bytes())?;
         Ok(sig)
     }
 
-    /// 写入一条审计日志（后台动作统一入口）。
+    /// 写入一条审计日志（后台动作统一入口，actor 固定为管理员）。
     fn audit(
         &self,
         _tenant_id: &str,
@@ -594,14 +1251,40 @@ impl LicensingService {
         entity_id: &str,
         now: i64,
     ) -> LicenseResult<()> {
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            action,
+            entity_type,
+            entity_id,
+            "",
+            now,
+        )
+    }
+
+    /// 写入一条审计日志（通用入口：任意 actor_type + 详情）。
+    ///
+    /// **不承载敏感值**：`detail` 不得包含激活码原文 / 私钥。设备侧动作（心跳 / 校验 /
+    /// 回执异常）以 [`ActorType::Device`] / [`ActorType::System`] 记录。
+    #[allow(clippy::too_many_arguments)]
+    fn write_audit(
+        &self,
+        actor_type: ActorType,
+        actor_id: &str,
+        action: &str,
+        entity_type: &str,
+        entity_id: &str,
+        detail: &str,
+        now: i64,
+    ) -> LicenseResult<()> {
         let log = AuditLog {
             id: now_ns_id("audit"),
-            actor_type: ActorType::Admin,
+            actor_type,
             actor_id: actor_id.to_string(),
             action: action.to_string(),
             entity_type: entity_type.to_string(),
             entity_id: entity_id.to_string(),
-            detail: String::new(),
+            detail: detail.to_string(),
             ts: now,
             ip: String::new(),
         };
@@ -612,16 +1295,29 @@ impl LicensingService {
 #[cfg(test)]
 mod tests {
     use super::LicensingService;
+    use crate::audit::ReceiptLedger;
     use crate::error::{LicenseError, PrebindKind};
     use crate::keys::KeyRing;
-    use crate::model::{now_unix_secs, CodeStatus, Tenant};
+    use crate::model::{now_ns_id, now_unix_secs, CodeStatus, Device, LeaseStatus, Tenant};
     use crate::proto::{
-        ActivationRequest, IssueCodesRequest, Prebind, ReissueCodeRequest, RevokeCodeRequest,
+        ActivationRequest, GapKind, HeartbeatRequest, IssueCodesRequest, Prebind, ReceiptCursor,
+        ReissueCodeRequest, RevokeCodeRequest,
     };
-    use crate::store::Store;
+    use crate::store::{AuditFilter, Store};
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
     use std::sync::Arc;
 
-    /// 构造带内存库 + 已注册签发密钥的服务（测试专用）。
+    /// **TEST_ONLY_** 设备/签发密钥种子（仅测试；生产密钥绝不硬编码、绝不入仓库）。
+    const TEST_ONLY_SEED: [u8; 32] = *b"iotdaq-test-seed-service-0000001";
+    /// **TEST_ONLY_** 独立异钥种子（用于「伪造签名必被拒」的负例）。
+    const TEST_ONLY_ROGUE_SEED: [u8; 32] = *b"iotdaq-rogue-seed-service-000001";
+
+    /// 构造带内存库 + 已知测试密钥的服务（测试专用）。
+    ///
+    /// 用**已知种子**注册密钥环，使测试可对心跳 / 校验请求生成可验证的 `device_sig`。
     fn build_service() -> Arc<LicensingService> {
         let store = Store::open_in_memory().expect("open in-memory store");
         let tenant = Tenant::new(
@@ -633,9 +1329,42 @@ mod tests {
         store.insert_tenant(&tenant).expect("seed tenant");
         let keyring = KeyRing::empty();
         keyring
-            .register_generated(None, 1_700_000_000)
+            .register_from_b64(
+                "k-test",
+                &B64.encode(TEST_ONLY_SEED),
+                Some("TEST_ONLY_kms".into()),
+                1_700_000_000,
+            )
             .expect("register signing key");
-        Arc::new(LicensingService::new(store, keyring))
+        Arc::new(LicensingService::with_ledger(
+            store,
+            keyring,
+            ReceiptLedger::open_in_memory(),
+        ))
+    }
+
+    /// 用测试密钥对给定摘要签名（STANDARD base64）。
+    fn sign_hash(hash: &[u8; 32]) -> String {
+        let key = SigningKey::from_bytes(&TEST_ONLY_SEED);
+        B64.encode(key.sign(hash).to_bytes())
+    }
+
+    /// 用**异钥**对给定摘要签名（负例用）。
+    fn sign_hash_rogue(hash: &[u8; 32]) -> String {
+        let key = SigningKey::from_bytes(&TEST_ONLY_ROGUE_SEED);
+        B64.encode(key.sign(hash).to_bytes())
+    }
+
+    /// 走一遍激活，返回 `(lease_id, machine_code)`（心跳 / 校验 / 回执测试的前置）。
+    fn activate_one(svc: &LicensingService) -> (String, String) {
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, &now_ns_id("idem")))
+            .expect("issue");
+        let code = &resp.codes[0];
+        let act = svc
+            .activate(&activate_req(&code.code, "MID-0001"))
+            .expect("activate");
+        (act.lease_id, "MID-0001".to_string())
     }
 
     fn issue_req(tenant: &str, prebind: Option<&str>, idem: &str) -> IssueCodesRequest {
@@ -661,6 +1390,31 @@ mod tests {
             ts: now_unix_secs().to_string(),
             req_sig: "s".to_string(),
         }
+    }
+
+    /// 构造带**自定义锚点集**的激活请求（N-of-M 冲突检测测试用）。
+    fn activate_req_with_anchors(
+        code_value: &str,
+        machine: &str,
+        anchors: &[&str],
+    ) -> ActivationRequest {
+        ActivationRequest {
+            activation_code: code_value.to_string(),
+            machine_code: machine.to_string(),
+            anchor_hashes: anchors.iter().map(|s| (*s).to_string()).collect(),
+            device_pubkey: "x".to_string(),
+            nonce: "n1".to_string(),
+            ts: now_unix_secs().to_string(),
+            req_sig: "s".to_string(),
+        }
+    }
+
+    /// 按机器码取设备（断言必须存在）。
+    fn device_of(svc: &LicensingService, machine: &str) -> Device {
+        svc.store()
+            .get_device_by_machine_code(machine)
+            .expect("get device")
+            .expect("device must exist")
     }
 
     fn revoke_req(reason: &str) -> RevokeCodeRequest {
@@ -966,6 +1720,414 @@ mod tests {
         assert_eq!(stored.idempotency_key.as_deref(), Some("g5-reissue"));
     }
 
+    // ================= §7 一机一码冲突检测（N-of-M 服务端强制点） =================
+
+    /// 参考锚点集（5 个互异值，模拟真实逐锚点 HMAC 哈希）。
+    const BASE_ANCHORS: [&str; 5] = [
+        "h-anchor-1",
+        "h-anchor-2",
+        "h-anchor-3",
+        "h-anchor-4",
+        "h-anchor-5",
+    ];
+
+    /// ① 同码同机重复激活 → **幂等**：device 数不变、租约数不变、返回同一租约与 Token。
+    #[test]
+    fn t46_same_code_same_machine_reactivation_is_idempotent() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "nofm-idem"))
+            .unwrap();
+        let code = &resp.codes[0];
+
+        let first = svc
+            .activate(&activate_req_with_anchors(
+                &code.code,
+                "MID-A",
+                &BASE_ANCHORS,
+            ))
+            .unwrap();
+        let dev = device_of(&svc, "MID-A");
+        assert_eq!(
+            svc.store().count_devices(None).unwrap(),
+            1,
+            "只应有 1 台设备"
+        );
+        assert_eq!(
+            svc.store()
+                .list_leases_by_device(&dev.device_id)
+                .unwrap()
+                .len(),
+            1,
+            "首次激活应恰好签发 1 条租约"
+        );
+
+        // 同码同机重复激活 → 幂等：同一租约、同一 Token、无新增。
+        let second = svc
+            .activate(&activate_req_with_anchors(
+                &code.code,
+                "MID-A",
+                &BASE_ANCHORS,
+            ))
+            .unwrap();
+        assert_eq!(first.lease_id, second.lease_id, "必须返回现存租约（幂等）");
+        assert_eq!(
+            first.lease_token, second.lease_token,
+            "同机重签必须逐字节一致（Ed25519 确定性 + 载荷取自既有租约）"
+        );
+        assert_eq!(svc.store().count_devices(None).unwrap(), 1, "device 数不变");
+        assert_eq!(
+            svc.store()
+                .list_leases_by_device(&dev.device_id)
+                .unwrap()
+                .len(),
+            1,
+            "租约数不变（绝不产生第二条重复租约）"
+        );
+    }
+
+    /// ② 异机但命中恰好 4/5（1 项漂移，模拟换网卡）→ **自动改绑 + 重签**，审计留痕。
+    #[test]
+    fn t46_one_anchor_drift_rebinds_same_machine_and_reissues_lease() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "nofm-drift1"))
+            .unwrap();
+        let code = &resp.codes[0];
+
+        let first = svc
+            .activate(&activate_req_with_anchors(
+                &code.code,
+                "MID-A",
+                &BASE_ANCHORS,
+            ))
+            .unwrap();
+        let dev = device_of(&svc, "MID-A");
+
+        // machine_code 变化 + 恰好 1 项锚点漂移（命中 4/5）→ 判同机。
+        let drifted = [
+            "h-anchor-1",
+            "h-anchor-2",
+            "h-anchor-3",
+            "h-anchor-4",
+            "h-anchor-DRIFT",
+        ];
+        let second = svc
+            .activate(&activate_req_with_anchors(&code.code, "MID-B", &drifted))
+            .unwrap();
+        assert_ne!(first.lease_id, second.lease_id, "改绑必须重签新租约");
+
+        // 改绑生效：同一 device 的身份锚点前移到新机器。
+        let rebound = device_of(&svc, "MID-B");
+        assert_eq!(
+            rebound.device_id, dev.device_id,
+            "复用同一 device（不新建）"
+        );
+        assert_eq!(
+            rebound.anchor_hashes,
+            drifted.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            "anchor_hashes 必须随 machine_code 一起前移"
+        );
+        assert!(
+            svc.store()
+                .get_device_by_machine_code("MID-A")
+                .unwrap()
+                .is_none(),
+            "旧 machine_code 不应再指向任何设备"
+        );
+
+        // 旧租约已作废、新租约已签发且可用。
+        assert_eq!(
+            svc.store()
+                .list_leases_by_device(&dev.device_id)
+                .unwrap()
+                .len(),
+            2,
+            "旧租约（作废）保留 + 新租约，共 2 条"
+        );
+        assert_eq!(
+            svc.store()
+                .get_lease(&first.lease_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            LeaseStatus::Stopped,
+            "旧租约必须被作废"
+        );
+        assert!(
+            svc.store()
+                .get_lease(&second.lease_id)
+                .unwrap()
+                .unwrap()
+                .is_usable_at(now_unix_secs()),
+            "新租约必须可用"
+        );
+
+        // 审计留痕：命中 4 / 漂移 1，且不含任何敏感值。
+        let logs = svc
+            .store()
+            .list_audit_logs(
+                &AuditFilter {
+                    action: Some("activation_rebind".into()),
+                    ..Default::default()
+                },
+                1,
+                10,
+            )
+            .unwrap();
+        assert_eq!(logs.len(), 1, "改绑必须留一条审计");
+        assert!(
+            logs[0].detail.contains("hits=4"),
+            "审计须记命中项数: {}",
+            logs[0].detail
+        );
+        assert!(
+            logs[0].detail.contains("drifts=1"),
+            "审计须记漂移项数: {}",
+            logs[0].detail
+        );
+        assert!(!logs[0].detail.contains("h-anchor"), "审计不得含锚点原文");
+        assert!(
+            !logs[0].detail.contains("MID-A") && !logs[0].detail.contains("MID-B"),
+            "审计不得含 machine_code 明文: {}",
+            logs[0].detail
+        );
+    }
+
+    /// ③ 异机且命中恰好 3/5 → `CodeBoundToOtherDevice`（403），**无任何副作用**。
+    #[test]
+    fn t46_two_anchor_drift_is_rejected_as_other_device_without_side_effects() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "nofm-drift2"))
+            .unwrap();
+        let code = &resp.codes[0];
+        svc.activate(&activate_req_with_anchors(
+            &code.code,
+            "MID-A",
+            &BASE_ANCHORS,
+        ))
+        .unwrap();
+        let dev = device_of(&svc, "MID-A");
+
+        // 命中恰好 3/5 → 异机。
+        let foreign = ["h-anchor-1", "h-anchor-2", "h-anchor-3", "h-x", "h-y"];
+        let err = svc
+            .activate(&activate_req_with_anchors(&code.code, "MID-B", &foreign))
+            .unwrap_err();
+        assert!(
+            matches!(err, LicenseError::CodeBoundToOtherDevice { .. }),
+            "异机必须判 CodeBoundToOtherDevice，实际: {err:?}"
+        );
+        assert_eq!(
+            err.error_code(),
+            crate::error::ERR_LICENSE_BOUND_OTHER_DEVICE
+        );
+
+        // 无副作用：device 记录未变、device 数 / 租约数不变、无新绑定。
+        assert_eq!(device_of(&svc, "MID-A"), dev, "设备记录不得被改动");
+        assert_eq!(svc.store().count_devices(None).unwrap(), 1);
+        assert_eq!(
+            svc.store()
+                .list_leases_by_device(&dev.device_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            svc.store()
+                .get_device_by_machine_code("MID-B")
+                .unwrap()
+                .is_none(),
+            "不得产生新绑定"
+        );
+        // 拒绝同样留审计（命中 3 / 漂移 2）。
+        let logs = svc
+            .store()
+            .list_audit_logs(
+                &AuditFilter {
+                    action: Some("activation_rejected_bound_to_other_device".into()),
+                    ..Default::default()
+                },
+                1,
+                10,
+            )
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(
+            logs[0].detail.contains("hits=3") && logs[0].detail.contains("drifts=2"),
+            "{}",
+            logs[0].detail
+        );
+    }
+
+    /// ③ 命中 0/5、空 `anchor_hashes` → 同样拒绝（且无副作用）。
+    #[test]
+    fn t46_zero_hits_and_empty_anchors_are_rejected() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "nofm-zero"))
+            .unwrap();
+        let code = &resp.codes[0];
+        svc.activate(&activate_req_with_anchors(
+            &code.code,
+            "MID-A",
+            &BASE_ANCHORS,
+        ))
+        .unwrap();
+
+        let err = svc
+            .activate(&activate_req_with_anchors(
+                &code.code,
+                "MID-Z",
+                &["z1", "z2", "z3", "z4", "z5"],
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, LicenseError::CodeBoundToOtherDevice { .. }),
+            "{err:?}"
+        );
+
+        let err = svc
+            .activate(&activate_req_with_anchors(&code.code, "MID-Y", &[]))
+            .unwrap_err();
+        assert!(
+            matches!(err, LicenseError::CodeBoundToOtherDevice { .. }),
+            "空锚点集必须判异机: {err:?}"
+        );
+
+        assert_eq!(
+            svc.store().count_devices(None).unwrap(),
+            1,
+            "拒绝不得产生设备"
+        );
+    }
+
+    /// 回归：预绑定不匹配（未绑定码）仍走既有 `ActivationMachineMismatch`，未被 §7 覆盖。
+    #[test]
+    fn t46_prebind_mismatch_still_rejected_as_activation_machine_mismatch() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", Some("MID-PB"), "nofm-prebind"))
+            .unwrap();
+        let code = &resp.codes[0];
+        let err = svc
+            .activate(&activate_req_with_anchors(
+                &code.code,
+                "MID-OTHER",
+                &BASE_ANCHORS,
+            ))
+            .unwrap_err();
+        match err {
+            LicenseError::PrebindConflict { kind } => {
+                assert_eq!(kind, PrebindKind::ActivationMachineMismatch)
+            }
+            other => panic!("expected PrebindConflict, got {other:?}"),
+        }
+    }
+
+    /// 回归：revoked 码仍被拒（④），且不产生设备。
+    #[test]
+    fn t46_revoked_code_is_rejected() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "nofm-revoked"))
+            .unwrap();
+        let cid = resp.codes[0].code_id.clone();
+        let code = resp.codes[0].code.clone();
+        svc.revoke("t-1", &cid, &revoke_req("gone"), "admin")
+            .unwrap();
+
+        let err = svc
+            .activate(&activate_req_with_anchors(&code, "MID-A", &BASE_ANCHORS))
+            .unwrap_err();
+        assert!(
+            matches!(err, LicenseError::ActivationRejected(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            svc.store().count_devices(None).unwrap(),
+            0,
+            "拒绝不得产生设备"
+        );
+    }
+
+    /// **敏感性断言**：拒绝路径的错误消息与审计事件**都不含**锚点原文 / `machine_code` / 码值。
+    #[test]
+    fn t46_reject_path_never_leaks_machine_code_anchors_or_code_value() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "nofm-leak"))
+            .unwrap();
+        let code = &resp.codes[0];
+
+        // 绑定记录锚点（会落 device.anchor_hashes）。
+        let bound = [
+            "SECRET-ANCHOR-1",
+            "SECRET-ANCHOR-2",
+            "SECRET-ANCHOR-3",
+            "SECRET-ANCHOR-4",
+            "SECRET-ANCHOR-5",
+        ];
+        svc.activate(&activate_req_with_anchors(
+            &code.code,
+            "MACHINE-BOUND",
+            &bound,
+        ))
+        .unwrap();
+
+        // 异机请求：machine_code 与锚点都带可识别串。
+        let err = svc
+            .activate(&activate_req_with_anchors(
+                &code.code,
+                "LEAK-MACHINE-XYZ",
+                &[
+                    "LEAK-ANCHOR-A",
+                    "LEAK-ANCHOR-B",
+                    "LEAK-ANCHOR-C",
+                    "LEAK-ANCHOR-D",
+                    "LEAK-ANCHOR-E",
+                ],
+            ))
+            .unwrap_err();
+        let msg = err.to_string();
+        for secret in [
+            "LEAK-MACHINE-XYZ",
+            "LEAK-ANCHOR-A",
+            "SECRET-ANCHOR-1",
+            code.code.as_str(),
+        ] {
+            assert!(!msg.contains(secret), "错误信息泄露敏感值 {secret}: {msg}");
+        }
+        assert!(msg.contains("machine replacement"), "须给可操作提示: {msg}");
+
+        // 审计事件同样不得含敏感值。
+        let logs = svc
+            .store()
+            .list_audit_logs(
+                &AuditFilter {
+                    action: Some("activation_rejected_bound_to_other_device".into()),
+                    ..Default::default()
+                },
+                1,
+                10,
+            )
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        let blob = format!(
+            "{} {} {}",
+            logs[0].actor_id, logs[0].detail, logs[0].entity_id
+        );
+        for secret in [
+            "LEAK-MACHINE-XYZ",
+            "LEAK-ANCHOR-A",
+            "SECRET-ANCHOR-1",
+            code.code.as_str(),
+        ] {
+            assert!(!blob.contains(secret), "审计泄露敏感值 {secret}: {blob}");
+        }
+    }
+
     // ---------------- 其他状态机健全性 ----------------
 
     #[test]
@@ -1009,5 +2171,360 @@ mod tests {
             .is_ok());
         let stored = svc.store().get_code_by_id(&cid).unwrap().unwrap();
         assert_eq!(stored.status, CodeStatus::Revoked);
+    }
+
+    // ======================= 心跳 / 校验 / 回执 端点 =======================
+
+    /// 构造已签名的心跳请求。
+    fn heartbeat_req(
+        lease_id: &str,
+        nonce: &str,
+        ts: i64,
+        cursor: Option<(i64, i64)>,
+        sign_ts: i64,
+    ) -> HeartbeatRequest {
+        let hash = crate::device_auth::heartbeat_payload_hash(lease_id, sign_ts, nonce, cursor);
+        let sig = sign_hash(&hash);
+        HeartbeatRequest {
+            lease_id: lease_id.to_string(),
+            ts: ts.to_string(),
+            nonce: nonce.to_string(),
+            receipt_cursor: cursor.map(|(f, t)| ReceiptCursor {
+                seq_from: f.to_string(),
+                seq_to: t.to_string(),
+            }),
+            device_sig: sig,
+        }
+    }
+
+    /// 构造 `/verify` 原始请求 JSON（已签名）。
+    fn verify_value(
+        mid: &str,
+        lease_id: &str,
+        digest: &str,
+        ts: i64,
+        nonce: &str,
+        sign_ts: i64,
+    ) -> serde_json::Value {
+        let hash = crate::device_auth::verify_payload_hash(mid, lease_id, digest, sign_ts, nonce);
+        json!({
+            "device_mid": mid,
+            "lease_id": lease_id,
+            "payload_digest": digest,
+            "ts": ts.to_string(),
+            "nonce": nonce,
+            "device_sig": sign_hash(&hash),
+        })
+    }
+
+    /// 构造已签名的回执请求 JSON。
+    fn receipt_value(
+        mid: &str,
+        lease_id: &str,
+        from: i64,
+        to: i64,
+        digest: &str,
+        signer: &dyn Fn(&[u8; 32]) -> String,
+    ) -> serde_json::Value {
+        let now = now_unix_secs();
+        let count = to - from + 1;
+        let hash =
+            crate::receipt::receipt_payload_hash(mid, lease_id, from, to, count, digest, now);
+        json!({
+            "device_mid": mid,
+            "lease_id": lease_id,
+            "seq_from": from.to_string(),
+            "seq_to": to.to_string(),
+            "count": count.to_string(),
+            "payload_digest": digest,
+            "ts": now.to_string(),
+            "sig": signer(&hash),
+        })
+    }
+
+    // ---------------- 心跳 ----------------
+
+    #[test]
+    fn hb_happy_writes_last_heartbeat_and_device_active() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let now = now_unix_secs();
+        let req = heartbeat_req(&lease_id, "hb-happy", now, None, now);
+        let resp = svc.heartbeat(&req).expect("heartbeat ok");
+        assert!(!resp.sig.is_empty(), "响应必须带服务端签名");
+        assert_eq!(resp.verify_mode, "B");
+        assert_eq!(resp.server_time, now.to_string());
+        assert!(resp.next_deadline.parse::<i64>().unwrap() > now);
+
+        let lease = svc.store().get_lease(&lease_id).unwrap().unwrap();
+        assert!(
+            lease.last_heartbeat_at.is_some(),
+            "必须回写 last_heartbeat_at"
+        );
+        let device = svc
+            .store()
+            .get_device_by_machine_code(&mid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(device.status, crate::model::DeviceStatus::Active);
+        // 心跳记录落库。
+        assert_eq!(
+            svc.store()
+                .list_heartbeats_by_lease(&lease_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hb_revoked_lease_returns_lease_revoked() {
+        let svc = build_service();
+        let (lease_id, _) = activate_one(&svc);
+        svc.store()
+            .update_lease_status(&lease_id, LeaseStatus::Stopped)
+            .unwrap();
+        let now = now_unix_secs();
+        let err = svc
+            .heartbeat(&heartbeat_req(&lease_id, "hb-rev", now, None, now))
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::LeaseRevoked(_)), "{err:?}");
+    }
+
+    #[test]
+    fn hb_unknown_lease_returns_lease_not_found() {
+        let svc = build_service();
+        let now = now_unix_secs();
+        let err = svc
+            .heartbeat(&heartbeat_req("lease-missing", "hb-404", now, None, now))
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::LeaseNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn hb_replayed_nonce_returns_nonce_replay() {
+        let svc = build_service();
+        let (lease_id, _) = activate_one(&svc);
+        let now = now_unix_secs();
+        svc.heartbeat(&heartbeat_req(&lease_id, "hb-replay", now, None, now))
+            .expect("first ok");
+        let err = svc
+            .heartbeat(&heartbeat_req(&lease_id, "hb-replay", now, None, now))
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::NonceReplay(_)), "{err:?}");
+    }
+
+    #[test]
+    fn hb_skewed_ts_returns_timestamp_skew() {
+        let svc = build_service();
+        let (lease_id, _) = activate_one(&svc);
+        let now = now_unix_secs();
+        let skewed = now - 10_000;
+        // 签在 skew 的 ts 上 → 验签通过、时间窗拒绝（证明窗在验签之后判定）。
+        let err = svc
+            .heartbeat(&heartbeat_req(&lease_id, "hb-skew", skewed, None, skewed))
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::TimestampSkew(_)), "{err:?}");
+    }
+
+    #[test]
+    fn hb_forged_signature_returns_verify_failed() {
+        let svc = build_service();
+        let (lease_id, _) = activate_one(&svc);
+        let now = now_unix_secs();
+        let hash = crate::device_auth::heartbeat_payload_hash(&lease_id, now, "hb-forge", None);
+        let req = HeartbeatRequest {
+            lease_id,
+            ts: now.to_string(),
+            nonce: "hb-forge".into(),
+            receipt_cursor: None,
+            device_sig: sign_hash_rogue(&hash),
+        };
+        let err = svc.heartbeat(&req).unwrap_err();
+        assert!(matches!(err, LicenseError::VerifyFailed(_)), "{err:?}");
+    }
+
+    // ---------------- /verify ----------------
+
+    #[test]
+    fn verify_happy_returns_ok_and_echoes_nonce() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let now = now_unix_secs();
+        let v = verify_value(&mid, &lease_id, "sha256:abc", now, "v-ok", now);
+        let resp = svc.verify(&v).expect("verify ok");
+        assert!(resp.ok);
+        assert_eq!(resp.nonce, "v-ok");
+        assert_eq!(resp.server_time, now.to_string());
+    }
+
+    #[test]
+    fn verify_forged_signature_returns_verify_failed() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let now = now_unix_secs();
+        let mut v = verify_value(&mid, &lease_id, "sha256:abc", now, "v-forge", now);
+        v["device_sig"] = json!("AAAA");
+        let err = svc.verify(&v).unwrap_err();
+        assert!(matches!(err, LicenseError::VerifyFailed(_)), "{err:?}");
+    }
+
+    #[test]
+    fn verify_skewed_ts_returns_timestamp_skew() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let now = now_unix_secs();
+        let skewed = now + 9_999;
+        let v = verify_value(&mid, &lease_id, "sha256:abc", skewed, "v-skew", skewed);
+        let err = svc.verify(&v).unwrap_err();
+        assert!(matches!(err, LicenseError::TimestampSkew(_)), "{err:?}");
+    }
+
+    #[test]
+    fn verify_replayed_nonce_returns_nonce_replay() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let now = now_unix_secs();
+        let v = verify_value(&mid, &lease_id, "sha256:abc", now, "v-replay", now);
+        svc.verify(&v).expect("first ok");
+        let err = svc.verify(&v).unwrap_err();
+        assert!(matches!(err, LicenseError::NonceReplay(_)), "{err:?}");
+    }
+
+    #[test]
+    fn verify_extra_field_returns_field_whitelist_violation() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let now = now_unix_secs();
+        let mut v = verify_value(&mid, &lease_id, "sha256:abc", now, "v-wl", now);
+        v["flow_rate"] = json!("42"); // 白名单外业务字段
+        let err = svc.verify(&v).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::FieldWhitelistViolation(_)),
+            "{err:?}"
+        );
+    }
+
+    // ---------------- /audit/receipt ----------------
+
+    #[test]
+    fn receipt_happy_is_accepted_with_gap_none() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let v = receipt_value(&mid, &lease_id, 1, 100, "sha256:d", &sign_hash);
+        let resp = svc.audit_receipt(&v).expect("accepted");
+        assert!(resp.accepted);
+        assert_eq!(resp.gap, GapKind::None);
+        assert!(resp.warnings.is_empty());
+    }
+
+    #[test]
+    fn receipt_gap_overlap_missing_are_detected() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+
+        // 连续窗口 1..100。
+        let r = svc
+            .audit_receipt(&receipt_value(&mid, &lease_id, 1, 100, "d1", &sign_hash))
+            .unwrap();
+        assert_eq!(r.gap, GapKind::None);
+
+        // gap：150..3000（期望 101）。
+        let r = svc
+            .audit_receipt(&receipt_value(
+                &mid, &lease_id, 150, 3_000, "d2", &sign_hash,
+            ))
+            .unwrap();
+        assert_eq!(r.gap, GapKind::Gap, "跳空必须被检出");
+        assert!(!r.warnings.is_empty());
+
+        // overlap（回退）：40..50（前沿 3000）。
+        let r = svc
+            .audit_receipt(&receipt_value(&mid, &lease_id, 40, 50, "d3", &sign_hash))
+            .unwrap();
+        assert_eq!(r.gap, GapKind::Overlap, "回退 / 重叠必须被检出");
+
+        // missing：另一台设备首个回执从 5 起步 → 前缀 [1,4] 缺失。
+        let other = svc
+            .issue_codes(&issue_req("t-1", None, &now_ns_id("idem-m")))
+            .unwrap();
+        let act = svc
+            .activate(&activate_req(&other.codes[0].code, "MID-OTHER"))
+            .unwrap();
+        let r = svc
+            .audit_receipt(&receipt_value(
+                "MID-OTHER",
+                &act.lease_id,
+                5,
+                9,
+                "d4",
+                &sign_hash,
+            ))
+            .unwrap();
+        assert_eq!(r.gap, GapKind::Missing, "窗口内无回执必须判为 missing");
+    }
+
+    #[test]
+    fn receipt_repeat_interval_is_idempotent_without_duplicate_alert() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let v = receipt_value(&mid, &lease_id, 1, 100, "d", &sign_hash);
+        let first = svc.audit_receipt(&v).expect("first");
+        assert!(first.accepted);
+
+        // 相同区间重复上报 → 幂等接受，无重复告警。
+        let second = svc.audit_receipt(&v).expect("replay accepted");
+        assert!(second.accepted);
+        assert_eq!(second.gap, GapKind::None);
+        assert!(second.warnings.is_empty(), "重放不得重复告警");
+
+        // 批次账本只落一条。
+        assert_eq!(svc.ledger().batch_count().unwrap(), 1);
+        assert!(svc.ledger().warnings_for(&mid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn receipt_extra_business_field_is_rejected() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        let mut v = receipt_value(&mid, &lease_id, 1, 100, "d", &sign_hash);
+        v["flow_rate"] = json!("42");
+        let err = svc.audit_receipt(&v).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::FieldWhitelistViolation(_)),
+            "{err:?}"
+        );
+        // 整单拒收：账本无批次。
+        assert_eq!(svc.ledger().batch_count().unwrap(), 0);
+    }
+
+    /// **回归（安全红线 1）**：对**已受理区间**伪造签名的回执必须被拒，
+    /// **不得**借「与上次同区间」的幂等路径拿到 `accepted = true`。
+    #[test]
+    fn receipt_forged_for_seen_interval_is_rejected_not_short_circuited() {
+        let svc = build_service();
+        let (lease_id, mid) = activate_one(&svc);
+        // 先让合法回执 [1,100] 入账（此后同区间命中幂等）。
+        svc.audit_receipt(&receipt_value(&mid, &lease_id, 1, 100, "d", &sign_hash))
+            .expect("legit first");
+        assert_eq!(svc.ledger().batch_count().unwrap(), 1);
+
+        // 同区间但用异钥签名 → 必须验签失败（而非幂等接受）。
+        let forged = receipt_value(&mid, &lease_id, 1, 100, "d", &sign_hash_rogue);
+        let err = svc.audit_receipt(&forged).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::VerifyFailed(_)),
+            "伪造回执必须验签失败，实际: {err:?}"
+        );
+        // 账本未被污染。
+        assert_eq!(svc.ledger().batch_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn receipt_unknown_lease_returns_lease_not_found() {
+        let svc = build_service();
+        let v = receipt_value("MID-0001", "lease-missing", 1, 10, "d", &sign_hash);
+        let err = svc.audit_receipt(&v).unwrap_err();
+        assert!(matches!(err, LicenseError::LeaseNotFound(_)), "{err:?}");
     }
 }

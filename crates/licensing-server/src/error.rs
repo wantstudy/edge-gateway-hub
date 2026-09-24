@@ -17,6 +17,20 @@ pub const ERR_LICENSE_KEYSTATE: u16 = 1040;
 pub const ERR_LICENSE_STORAGE: u16 = 1050;
 /// 授权域错误码：预绑定冲突（task 46 一机一码）。
 pub const ERR_LICENSE_PREBIND: u16 = 1060;
+/// 授权域错误码：A 档二次校验验签失败（设计 §1.3）。
+pub const ERR_LICENSE_VERIFY: u16 = 1070;
+/// 授权域错误码：时间窗偏移（±5min，设计 §1.2 / §1.3）。
+pub const ERR_LICENSE_SKEW: u16 = 1080;
+/// 授权域错误码：租约不存在（设计 §1.2 / §1.4）。
+pub const ERR_LICENSE_LEASE: u16 = 1090;
+/// 授权域错误码：租约已被后台废弃（立即失效，设计 §1.2）。
+pub const ERR_LICENSE_LEASE_STATE: u16 = 1100;
+/// 授权域错误码：nonce 重放（设计 §1.2 / §1.3）。
+pub const ERR_LICENSE_NONCE: u16 = 1110;
+/// 授权域错误码：字段白名单越界 / 回执字段非法（设计 §1.3 / §1.4）。
+pub const ERR_LICENSE_RECEIPT: u16 = 1120;
+/// 授权域错误码：**同码异机**（一机一码冲突检测，`docs/design/machine-fingerprint.md` §7 步骤 ③）。
+pub const ERR_LICENSE_BOUND_OTHER_DEVICE: u16 = 1130;
 
 /// licensing-server 主错误枚举。
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +76,64 @@ pub enum LicenseError {
         /// 冲突细分种类（结构化，供调用方与 HTTP 层按类型分支）。
         kind: PrebindKind,
     },
+
+    /// **一机一码冲突**：激活码已绑定到另一台设备，且新机器的锚点命中数低于同机阈值
+    /// （`docs/design/machine-fingerprint.md` §7 步骤 ③）。
+    ///
+    /// **与 [`LicenseError::PrebindConflict`] 语义不同，二者不可互替**：
+    /// 后者是**预绑定**不匹配——码**尚未绑定**、首次认领时请求 `machine_code` 与
+    /// `prebind_machine_code` 不符；本变体是码**已绑定**到某设备后，另一台机器上报的
+    /// `anchor_hashes` 命中 **≤3/5** 被判定为**异机**。两者一个属「发码前约束」，
+    /// 一个属「绑定时冲突」，错误码不可复用（`activation_machine_mismatch` 不能拿来表达本条）。
+    ///
+    /// 对应业务码 `CODE_BOUND_TO_OTHER_DEVICE`（HTTP **403**，`docs/design/licensing-api.md` §1.1）。
+    /// 消息**一律不含**锚点哈希原文、`machine_code` 明文或激活码原文（错误会进日志与响应体），
+    /// 只给出「申请换机」这类可操作提示。
+    #[error("LicenseError: code bound to another device: {kind}; apply for a machine replacement via the admin console")]
+    CodeBoundToOtherDevice {
+        /// 判定依据（结构化，供 HTTP 层 / 前端提示按类型分支）。
+        kind: BoundOtherDeviceKind,
+    },
+
+    /// 租约不存在（心跳 / 回执上报了未知 `lease_id`）。
+    ///
+    /// 对应业务码 `LEASE_NOT_FOUND`（HTTP 404，设计 §1.2 / §1.4）。
+    #[error("LicenseError: lease not found: {0}")]
+    LeaseNotFound(String),
+
+    /// 租约已被后台废弃（**废弃语义 = 立即失效**，同一心跳周期内即被拒）。
+    ///
+    /// 对应业务码 `LEASE_REVOKED`（HTTP 403，设计 §1.2 / §1.3 / §1.4）。
+    /// 与 [`LicenseError::HeartbeatRejected`] 同为 403 但**分属不同语义**：
+    /// 后者是心跳路径的历史泛化错误，本变体专指「租约状态机已被置为废弃」。
+    #[error("LicenseError: lease revoked: {0}")]
+    LeaseRevoked(String),
+
+    /// A 档二次校验（`/verify`）/ 回执（`/audit/receipt`）验签失败。
+    ///
+    /// 对应业务码 `VERIFY_FAIL`（HTTP 401，设计 §1.3）。
+    #[error("LicenseError: verify failed: {0}")]
+    VerifyFailed(String),
+
+    /// 时间窗超限（`|now - ts| > ±5min`）。
+    ///
+    /// 对应业务码 `TIMESTAMP_SKEW`（HTTP 401，设计 §1.2 / §1.3）。
+    /// **独立变体**：与 `VerifyFailed` 同为 401 但触发原因不同，
+    /// HTTP 层据此映射到不同业务码，调用方无需解析文案。
+    #[error("LicenseError: timestamp skew: {0}")]
+    TimestampSkew(String),
+
+    /// nonce 重放（同 `nonce` 二次提交 → `nonce_cache` 命中）。
+    ///
+    /// 对应业务码 `NONCE_REPLAY`（HTTP 409，设计 §1.2 / §1.3）。
+    #[error("LicenseError: nonce replay: {0}")]
+    NonceReplay(String),
+
+    /// 字段白名单越界 / 回执字段非法（请求体出现白名单外字段或字段不合规）。
+    ///
+    /// 对应业务码 `FIELD_WHITELIST_VIOLATION`（HTTP 422，设计 §1.3 / §1.4）。
+    #[error("LicenseError: field whitelist violation: {0}")]
+    FieldWhitelistViolation(String),
 }
 
 /// 预绑定冲突的细分种类。
@@ -98,10 +170,71 @@ impl std::fmt::Display for PrebindKind {
     }
 }
 
+/// 「同码异机」冲突的细分种类（对齐 [`PrebindKind`] 的稳定字符串风格：小写 `snake_case`）。
+///
+/// 与 [`PrebindKind`] 一样是**结构化**细分：让上层按类型分支，而**不解析错误文本**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundOtherDeviceKind {
+    /// 激活：该码已绑定到另一台设备，且新机器锚点命中数 **≤3/5**（低于同机阈值）→ 判异机。
+    AnchorMismatch,
+}
+
+impl BoundOtherDeviceKind {
+    /// 稳定字符串标识（日志 / 审计 / 前端 i18n key 用）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BoundOtherDeviceKind::AnchorMismatch => "code_bound_to_other_device",
+        }
+    }
+}
+
+impl std::fmt::Display for BoundOtherDeviceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl LicenseError {
     /// 构造预绑定冲突错误（语法糖，避免调用方写嵌套结构体字面量）。
     pub fn prebind_conflict(kind: PrebindKind) -> Self {
         LicenseError::PrebindConflict { kind }
+    }
+
+    /// 构造「同码异机」冲突错误（设计 §7 步骤 ③；HTTP 403 `CODE_BOUND_TO_OTHER_DEVICE`）。
+    pub fn code_bound_to_other_device() -> Self {
+        LicenseError::CodeBoundToOtherDevice {
+            kind: BoundOtherDeviceKind::AnchorMismatch,
+        }
+    }
+
+    /// 构造「租约不存在」错误。
+    pub fn lease_not_found(message: impl Into<String>) -> Self {
+        LicenseError::LeaseNotFound(message.into())
+    }
+
+    /// 构造「租约已废弃」错误。
+    pub fn lease_revoked(message: impl Into<String>) -> Self {
+        LicenseError::LeaseRevoked(message.into())
+    }
+
+    /// 构造「验签失败」错误。
+    pub fn verify_failed(message: impl Into<String>) -> Self {
+        LicenseError::VerifyFailed(message.into())
+    }
+
+    /// 构造「时间窗超限」错误。
+    pub fn timestamp_skew(message: impl Into<String>) -> Self {
+        LicenseError::TimestampSkew(message.into())
+    }
+
+    /// 构造「nonce 重放」错误。
+    pub fn nonce_replay(message: impl Into<String>) -> Self {
+        LicenseError::NonceReplay(message.into())
+    }
+
+    /// 构造「字段白名单越界」错误。
+    pub fn field_whitelist_violation(message: impl Into<String>) -> Self {
+        LicenseError::FieldWhitelistViolation(message.into())
     }
 
     /// 错误码（u16，非零）。
@@ -114,6 +247,13 @@ impl LicenseError {
             LicenseError::KeyStateIllegal(_) => ERR_LICENSE_KEYSTATE,
             LicenseError::Storage(_) => ERR_LICENSE_STORAGE,
             LicenseError::PrebindConflict { .. } => ERR_LICENSE_PREBIND,
+            LicenseError::CodeBoundToOtherDevice { .. } => ERR_LICENSE_BOUND_OTHER_DEVICE,
+            LicenseError::LeaseNotFound(_) => ERR_LICENSE_LEASE,
+            LicenseError::LeaseRevoked(_) => ERR_LICENSE_LEASE_STATE,
+            LicenseError::VerifyFailed(_) => ERR_LICENSE_VERIFY,
+            LicenseError::TimestampSkew(_) => ERR_LICENSE_SKEW,
+            LicenseError::NonceReplay(_) => ERR_LICENSE_NONCE,
+            LicenseError::FieldWhitelistViolation(_) => ERR_LICENSE_RECEIPT,
         }
     }
 }
@@ -159,6 +299,34 @@ mod tests {
                 LicenseError::Storage("migration failed".into()),
                 ERR_LICENSE_STORAGE,
             ),
+            (
+                LicenseError::LeaseNotFound("lease-1".into()),
+                ERR_LICENSE_LEASE,
+            ),
+            (
+                LicenseError::LeaseRevoked("lease-1".into()),
+                ERR_LICENSE_LEASE_STATE,
+            ),
+            (
+                LicenseError::VerifyFailed("bad sig".into()),
+                ERR_LICENSE_VERIFY,
+            ),
+            (
+                LicenseError::TimestampSkew("ts out of window".into()),
+                ERR_LICENSE_SKEW,
+            ),
+            (
+                LicenseError::NonceReplay("nonce-1".into()),
+                ERR_LICENSE_NONCE,
+            ),
+            (
+                LicenseError::FieldWhitelistViolation("flow_rate".into()),
+                ERR_LICENSE_RECEIPT,
+            ),
+            (
+                LicenseError::code_bound_to_other_device(),
+                ERR_LICENSE_BOUND_OTHER_DEVICE,
+            ),
         ];
         let mut seen = std::collections::HashSet::new();
         for (err, code) in cases {
@@ -176,5 +344,37 @@ mod tests {
         let err: LicenseError = rusqlite::Error::QueryReturnedNoRows.into();
         assert_eq!(err.error_code(), ERR_LICENSE_STORAGE);
         assert!(err.to_string().contains("LicenseError: storage"), "{err}");
+    }
+
+    /// 「同码异机」结构化变体：错误码正确、Display 含稳定串与可操作提示、**不含敏感值**。
+    #[test]
+    fn code_bound_to_other_device_carries_stable_kind_and_no_secret() {
+        let err = LicenseError::code_bound_to_other_device();
+        assert_eq!(err.error_code(), ERR_LICENSE_BOUND_OTHER_DEVICE);
+        assert_ne!(
+            err.error_code(),
+            ERR_LICENSE_PREBIND,
+            "不得与预绑定冲突共码"
+        );
+
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("LicenseError"), "{rendered}");
+        // 稳定细分类字符串（前端 i18n key / 风控统计）。
+        assert!(
+            rendered.contains("code_bound_to_other_device"),
+            "缺少稳定 kind 串: {rendered}"
+        );
+        // 可操作提示（引导「申请换机」）。
+        assert!(rendered.contains("machine replacement"), "{rendered}");
+        // 结构化 kind 的稳定字符串与 PrebindKind 风格一致（小写 snake_case）。
+        assert_eq!(
+            BoundOtherDeviceKind::AnchorMismatch.as_str(),
+            "code_bound_to_other_device"
+        );
+        assert_ne!(
+            BoundOtherDeviceKind::AnchorMismatch.as_str(),
+            PrebindKind::ActivationMachineMismatch.as_str(),
+            "异机冲突的 kind 不得与预绑定不匹配混用"
+        );
     }
 }

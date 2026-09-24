@@ -1152,6 +1152,102 @@ impl Store {
         Ok(())
     }
 
+    /// **§7 步骤 ② 的原子改绑**：更新设备绑定（`machine_code` + `anchor_hashes`，状态置活）、
+    /// 作废该设备全部旧租约、写入新租约、并落一条审计留痕——**全部在同一事务内**。
+    ///
+    /// # 为何必须原子
+    /// 这四步若分属不同事务，中途失败会留下**中间态**：
+    /// 「已改绑 `machine_code` 但旧租约仍有效」（旧租约与新身份并存），或
+    /// 「旧租约已作废但新租约未签发」（设备既非旧机也非新机的空洞期）。单事务把它们
+    /// 收敛为一个线性化点：要么全部生效，要么全部回滚。
+    ///
+    /// # 与 `bind_code_to_device` 的区别
+    /// 后者处理「首次绑定」（`bound_device_id IS NULL` 的条件 UPDATE，防并发双绑）；
+    /// 本方法处理「**已绑定**码在同机（漂移 / 重装）场景的改绑」，绑定关系不变，只前移
+    /// 设备的身份锚点与租约。
+    ///
+    /// # Errors
+    /// - 设备不存在 → [`LicenseError::Storage`]（事务回滚，无副作用）
+    /// - 新 `machine_code` 与其它设备冲突（`device.machine_code` 唯一约束）→
+    ///   [`LicenseError::Storage`]（事务回滚，绑定关系与租约均不变）
+    /// - SQLite 错误 → [`LicenseError::Storage`]（事务回滚）
+    pub fn rebind_device_and_issue_lease(
+        &self,
+        device_id: &str,
+        new_machine_code: &str,
+        new_anchor_hashes: &[String],
+        new_lease: &Lease,
+        audit: &AuditLog,
+    ) -> LicenseResult<()> {
+        let anchors = encode_anchor_hashes(new_anchor_hashes)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+
+        // 1) 改绑：`machine_code` 与 `anchor_hashes` 一起刷新（保持「绑定记录」自洽——
+        //    `machine_code` 是锚点组合的 HMAC，二者必须同步前移），并置状态为 `active`。
+        //    唯一约束冲突（新 machine_code 已被别的设备占用）由数据库仲裁 → 回滚。
+        let affected = tx.execute(
+            "UPDATE device
+                SET machine_code = ?2, anchor_hashes = ?3, status = 'active'
+              WHERE device_id = ?1",
+            params![device_id, new_machine_code, anchors],
+        )?;
+        if affected == 0 {
+            return Err(LicenseError::Storage(format!(
+                "cannot rebind: device not found: {device_id}"
+            )));
+        }
+
+        // 2) 作废该设备全部**未停止**租约（改绑后旧租约一律失效，弃用语义 = 立即失效）。
+        tx.execute(
+            "UPDATE lease SET status = 'stopped'
+              WHERE device_id = ?1 AND status != 'stopped'",
+            params![device_id],
+        )?;
+
+        // 3) 写入新租约（在「作废旧租约」之后插入，故不会被上一步误置为 stopped）。
+        tx.execute(
+            "INSERT INTO lease
+               (lease_id, device_id, code_id, kid, token_sig, verify_mode, tier,
+                issued_at, valid_until, last_heartbeat_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                new_lease.lease_id,
+                new_lease.device_id,
+                new_lease.code_id,
+                new_lease.kid,
+                new_lease.token_sig,
+                new_lease.verify_mode.as_str(),
+                new_lease.tier,
+                new_lease.issued_at,
+                new_lease.valid_until,
+                new_lease.last_heartbeat_at,
+                new_lease.status.as_str(),
+            ],
+        )?;
+
+        // 4) 审计留痕（同事务：避免「改绑已提交、审计缺失」的中间态；审计内容不含敏感值）。
+        tx.execute(
+            "INSERT INTO audit_log
+               (id, actor_type, actor_id, action, entity_type, entity_id, detail, ts, ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                audit.id,
+                audit.actor_type.as_str(),
+                audit.actor_id,
+                audit.action,
+                audit.entity_type,
+                audit.entity_id,
+                audit.detail,
+                audit.ts,
+                audit.ip,
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     // ================= heartbeat =================
 
     /// 插入心跳记录。
@@ -1973,6 +2069,171 @@ mod tests {
         );
         // reissued 再重发 → KeyStateIllegal（单向状态机）。
         assert!(store.mark_code_reissued("c-1").is_err());
+    }
+
+    /// §7 步骤 ② 的原子改绑：设备身份前移 + 旧租约作废 + 新租约写入 + 审计——一次成功。
+    #[test]
+    fn rebind_device_and_issue_lease_is_atomic_and_consistent() {
+        let (store, _) = fixture();
+        insert_min_keys(&store);
+        store
+            .insert_device(&sample_device("dev-1", "mc-old", DeviceStatus::Active))
+            .expect("device");
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+        let old = Lease {
+            lease_id: "l-old".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-1".into(),
+            kid: "k-test".into(),
+            token_sig: "sig-old".into(),
+            verify_mode: VerifyMode::B,
+            tier: "pro".into(),
+            issued_at: 1_700_000_000,
+            valid_until: 1_700_600_000,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        store.insert_lease(&old).expect("old lease");
+
+        let new = Lease {
+            lease_id: "l-new".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-1".into(),
+            kid: "k-test".into(),
+            token_sig: "sig-new".into(),
+            verify_mode: VerifyMode::B,
+            tier: "pro".into(),
+            issued_at: 1_700_000_100,
+            valid_until: 1_700_600_000,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        let audit = AuditLog {
+            id: "audit-1".into(),
+            actor_type: ActorType::System,
+            actor_id: "system".into(),
+            action: "activation_rebind".into(),
+            entity_type: "activation_code".into(),
+            entity_id: "c-1".into(),
+            detail: "hits=4 drifts=1".into(),
+            ts: 1_700_000_100,
+            ip: String::new(),
+        };
+        store
+            .rebind_device_and_issue_lease(
+                "dev-1",
+                "mc-new",
+                &["x".into(), "y".into()],
+                &new,
+                &audit,
+            )
+            .expect("rebind");
+
+        // 设备身份 + 锚点一起前移。
+        let dev = store.get_device("dev-1").unwrap().unwrap();
+        assert_eq!(dev.machine_code, "mc-new");
+        assert_eq!(dev.anchor_hashes, vec!["x".to_string(), "y".to_string()]);
+        // 旧租约作废、新租约 active。
+        assert_eq!(
+            store.get_lease("l-old").unwrap().unwrap().status,
+            LeaseStatus::Stopped
+        );
+        assert_eq!(
+            store.get_lease("l-new").unwrap().unwrap().status,
+            LeaseStatus::Active
+        );
+        // 审计留痕落库。
+        let logs = store
+            .list_audit_logs(
+                &AuditFilter {
+                    action: Some("activation_rebind".into()),
+                    ..Default::default()
+                },
+                1,
+                10,
+            )
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].detail, "hits=4 drifts=1");
+    }
+
+    /// 新 `machine_code` 与其它设备冲突 → 唯一约束失败 → **整事务回滚**（无任何中间态）。
+    #[test]
+    fn rebind_rolls_back_when_new_machine_code_is_taken() {
+        let (store, _) = fixture();
+        insert_min_keys(&store);
+        store
+            .insert_device(&sample_device("dev-1", "mc-old", DeviceStatus::Active))
+            .expect("d1");
+        store
+            .insert_device(&sample_device("dev-2", "mc-taken", DeviceStatus::Active))
+            .expect("d2");
+        store
+            .insert_code(&sample_code("c-1", "CODE-1"))
+            .expect("code");
+        let old = Lease {
+            lease_id: "l-old".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-1".into(),
+            kid: "k-test".into(),
+            token_sig: "sig-old".into(),
+            verify_mode: VerifyMode::B,
+            tier: "pro".into(),
+            issued_at: 1_700_000_000,
+            valid_until: 1_700_600_000,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        store.insert_lease(&old).expect("old lease");
+        let new = Lease {
+            lease_id: "l-new".into(),
+            device_id: "dev-1".into(),
+            code_id: "c-1".into(),
+            kid: "k-test".into(),
+            token_sig: "sig-new".into(),
+            verify_mode: VerifyMode::B,
+            tier: "pro".into(),
+            issued_at: 1_700_000_100,
+            valid_until: 1_700_600_000,
+            last_heartbeat_at: None,
+            status: LeaseStatus::Active,
+        };
+        let audit = AuditLog {
+            id: "audit-1".into(),
+            actor_type: ActorType::System,
+            actor_id: "system".into(),
+            action: "activation_rebind".into(),
+            entity_type: "activation_code".into(),
+            entity_id: "c-1".into(),
+            detail: "x".into(),
+            ts: 1,
+            ip: String::new(),
+        };
+
+        let err = store
+            .rebind_device_and_issue_lease("dev-1", "mc-taken", &[], &new, &audit)
+            .expect_err("conflicting machine_code must fail");
+        assert!(matches!(err, LicenseError::Storage(_)), "{err:?}");
+
+        // 全回滚：设备身份 / 旧租约 / 新租约 / 审计均无变化。
+        assert_eq!(
+            store.get_device("dev-1").unwrap().unwrap().machine_code,
+            "mc-old"
+        );
+        assert_eq!(
+            store.get_lease("l-old").unwrap().unwrap().status,
+            LeaseStatus::Active
+        );
+        assert!(store.get_lease("l-new").unwrap().is_none());
+        assert_eq!(
+            store
+                .list_audit_logs(&AuditFilter::default(), 1, 10)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]

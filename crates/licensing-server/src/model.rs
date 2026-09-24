@@ -35,6 +35,16 @@ use crate::error::{LicenseError, LicenseResult};
 /// 服务端按 N-of-M（N 由风控阈值决定）判定「同机」。
 pub const ANCHOR_COUNT: usize = 5;
 
+/// N-of-M 同机判定阈值：命中 ≥ 本值 → 同机（允许 `ANCHOR_COUNT - 本值` 项漂移）。
+///
+/// 依据 `docs/design/machine-fingerprint.md` §3：**N=4, M=5，允许 1 项漂移**。
+/// 判定**只在服务端执行**（客户端不预判、不缓存「是否同机」结论）。
+///
+/// 本常量是同机判定的**单一来源**：阈值比较一律经
+/// [`Device::is_same_machine_by_anchors`]，任何调用方（如 `service::activate` 的
+/// §7 冲突检测）都**不得**再写 `>= 4` 字面量——否则阈值会悄悄分叉。
+pub const SAME_MACHINE_MIN_HITS: usize = 4;
+
 // ---- 时间与主键工具 ----
 
 /// 当前 UTC 秒（跨端统一时间口径）。
@@ -468,6 +478,26 @@ impl Device {
         let mine = normalize(&self.anchor_hashes);
         let theirs = normalize(other);
         mine.intersection(&theirs).count()
+    }
+
+    /// §7 判定：锚点命中数是否达到**同机阈值**（≥ [`SAME_MACHINE_MIN_HITS`]＝4/5）。
+    ///
+    /// 与 [`Device::anchor_match_count`] 一样是**纯函数**；把「阈值比较」收敛到此处，
+    /// 使阈值只有一个来源（`service` 层只调用本方法，不再写 `>= 4` 字面量）。
+    ///
+    /// 语义（对齐 `docs/design/machine-fingerprint.md` §3）：
+    /// - 命中 ≥4/5 → 同机（容忍 1 项漂移：换网卡 / 加硬盘 / 虚拟化迁移 / OS 重装）；
+    /// - 命中 ≤3/5 → 异机（2 项及以上同时变化在合法运维中罕见，判异机）。
+    pub fn is_same_machine_by_anchors(&self, other: &[String]) -> bool {
+        self.anchor_match_count(other) >= SAME_MACHINE_MIN_HITS
+    }
+
+    /// 相对本机绑定记录，给定锚点集的**漂移项数**（`ANCHOR_COUNT - 命中数`）。
+    ///
+    /// 仅供审计留痕（「命中几项 / 漂移几项」）使用；**不参与判定**（判定见
+    /// [`Device::is_same_machine_by_anchors`]）。饱和减避免下溢。
+    pub fn anchor_drift_count(&self, other: &[String]) -> usize {
+        ANCHOR_COUNT.saturating_sub(self.anchor_match_count(other))
     }
 }
 
@@ -1102,5 +1132,89 @@ mod tests {
     #[test]
     fn anchor_count_is_five() {
         assert_eq!(ANCHOR_COUNT, 5);
+    }
+
+    #[test]
+    fn same_machine_threshold_is_four_of_five_with_one_drift_tolerance() {
+        // §3 红线：N=4, M=5 —— 恰好允许 1 项漂移（既不要求全等，也不容忍 2 项）。
+        assert_eq!(SAME_MACHINE_MIN_HITS, 4);
+        const {
+            assert!(
+                SAME_MACHINE_MIN_HITS < ANCHOR_COUNT,
+                "阈值必须低于锚点总数，否则「允许漂移」名存实亡"
+            );
+        }
+        assert_eq!(
+            ANCHOR_COUNT - SAME_MACHINE_MIN_HITS,
+            1,
+            "必须恰好允许 1 项漂移（而非 0 或 2）"
+        );
+    }
+
+    #[test]
+    fn is_same_machine_by_anchors_covers_full_boundary_matrix() {
+        let device = Device::new(
+            "dev-1".into(),
+            "t-1".into(),
+            "mc-1".into(),
+            vec![
+                "a1".into(),
+                "b2".into(),
+                "c3".into(),
+                "d4".into(),
+                "e5".into(),
+            ],
+            1_000,
+        );
+        let v = |items: &[&str]| {
+            items
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<String>>()
+        };
+
+        // 5/5、4/5（1 项漂移）→ 同机。
+        assert!(device.is_same_machine_by_anchors(&device.anchor_hashes.clone()));
+        assert!(device.is_same_machine_by_anchors(&v(&["a1", "b2", "c3", "d4", "zz"])));
+        // 3/5、0/5、空集 → 异机。
+        assert!(!device.is_same_machine_by_anchors(&v(&["a1", "b2", "c3", "yy", "zz"])));
+        assert!(!device.is_same_machine_by_anchors(&v(&["p", "q", "r", "s", "t"])));
+        assert!(!device.is_same_machine_by_anchors(&[]));
+        // 大小写不敏感（沿用 `anchor_match_count` 语义）→ 5/5 仍同机。
+        assert!(device.is_same_machine_by_anchors(&v(&["A1", "B2", "C3", "D4", "E5"])));
+    }
+
+    #[test]
+    fn anchor_drift_count_reflects_misses() {
+        let device = Device::new(
+            "dev-1".into(),
+            "t-1".into(),
+            "mc-1".into(),
+            vec![
+                "a1".into(),
+                "b2".into(),
+                "c3".into(),
+                "d4".into(),
+                "e5".into(),
+            ],
+            1_000,
+        );
+        let v = |items: &[&str]| {
+            items
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(device.anchor_drift_count(&device.anchor_hashes.clone()), 0);
+        assert_eq!(
+            device.anchor_drift_count(&v(&["a1", "b2", "c3", "d4", "zz"])),
+            1
+        );
+        assert_eq!(
+            device.anchor_drift_count(&v(&["a1", "b2", "c3", "yy", "zz"])),
+            2
+        );
+        assert_eq!(device.anchor_drift_count(&v(&["p", "q", "r", "s", "t"])), 5);
+        assert_eq!(device.anchor_drift_count(&[]), 5);
     }
 }
