@@ -2026,7 +2026,8 @@ mod tests {
     fn open_fails_when_migration_fails_on_corrupt_db() {
         let dir = tempdir();
         let db_path = dir.path().join(TELEMETRY_DB_FILE_NAME);
-        std::fs::write(&db_path, b"this is definitely not a sqlite database").expect("seed garbage");
+        std::fs::write(&db_path, b"this is definitely not a sqlite database")
+            .expect("seed garbage");
 
         let clock = ManualClock::new(T0_NS);
         let err = TelemetryStore::open(cfg(dir.path(), "gw-corrupt", MACHINE_A), Arc::new(clock))

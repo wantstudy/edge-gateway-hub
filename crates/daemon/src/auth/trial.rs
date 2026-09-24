@@ -46,7 +46,9 @@ const FINGERPRINT_HEX_LEN: usize = 64;
 #[derive(Debug, thiserror::Error)]
 pub enum TrialKeyError {
     /// 指纹不是 task 3 输出格式（64 字符 hex）。
-    #[error("trial key source fingerprint must be {len}-char hex (machine_id output), got len {got}")]
+    #[error(
+        "trial key source fingerprint must be {len}-char hex (machine_id output), got len {got}"
+    )]
     BadFingerprint {
         /// 要求长度（64）。
         len: usize,
@@ -90,8 +92,8 @@ impl HmacKey {
 
     /// 计算规范化消息的 HMAC-SHA256，返回 64 字符 hex。
     fn sign_hex(&self, message: &[u8]) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.bytes)
-            .expect("HMAC accepts any 32-byte key");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.bytes).expect("HMAC accepts any 32-byte key");
         mac.update(message);
         hex::encode(mac.finalize().into_bytes())
     }
@@ -280,10 +282,12 @@ mod tests {
 
     /// test-only：测试专用机器码指纹 A（64 hex，模拟 task 3 输出），
     /// **仅测试使用，禁止用于真实部署**。
-    const TEST_ONLY_FINGERPRINT_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_ONLY_FINGERPRINT_A: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// test-only：另一台机器的指纹 B（换机场景），禁止用于真实部署。
-    const TEST_ONLY_FINGERPRINT_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const TEST_ONLY_FINGERPRINT_B: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     /// 测试密钥（指纹 A 派生）。
     fn key_a() -> HmacKey {
@@ -423,7 +427,8 @@ mod tests {
         // 篡改 last_seen_ms。
         let mut tampered = marker.clone();
         tampered.last_seen_ms = 0;
-        let tamper_last = serde_json::to_string(&tampered).expect("in-memory serialize cannot fail");
+        let tamper_last =
+            serde_json::to_string(&tampered).expect("in-memory serialize cannot fail");
         assert_eq!(
             evaluate(Some(&tamper_last), &key_a(), &clock),
             TrialVerdict::ExpiredDegrade,
@@ -592,7 +597,10 @@ mod tests {
         assert_eq!(last_seen, t0 + 10 * HOUR_MS, "*last_seen 须同步回传新锚点");
 
         let renewed: TrialMarker = serde_json::from_str(&renewed_json).expect("renewed parses");
-        assert_eq!(renewed.started_at_ms, t0, "renew 不得改动 started（不延长试用期）");
+        assert_eq!(
+            renewed.started_at_ms, t0,
+            "renew 不得改动 started（不延长试用期）"
+        );
         assert_eq!(renewed.last_seen_ms, t0 + 10 * HOUR_MS);
         assert_ne!(renewed.sig, marker.sig, "重签后签名必须变化");
         assert_ne!(renewed_json, marker_json, "重签产物必须是新 JSON");

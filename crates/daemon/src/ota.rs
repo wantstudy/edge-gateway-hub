@@ -118,7 +118,11 @@ fn ota_signing_message(version: u64, payload_sha256_hex: &str) -> Vec<u8> {
     msg.extend_from_slice(OTA_SIGNING_DOMAIN_V1.as_bytes());
     let version_field = format!("ver={}:{}|", version.to_string().len(), version);
     msg.extend_from_slice(version_field.as_bytes());
-    let sha_field = format!("sha256={}:{}|", payload_sha256_hex.len(), payload_sha256_hex);
+    let sha_field = format!(
+        "sha256={}:{}|",
+        payload_sha256_hex.len(),
+        payload_sha256_hex
+    );
     msg.extend_from_slice(sha_field.as_bytes());
     msg
 }
@@ -411,13 +415,13 @@ pub fn parse_manifest(raw: &[u8]) -> DaemonResult<OtaManifest> {
         })
     };
 
-    let version: u64 = require_str("version")?
-        .parse()
-        .map_err(|_| DaemonError::ProtocolError("ota manifest version is not a valid u64".to_string()))?;
+    let version: u64 = require_str("version")?.parse().map_err(|_| {
+        DaemonError::ProtocolError("ota manifest version is not a valid u64".to_string())
+    })?;
     let ts_ns = require_str("ts_ns")?.to_string();
-    let size: usize = require_str("size")?
-        .parse()
-        .map_err(|_| DaemonError::ProtocolError("ota manifest size is not a valid usize".to_string()))?;
+    let size: usize = require_str("size")?.parse().map_err(|_| {
+        DaemonError::ProtocolError("ota manifest size is not a valid usize".to_string())
+    })?;
     let payload_sha256 = require_str("payload_sha256")?.to_ascii_lowercase();
     let sig_b64 = require_str("sig_b64")?.to_string();
 
@@ -512,9 +516,7 @@ fn parse_ota_http_url(url: &str) -> DaemonResult<(String, u16, String)> {
             if h.is_empty() {
                 return Err(wrap("missing host".to_string()));
             }
-            let port: u16 = p
-                .parse()
-                .map_err(|_| wrap(format!("invalid port {p:?}")))?;
+            let port: u16 = p.parse().map_err(|_| wrap(format!("invalid port {p:?}")))?;
             (h.to_string(), port)
         }
         None => (authority.to_string(), 80),
@@ -527,11 +529,15 @@ fn parse_ota_http_url(url: &str) -> DaemonResult<(String, u16, String)> {
 ///
 /// 非 2xx 状态码 → `ProtocolError`。
 fn parse_ota_http_response(raw: &[u8]) -> DaemonResult<Vec<u8>> {
-    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| {
-        DaemonError::ProtocolError("ota http response missing header terminator".to_string())
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| {
+            DaemonError::ProtocolError("ota http response missing header terminator".to_string())
+        })?;
+    let head = std::str::from_utf8(&raw[..header_end]).map_err(|_| {
+        DaemonError::ProtocolError("ota http response head is not utf-8".to_string())
     })?;
-    let head = std::str::from_utf8(&raw[..header_end])
-        .map_err(|_| DaemonError::ProtocolError("ota http response head is not utf-8".to_string()))?;
     let body = &raw[header_end + 4..];
 
     let mut lines = head.split("\r\n");
@@ -546,7 +552,9 @@ fn parse_ota_http_response(raw: &[u8]) -> DaemonResult<Vec<u8>> {
             DaemonError::ProtocolError(format!("ota http malformed status line {status_line:?}"))
         })?;
     if !(200..300).contains(&status) {
-        return Err(DaemonError::ProtocolError(format!("ota http status {status}")));
+        return Err(DaemonError::ProtocolError(format!(
+            "ota http status {status}"
+        )));
     }
 
     let mut content_length: Option<usize> = None;
@@ -767,7 +775,9 @@ impl OtaManager {
         }
 
         self.state = OtaState::Downloading;
-        self.audit(OtaAudit::DownloadStarted { url: url.to_string() });
+        self.audit(OtaAudit::DownloadStarted {
+            url: url.to_string(),
+        });
 
         let raw = match fetch_http(url, self.timeout).await {
             Ok(raw) => raw,
@@ -837,9 +847,13 @@ impl OtaManager {
         }
         // 状态不变式保证 staged 存在；此处防御式收敛为错误而非 panic。
         let manifest = self.staged.clone().ok_or_else(|| {
-            DaemonError::ProtocolError("ota staged manifest missing in ReadyToApply state".to_string())
+            DaemonError::ProtocolError(
+                "ota staged manifest missing in ReadyToApply state".to_string(),
+            )
         })?;
-        self.store.save_bytes(SLOT_PENDING, &manifest.payload).await?;
+        self.store
+            .save_bytes(SLOT_PENDING, &manifest.payload)
+            .await?;
         self.store
             .persist_meta(&OtaMeta {
                 current_version: self.current_version.to_string(),
@@ -900,7 +914,10 @@ impl OtaManager {
     ///
     /// # Errors
     /// meta 解析失败 / pending 槽缺字节 / 存储故障。
-    pub async fn boot_commit_or_rollback(&mut self, committed: bool) -> DaemonResult<OtaBootDecision> {
+    pub async fn boot_commit_or_rollback(
+        &mut self,
+        committed: bool,
+    ) -> DaemonResult<OtaBootDecision> {
         let Some(meta) = self.store.load_meta().await? else {
             return Ok(OtaBootDecision::NoPending);
         };
@@ -914,15 +931,11 @@ impl OtaManager {
         })?;
 
         if committed {
-            let bytes = self
-                .store
-                .load_bytes(SLOT_PENDING)
-                .await?
-                .ok_or_else(|| {
-                    DaemonError::StorageError(format!(
-                        "ota commit: pending slot {SLOT_PENDING:?} missing for version {pending_str}"
-                    ))
-                })?;
+            let bytes = self.store.load_bytes(SLOT_PENDING).await?.ok_or_else(|| {
+                DaemonError::StorageError(format!(
+                    "ota commit: pending slot {SLOT_PENDING:?} missing for version {pending_str}"
+                ))
+            })?;
             self.store.save_bytes(SLOT_CURRENT, &bytes).await?;
             self.store.delete(SLOT_PENDING).await?;
             self.store
@@ -937,7 +950,9 @@ impl OtaManager {
                 version: pending_str,
             });
             self.state = OtaState::Applied;
-            Ok(OtaBootDecision::Committed { version: pending_version })
+            Ok(OtaBootDecision::Committed {
+                version: pending_version,
+            })
         } else {
             self.store.delete(SLOT_PENDING).await?;
             self.store
@@ -1129,9 +1144,7 @@ mod tests {
     }
 
     /// 构造管理器 + 内存 store 句柄（供槽位断言）。
-    fn manager_with_store(
-        current_version: u64,
-    ) -> (OtaManager, Arc<InMemoryOtaStore>) {
+    fn manager_with_store(current_version: u64) -> (OtaManager, Arc<InMemoryOtaStore>) {
         let store = Arc::new(InMemoryOtaStore::default());
         let manager = OtaManager::new(
             Arc::clone(&store) as Arc<dyn OtaStore>,
@@ -1200,8 +1213,8 @@ mod tests {
         // size 不匹配（声明长度 ≠ 实际长度）。
         let sha = sha256_hex(&payload);
         let sig = key_a().sign(&ota_signing_message(3, &sha));
-        let mut bad_size: Value = serde_json::from_slice(&build_manifest_json(&key_a(), 3, &payload))
-            .expect("json");
+        let mut bad_size: Value =
+            serde_json::from_slice(&build_manifest_json(&key_a(), 3, &payload)).expect("json");
         bad_size["size"] = serde_json::json!("999");
         let _ = sig; // 签名对 size 无约束（签名对象是 version+sha），size 校验独立生效。
         let err = parse_manifest(&serde_json::to_vec(&bad_size).expect("json"))
@@ -1420,7 +1433,8 @@ mod tests {
             .await
             .expect_err("downgrade must be rejected");
         assert!(
-            err.to_string().contains("new version 1 must be greater than current 5"),
+            err.to_string()
+                .contains("new version 1 must be greater than current 5"),
             "{err}"
         );
         assert_eq!(ota.state(), OtaState::Failed);
@@ -1449,10 +1463,17 @@ mod tests {
             Some(payload),
             "pending 槽持有新包字节"
         );
-        assert_eq!(store.load_bytes(SLOT_CURRENT).await.expect("load current"), None);
+        assert_eq!(
+            store.load_bytes(SLOT_CURRENT).await.expect("load current"),
+            None
+        );
 
         // meta：current=1，pending=2（字符串）。
-        let meta = store.load_meta().await.expect("meta").expect("meta present");
+        let meta = store
+            .load_meta()
+            .await
+            .expect("meta")
+            .expect("meta present");
         assert_eq!(meta.current_version, "1");
         assert_eq!(meta.pending_version, Some("2".to_string()));
 
@@ -1513,7 +1534,10 @@ mod tests {
         ota.apply().await.expect("apply");
 
         // 模拟新版本启动后健康确认。
-        let decision = ota.boot_commit_or_rollback(true).await.expect("boot decide");
+        let decision = ota
+            .boot_commit_or_rollback(true)
+            .await
+            .expect("boot decide");
         assert_eq!(decision, OtaBootDecision::Committed { version: 2 });
         assert_eq!(ota.current_version(), 2, "commit 后版本推进");
         assert_eq!(ota.state(), OtaState::Applied);
@@ -1524,7 +1548,10 @@ mod tests {
             Some(new_payload),
             "commit 后 current 槽持有新版本字节"
         );
-        assert_eq!(store.load_bytes(SLOT_PENDING).await.expect("load pending"), None);
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("load pending"),
+            None
+        );
         let meta = store.load_meta().await.expect("meta").expect("meta");
         assert_eq!(meta.current_version, "2");
         assert_eq!(meta.pending_version, None);
@@ -1558,13 +1585,19 @@ mod tests {
         ota.apply().await.expect("apply");
 
         // 模拟新版本启动后反复崩溃 / 宽限期超时 → 未 commit。
-        let decision = ota.boot_commit_or_rollback(false).await.expect("boot decide");
+        let decision = ota
+            .boot_commit_or_rollback(false)
+            .await
+            .expect("boot decide");
         assert_eq!(decision, OtaBootDecision::RolledBackTo { version: 1 });
         assert_eq!(ota.current_version(), 1, "版本不推进");
         assert_eq!(ota.state(), OtaState::RolledBack);
 
         // pending 清除；current 槽旧字节原样恢复。
-        assert_eq!(store.load_bytes(SLOT_PENDING).await.expect("load pending"), None);
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("load pending"),
+            None
+        );
         assert_eq!(
             store.load_bytes(SLOT_CURRENT).await.expect("load current"),
             Some(old_payload),
@@ -1633,7 +1666,10 @@ mod tests {
         assert_eq!(ota.state(), OtaState::RolledBack);
         assert_eq!(ota.current_version(), 1, "手动回滚不推进版本");
 
-        assert_eq!(store.load_bytes(SLOT_PENDING).await.expect("load pending"), None);
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("load pending"),
+            None
+        );
         assert_eq!(
             store.load_bytes(SLOT_CURRENT).await.expect("load current"),
             Some(old_payload),
@@ -1657,7 +1693,10 @@ mod tests {
     #[tokio::test]
     async fn manual_rollback_requires_applied_state() {
         let mut ota = manager(1);
-        let err = ota.rollback().await.expect_err("rollback from Idle must fail");
+        let err = ota
+            .rollback()
+            .await
+            .expect_err("rollback from Idle must fail");
         assert!(matches!(err, DaemonError::ProtocolError(_)), "{err:?}");
         assert!(matches!(
             ota.audit_log().last().map(|e| &e.record),
@@ -1790,9 +1829,18 @@ mod tests {
         };
         let raw = meta.to_json().expect("serialize");
         let value: Value = serde_json::from_str(&raw).expect("json");
-        assert!(value["current_version"].is_string(), "current_version 必须是字符串");
-        assert!(value["pending_version"].is_string(), "pending_version 必须是字符串");
-        assert!(value["updated_ts_ns"].is_string(), "updated_ts_ns 必须是字符串");
+        assert!(
+            value["current_version"].is_string(),
+            "current_version 必须是字符串"
+        );
+        assert!(
+            value["pending_version"].is_string(),
+            "pending_version 必须是字符串"
+        );
+        assert!(
+            value["updated_ts_ns"].is_string(),
+            "updated_ts_ns 必须是字符串"
+        );
         assert_eq!(OtaMeta::from_json(&raw).expect("round trip"), meta);
 
         // 数值型字段拒绝（双向守护）。
@@ -1804,7 +1852,10 @@ mod tests {
         let none_meta = OtaMeta::new(9);
         let none_raw = none_meta.to_json().expect("serialize");
         assert!(none_raw.contains("\"pending_version\":null"));
-        assert_eq!(OtaMeta::from_json(&none_raw).expect("round trip"), none_meta);
+        assert_eq!(
+            OtaMeta::from_json(&none_raw).expect("round trip"),
+            none_meta
+        );
     }
 
     /// QA: 签名消息构造为域分隔 + 长度定界，version 或 sha 任一变化消息即变。
@@ -1815,7 +1866,10 @@ mod tests {
         let rendered = String::from_utf8(msg).expect("message is ascii");
         assert!(rendered.starts_with(OTA_SIGNING_DOMAIN_V1), "{rendered}");
         assert!(rendered.contains("ver=1:3|"), "{rendered}");
-        assert!(rendered.contains(&format!("sha256=64:{sha}|")), "{rendered}");
+        assert!(
+            rendered.contains(&format!("sha256=64:{sha}|")),
+            "{rendered}"
+        );
 
         // 长度定界防拼接歧义 + 内容敏感。
         assert_ne!(

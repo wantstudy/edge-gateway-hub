@@ -204,7 +204,11 @@ fn apply_one(conn: &Connection, migration: &Migration) -> DaemonResult<()> {
     tx.execute(
         "INSERT OR REPLACE INTO schema_migrations(version, description, applied_at) \
          VALUES(?1, ?2, ?3)",
-        params![i64::from(migration.version), migration.description, unix_secs_i64()],
+        params![
+            i64::from(migration.version),
+            migration.description,
+            unix_secs_i64()
+        ],
     )
     .map_err(map_sqlite)?;
     tx.pragma_update(None, "user_version", i64::from(migration.version))
@@ -288,7 +292,9 @@ pub fn integrity_check(conn: &Connection) -> DaemonResult<IntegrityReport> {
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(map_sqlite)?;
     if !status.eq_ignore_ascii_case("ok") {
-        return Err(storage_err(format!("sqlite integrity_check failed: {status}")));
+        return Err(storage_err(format!(
+            "sqlite integrity_check failed: {status}"
+        )));
     }
 
     // 2) 版本不超前于二进制（forward-only）。
@@ -590,10 +596,9 @@ impl<T: fmt::Debug> fmt::Debug for LoadOutcome<T> {
                 .field("config", config)
                 .field("warnings", warnings)
                 .finish(),
-            Self::SafeMode { reason } => f
-                .debug_struct("SafeMode")
-                .field("reason", reason)
-                .finish(),
+            Self::SafeMode { reason } => {
+                f.debug_struct("SafeMode").field("reason", reason).finish()
+            }
         }
     }
 }
@@ -624,7 +629,9 @@ pub fn backup_before_rewrite(path: &Path) -> DaemonResult<PathBuf> {
     let data = std::fs::read(path)
         .map_err(|e| storage_err(format!("backup: read {}: {e}", path.display())))?;
 
-    let dir = path.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let dir = path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -825,7 +832,11 @@ mod tests {
 
         assert!(run_migrations_with(&conn, &registry).is_err());
         // v1 已成功提交，只有 v2 被回滚 → 版本停在 1。
-        assert_eq!(current_version(&conn).expect("version"), 1, "仅失败的那条不得前进");
+        assert_eq!(
+            current_version(&conn).expect("version"),
+            1,
+            "仅失败的那条不得前进"
+        );
         let t2b: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='t2b'",
@@ -870,7 +881,9 @@ mod tests {
             .expect("custom row");
         assert_eq!(v, "ok");
         // 闭包迁移同样幂等：重跑 no-op、数据不重复。
-        assert!(run_migrations_with(&conn, &registry).expect("rerun").is_noop());
+        assert!(run_migrations_with(&conn, &registry)
+            .expect("rerun")
+            .is_noop());
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM custom_t", [], |r| r.get(0))
             .expect("count");
@@ -896,7 +909,11 @@ mod tests {
         ];
         let err = run_migrations_with(&conn, &bad).expect_err("must reject");
         assert_eq!(err.error_code(), ERR_CONFIG);
-        assert_eq!(current_version(&conn).expect("version"), 0, "不得执行任何迁移");
+        assert_eq!(
+            current_version(&conn).expect("version"),
+            0,
+            "不得执行任何迁移"
+        );
 
         let zero = vec![Migration {
             version: 0,
@@ -921,7 +938,11 @@ mod tests {
             err.to_string().contains("forward-only"),
             "错误须说明 forward-only: {err}"
         );
-        assert_eq!(current_version(&conn).expect("version"), 99, "版本不得被改动");
+        assert_eq!(
+            current_version(&conn).expect("version"),
+            99,
+            "版本不得被改动"
+        );
     }
 
     /// integrity_check 通过路：内置迁移后全项一致（账本恰为 1..=user_version）。
@@ -1017,8 +1038,7 @@ mod tests {
         );
         let content = std::fs::read(&backup).expect("read backup");
         assert_eq!(
-            content,
-            b"version = 1\n[gw]\nid = \"a\"\n",
+            content, b"version = 1\n[gw]\nid = \"a\"\n",
             "备份内容必须与原文逐字节一致"
         );
         // 原文件未被改动。
@@ -1058,7 +1078,9 @@ mod tests {
     #[test]
     fn config_upgrade_chain_applies_in_order_and_rejects_unknown_version() {
         let step1 = FnUpgradeStep::new(1, 2, |raw| {
-            Ok(format!("{raw}\n# upgraded to v2\n[added_v2]\nflag = true\n"))
+            Ok(format!(
+                "{raw}\n# upgraded to v2\n[added_v2]\nflag = true\n"
+            ))
         })
         .expect("step1");
         let step2 = FnUpgradeStep::new(2, 3, |raw| {
@@ -1092,7 +1114,8 @@ mod tests {
         let err = unknown.upgrade_with(&chain).expect_err("unknown from");
         assert_eq!(err.error_code(), ERR_CONFIG);
         assert!(
-            err.to_string().contains("no config upgrade path from version 5"),
+            err.to_string()
+                .contains("no config upgrade path from version 5"),
             "err: {err}"
         );
 

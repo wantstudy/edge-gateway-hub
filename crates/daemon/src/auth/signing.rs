@@ -841,9 +841,8 @@ mod tests {
             .expect("handle");
         let adapter = Arc::new(KeyHandleKeyProviderAdapter::new(handle));
 
-        let signer =
-            AuthSigner::new(adapter.clone(), Arc::new(AlwaysLicensed), test_mid())
-                .expect("test mid is 64-hex");
+        let signer = AuthSigner::new(adapter.clone(), Arc::new(AlwaysLicensed), test_mid())
+            .expect("test mid is 64-hex");
         let batch = sample_batch();
 
         let block = signer
@@ -925,7 +924,11 @@ mod tests {
 
         // 密钥域分离：句柄 B 的公钥验 A 的签名必须失败。
         assert!(
-            signer_b.public_key().expect("pk b").verify(&msg, &sig_a).is_err(),
+            signer_b
+                .public_key()
+                .expect("pk b")
+                .verify(&msg, &sig_a)
+                .is_err(),
             "foreign-key signature must fail (no cross-key signing)"
         );
     }
@@ -955,7 +958,10 @@ mod tests {
         .expect("test mid is 64-hex");
 
         let adapter_rendered = format!("{adapter:?}");
-        assert!(adapter_rendered.contains("<redacted>"), "{adapter_rendered}");
+        assert!(
+            adapter_rendered.contains("<redacted>"),
+            "{adapter_rendered}"
+        );
         assert!(
             !adapter_rendered.contains("a1a1"),
             "no key material in Debug output: {adapter_rendered}"

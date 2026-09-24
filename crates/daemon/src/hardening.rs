@@ -73,8 +73,7 @@ pub const fn xor_mask_bytes<const N: usize>(data: &[u8; N], key: u8) -> [u8; N] 
 #[macro_export]
 macro_rules! obf_const {
     ($key:expr, $data:expr) => {{
-        const OBF_CIPHER: [u8; $data.len()] =
-            $crate::hardening::xor_mask_bytes(&$data, $key as u8);
+        const OBF_CIPHER: [u8; $data.len()] = $crate::hardening::xor_mask_bytes(&$data, $key as u8);
         OBF_CIPHER
     }};
 }
@@ -355,7 +354,9 @@ impl InMemoryRedundantStore {
         if n == 0 {
             return Err(HardeningError::NoSlots);
         }
-        Ok(Self { slots: vec![None; n] })
+        Ok(Self {
+            slots: vec![None; n],
+        })
     }
 }
 
@@ -409,13 +410,19 @@ impl RedundantStore for InMemoryRedundantStore {
     }
 
     fn erase_slot(&mut self, slot: usize) -> Result<(), HardeningError> {
-        let s = self.slots.get_mut(slot).ok_or(HardeningError::InvalidSlot(slot))?;
+        let s = self
+            .slots
+            .get_mut(slot)
+            .ok_or(HardeningError::InvalidSlot(slot))?;
         *s = None;
         Ok(())
     }
 
     fn corrupt_slot(&mut self, slot: usize, bytes: &[u8]) -> Result<(), HardeningError> {
-        let s = self.slots.get_mut(slot).ok_or(HardeningError::InvalidSlot(slot))?;
+        let s = self
+            .slots
+            .get_mut(slot)
+            .ok_or(HardeningError::InvalidSlot(slot))?;
         *s = Some(bytes.to_vec());
         Ok(())
     }
@@ -463,7 +470,10 @@ mod tests {
         let plaintext = b"https://licensing.example.com/v1/activate";
         let key = 0xA7u8;
         let cipher = obfuscate(plaintext, key);
-        assert_eq!(deobfuscate(&cipher, key).unwrap(), "https://licensing.example.com/v1/activate");
+        assert_eq!(
+            deobfuscate(&cipher, key).unwrap(),
+            "https://licensing.example.com/v1/activate"
+        );
     }
 
     /// T02 混淆后字节 ≠ 原文（key 非 0 时）。
@@ -493,7 +503,10 @@ mod tests {
     #[test]
     fn deobfuscate_rejects_invalid_utf8() {
         let cipher = obfuscate(&[0xFF, 0xFE, 0x80], 0x00); // key=0 → 原样，非法 UTF-8
-        assert!(matches!(deobfuscate(&cipher, 0x00), Err(HardeningError::InvalidUtf8)));
+        assert!(matches!(
+            deobfuscate(&cipher, 0x00),
+            Err(HardeningError::InvalidUtf8)
+        ));
     }
 
     /// T05 宽松版 `obf`：正常解码 + 非法输入返回空串、绝不 panic。
@@ -513,7 +526,10 @@ mod tests {
         let path = dir.path().join("asset.bin");
         std::fs::write(&path, b"firmware payload v1").unwrap();
         let expected: [u8; 32] = sha2::Sha256::digest(b"firmware payload v1").into();
-        assert_eq!(verify_file_integrity(&path, &expected), IntegrityVerdict::Ok);
+        assert_eq!(
+            verify_file_integrity(&path, &expected),
+            IntegrityVerdict::Ok
+        );
     }
 
     /// T07 文件完整性：篡改检出 → Tampered。
@@ -548,7 +564,9 @@ mod tests {
     #[test]
     fn restricted_mode_from_integrity_verdicts() {
         assert_eq!(RestrictedMode::from_integrity(&IntegrityVerdict::Ok), None);
-        let tampered = IntegrityVerdict::Tampered { actual_hex: "ab".into() };
+        let tampered = IntegrityVerdict::Tampered {
+            actual_hex: "ab".into(),
+        };
         assert_eq!(
             RestrictedMode::from_integrity(&tampered).map(|m| m.reason()),
             Some(RestrictedReason::IntegrityTampered)
@@ -695,9 +713,18 @@ mod tests {
     #[test]
     fn release_profile_hardening_is_registered() {
         let root_toml = include_str!("../../../Cargo.toml");
-        assert!(root_toml.contains("strip = true"), "workspace root missing strip");
-        assert!(root_toml.contains("panic = \"abort\""), "workspace root missing panic=abort");
-        assert!(root_toml.contains("codegen-units = 1"), "workspace root missing codegen-units");
+        assert!(
+            root_toml.contains("strip = true"),
+            "workspace root missing strip"
+        );
+        assert!(
+            root_toml.contains("panic = \"abort\""),
+            "workspace root missing panic=abort"
+        );
+        assert!(
+            root_toml.contains("codegen-units = 1"),
+            "workspace root missing codegen-units"
+        );
         assert!(root_toml.contains("lto ="), "workspace root missing lto");
 
         let daemon_toml = include_str!("../Cargo.toml");

@@ -85,7 +85,10 @@ impl std::fmt::Display for PathError {
             PathError::EmptySegment { index } => write!(f, "empty segment at #{index}"),
             PathError::MissingKey { key } => write!(f, "missing key {key:?}"),
             PathError::InvalidIndex { segment } => {
-                write!(f, "array index must be a non-negative integer, got {segment:?}")
+                write!(
+                    f,
+                    "array index must be a non-negative integer, got {segment:?}"
+                )
             }
             PathError::IndexOutOfRange { index, len } => {
                 write!(f, "array index {index} out of range (len={len})")
@@ -128,24 +131,18 @@ pub fn extract_path<'a>(root: &'a Value, path: &str) -> Result<&'a Value, PathEr
         }
         match current {
             Value::Object(map) => {
-                current = map
-                    .get(segment)
-                    .ok_or_else(|| PathError::MissingKey {
-                        key: segment.to_string(),
-                    })?;
+                current = map.get(segment).ok_or_else(|| PathError::MissingKey {
+                    key: segment.to_string(),
+                })?;
             }
             Value::Array(arr) => {
-                let index: usize = segment
-                    .parse()
-                    .map_err(|_| PathError::InvalidIndex {
-                        segment: segment.to_string(),
-                    })?;
-                current =
-                    arr.get(index)
-                        .ok_or_else(|| PathError::IndexOutOfRange {
-                            index,
-                            len: arr.len(),
-                        })?;
+                let index: usize = segment.parse().map_err(|_| PathError::InvalidIndex {
+                    segment: segment.to_string(),
+                })?;
+                current = arr.get(index).ok_or_else(|| PathError::IndexOutOfRange {
+                    index,
+                    len: arr.len(),
+                })?;
             }
             other => {
                 return Err(PathError::NotNavigable {
@@ -384,7 +381,10 @@ impl MqttInDriver {
                 .subscribe(mapping.topic.as_str(), QoS::AtLeastOnce)
                 .await
                 .map_err(|e| {
-                    DaemonError::ProtocolError(format!("mqtt-in subscribe {:?}: {e}", mapping.topic))
+                    DaemonError::ProtocolError(format!(
+                        "mqtt-in subscribe {:?}: {e}",
+                        mapping.topic
+                    ))
                 })?;
         }
         self.session = Some((client, eventloop));
@@ -431,11 +431,8 @@ where
                 match serde_json::from_slice::<Value>(publish.payload.as_ref()) {
                     Ok(root) => {
                         for mapping in matched {
-                            let sample = json_point_sample(
-                                &mapping.point_id,
-                                &mapping.json_path,
-                                &root,
-                            );
+                            let sample =
+                                json_point_sample(&mapping.point_id, &mapping.json_path, &root);
                             on_sample(sample);
                         }
                     }
@@ -513,18 +510,36 @@ mod tests {
     fn topic_matches_exact() {
         assert!(topic_matches("sensor/temp", "sensor/temp"));
         assert!(!topic_matches("sensor/temp", "sensor/hum"));
-        assert!(!topic_matches("Sensor/temp", "sensor/temp"), "case-sensitive");
-        assert!(!topic_matches("sensor/temp", "sensor/temp/x"), "no extra levels");
-        assert!(!topic_matches("sensor/temp/x", "sensor/temp"), "no missing levels");
-        assert!(!topic_matches("sensor", "sensortemp"), "whole level match only");
+        assert!(
+            !topic_matches("Sensor/temp", "sensor/temp"),
+            "case-sensitive"
+        );
+        assert!(
+            !topic_matches("sensor/temp", "sensor/temp/x"),
+            "no extra levels"
+        );
+        assert!(
+            !topic_matches("sensor/temp/x", "sensor/temp"),
+            "no missing levels"
+        );
+        assert!(
+            !topic_matches("sensor", "sensortemp"),
+            "whole level match only"
+        );
     }
 
     /// QA: `+` 单层通配（含空层）。
     #[test]
     fn topic_matches_single_level_wildcard() {
         assert!(topic_matches("sensor/+", "sensor/temp"));
-        assert!(!topic_matches("sensor/+", "sensor"), "+ needs its own level");
-        assert!(!topic_matches("sensor/+", "sensor/temp/x"), "+ is exactly one level");
+        assert!(
+            !topic_matches("sensor/+", "sensor"),
+            "+ needs its own level"
+        );
+        assert!(
+            !topic_matches("sensor/+", "sensor/temp/x"),
+            "+ is exactly one level"
+        );
         assert!(topic_matches("+/temp", "sensor/temp"));
         assert!(topic_matches("a/+/c", "a//c"), "+ matches empty level");
         assert!(topic_matches("sensor/+/temp", "sensor/line1/temp"));
@@ -535,7 +550,10 @@ mod tests {
     #[test]
     fn topic_matches_multi_level_wildcard() {
         assert!(topic_matches("sensor/#", "sensor/temp/x"));
-        assert!(topic_matches("sensor/#", "sensor"), "# also matches zero levels");
+        assert!(
+            topic_matches("sensor/#", "sensor"),
+            "# also matches zero levels"
+        );
         assert!(topic_matches("#", "a/b/c"));
         assert!(topic_matches("#", "sensor"));
         assert!(!topic_matches("a/#/c", "a/x/c"), "# must be the last level");
@@ -577,8 +595,8 @@ mod tests {
     /// QA Error: 空路径 / 空分段 / 缺键 / 下标越界或非法 / 标量下钻。
     #[test]
     fn extract_path_errors() {
-        let root: Value =
-            serde_json::from_str(r#"{"data":{"t":1.0},"list":[10,20],"s":"scalar"}"#).expect("json");
+        let root: Value = serde_json::from_str(r#"{"data":{"t":1.0},"list":[10,20],"s":"scalar"}"#)
+            .expect("json");
 
         assert_eq!(extract_path(&root, "").unwrap_err(), PathError::Empty);
         assert!(matches!(
@@ -599,7 +617,10 @@ mod tests {
         ));
         assert!(matches!(
             extract_path(&root, "s.0"),
-            Err(PathError::NotNavigable { actual: "string", .. })
+            Err(PathError::NotNavigable {
+                actual: "string",
+                ..
+            })
         ));
     }
 
@@ -612,10 +633,16 @@ mod tests {
             json_to_f64(&Value::from(" 3.25 ")).expect("numeric string ok"),
             3.25
         );
-        assert!(json_to_f64(&Value::from("abc")).is_err(), "non-numeric string");
+        assert!(
+            json_to_f64(&Value::from("abc")).is_err(),
+            "non-numeric string"
+        );
         assert!(json_to_f64(&Value::Bool(true)).is_err(), "bool not numeric");
         assert!(json_to_f64(&Value::Null).is_err(), "null not numeric");
-        assert!(json_to_f64(&serde_json::json!([1])).is_err(), "array not numeric");
+        assert!(
+            json_to_f64(&serde_json::json!([1])).is_err(),
+            "array not numeric"
+        );
     }
 
     /// QA: json_point_sample 成功 → Good；路径缺失 / 类型错误 → Bad（value=NaN）。
@@ -634,7 +661,11 @@ mod tests {
 
         let type_err = json_point_sample("t1", "s", &root);
         assert_eq!(type_err.quality, Quality::Bad);
-        assert!(type_err.detail.contains("not numeric"), "{}", type_err.detail);
+        assert!(
+            type_err.detail.contains("not numeric"),
+            "{}",
+            type_err.detail
+        );
     }
 
     // ---- payload 映射 ----

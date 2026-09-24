@@ -402,12 +402,7 @@ where
         })?;
         // 签名 / 时间窗 / 角色解析全部在 Rust 侧完成（红线）；未知角色由
         // `From<JwtError>` 转 403，其余转 401。
-        let claims = verify(
-            &token,
-            auth.key,
-            now_unix_secs(),
-            auth.leeway_secs,
-        )?;
+        let claims = verify(&token, auth.key, now_unix_secs(), auth.leeway_secs)?;
         let role = claims.role;
         Ok(AuthedRole { claims, role })
     }
@@ -492,10 +487,23 @@ mod tests {
     #[test]
     fn role_str_roundtrip_and_aliases_rejected() {
         for role in [Role::Ops, Role::LicOps, Role::Risk, Role::System] {
-            assert_eq!(Role::from_str(role.as_str()), Some(role), "{}", role.as_str());
+            assert_eq!(
+                Role::from_str(role.as_str()),
+                Some(role),
+                "{}",
+                role.as_str()
+            );
         }
-        assert_eq!(Role::from_str("admin"), None, "legacy alias must be rejected");
-        assert_eq!(Role::from_str("viewer"), None, "legacy alias must be rejected");
+        assert_eq!(
+            Role::from_str("admin"),
+            None,
+            "legacy alias must be rejected"
+        );
+        assert_eq!(
+            Role::from_str("viewer"),
+            None,
+            "legacy alias must be rejected"
+        );
         assert_eq!(Role::from_str("System"), None, "case sensitive");
         assert_eq!(Role::from_str(""), None);
         assert_eq!(Role::from_str("root"), None);
@@ -702,7 +710,9 @@ mod tests {
         let authed = AuthedRole::from_request_parts(&mut parts_with(Some(&token)), &state)
             .await
             .expect("valid token must pass");
-        authed.ensure(Permission::AuditView).expect("risk may view audit");
+        authed
+            .ensure(Permission::AuditView)
+            .expect("risk may view audit");
         let rejection = authed
             .ensure(Permission::AuditExport)
             .expect_err("risk must not export audit");

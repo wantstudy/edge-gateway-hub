@@ -268,9 +268,8 @@ fn windows_program_data_root() -> PathBuf {
 /// 任一目录创建失败 → [`DaemonError::StorageError`]（含路径与 IO 原因）。
 pub fn ensure_dirs(paths: &PlatformPaths) -> DaemonResult<()> {
     for dir in [&paths.data_dir, &paths.config_dir] {
-        std::fs::create_dir_all(dir).map_err(|e| {
-            DaemonError::StorageError(format!("ensure dir {}: {e}", dir.display()))
-        })?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| DaemonError::StorageError(format!("ensure dir {}: {e}", dir.display())))?;
     }
     Ok(())
 }
@@ -383,7 +382,8 @@ fn evaluate_anchor_file(path: &Path, min_len: usize) -> AnchorMountStatus {
     match std::fs::read(path) {
         Err(_) => AnchorMountStatus::Missing,
         Ok(bytes) => {
-            let plausible = bytes.len() >= min_len && bytes.iter().any(|b| !b.is_ascii_whitespace());
+            let plausible =
+                bytes.len() >= min_len && bytes.iter().any(|b| !b.is_ascii_whitespace());
             if !plausible {
                 return AnchorMountStatus::Missing;
             }
@@ -530,10 +530,7 @@ mod tests {
         let p = paths(RuntimeForm::LinuxSystemd);
         assert_eq!(p.data_dir, PathBuf::from("/var/lib/iot-daq"));
         assert_eq!(p.config_dir, PathBuf::from("/etc/iot-daq"));
-        assert_eq!(
-            p.anchor_machine_id,
-            Some(PathBuf::from("/etc/machine-id"))
-        );
+        assert_eq!(p.anchor_machine_id, Some(PathBuf::from("/etc/machine-id")));
         assert_eq!(p.anchor_dmi, Some(PathBuf::from("/sys/class/dmi/id")));
         assert!(p.anchor_host_mac.is_some());
     }
@@ -545,10 +542,7 @@ mod tests {
         let p = paths(RuntimeForm::LinuxDocker);
         assert_eq!(p.data_dir, PathBuf::from("/var/lib/iot-daq"));
         assert_eq!(p.config_dir, PathBuf::from("/etc/iot-daq"));
-        assert_eq!(
-            p.anchor_machine_id,
-            Some(PathBuf::from("/etc/machine-id"))
-        );
+        assert_eq!(p.anchor_machine_id, Some(PathBuf::from("/etc/machine-id")));
         assert!(RuntimeForm::LinuxDocker.is_container());
         assert!(!RuntimeForm::LinuxSystemd.is_container());
     }

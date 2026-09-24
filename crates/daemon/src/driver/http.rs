@@ -75,8 +75,7 @@ impl From<HttpError> for DaemonError {
 /// # Errors
 /// 非 `http://` 前缀 / 缺主机 / 端口非法 → [`HttpError::Protocol`]。
 fn parse_http_url(url: &str) -> Result<(String, u16, String), HttpError> {
-    let wrap =
-        |detail: String| HttpError::Protocol(format!("invalid http url {url:?}: {detail}"));
+    let wrap = |detail: String| HttpError::Protocol(format!("invalid http url {url:?}: {detail}"));
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| wrap("only http:// scheme supported in V1 (no TLS)".to_string()))?;
@@ -101,12 +100,7 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), HttpError> {
 }
 
 /// 构建最小 HTTP/1.1 GET 请求报文（`\r\n\r\n` 结尾）。
-fn build_get_request(
-    host: &str,
-    port: u16,
-    path: &str,
-    headers: &[(String, String)],
-) -> String {
+fn build_get_request(host: &str, port: u16, path: &str, headers: &[(String, String)]) -> String {
     let host_header = if port == 80 {
         host.to_string()
     } else {
@@ -140,9 +134,8 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, HttpError> {
         let line = std::str::from_utf8(&data[..line_end])
             .map_err(|_| HttpError::Protocol("chunk size line is not utf-8".to_string()))?;
         let size_str = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_str, 16).map_err(|_| {
-            HttpError::Protocol(format!("invalid chunk size {size_str:?}"))
-        })?;
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| HttpError::Protocol(format!("invalid chunk size {size_str:?}")))?;
         data = &data[line_end + 2..];
         if size == 0 {
             // 终止块后的 trailer 不做解析（最小实现），直接结束。
@@ -156,7 +149,9 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, HttpError> {
         }
         out.extend_from_slice(&data[..size]);
         if &data[size..size + 2] != b"\r\n" {
-            return Err(HttpError::Protocol("missing CRLF after chunk data".to_string()));
+            return Err(HttpError::Protocol(
+                "missing CRLF after chunk data".to_string(),
+            ));
         }
         data = &data[size + 2..];
     }
@@ -283,12 +278,17 @@ impl HttpDriver {
     /// URL / 连接 / 超时 / 状态码 / JSON 解析失败 → [`DaemonError`]（映射见局部错误）。
     pub async fn poll(&mut self) -> DaemonResult<Vec<JsonPointSample>> {
         let (host, port, path) = parse_http_url(&self.config.url).map_err(HttpError::from)?;
-        let raw = Self::fetch(&host, port, &path, &self.config.headers, self.config.timeout)
-            .await
-            .map_err(HttpError::from)?;
-        let payload: Value = serde_json::from_slice(&raw).map_err(|e| {
-            DaemonError::ProtocolError(format!("http payload json parse: {e}"))
-        })?;
+        let raw = Self::fetch(
+            &host,
+            port,
+            &path,
+            &self.config.headers,
+            self.config.timeout,
+        )
+        .await
+        .map_err(HttpError::from)?;
+        let payload: Value = serde_json::from_slice(&raw)
+            .map_err(|e| DaemonError::ProtocolError(format!("http payload json parse: {e}")))?;
         Ok(self
             .config
             .points
@@ -431,7 +431,9 @@ mod tests {
     where
         F: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
     {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let handler = std::sync::Arc::new(handler);
         tokio::spawn(async move {
@@ -517,7 +519,10 @@ mod tests {
             "",
         ] {
             let err = parse_http_url(url).expect_err(&format!("must reject {url:?}"));
-            assert!(matches!(err, HttpError::Protocol(_)), "for {url:?}: {err:?}");
+            assert!(
+                matches!(err, HttpError::Protocol(_)),
+                "for {url:?}: {err:?}"
+            );
         }
     }
 
@@ -543,7 +548,10 @@ mod tests {
         );
         // 80 端口省略端口后缀。
         let request = build_get_request("host", 80, "/", &[]);
-        assert!(request.starts_with("GET / HTTP/1.1\r\nHost: host\r\n"), "{request:?}");
+        assert!(
+            request.starts_with("GET / HTTP/1.1\r\nHost: host\r\n"),
+            "{request:?}"
+        );
         assert!(request.ends_with("\r\n\r\n"), "\\r\\n\\r\\n terminated");
     }
 
@@ -582,7 +590,10 @@ mod tests {
             Quality::Bad
         );
         // 空路径 → PathError::Empty（共享错误类型契约）。
-        assert_eq!(crate::driver::mqtt_in::extract_path(&root, ""), Err(PathError::Empty));
+        assert_eq!(
+            crate::driver::mqtt_in::extract_path(&root, ""),
+            Err(PathError::Empty)
+        );
     }
 
     // ---- chunked 解码 ----
@@ -742,13 +753,13 @@ mod tests {
         let err = driver.poll().await.expect_err("503 must fail");
         assert!(matches!(err, DaemonError::ProtocolError(_)), "{err:?}");
         assert_eq!(err.error_code(), ERR_PROTOCOL);
-        assert!(err.to_string().contains("503"), "message keeps status: {err}");
+        assert!(
+            err.to_string().contains("503"),
+            "message keeps status: {err}"
+        );
 
         let addr = spawn_http_mock(move |_request| ok_response("not-json")).await;
-        let mut driver = HttpDriver::new(test_config(
-            format!("http://{addr}/x"),
-            Vec::new(),
-        ));
+        let mut driver = HttpDriver::new(test_config(format!("http://{addr}/x"), Vec::new()));
         let err = driver.poll().await.expect_err("invalid json must fail");
         assert!(matches!(err, DaemonError::ProtocolError(_)), "{err:?}");
     }
@@ -756,10 +767,8 @@ mod tests {
     /// QA Error: 连接拒绝 → NetworkError。
     #[tokio::test]
     async fn connection_refused_maps_to_network_error() {
-        let mut driver = HttpDriver::new(test_config(
-            "http://127.0.0.1:1/x".to_string(),
-            Vec::new(),
-        ));
+        let mut driver =
+            HttpDriver::new(test_config("http://127.0.0.1:1/x".to_string(), Vec::new()));
         let err = driver.poll().await.expect_err("must fail");
         assert!(matches!(err, DaemonError::NetworkError(_)), "{err:?}");
         assert_eq!(err.error_code(), ERR_NETWORK);
@@ -849,10 +858,8 @@ mod tests {
     /// 空点位表 read 直通：不发起请求返回空。
     #[tokio::test]
     async fn empty_read_is_noop() {
-        let mut driver = HttpDriver::new(test_config(
-            "http://127.0.0.1:1/x".to_string(),
-            Vec::new(),
-        ));
+        let mut driver =
+            HttpDriver::new(test_config("http://127.0.0.1:1/x".to_string(), Vec::new()));
         assert!(driver.read(&[]).await.expect("empty read").is_empty());
     }
 }

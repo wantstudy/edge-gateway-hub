@@ -937,9 +937,9 @@ impl OfflineQueue {
 
         // batch_seq 来源：未注入则用内置原子计数器（起点 = 持久化 last_seq + 1，
         // 保证重启后不回退、不复用）。
-        let seq_source: Arc<dyn BatchSeqSource> = hooks.seq_source.unwrap_or_else(|| {
-            Arc::new(AtomicSeqSource::new(init.last_seq.saturating_add(1)))
-        });
+        let seq_source: Arc<dyn BatchSeqSource> = hooks
+            .seq_source
+            .unwrap_or_else(|| Arc::new(AtomicSeqSource::new(init.last_seq.saturating_add(1))));
 
         Ok(Self {
             cfg,
@@ -1013,8 +1013,7 @@ impl OfflineQueue {
                      (batch_seq {seq} overflowed, data returned to caller)"
                 )));
             }
-            mem.rows.len() >= self.cfg.high_water_rows()
-                || mem.bytes >= self.cfg.high_water_bytes()
+            mem.rows.len() >= self.cfg.high_water_rows() || mem.bytes >= self.cfg.high_water_bytes()
         };
 
         // 超高水位 → 降级：新数据直接走离线落盘路径（不进内存）。
@@ -1030,8 +1029,7 @@ impl OfflineQueue {
             let mut mem = self.mem();
             mem.rows.push_back(batch);
             mem.bytes = mem.bytes.saturating_add(payload_len);
-            mem.rows.len() >= self.cfg.high_water_rows()
-                || mem.bytes >= self.cfg.high_water_bytes()
+            mem.rows.len() >= self.cfg.high_water_rows() || mem.bytes >= self.cfg.high_water_bytes()
         };
         // 达高水位 → 整队列落盘；失败则数据留内存（后续入队走硬上限拒绝路径）。
         if now_over_high_water {
@@ -1614,7 +1612,10 @@ mod tests {
                 assert!(seen.insert(key.clone()), "幂等键重复: {key}");
             }
         }
-        assert_eq!(batch.last().map(|b| b.payload.clone()), Some(b"p-04".to_vec()));
+        assert_eq!(
+            batch.last().map(|b| b.payload.clone()),
+            Some(b"p-04".to_vec())
+        );
         queue.set_persist_failure(false);
         queue.close().expect("close");
     }
@@ -2006,7 +2007,10 @@ mod tests {
         assert_eq!(config2.high_water_rows(), 4_096);
         config2.mem_high_water_rows = 0;
         assert_eq!(
-            config2.validate().expect_err("zero high water").error_code(),
+            config2
+                .validate()
+                .expect_err("zero high water")
+                .error_code(),
             ERR_CONFIG
         );
     }

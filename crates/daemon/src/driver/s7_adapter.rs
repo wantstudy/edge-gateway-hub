@@ -39,9 +39,7 @@
 use async_trait::async_trait;
 use tokio::task::spawn_blocking;
 
-use crate::driver::s7::{
-    derive_tsap, S7Address, S7Area, S7Error, S7Session, S7Size,
-};
+use crate::driver::s7::{derive_tsap, S7Address, S7Area, S7Error, S7Session, S7Size};
 use crate::driver::{Driver, PointAddress, PointSample, ReadPoint, WritePoint};
 use crate::error::{DaemonError, DaemonResult};
 
@@ -368,12 +366,14 @@ mod tests {
 
     /// 确认会话层地址解析与统一解析器转换结果一致（防两套语义漂移）。
     fn assert_same_as_session_parser(raw: &str) {
-        let unified =
-            point_to_s7_address(&PointAddressParser::parse(raw).unwrap())
-                .unwrap_or_else(|e| panic!("unified conversion must accept {raw:?}: {e:?}"));
+        let unified = point_to_s7_address(&PointAddressParser::parse(raw).unwrap())
+            .unwrap_or_else(|e| panic!("unified conversion must accept {raw:?}: {e:?}"));
         let session = parse_s7_address(raw)
             .unwrap_or_else(|e| panic!("session parser must accept {raw:?}: {e:?}"));
-        assert_eq!(unified, session, "unified/session parser mismatch for {raw:?}");
+        assert_eq!(
+            unified, session,
+            "unified/session parser mismatch for {raw:?}"
+        );
     }
 
     // ---- 类型转换：往返一致性 ----
@@ -390,10 +390,9 @@ mod tests {
             assert_same_as_session_parser(raw);
         }
         // 裸 M 形式（统一解析器）≡ 会话层 <byte>.<bit> 位形式。
-        let bare_m = point_to_s7_address(&PointAddressParser::parse("M100").unwrap())
-            .expect("valid");
-        let explicit_m =
-            parse_s7_address("M100.0").expect("valid session-side equivalent");
+        let bare_m =
+            point_to_s7_address(&PointAddressParser::parse("M100").unwrap()).expect("valid");
+        let explicit_m = parse_s7_address("M100.0").expect("valid session-side equivalent");
         assert_eq!(bare_m, explicit_m, "bare M100 must equal M100.0");
         let a = point_to_s7_address(&PointAddressParser::parse("DB12.DBX34.7").unwrap())
             .expect("valid");
@@ -407,13 +406,55 @@ mod tests {
     #[test]
     fn conversion_rejects_unsupported_addresses() {
         let cases = [
-            PointAddress { db: 1, area: None, start: 0, bit: false, bit_index: 0 }, // DB 非位访问
-            PointAddress { db: 0, area: Some('D'), start: 100, bit: false, bit_index: 0 }, // MC 字区
-            PointAddress { db: 0, area: Some('4'), start: 1, bit: false, bit_index: 0 },   // Modbus 区
-            PointAddress { db: u32::from(u16::MAX) + 1, area: None, start: 0, bit: true, bit_index: 0 }, // DB 超 u16
-            PointAddress { db: 1, area: None, start: S7_MAX_BYTE_OFFSET + 1, bit: true, bit_index: 0 },  // 偏移越界
-            PointAddress { db: 1, area: Some('M'), start: 5, bit: true, bit_index: 8 },  // 位号 > 7
-            PointAddress { db: 1, area: Some('M'), start: 5, bit: false, bit_index: 0 }, // M 非位
+            PointAddress {
+                db: 1,
+                area: None,
+                start: 0,
+                bit: false,
+                bit_index: 0,
+            }, // DB 非位访问
+            PointAddress {
+                db: 0,
+                area: Some('D'),
+                start: 100,
+                bit: false,
+                bit_index: 0,
+            }, // MC 字区
+            PointAddress {
+                db: 0,
+                area: Some('4'),
+                start: 1,
+                bit: false,
+                bit_index: 0,
+            }, // Modbus 区
+            PointAddress {
+                db: u32::from(u16::MAX) + 1,
+                area: None,
+                start: 0,
+                bit: true,
+                bit_index: 0,
+            }, // DB 超 u16
+            PointAddress {
+                db: 1,
+                area: None,
+                start: S7_MAX_BYTE_OFFSET + 1,
+                bit: true,
+                bit_index: 0,
+            }, // 偏移越界
+            PointAddress {
+                db: 1,
+                area: Some('M'),
+                start: 5,
+                bit: true,
+                bit_index: 8,
+            }, // 位号 > 7
+            PointAddress {
+                db: 1,
+                area: Some('M'),
+                start: 5,
+                bit: false,
+                bit_index: 0,
+            }, // M 非位
         ];
         for p in &cases {
             let err = point_to_s7_address(p).expect_err("must reject");
@@ -434,8 +475,8 @@ mod tests {
         for raw in ["DB2.DBB10", "DB2.DBW20", "DB2.DBD40", "DB1.DBD2097151"] {
             assert_same_as_session_parser(raw);
         }
-        let w = point_to_s7_address(&PointAddressParser::parse("DB2.DBW20").unwrap())
-            .expect("valid");
+        let w =
+            point_to_s7_address(&PointAddressParser::parse("DB2.DBW20").unwrap()).expect("valid");
         assert_eq!(w.size, S7Size::Word);
         assert_eq!((w.db, w.byte_offset), (2, 20));
     }
@@ -450,13 +491,21 @@ mod tests {
             parse_s7_address("I0.1").expect("session parser"),
             "unified/session parser mismatch"
         );
-        assert_eq!((i.area, i.byte_offset, i.bit_index, i.size),
-                   (S7Area::I, 0, 1, S7Size::Bit));
+        assert_eq!(
+            (i.area, i.byte_offset, i.bit_index, i.size),
+            (S7Area::I, 0, 1, S7Size::Bit)
+        );
         let q = point_to_s7_address(&PointAddressParser::parse("Q0.3").unwrap()).expect("valid");
         assert_eq!(q, parse_s7_address("Q0.3").expect("session parser"));
         assert_eq!(q.area, S7Area::Q);
         // MC 字区（db=0）不属 S7：仍收敛为 ProtocolError。
-        let mc_d = PointAddress { db: 0, area: Some('D'), start: 100, bit: false, bit_index: 0 };
+        let mc_d = PointAddress {
+            db: 0,
+            area: Some('D'),
+            start: 100,
+            bit: false,
+            bit_index: 0,
+        };
         let err = point_to_s7_address(&mc_d).expect_err("MC D must be rejected");
         assert_eq!(err.error_code(), ERR_PROTOCOL);
     }
@@ -469,10 +518,19 @@ mod tests {
         // 协议语义类 → ProtocolError（码 1000）。
         let protocol_cases: Vec<(S7Error, &str)> = vec![
             (S7Error::BadFrame("truncated".to_string()), "s7 bad frame"),
-            (S7Error::BadAddress("DB1.DBZ0".to_string()), "s7 bad address"),
-            (S7Error::BadParam("too many items".to_string()), "s7 bad param"),
             (
-                S7Error::ReturnCode { code: 0x05, detail: "address out of range（地址越界）" },
+                S7Error::BadAddress("DB1.DBZ0".to_string()),
+                "s7 bad address",
+            ),
+            (
+                S7Error::BadParam("too many items".to_string()),
+                "s7 bad param",
+            ),
+            (
+                S7Error::ReturnCode {
+                    code: 0x05,
+                    detail: "address out of range（地址越界）",
+                },
                 "return code 0x05",
             ),
         ];
@@ -489,7 +547,10 @@ mod tests {
         let mapped = map_s7_error(S7Error::NetworkError("peer closed connection".to_string()));
         assert!(matches!(mapped, DaemonError::NetworkError(_)), "{mapped:?}");
         assert_eq!(mapped.error_code(), ERR_NETWORK);
-        assert!(mapped.to_string().contains("peer closed connection"), "{mapped}");
+        assert!(
+            mapped.to_string().contains("peer closed connection"),
+            "{mapped}"
+        );
     }
 
     // ---- mock S7 服务器（与会话层 session_tests 同构；hold=false 用完即关）----
@@ -613,16 +674,19 @@ mod tests {
         script.push(vec![build_tpkt(&ack).expect("tpkt")]);
         let (addr, _rec) = spawn_mock_multi(vec![script]);
 
-        let mut driver: Box<dyn Driver> = Box::new(S7Driver::with_rack_slot(
-            addr.to_string(),
-            0,
-            0,
-        ));
+        let mut driver: Box<dyn Driver> =
+            Box::new(S7Driver::with_rack_slot(addr.to_string(), 0, 0));
         let p1 = PointAddressParser::parse("DB1.DBX0.0").expect("addr");
         let p2 = PointAddressParser::parse("M100").expect("addr");
         let points = [
-            ReadPoint { address: p1.clone(), count: 1 },
-            ReadPoint { address: p2.clone(), count: 1 },
+            ReadPoint {
+                address: p1.clone(),
+                count: 1,
+            },
+            ReadPoint {
+                address: p2.clone(),
+                count: 1,
+            },
         ];
         let samples = driver.read(&points).await.expect("read");
         assert_eq!(samples.len(), 2, "1:1 with request");
@@ -641,7 +705,8 @@ mod tests {
         script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
         let (addr, received) = spawn_mock_multi(vec![script]);
 
-        let mut driver: Box<dyn Driver> = Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
+        let mut driver: Box<dyn Driver> =
+            Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
         driver
             .write(&[WritePoint {
                 address: PointAddressParser::parse("DB1.DBX0.0").expect("addr"),
@@ -667,11 +732,17 @@ mod tests {
     #[tokio::test]
     async fn dyn_driver_read_preserves_reconnect_semantics() {
         let mut script2 = handshake_script();
-        script2.push(vec![build_tpkt(&read_ack_frame_items(&[(0x01, 1, vec![0x12])])).expect("tpkt")]);
+        script2.push(vec![build_tpkt(&read_ack_frame_items(&[(
+            0x01,
+            1,
+            vec![0x12],
+        )]))
+        .expect("tpkt")]);
         // 连接 1：仅握手（随后被 mock 关闭）；连接 2：握手 + 正常应答。
         let (addr, _rec) = spawn_mock_multi(vec![handshake_script(), script2]);
 
-        let mut driver: Box<dyn Driver> = Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
+        let mut driver: Box<dyn Driver> =
+            Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
         driver.connect().await.expect("connect");
         let samples = driver
             .read(&[ReadPoint {
@@ -727,14 +798,24 @@ mod tests {
         script.push(vec![build_tpkt(&ack).expect("tpkt")]);
         let (addr, received) = spawn_mock_multi(vec![script]);
 
-        let mut driver: Box<dyn Driver> = Box::new(S7Driver::with_rack_slot(addr.to_string(), 0, 0));
+        let mut driver: Box<dyn Driver> =
+            Box::new(S7Driver::with_rack_slot(addr.to_string(), 0, 0));
         let pi = PointAddressParser::parse("I0.1").expect("addr");
         let pq = PointAddressParser::parse("Q0.3").expect("addr");
         let pw = PointAddressParser::parse("DB1.DBW0").expect("addr");
         let points = [
-            ReadPoint { address: pi.clone(), count: 1 },
-            ReadPoint { address: pq.clone(), count: 1 },
-            ReadPoint { address: pw.clone(), count: 1 },
+            ReadPoint {
+                address: pi.clone(),
+                count: 1,
+            },
+            ReadPoint {
+                address: pq.clone(),
+                count: 1,
+            },
+            ReadPoint {
+                address: pw.clone(),
+                count: 1,
+            },
         ];
         let samples = driver.read(&points).await.expect("read");
         assert_eq!(samples.len(), 3, "1:1 with request");
@@ -766,11 +847,18 @@ mod tests {
         script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
         let (addr, received) = spawn_mock_multi(vec![script]);
 
-        let mut driver: Box<dyn Driver> = Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
+        let mut driver: Box<dyn Driver> =
+            Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
         driver
             .write(&[
-                WritePoint { address: PointAddressParser::parse("Q0.3").expect("addr"), value: vec![0x01] },
-                WritePoint { address: PointAddressParser::parse("I0.1").expect("addr"), value: vec![0x00] },
+                WritePoint {
+                    address: PointAddressParser::parse("Q0.3").expect("addr"),
+                    value: vec![0x01],
+                },
+                WritePoint {
+                    address: PointAddressParser::parse("I0.1").expect("addr"),
+                    value: vec![0x00],
+                },
             ])
             .await
             .expect("write");
@@ -796,14 +884,27 @@ mod tests {
         script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
         let (addr, received) = spawn_mock_multi(vec![script]);
 
-        let mut driver: Box<dyn Driver> = Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
+        let mut driver: Box<dyn Driver> =
+            Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
         let parse = |raw: &str| PointAddressParser::parse(raw).expect("addr");
         driver
             .write(&[
-                WritePoint { address: parse("DB1.DBB0"), value: vec![0xAA] },
-                WritePoint { address: parse("DB1.DBB1"), value: vec![0xBB] },
-                WritePoint { address: parse("DB1.DBB2"), value: vec![0xCC] },
-                WritePoint { address: parse("DB1.DBB10"), value: vec![0xDD] }, // 间隙 → 第二帧
+                WritePoint {
+                    address: parse("DB1.DBB0"),
+                    value: vec![0xAA],
+                },
+                WritePoint {
+                    address: parse("DB1.DBB1"),
+                    value: vec![0xBB],
+                },
+                WritePoint {
+                    address: parse("DB1.DBB2"),
+                    value: vec![0xCC],
+                },
+                WritePoint {
+                    address: parse("DB1.DBB10"),
+                    value: vec![0xDD],
+                }, // 间隙 → 第二帧
             ])
             .await
             .expect("write");
@@ -816,7 +917,11 @@ mod tests {
         assert_eq!(&p1[29..31], &3u16.to_be_bytes(), "units = 3 bytes");
         assert_eq!(&p1[31..34], &[0xAA, 0xBB, 0xCC], "merged payload in order");
         let p2 = crate::driver::s7::parse_tpkt(&rec[3]).expect("tpkt");
-        assert_eq!(&p2[29..31], &1u16.to_be_bytes(), "gap point stays its own frame");
+        assert_eq!(
+            &p2[29..31],
+            &1u16.to_be_bytes(),
+            "gap point stays its own frame"
+        );
         assert_eq!(p2[31], 0xDD);
     }
 
@@ -825,13 +930,16 @@ mod tests {
     async fn driver_write_rejects_wrong_value_width() {
         let mut driver = S7Driver::new("127.0.0.1:1".to_string(), derive_tsap(0, 0));
         let cases = [
-            ("DB1.DBW0", vec![0x12u8]),            // 字写 1 字节（须 2）
-            ("DB1.DBB0", vec![0x01, 0x02]),        // 字节写 2 字节（须 1）
-            ("DB1.DBD0", vec![0x01, 0x02, 0x03]),  // 双字写 3 字节（须 4）
+            ("DB1.DBW0", vec![0x12u8]),           // 字写 1 字节（须 2）
+            ("DB1.DBB0", vec![0x01, 0x02]),       // 字节写 2 字节（须 1）
+            ("DB1.DBD0", vec![0x01, 0x02, 0x03]), // 双字写 3 字节（须 4）
         ];
         for (raw, value) in cases {
             let err = driver
-                .write(&[WritePoint { address: PointAddressParser::parse(raw).expect("addr"), value }])
+                .write(&[WritePoint {
+                    address: PointAddressParser::parse(raw).expect("addr"),
+                    value,
+                }])
                 .await
                 .expect_err("must reject wrong width");
             assert!(

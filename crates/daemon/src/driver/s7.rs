@@ -183,7 +183,11 @@ pub fn parse_s7_address(raw: &str) -> Result<S7Address, S7Error> {
             Some(b'B') => (S7Size::Byte, &spec[1..]),
             Some(b'W') => (S7Size::Word, &spec[1..]),
             Some(b'D') => (S7Size::DWord, &spec[1..]),
-            _ => return Err(bad(format!("unknown access type {spec:?} (X/B/W/D expected)"))),
+            _ => {
+                return Err(bad(format!(
+                    "unknown access type {spec:?} (X/B/W/D expected)"
+                )))
+            }
         };
         if size == S7Size::Bit {
             let (off, bit_raw) = tail
@@ -204,7 +208,9 @@ pub fn parse_s7_address(raw: &str) -> Result<S7Address, S7Error> {
             })
         } else {
             if tail.contains('.') {
-                return Err(bad("byte/word/dword address must not have bit suffix".into()));
+                return Err(bad(
+                    "byte/word/dword address must not have bit suffix".into()
+                ));
             }
             Ok(S7Address {
                 area: S7Area::Db,
@@ -219,11 +225,7 @@ pub fn parse_s7_address(raw: &str) -> Result<S7Address, S7Error> {
             b'M' => S7Area::M,
             b'I' => S7Area::I,
             b'Q' => S7Area::Q,
-            _ => {
-                return Err(bad(
-                    "expected DB… / M… / I… / Q… address".to_string(),
-                ))
-            }
+            _ => return Err(bad("expected DB… / M… / I… / Q… address".to_string())),
         };
         let rest = &s[1..];
         // MB/MW/MD（及 IB/IW/ID、QB/QW/QD）字节/字/双字形式。
@@ -237,7 +239,9 @@ pub fn parse_s7_address(raw: &str) -> Result<S7Address, S7Error> {
         if let Some((_, size)) = sized {
             let tail = &rest[1..];
             if tail.contains('.') {
-                return Err(bad("byte/word/dword address must not have bit suffix".into()));
+                return Err(bad(
+                    "byte/word/dword address must not have bit suffix".into()
+                ));
             }
             Ok(S7Address {
                 area,
@@ -248,9 +252,9 @@ pub fn parse_s7_address(raw: &str) -> Result<S7Address, S7Error> {
             })
         } else {
             // 位形式：<byte>.<bit>。
-            let (off, bit_raw) = rest
-                .split_once('.')
-                .ok_or_else(|| bad("bit access requires <byte>.<bit> (e.g. M1.2) or MB/MW/MD".into()))?;
+            let (off, bit_raw) = rest.split_once('.').ok_or_else(|| {
+                bad("bit access requires <byte>.<bit> (e.g. M1.2) or MB/MW/MD".into())
+            })?;
             let bit_index: u8 = bit_raw
                 .parse()
                 .map_err(|_| bad(format!("bit index must be 0-7, got {bit_raw:?}")))?;
@@ -333,8 +337,12 @@ pub fn read_u32_be(buf: &[u8]) -> Result<u32, S7Error> {
 /// # Errors
 /// 载荷超过 u16 总长上限（> 65531 字节）返回 [`S7Error::BadParam`]。
 pub fn build_tpkt(payload: &[u8]) -> Result<Vec<u8>, S7Error> {
-    let total = u16::try_from(payload.len() + 4)
-        .map_err(|_| S7Error::BadParam(format!("payload {} bytes overflows TPKT u16 length", payload.len())))?;
+    let total = u16::try_from(payload.len() + 4).map_err(|_| {
+        S7Error::BadParam(format!(
+            "payload {} bytes overflows TPKT u16 length",
+            payload.len()
+        ))
+    })?;
     let mut out = Vec::with_capacity(total as usize);
     out.extend_from_slice(&[0x03, 0x00]); // 版本 3.0
     out.extend_from_slice(&total.to_be_bytes());
@@ -394,12 +402,22 @@ pub fn build_cotp_cr(remote_tsap: [u8; 2]) -> Vec<u8> {
     vec![
         0x11, // LI：LI 字节之后共 17 字节
         0xE0, // TPDU 类型：CR（Connection Request）
-        0x00, 0x01, // 目的引用（CR 阶段固定 0x0001）
-        0x00, 0x00, // 源引用（未分配，0x0000）
+        0x00,
+        0x01, // 目的引用（CR 阶段固定 0x0001）
+        0x00,
+        0x00, // 源引用（未分配，0x0000）
         0xF0, // 类字段：class 0（抓包样例值）
-        0xC0, 0x01, 0x09, // TPDU 大小参数：2^9 = 512 字节
-        0xC1, 0x02, 0x01, 0x00, // 源 TSAP 参数（本地，固定 0x0100）
-        0xC2, 0x02, remote_tsap[0], remote_tsap[1], // 目的 TSAP 参数（远端，含机架/槽位）
+        0xC0,
+        0x01,
+        0x09, // TPDU 大小参数：2^9 = 512 字节
+        0xC1,
+        0x02,
+        0x01,
+        0x00, // 源 TSAP 参数（本地，固定 0x0100）
+        0xC2,
+        0x02,
+        remote_tsap[0],
+        remote_tsap[1], // 目的 TSAP 参数（远端，含机架/槽位）
     ]
 }
 
@@ -568,11 +586,7 @@ pub fn build_read_var(pdu_ref: u16, items: &[S7ReadItem]) -> Result<Vec<u8>, S7E
 ///
 /// # Errors
 /// 数据超出 u16 数据区 → [`S7Error::BadParam`]。
-pub fn build_write_var(
-    pdu_ref: u16,
-    address: &S7Address,
-    data: &[u8],
-) -> Result<Vec<u8>, S7Error> {
+pub fn build_write_var(pdu_ref: u16, address: &S7Address, data: &[u8]) -> Result<Vec<u8>, S7Error> {
     // 数据区 = 每项数据头 4 字节（返回码 + 传输尺寸 + 长度）+ 数据本体。
     let data_len = u16::try_from(data.len() + 4)
         .map_err(|_| S7Error::BadParam(format!("write data {} bytes overflows u16", data.len())))?;
@@ -748,7 +762,9 @@ impl S7Session {
 
         // 1) COTP CR → CC。
         let cr = build_tpkt(&build_cotp_cr(tsap))?;
-        stream.write_all(&cr).map_err(|e| io_err("send cotp cr", e))?;
+        stream
+            .write_all(&cr)
+            .map_err(|e| io_err("send cotp cr", e))?;
         let cc_frame = recv_frame(&mut stream)?;
         parse_cotp_cc(parse_tpkt(&cc_frame)?)?;
 
@@ -756,7 +772,9 @@ impl S7Session {
         let mut cotp_s7 = build_cotp_dt_data().to_vec();
         cotp_s7.extend_from_slice(&build_setup_communication(0x0000, S7_REQUESTED_PDU));
         let setup = build_tpkt(&cotp_s7)?;
-        stream.write_all(&setup).map_err(|e| io_err("send setup", e))?;
+        stream
+            .write_all(&setup)
+            .map_err(|e| io_err("send setup", e))?;
         let ack_frame = recv_frame(&mut stream)?;
         let negotiated_pdu = parse_setup_ack(parse_tpkt(&ack_frame)?)?;
 
@@ -839,98 +857,98 @@ impl S7Session {
         Ok(results)
     }
 
-/// 单个 Read Var 请求可承载的最大 Item 数：协商 PDU 扣除帧固定开销
-/// （[`READ_FRAME_OVERHEAD`]）后按每 Item 12 字节取整；至少 1（防御
-/// 异常小的协商值，避免空请求）。
-fn max_items_per_request(&self) -> usize {
-    let budget = (self.negotiated_pdu as usize).saturating_sub(READ_FRAME_OVERHEAD);
-    (budget / ITEM_ENCODED_LEN).max(1)
-}
-
-/// 批量写入点位：同区同 DB、字节区间相邻衔接的**非位**写入合并为单 Item
-/// 的 Write Var 报文（一帧一个 Item，数据为各点载荷顺序拼接），按协商 PDU
-/// 的单帧数据预算再切分；位写入永不合并（逐点一帧）。结果整体成功或整体
-/// 失败（任一帧 ACK 非 OK → 整体 `Err`，与 Driver 契约一致）。
-/// 遇对端关闭类网络错误自动重连一次并整体重试，二次失败上抛。
-///
-/// `data` 编码语义与 [`build_write_var`] 一致；每个载荷长度必须与对应地址
-/// 尺寸宽度一致（Bit=1 字节 0x00/0x01、Byte=1、Word=2、DWord=4）。
-///
-/// # Errors
-/// 网络 / 帧结构 / ReturnCode / 载荷宽度与地址不符 → [`S7Error`]；空切片直接返回。
-pub fn write_points(&mut self, reqs: &[(S7Address, Vec<u8>)]) -> Result<(), S7Error> {
-    match self.write_points_once(reqs) {
-        Err(e) if Self::is_connection_lost(&e) => {
-            self.reconnect()?;
-            self.write_points_once(reqs)
-        }
-        other => other,
+    /// 单个 Read Var 请求可承载的最大 Item 数：协商 PDU 扣除帧固定开销
+    /// （[`READ_FRAME_OVERHEAD`]）后按每 Item 12 字节取整；至少 1（防御
+    /// 异常小的协商值，避免空请求）。
+    fn max_items_per_request(&self) -> usize {
+        let budget = (self.negotiated_pdu as usize).saturating_sub(READ_FRAME_OVERHEAD);
+        (budget / ITEM_ENCODED_LEN).max(1)
     }
-}
 
-/// 单次批量写尝试（无重连）：合并 → 组内按 PDU 数据预算切帧 → 逐帧执行。
-fn write_points_once(&mut self, reqs: &[(S7Address, Vec<u8>)]) -> Result<(), S7Error> {
-    if reqs.is_empty() {
-        return Ok(());
-    }
-    let addrs: Vec<S7Address> = reqs.iter().map(|(a, _)| a.clone()).collect();
-    let groups = merge_adjacent_groups(&addrs);
-    let max_data = self.max_write_data_bytes();
-    let mut cursor = 0usize; // reqs 下标（与 addrs 同序同长）
-    for (item, widths) in groups {
-        let member_count = widths.len();
-        let mut start = 0usize; // 组内成员下标
-        let mut offset = item.address.byte_offset;
-        while start < member_count {
-            let mut data: Vec<u8> = Vec::new();
-            let mut taken = 0usize;
-            while start + taken < member_count {
-                let width = usize::from(widths[start + taken]);
-                let payload = &reqs[cursor + start + taken].1;
-                // 防御：载荷宽度须与地址尺寸一致（适配层已 fail-fast 校验）。
-                if payload.len() != width {
-                    return Err(S7Error::BadParam(format!(
-                        "write payload {} bytes != address width {width} for {:?}",
-                        payload.len(),
-                        reqs[cursor + start + taken].0
-                    )));
-                }
-                // 首成员必入帧（与 max_items 的 max(1) 同思路）；后续成员按
-                // 单帧数据预算断开。组内地址连续，任意断开均合法。
-                if !data.is_empty() && data.len() + width > max_data {
-                    break;
-                }
-                data.extend_from_slice(payload);
-                taken += 1;
+    /// 批量写入点位：同区同 DB、字节区间相邻衔接的**非位**写入合并为单 Item
+    /// 的 Write Var 报文（一帧一个 Item，数据为各点载荷顺序拼接），按协商 PDU
+    /// 的单帧数据预算再切分；位写入永不合并（逐点一帧）。结果整体成功或整体
+    /// 失败（任一帧 ACK 非 OK → 整体 `Err`，与 Driver 契约一致）。
+    /// 遇对端关闭类网络错误自动重连一次并整体重试，二次失败上抛。
+    ///
+    /// `data` 编码语义与 [`build_write_var`] 一致；每个载荷长度必须与对应地址
+    /// 尺寸宽度一致（Bit=1 字节 0x00/0x01、Byte=1、Word=2、DWord=4）。
+    ///
+    /// # Errors
+    /// 网络 / 帧结构 / ReturnCode / 载荷宽度与地址不符 → [`S7Error`]；空切片直接返回。
+    pub fn write_points(&mut self, reqs: &[(S7Address, Vec<u8>)]) -> Result<(), S7Error> {
+        match self.write_points_once(reqs) {
+            Err(e) if Self::is_connection_lost(&e) => {
+                self.reconnect()?;
+                self.write_points_once(reqs)
             }
-            let mut frame_addr = item.address.clone();
-            frame_addr.byte_offset = offset;
-            let pdu_ref = self.next_pdu_ref;
-            self.next_pdu_ref = self.next_pdu_ref.wrapping_add(1);
-            let mut cotp_s7 = build_cotp_dt_data().to_vec();
-            cotp_s7.extend_from_slice(&build_write_var(pdu_ref, &frame_addr, &data)?);
-            let frame = build_tpkt(&cotp_s7)?;
-            self.stream
-                .write_all(&frame)
-                .map_err(|e| io_err("send write var", e))?;
-            let resp_frame = recv_frame(&mut self.stream)?;
-            parse_write_ack(parse_tpkt(&resp_frame)?)?;
-            // 每个载荷长度 == 其宽度（上方防御校验），故累计字节数即宽度之和。
-            offset += data.len() as u32;
-            start += taken;
+            other => other,
         }
-        cursor += member_count;
     }
-    Ok(())
-}
 
-/// 单个 Write Var 请求的数据区预算（字节）：协商 PDU 扣除帧固定开销
-/// [`WRITE_FRAME_OVERHEAD`]；至少 1（防御异常小的协商值）。
-fn max_write_data_bytes(&self) -> usize {
-    (self.negotiated_pdu as usize)
-        .saturating_sub(WRITE_FRAME_OVERHEAD)
-        .max(1)
-}
+    /// 单次批量写尝试（无重连）：合并 → 组内按 PDU 数据预算切帧 → 逐帧执行。
+    fn write_points_once(&mut self, reqs: &[(S7Address, Vec<u8>)]) -> Result<(), S7Error> {
+        if reqs.is_empty() {
+            return Ok(());
+        }
+        let addrs: Vec<S7Address> = reqs.iter().map(|(a, _)| a.clone()).collect();
+        let groups = merge_adjacent_groups(&addrs);
+        let max_data = self.max_write_data_bytes();
+        let mut cursor = 0usize; // reqs 下标（与 addrs 同序同长）
+        for (item, widths) in groups {
+            let member_count = widths.len();
+            let mut start = 0usize; // 组内成员下标
+            let mut offset = item.address.byte_offset;
+            while start < member_count {
+                let mut data: Vec<u8> = Vec::new();
+                let mut taken = 0usize;
+                while start + taken < member_count {
+                    let width = usize::from(widths[start + taken]);
+                    let payload = &reqs[cursor + start + taken].1;
+                    // 防御：载荷宽度须与地址尺寸一致（适配层已 fail-fast 校验）。
+                    if payload.len() != width {
+                        return Err(S7Error::BadParam(format!(
+                            "write payload {} bytes != address width {width} for {:?}",
+                            payload.len(),
+                            reqs[cursor + start + taken].0
+                        )));
+                    }
+                    // 首成员必入帧（与 max_items 的 max(1) 同思路）；后续成员按
+                    // 单帧数据预算断开。组内地址连续，任意断开均合法。
+                    if !data.is_empty() && data.len() + width > max_data {
+                        break;
+                    }
+                    data.extend_from_slice(payload);
+                    taken += 1;
+                }
+                let mut frame_addr = item.address.clone();
+                frame_addr.byte_offset = offset;
+                let pdu_ref = self.next_pdu_ref;
+                self.next_pdu_ref = self.next_pdu_ref.wrapping_add(1);
+                let mut cotp_s7 = build_cotp_dt_data().to_vec();
+                cotp_s7.extend_from_slice(&build_write_var(pdu_ref, &frame_addr, &data)?);
+                let frame = build_tpkt(&cotp_s7)?;
+                self.stream
+                    .write_all(&frame)
+                    .map_err(|e| io_err("send write var", e))?;
+                let resp_frame = recv_frame(&mut self.stream)?;
+                parse_write_ack(parse_tpkt(&resp_frame)?)?;
+                // 每个载荷长度 == 其宽度（上方防御校验），故累计字节数即宽度之和。
+                offset += data.len() as u32;
+                start += taken;
+            }
+            cursor += member_count;
+        }
+        Ok(())
+    }
+
+    /// 单个 Write Var 请求的数据区预算（字节）：协商 PDU 扣除帧固定开销
+    /// [`WRITE_FRAME_OVERHEAD`]；至少 1（防御异常小的协商值）。
+    fn max_write_data_bytes(&self) -> usize {
+        (self.negotiated_pdu as usize)
+            .saturating_sub(WRITE_FRAME_OVERHEAD)
+            .max(1)
+    }
 
     /// 写单个点位（一次 Write Var 请求）。
     ///
@@ -1030,8 +1048,7 @@ fn merge_adjacent_groups(addrs: &[S7Address]) -> Vec<(S7ReadItem, Vec<u16>)> {
                     && a.size != S7Size::Bit
                     && item.address.area == a.area
                     && item.address.db == a.db
-                    && item.address.byte_offset
-                        + widths.iter().map(|&w| u32::from(w)).sum::<u32>()
+                    && item.address.byte_offset + widths.iter().map(|&w| u32::from(w)).sum::<u32>()
                         == a.byte_offset
                     && u32::from(item.count) + u32::from(width) <= u32::from(u16::MAX)
             }
@@ -1044,7 +1061,13 @@ fn merge_adjacent_groups(addrs: &[S7Address]) -> Vec<(S7ReadItem, Vec<u16>)> {
                 continue;
             }
         }
-        groups.push((S7ReadItem { address: a.clone(), count: width }, vec![width]));
+        groups.push((
+            S7ReadItem {
+                address: a.clone(),
+                count: width,
+            },
+            vec![width],
+        ));
     }
     groups
 }
@@ -1105,7 +1128,10 @@ mod tests {
             }
         );
         // DBB/DBW/DBD 记录字节偏移，位号恒 0。
-        assert_eq!(parse_s7_address(" db2.dbb10 ").expect("valid").byte_offset, 10);
+        assert_eq!(
+            parse_s7_address(" db2.dbb10 ").expect("valid").byte_offset,
+            10
+        );
         let w = parse_s7_address("DB2.DBW20").expect("valid");
         assert_eq!((w.db, w.byte_offset, w.size), (2, 20, S7Size::Word));
         let d = parse_s7_address("DB2.DBD40").expect("valid");
@@ -1119,7 +1145,10 @@ mod tests {
         assert_eq!((q.area, q.bit_index), (S7Area::Q, 7));
         // M/I/Q 字节/字/双字。
         let mb = parse_s7_address("MB5").expect("valid");
-        assert_eq!((mb.area, mb.size, mb.byte_offset), (S7Area::M, S7Size::Byte, 5));
+        assert_eq!(
+            (mb.area, mb.size, mb.byte_offset),
+            (S7Area::M, S7Size::Byte, 5)
+        );
         let mw = parse_s7_address("MW6").expect("valid");
         assert_eq!(mw.size, S7Size::Word);
         let md = parse_s7_address("MD8").expect("valid");
@@ -1156,7 +1185,10 @@ mod tests {
         ];
         for raw in cases {
             let err = parse_s7_address(raw).expect_err(&format!("must reject {raw:?}"));
-            assert!(matches!(err, S7Error::BadAddress(_)), "for {raw:?}: {err:?}");
+            assert!(
+                matches!(err, S7Error::BadAddress(_)),
+                "for {raw:?}: {err:?}"
+            );
             assert!(
                 err.to_string().contains(raw),
                 "message keeps input for {raw:?}: {err}"
@@ -1192,14 +1224,14 @@ mod tests {
 
         // 截断：总长声明 7 但只给了 6 字节。
         let truncated = &frame[..frame.len() - 1];
-        assert!(matches!(
-            parse_tpkt(truncated),
-            Err(S7Error::BadFrame(_))
-        ));
+        assert!(matches!(parse_tpkt(truncated), Err(S7Error::BadFrame(_))));
         // 版本非 0x0300。
         let mut bad_version = frame.clone();
         bad_version[0] = 0x04;
-        assert!(matches!(parse_tpkt(&bad_version), Err(S7Error::BadFrame(_))));
+        assert!(matches!(
+            parse_tpkt(&bad_version),
+            Err(S7Error::BadFrame(_))
+        ));
     }
 
     // ---- COTP ----
@@ -1215,7 +1247,10 @@ mod tests {
         let cr = build_cotp_cr(derive_tsap(0, 0));
         // golden：LI(11) | CR(E0) | dst-ref(0001) | src-ref(0000) | class(F0)
         //       | TPDU-size(C0 01 09) | src-TSAP(C1 02 0100) | dst-TSAP(C2 02 0300)
-        assert_eq!(cr, hex("11 E0 00 01 00 00 F0 C0 01 09 C1 02 01 00 C2 02 03 00"));
+        assert_eq!(
+            cr,
+            hex("11 E0 00 01 00 00 F0 C0 01 09 C1 02 01 00 C2 02 03 00")
+        );
 
         // CC（0xD0）合法：LI=6，其后 6 字节。
         let cc = hex("06 D0 00 01 00 00 00");
@@ -1237,7 +1272,10 @@ mod tests {
         //       | F0 00 0100(caller) 0100(callee) 01E0(PDU=480)
         // 注：参数区共 8 字节（1+1+2+2+2），与头部 param len=0x0008 一致
         //（对照真实 S7comm 抓包：… 00 08 00 00 F0 00 00 01 00 01 01 E0）。
-        assert_eq!(req, hex("32 01 00 00 00 00 00 08 00 00 F0 00 00 01 00 01 01 E0"));
+        assert_eq!(
+            req,
+            hex("32 01 00 00 00 00 00 08 00 00 F0 00 00 01 00 01 01 E0")
+        );
 
         // ACK golden：对端回 PDU 960（0x03C0），错误类/码为 0，参数区 8 字节同构。
         let ack = hex("32 03 00 00 00 00 00 08 00 00 00 00 F0 00 00 01 00 01 03 C0");
@@ -1255,8 +1293,14 @@ mod tests {
     #[test]
     fn read_var_single_item_golden() {
         let addr = parse_s7_address("DB1.DBX2.1").expect("valid");
-        let frame =
-            build_read_var(0x0100, &[S7ReadItem { address: addr, count: 1 }]).expect("build");
+        let frame = build_read_var(
+            0x0100,
+            &[S7ReadItem {
+                address: addr,
+                count: 1,
+            }],
+        )
+        .expect("build");
         // golden：头 10B（ref=0100、param=000E、data=0000）+ 功能码 04、项数 01
         //       + Item：12 0A 10 01(bit) 0001(1 位) 0001(DB=1) 84(DB 区) 000011((2<<3)|1)
         assert_eq!(
@@ -1273,8 +1317,14 @@ mod tests {
         let frame = build_read_var(
             0,
             &[
-                S7ReadItem { address: w, count: 2 },
-                S7ReadItem { address: b, count: 1 },
+                S7ReadItem {
+                    address: w,
+                    count: 2,
+                },
+                S7ReadItem {
+                    address: b,
+                    count: 1,
+                },
             ],
         )
         .expect("build");
@@ -1282,11 +1332,9 @@ mod tests {
         // Item2 transport 01、1 位、区 83(M)、地址 (3<<3)|5=0x1D。
         assert_eq!(
             frame,
-            hex(
-                "32 01 00 00 00 00 00 1A 00 00 04 02 \
+            hex("32 01 00 00 00 00 00 1A 00 00 04 02 \
                  12 0A 10 04 00 02 00 01 84 00 00 00 \
-                 12 0A 10 01 00 01 00 00 83 00 00 1D"
-            )
+                 12 0A 10 01 00 01 00 00 83 00 00 1D")
         );
     }
 
@@ -1299,11 +1347,9 @@ mod tests {
         //       0002(2 字节) + 大端 12 34。
         assert_eq!(
             frame,
-            hex(
-                "32 01 00 00 00 00 00 0E 00 06 05 01 \
+            hex("32 01 00 00 00 00 00 0E 00 06 05 01 \
                  12 0A 10 04 00 02 00 01 84 00 00 00 \
-                 00 04 00 02 12 34"
-            )
+                 00 04 00 02 12 34")
         );
         // 大端语义二次断言：数据本体经 read_u16_be 还原 0x1234。
         let value = read_u16_be(&frame[frame.len() - 2..]).expect("read value");
@@ -1316,17 +1362,18 @@ mod tests {
         assert_eq!(read_u16_be(&hex("12 34")).expect("u16"), 0x1234);
         assert_eq!(read_u32_be(&hex("12 34 56 78")).expect("u32"), 0x1234_5678);
         assert!(matches!(read_u16_be(&[0x12]), Err(S7Error::BadFrame(_))));
-        assert!(matches!(read_u32_be(&[0x12, 0x34]), Err(S7Error::BadFrame(_))));
+        assert!(matches!(
+            read_u32_be(&[0x12, 0x34]),
+            Err(S7Error::BadFrame(_))
+        ));
     }
 
     /// QA: Read ACK 解析 OK（字 Item + 位 Item 位长回推字节）。
     #[test]
     fn parse_read_ack_ok() {
         // 两项：FF 04 0004 + 4 字节数据；FF 01 0001（1 位 → 1 字节）+ 01。
-        let ack = hex(
-            "32 03 00 00 00 00 00 02 00 0C 00 00 04 02 \
-             FF 04 00 04 12 34 56 78 FF 01 00 01 01",
-        );
+        let ack = hex("32 03 00 00 00 00 00 02 00 0C 00 00 04 02 \
+             FF 04 00 04 12 34 56 78 FF 01 00 01 01");
         let values = parse_read_ack(&ack).expect("parse ok");
         assert_eq!(
             values,
@@ -1506,7 +1553,10 @@ mod session_tests {
 
     /// 标准握手脚本：CR→CC、Setup→ACK（两组应答）。
     fn handshake_script() -> Vec<Vec<Vec<u8>>> {
-        vec![vec![build_tpkt(&cotp_cc_frame()).expect("tpkt")], vec![build_tpkt(&setup_ack_frame()).expect("tpkt")]]
+        vec![
+            vec![build_tpkt(&cotp_cc_frame()).expect("tpkt")],
+            vec![build_tpkt(&setup_ack_frame()).expect("tpkt")],
+        ]
     }
 
     /// QA Happy: mock 服务器三步握手成功，协商 PDU = 480。
@@ -1522,13 +1572,19 @@ mod session_tests {
     #[test]
     fn mock_read_word_bigendian_0x1234() {
         let mut script = handshake_script();
-        script.push(vec![build_tpkt(&read_ack_frame(0x04, 2, &[0x12, 0x34])).expect("tpkt")]);
+        script.push(vec![
+            build_tpkt(&read_ack_frame(0x04, 2, &[0x12, 0x34])).expect("tpkt")
+        ]);
         let addr = spawn_mock(script);
         let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
         let a = parse_s7_address("DB1.DBW0").expect("addr");
         let vals = s.read_points(&[a]).expect("read");
         assert_eq!(vals.len(), 1);
-        assert_eq!(read_u16_be(&vals[0]).expect("u16"), 0x1234, "big-endian word");
+        assert_eq!(
+            read_u16_be(&vals[0]).expect("u16"),
+            0x1234,
+            "big-endian word"
+        );
         s.shutdown();
     }
 
@@ -1536,7 +1592,9 @@ mod session_tests {
     #[test]
     fn mock_read_bit() {
         let mut script = handshake_script();
-        script.push(vec![build_tpkt(&read_ack_frame(0x01, 1, &[0x01])).expect("tpkt")]);
+        script.push(vec![
+            build_tpkt(&read_ack_frame(0x01, 1, &[0x01])).expect("tpkt")
+        ]);
         let addr = spawn_mock(script);
         let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
         let a = parse_s7_address("M1.2").expect("addr");
@@ -1568,8 +1626,8 @@ mod session_tests {
     fn mock_connect_no_reply_is_network_error() {
         // 空脚本：mock 只收 CR 不回包（EOF / 对端关闭）。
         let addr = spawn_mock(vec![vec![]]);
-        let err = S7Session::connect(&addr.to_string(), derive_tsap(0, 0))
-            .expect_err("must time out");
+        let err =
+            S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect_err("must time out");
         assert!(matches!(err, S7Error::NetworkError(_)), "got {err:?}");
     }
 
@@ -1580,8 +1638,8 @@ mod session_tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         drop(listener);
-        let err = S7Session::connect(&addr.to_string(), derive_tsap(0, 0))
-            .expect_err("must be refused");
+        let err =
+            S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect_err("must be refused");
         assert!(matches!(err, S7Error::NetworkError(_)), "got {err:?}");
     }
 
@@ -1622,7 +1680,11 @@ mod session_tests {
             matches!(err, S7Error::ReturnCode { code: 0x05, .. }),
             "got {err:?}"
         );
-        assert_eq!(received.lock().expect("lock").len(), 3, "no reconnect retry");
+        assert_eq!(
+            received.lock().expect("lock").len(),
+            3,
+            "no reconnect retry"
+        );
         s.shutdown();
     }
 
@@ -1632,8 +1694,12 @@ mod session_tests {
     #[test]
     fn mock_read_merges_adjacent_words_into_single_item() {
         let mut script = handshake_script();
-        script.push(vec![build_tpkt(&read_ack_frame(0x04, 4, &[0x12, 0x34, 0x56, 0x78]))
-            .expect("tpkt")]);
+        script.push(vec![build_tpkt(&read_ack_frame(
+            0x04,
+            4,
+            &[0x12, 0x34, 0x56, 0x78],
+        ))
+        .expect("tpkt")]);
         let (addr, received) = spawn_mock_multi(vec![script]);
         let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
         let w0 = parse_s7_address("DB1.DBW0").expect("addr");
@@ -1641,12 +1707,20 @@ mod session_tests {
         let vals = s.read_points(&[w0, w2]).expect("read");
         s.shutdown();
 
-        assert_eq!(vals, vec![hex("12 34"), hex("56 78")], "split back per address");
+        assert_eq!(
+            vals,
+            vec![hex("12 34"), hex("56 78")],
+            "split back per address"
+        );
         let rec = received.lock().expect("lock");
         let payload = parse_tpkt(&rec[2]).expect("tpkt");
         assert_eq!(payload[14], 1, "merged into a single item");
         // Item 长度字段位于 payload[19..21]（Item 头 4 字节之后）。
-        assert_eq!(&payload[19..21], &4u16.to_be_bytes(), "merged count = 4 bytes");
+        assert_eq!(
+            &payload[19..21],
+            &4u16.to_be_bytes(),
+            "merged count = 4 bytes"
+        );
     }
 
     /// QA: 合并边界——有间隙不合拢、位地址不合拢、跨 DB 不合拢；异宽可链式合并。
@@ -1687,7 +1761,9 @@ mod session_tests {
             let items: Vec<(u8, u16, Vec<u8>)> = (0..count)
                 .map(|j| (0x04u8, 2u16, (base + j as u16).to_be_bytes().to_vec()))
                 .collect();
-            script.push(vec![build_tpkt(&read_ack_frame_items(&items)).expect("tpkt")]);
+            script.push(vec![
+                build_tpkt(&read_ack_frame_items(&items)).expect("tpkt")
+            ]);
         }
         let (addr, received) = spawn_mock_multi(vec![script]);
         let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
@@ -1704,7 +1780,11 @@ mod session_tests {
         // 结果顺序与取值逐一正确（按请求内序号还原）。
         assert_eq!(vals.len(), 40);
         for (i, v) in vals.iter().enumerate() {
-            let expect = if i < 38 { 100 + i as u16 } else { 200 + (i - 38) as u16 };
+            let expect = if i < 38 {
+                100 + i as u16
+            } else {
+                200 + (i - 38) as u16
+            };
             assert_eq!(read_u16_be(v).expect("u16"), expect, "index {i}");
         }
     }
@@ -1715,7 +1795,9 @@ mod session_tests {
     #[test]
     fn mock_reconnect_after_peer_close_succeeds() {
         let mut script2 = handshake_script();
-        script2.push(vec![build_tpkt(&read_ack_frame(0x04, 2, &[0x12, 0x34])).expect("tpkt")]);
+        script2.push(vec![
+            build_tpkt(&read_ack_frame(0x04, 2, &[0x12, 0x34])).expect("tpkt")
+        ]);
         // 连接 1：仅握手（随后被 mock 关闭）；连接 2：握手 + 正常应答。
         let (addr, _rec) = spawn_mock_multi(vec![handshake_script(), script2]);
         let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
@@ -1733,7 +1815,9 @@ mod session_tests {
         // 让 mock 线程处理完连接 1 并释放监听端口（脚本耗尽后 mock 关闭退出）。
         thread::sleep(Duration::from_millis(300));
         let a = parse_s7_address("DB1.DBW0").expect("addr");
-        let err = s.read_points(&[a]).expect_err("second failure must propagate");
+        let err = s
+            .read_points(&[a])
+            .expect_err("second failure must propagate");
         assert!(matches!(err, S7Error::NetworkError(_)), "got {err:?}");
     }
 }

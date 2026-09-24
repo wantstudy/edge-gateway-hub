@@ -236,7 +236,9 @@ impl ReceiptLedger {
     pub fn open(path: Option<&str>) -> Self {
         let primary = match path {
             Some(p) => Connection::open(p).ok().filter(|c| migrate(c).is_ok()),
-            None => Connection::open_in_memory().ok().filter(|c| migrate(c).is_ok()),
+            None => Connection::open_in_memory()
+                .ok()
+                .filter(|c| migrate(c).is_ok()),
         };
         // 主库不可用 → 内存库兜底（幂等记忆退化为进程生命周期）。
         let conn = primary
@@ -637,7 +639,11 @@ mod tests {
             1,
             "重放不得新增批次头"
         );
-        assert_eq!(ledger.cursor_of("mid-a").expect("cursor"), Some((1, 10)), "重放不得移动 cursor");
+        assert_eq!(
+            ledger.cursor_of("mid-a").expect("cursor"),
+            Some((1, 10)),
+            "重放不得移动 cursor"
+        );
         assert!(
             ledger.warnings_for("mid-a").expect("warnings").is_empty(),
             "重放不得产生告警"
@@ -649,11 +655,20 @@ mod tests {
     fn record_batch_persists_warnings_for_all_anomalies() {
         let ledger = ReceiptLedger::open_in_memory();
         // 首批 1..10。
-        ledger.record_batch(&rec("mid-w", "lease-w", 1, 10, "d")).expect("first");
+        ledger
+            .record_batch(&rec("mid-w", "lease-w", 1, 10, "d"))
+            .expect("first");
 
         // 跳空 25..30。
-        let out = ledger.record_batch(&rec("mid-w", "lease-w", 25, 30, "d")).expect("gap");
-        let BatchOutcome::Recorded { gap, warnings, last_seq_to } = out else {
+        let out = ledger
+            .record_batch(&rec("mid-w", "lease-w", 25, 30, "d"))
+            .expect("gap");
+        let BatchOutcome::Recorded {
+            gap,
+            warnings,
+            last_seq_to,
+        } = out
+        else {
             panic!("必须 Recorded");
         };
         assert_eq!(gap, GapKind::Gap);
@@ -661,7 +676,9 @@ mod tests {
         assert_eq!(warnings.len(), 1);
 
         // 回退 12..18（前沿 30）。
-        let out = ledger.record_batch(&rec("mid-w", "lease-w", 12, 18, "d")).expect("regress");
+        let out = ledger
+            .record_batch(&rec("mid-w", "lease-w", 12, 18, "d"))
+            .expect("regress");
         let BatchOutcome::Recorded { gap, warnings, .. } = out else {
             panic!("必须 Recorded");
         };
@@ -669,7 +686,9 @@ mod tests {
         assert!(warnings[0].starts_with("regress:"), "{}", warnings[0]);
 
         // 重叠（非回退）31..40。
-        let out = ledger.record_batch(&rec("mid-w", "lease-w", 31, 40, "d")).expect("overlap");
+        let out = ledger
+            .record_batch(&rec("mid-w", "lease-w", 31, 40, "d"))
+            .expect("overlap");
         let BatchOutcome::Recorded { gap, warnings, .. } = out else {
             panic!("必须 Recorded");
         };
@@ -677,7 +696,9 @@ mod tests {
         let _ = warnings;
 
         // 重叠：20..45 与前沿 40 相交。
-        let out = ledger.record_batch(&rec("mid-w", "lease-w", 20, 45, "d")).expect("overlap2");
+        let out = ledger
+            .record_batch(&rec("mid-w", "lease-w", 20, 45, "d"))
+            .expect("overlap2");
         let BatchOutcome::Recorded { gap, warnings, .. } = out else {
             panic!("必须 Recorded");
         };
@@ -692,7 +713,11 @@ mod tests {
         assert_eq!(rows[2].kind, "overlap");
         // 明细与响应 warnings 字段同文（detail 即告警原文）。
         // 跳空批次 25..30 的前沿是首批的 10 → 期望起点为 11。
-        assert!(rows[0].detail.contains("expected seq_from 11"), "{}", rows[0].detail);
+        assert!(
+            rows[0].detail.contains("expected seq_from 11"),
+            "{}",
+            rows[0].detail
+        );
         assert_eq!(rows[0].seq_from, 25);
         assert_eq!(rows[0].last_seq_to, 10);
         assert!(rows[1].detail.starts_with("regress:"), "{}", rows[1].detail);
@@ -704,15 +729,25 @@ mod tests {
     fn cursor_is_per_device_and_survives_lease_change() {
         let ledger = ReceiptLedger::open_in_memory();
         // 设备 A：lease-1 上 1..10。
-        ledger.record_batch(&rec("mid-a", "lease-1", 1, 10, "d")).expect("a1");
+        ledger
+            .record_batch(&rec("mid-a", "lease-1", 1, 10, "d"))
+            .expect("a1");
         // 设备 A 换租约 lease-2：11..20 仍应判定为连续（跨租约延续）。
-        let out = ledger.record_batch(&rec("mid-a", "lease-2", 11, 20, "d")).expect("a2");
-        let BatchOutcome::Recorded { gap, .. } = out else { panic!("必须 Recorded") };
+        let out = ledger
+            .record_batch(&rec("mid-a", "lease-2", 11, 20, "d"))
+            .expect("a2");
+        let BatchOutcome::Recorded { gap, .. } = out else {
+            panic!("必须 Recorded")
+        };
         assert_eq!(gap, GapKind::None, "同设备跨租约必须延续序号历史");
 
         // 设备 B 从 1..5 起步：不得受设备 A 的 cursor 影响。
-        let out = ledger.record_batch(&rec("mid-b", "lease-3", 1, 5, "d")).expect("b1");
-        let BatchOutcome::Recorded { gap, warnings, .. } = out else { panic!("必须 Recorded") };
+        let out = ledger
+            .record_batch(&rec("mid-b", "lease-3", 1, 5, "d"))
+            .expect("b1");
+        let BatchOutcome::Recorded { gap, warnings, .. } = out else {
+            panic!("必须 Recorded")
+        };
         assert_eq!(gap, GapKind::None);
         assert!(warnings.is_empty());
         assert_eq!(ledger.cursor_of("mid-a").expect("cursor-a"), Some((11, 20)));
@@ -723,15 +758,25 @@ mod tests {
     #[test]
     fn cursor_frontier_is_monotonic_against_regress() {
         let ledger = ReceiptLedger::open_in_memory();
-        ledger.record_batch(&rec("mid-m", "lease-m", 1, 100, "d")).expect("first");
+        ledger
+            .record_batch(&rec("mid-m", "lease-m", 1, 100, "d"))
+            .expect("first");
         // 回退批次 40..50：Recorded（新批次键）但前沿保持 100。
-        let out = ledger.record_batch(&rec("mid-m", "lease-m", 40, 50, "d")).expect("regress");
-        let BatchOutcome::Recorded { gap, .. } = out else { panic!("必须 Recorded") };
+        let out = ledger
+            .record_batch(&rec("mid-m", "lease-m", 40, 50, "d"))
+            .expect("regress");
+        let BatchOutcome::Recorded { gap, .. } = out else {
+            panic!("必须 Recorded")
+        };
         assert_eq!(gap, GapKind::Overlap);
         assert_eq!(ledger.cursor_of("mid-m").expect("cursor"), Some((40, 100)));
         // 后续 101..110 仍以 100 为前沿 → 连续。
-        let out = ledger.record_batch(&rec("mid-m", "lease-m", 101, 110, "d")).expect("next");
-        let BatchOutcome::Recorded { gap, warnings, .. } = out else { panic!("必须 Recorded") };
+        let out = ledger
+            .record_batch(&rec("mid-m", "lease-m", 101, 110, "d"))
+            .expect("next");
+        let BatchOutcome::Recorded { gap, warnings, .. } = out else {
+            panic!("必须 Recorded")
+        };
         assert_eq!(gap, GapKind::None);
         assert!(warnings.is_empty());
     }
@@ -741,11 +786,13 @@ mod tests {
     fn big_seq_numbers_round_trip_losslessly() {
         let ledger = ReceiptLedger::open_in_memory();
         let base: u64 = 9_007_199_254_740_993; // 2^53 + 1
-        // 无历史的大数起步：按「前缀缺失」判 Gap（先验证大数比较不溢出）。
+                                               // 无历史的大数起步：按「前缀缺失」判 Gap（先验证大数比较不溢出）。
         let out = ledger
             .record_batch(&rec("mid-big", "lease-big", base, base + 9, "d"))
             .expect("big batch");
-        let BatchOutcome::Recorded { gap, .. } = out else { panic!("必须 Recorded") };
+        let BatchOutcome::Recorded { gap, .. } = out else {
+            panic!("必须 Recorded")
+        };
         assert_eq!(gap, GapKind::Gap, "无历史且 seq_from > 1 必须判 Gap");
         assert_eq!(
             ledger.cursor_of("mid-big").expect("cursor"),
@@ -756,7 +803,9 @@ mod tests {
         let out = ledger
             .record_batch(&rec("mid-big", "lease-big", base + 10, base + 19, "d"))
             .expect("big next");
-        let BatchOutcome::Recorded { gap, warnings, .. } = out else { panic!("必须 Recorded") };
+        let BatchOutcome::Recorded { gap, warnings, .. } = out else {
+            panic!("必须 Recorded")
+        };
         assert_eq!(gap, GapKind::None);
         assert!(warnings.is_empty());
     }
@@ -765,8 +814,12 @@ mod tests {
     #[test]
     fn first_batch_with_missing_prefix_is_gap_with_warning() {
         let ledger = ReceiptLedger::open_in_memory();
-        let out = ledger.record_batch(&rec("mid-p", "lease-p", 5, 9, "d")).expect("first");
-        let BatchOutcome::Recorded { gap, warnings, .. } = out else { panic!("必须 Recorded") };
+        let out = ledger
+            .record_batch(&rec("mid-p", "lease-p", 5, 9, "d"))
+            .expect("first");
+        let BatchOutcome::Recorded { gap, warnings, .. } = out else {
+            panic!("必须 Recorded")
+        };
         assert_eq!(gap, GapKind::Gap);
         assert_eq!(warnings.len(), 1);
         assert_eq!(ledger.warnings_for("mid-p").expect("rows").len(), 1);
@@ -819,14 +872,20 @@ mod tests {
             })
             .collect();
         for h in handles {
-            let out = h.join().expect("thread must not panic").expect("distinct batch");
+            let out = h
+                .join()
+                .expect("thread must not panic")
+                .expect("distinct batch");
             let BatchOutcome::Recorded { gap, .. } = out else {
                 panic!("不同批次必须全部 Recorded: {out:?}")
             };
             let _ = gap;
         }
         assert_eq!(ledger.batch_count().expect("count"), 4);
-        assert_eq!(ledger.cursor_of("mid-d").expect("cursor").map(|(_, to)| to), Some(40));
+        assert_eq!(
+            ledger.cursor_of("mid-d").expect("cursor").map(|(_, to)| to),
+            Some(40)
+        );
     }
 
     /// 迁移幂等：同一文件库重复 open 不报错、数据保留。
@@ -838,12 +897,20 @@ mod tests {
 
         {
             let ledger = ReceiptLedger::open(Some(path_str));
-            ledger.record_batch(&rec("mid-f", "lease-f", 1, 10, "d")).expect("first");
+            ledger
+                .record_batch(&rec("mid-f", "lease-f", 1, 10, "d"))
+                .expect("first");
         }
         // 重新打开：迁移幂等 + 批次头仍在（重启后幂等记忆保留）。
         let ledger = ReceiptLedger::open(Some(path_str));
-        assert_eq!(ledger.batch_count().expect("count"), 1, "重启后批次头必须保留");
-        let out = ledger.record_batch(&rec("mid-f", "lease-f", 1, 10, "d")).expect("replay");
+        assert_eq!(
+            ledger.batch_count().expect("count"),
+            1,
+            "重启后批次头必须保留"
+        );
+        let out = ledger
+            .record_batch(&rec("mid-f", "lease-f", 1, 10, "d"))
+            .expect("replay");
         assert_eq!(out, BatchOutcome::Replay, "重启后同批次仍须判重放");
         assert_eq!(ledger.batch_count().expect("count"), 1);
     }
@@ -857,6 +924,10 @@ mod tests {
         r.seq_to = huge;
         let err = ledger.record_batch(&r).expect_err("必须拒绝");
         assert!(err.to_string().contains("seq_to"), "{err}");
-        assert_eq!(ledger.batch_count().expect("count"), 0, "失败批次不得留下半途状态");
+        assert_eq!(
+            ledger.batch_count().expect("count"),
+            0,
+            "失败批次不得留下半途状态"
+        );
     }
 }

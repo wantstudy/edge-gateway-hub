@@ -228,7 +228,10 @@ mod tests {
     #[test]
     fn interval_boundary_1000ms() {
         let at_limit = config_with_devices(1, FREE_MIN_POLL_INTERVAL_MS);
-        assert!(validate(&at_limit, false).is_empty(), "恰好 1000ms 必须放行");
+        assert!(
+            validate(&at_limit, false).is_empty(),
+            "恰好 1000ms 必须放行"
+        );
 
         let too_fast = config_with_devices(1, FREE_MIN_POLL_INTERVAL_MS - 1);
         assert_eq!(
@@ -268,7 +271,10 @@ mod tests {
         assert!(validate(&clean, false).is_empty());
 
         let with_outlet = config_with_outlet(clean);
-        assert_eq!(validate(&with_outlet, false), vec![LimitViolation::NorthEnabled]);
+        assert_eq!(
+            validate(&with_outlet, false),
+            vec![LimitViolation::NorthEnabled]
+        );
     }
 
     /// QA：多类违规聚合（不短路）—— 超额设备 + 快间隔 + 北向同时上报。

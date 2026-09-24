@@ -171,11 +171,14 @@ impl McDeviceCode {
 /// 空串 / 未知区 / 元件号缺失或非十进制 / 越界（超 u32）→ [`DaemonError::ProtocolError`]。
 pub fn parse_mc_address(raw: &str) -> DaemonResult<PointAddress> {
     let upper = raw.trim().to_ascii_uppercase();
-    let wrap =
-        |detail: String| DaemonError::ProtocolError(format!("invalid mc address {raw:?}: {detail}"));
+    let wrap = |detail: String| {
+        DaemonError::ProtocolError(format!("invalid mc address {raw:?}: {detail}"))
+    };
 
     let mut chars = upper.chars();
-    let area = chars.next().ok_or_else(|| wrap("empty address".to_string()))?;
+    let area = chars
+        .next()
+        .ok_or_else(|| wrap("empty address".to_string()))?;
     let code = McDeviceCode::from_area(area)
         .ok_or_else(|| wrap(format!("unsupported mc area {area:?} (D/M/X/Y only)")))?;
     let number_raw = chars.as_str();
@@ -496,7 +499,9 @@ impl McDriver {
             Err(e) => {
                 self.reconnector.next_delay();
                 let _ = reason; // 失败原因并入最终错误消息（保留可检索性）
-                Err(DaemonError::NetworkError(format!("mc reconnect failed: {e}")))
+                Err(DaemonError::NetworkError(format!(
+                    "mc reconnect failed: {e}"
+                )))
             }
         }
     }
@@ -600,8 +605,7 @@ impl McDriver {
 
     /// 合并读取请求：同区连续/重叠地址并入单批；单批超出该区单帧上限则拆分。
     fn merge_read_batches(points: &[ReadPoint]) -> DaemonResult<Vec<ReadBatch>> {
-        let mut entries: Vec<(McDeviceCode, u32, u32, usize)> =
-            Vec::with_capacity(points.len());
+        let mut entries: Vec<(McDeviceCode, u32, u32, usize)> = Vec::with_capacity(points.len());
         for (i, p) in points.iter().enumerate() {
             let (code, start, count) = Self::validate_read_point(p)?;
             entries.push((code, start, count, i));
@@ -693,7 +697,6 @@ impl McDriver {
         }
         Ok(batches)
     }
-
 }
 
 #[async_trait]
@@ -805,10 +808,7 @@ mod tests {
 
     /// hex 字符串 → 字节串（golden bytes 断言辅助；空格/下划线被忽略）。
     fn hex(s: &str) -> Vec<u8> {
-        let clean: String = s
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
+        let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
         (0..clean.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).expect("valid hex pair"))
@@ -970,8 +970,7 @@ mod tests {
     #[test]
     fn parse_mc_address_errors() {
         for raw in ["", "  ", "Z10", "D", "M-1", "D100.5", "X1F", "Y99999999999"] {
-            let err = parse_mc_address(raw)
-                .expect_err(&format!("must reject {raw:?}"));
+            let err = parse_mc_address(raw).expect_err(&format!("must reject {raw:?}"));
             assert!(
                 matches!(err, DaemonError::ProtocolError(_)),
                 "for {raw:?}: {err:?}"
@@ -986,7 +985,8 @@ mod tests {
     /// QA: 批量读 D100 × 2（字）请求帧 golden bytes。
     #[test]
     fn golden_read_word_request_frame() {
-        let frame = McDriver::build_request(CMD_BATCH_READ, SUBCMD_WORD, McDeviceCode::D, 100, 2, &[]);
+        let frame =
+            McDriver::build_request(CMD_BATCH_READ, SUBCMD_WORD, McDeviceCode::D, 100, 2, &[]);
         assert_eq!(
             frame,
             hex("00 50  00 FF  FF 03  00  0D 00  10 00  01 04  00 00  A8  64 00 00 00  02 00"),
@@ -997,7 +997,8 @@ mod tests {
     /// QA: 批量读 M50 × 3（位）请求帧 golden bytes。
     #[test]
     fn golden_read_bit_request_frame() {
-        let frame = McDriver::build_request(CMD_BATCH_READ, SUBCMD_BIT, McDeviceCode::M, 50, 3, &[]);
+        let frame =
+            McDriver::build_request(CMD_BATCH_READ, SUBCMD_BIT, McDeviceCode::M, 50, 3, &[]);
         assert_eq!(
             frame,
             hex("00 50  00 FF  FF 03  00  0D 00  10 00  01 04  00 01  90  32 00 00 00  03 00"),
@@ -1096,10 +1097,17 @@ mod tests {
             },
         ];
         let batches = McDriver::merge_read_batches(&pts).expect("merge ok");
-        assert_eq!(batches.len(), 3, "D100-104 merged; D200 separate; M50 separate");
+        assert_eq!(
+            batches.len(),
+            3,
+            "D100-104 merged; D200 separate; M50 separate"
+        );
         assert_eq!(batches[0].code, McDeviceCode::D);
-        assert_eq!((batches[0].start, batches[0].count), (100, 5),
-            "D100+2 / D102+3 cover [100,105); D103+1 fully inside (no extension)");
+        assert_eq!(
+            (batches[0].start, batches[0].count),
+            (100, 5),
+            "D100+2 / D102+3 cover [100,105); D103+1 fully inside (no extension)"
+        );
         assert_eq!(batches[0].indices, vec![0, 1, 4], "input order preserved");
         // 批次按（区字母, 起始号）排序：D 区批次在前，采样回填按 indices 保证输入顺序。
         assert_eq!(
@@ -1272,7 +1280,11 @@ mod tests {
         let samples = driver.read(&[point.clone()]).await.expect("read");
         assert_eq!(samples.len(), 1, "1:1 with request");
         assert_eq!(samples[0].address, point.address, "echoes request address");
-        assert_eq!(samples[0].value, vec![0x12, 0x34, 0xAB, 0xCD], "word BE passthrough");
+        assert_eq!(
+            samples[0].value,
+            vec![0x12, 0x34, 0xAB, 0xCD],
+            "word BE passthrough"
+        );
 
         // 请求帧与 golden bytes 完全一致。
         let logged = requests.lock().expect("req lock");
@@ -1308,7 +1320,11 @@ mod tests {
             count: 3,
         };
         let samples = driver.read(&[point]).await.expect("read");
-        assert_eq!(samples[0].value, vec![0x01, 0x01, 0x00], "bit samples normalized to 0/1");
+        assert_eq!(
+            samples[0].value,
+            vec![0x01, 0x01, 0x00],
+            "bit samples normalized to 0/1"
+        );
         driver.disconnect().await.expect("disconnect");
     }
 
@@ -1338,7 +1354,14 @@ mod tests {
         assert_eq!(logged.len(), 1, "single write frame");
         assert_eq!(
             logged[0],
-            McDriver::build_request(CMD_BATCH_WRITE, SUBCMD_WORD, McDeviceCode::D, 100, 1, &[0x12, 0x34]),
+            McDriver::build_request(
+                CMD_BATCH_WRITE,
+                SUBCMD_WORD,
+                McDeviceCode::D,
+                100,
+                1,
+                &[0x12, 0x34]
+            ),
             "server saw exact golden write frame"
         );
         driver.disconnect().await.expect("disconnect");
@@ -1436,10 +1459,7 @@ mod tests {
     /// QA: 连接丢失后按退避重连一次并重试成功（flaky 服务器首连接即断）。
     #[tokio::test]
     async fn reconnect_after_connection_loss() {
-        let addr = spawn_flaky_server(move |_request| {
-            build_ok_response(&[0xCA, 0xFE])
-        })
-        .await;
+        let addr = spawn_flaky_server(move |_request| build_ok_response(&[0xCA, 0xFE])).await;
 
         let mut driver = McDriver::new(test_config(addr));
         driver.connect().await.expect("connect (conn1)");
@@ -1449,7 +1469,11 @@ mod tests {
             count: 1,
         };
         let samples = driver.read(&[point]).await.expect("read after reconnect");
-        assert_eq!(samples[0].value, vec![0xCA, 0xFE], "retry succeeded on conn2");
+        assert_eq!(
+            samples[0].value,
+            vec![0xCA, 0xFE],
+            "retry succeeded on conn2"
+        );
         assert_eq!(
             driver.reconnector().clone().next_delay(),
             Duration::from_millis(2),

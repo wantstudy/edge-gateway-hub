@@ -2063,10 +2063,7 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<usize> {
-            self.calls
-                .lock()
-                .expect("degrade calls lock")
-                .clone()
+            self.calls.lock().expect("degrade calls lock").clone()
         }
     }
 
@@ -2084,17 +2081,19 @@ mod tests {
     #[tokio::test]
     async fn watermark_triggers_degrade_callback_and_skips_send() {
         let broker = spawn_mock_broker(BrokerOptions::default()).await;
-        let mut client = MqttClient::new(
-            endpoint_for(broker.port, "iot-daq-wm")
-                .with_send_watermarks(64, 3),
-        )
-        .expect("client");
+        let mut client =
+            MqttClient::new(endpoint_for(broker.port, "iot-daq-wm").with_send_watermarks(64, 3))
+                .expect("client");
         client.poll_event().await.expect("connect");
 
         // 水位以内：正常发送（不轮询确认 → outstanding 持续增长）。
         for i in 0..3 {
             let outcome = client
-                .publish_backpressured(&format!("telemetry/dev-1/p{i}"), b"ok".to_vec(), &RecordingDegrade::new())
+                .publish_backpressured(
+                    &format!("telemetry/dev-1/p{i}"),
+                    b"ok".to_vec(),
+                    &RecordingDegrade::new(),
+                )
                 .await
                 .expect("publish under watermark");
             assert_eq!(outcome, PublishOutcome::Sent);
@@ -2144,8 +2143,7 @@ mod tests {
     async fn watermark_recovers_after_pubacks() {
         let broker = spawn_mock_broker(BrokerOptions::default()).await;
         let mut client = MqttClient::new(
-            endpoint_for(broker.port, "iot-daq-wm-rec")
-                .with_send_watermarks(64, 1),
+            endpoint_for(broker.port, "iot-daq-wm-rec").with_send_watermarks(64, 1),
         )
         .expect("client");
         client.poll_event().await.expect("connect");
@@ -2192,8 +2190,7 @@ mod tests {
     async fn degrade_path_never_blocks_or_touches_network() {
         // 从未 poll（未建立任何连接）——publish 只是入请求通道（容量 64）。
         let mut client = MqttClient::new(
-            endpoint_for(DEFAULT_MQTT_PORT, "iot-daq-wm-off")
-                .with_send_watermarks(64, 4),
+            endpoint_for(DEFAULT_MQTT_PORT, "iot-daq-wm-off").with_send_watermarks(64, 4),
         )
         .expect("client");
         let degrade = RecordingDegrade::new();
@@ -2228,7 +2225,9 @@ mod tests {
         );
         let over = EndpointConfig::new("o", "127.0.0.1", 1883).with_send_watermarks(64, 65);
         assert_eq!(
-            over.validate().expect_err("watermark > capacity").error_code(),
+            over.validate()
+                .expect_err("watermark > capacity")
+                .error_code(),
             ERR_CONFIG
         );
         let ok = EndpointConfig::new("o", "127.0.0.1", 1883).with_send_watermarks(64, 64);

@@ -41,7 +41,11 @@ fn parse_args() -> Result<Args, String> {
             "--bind" => {
                 bind_addr = Some(raw.next().ok_or("--bind 需要一个地址参数")?);
             }
-            other => return Err(format!("未知参数 {other}（支持 --config <path> / --bind <addr>）")),
+            other => {
+                return Err(format!(
+                    "未知参数 {other}（支持 --config <path> / --bind <addr>）"
+                ))
+            }
         }
     }
     Ok(Args {
@@ -68,7 +72,10 @@ async fn main() -> ExitCode {
     let config = match GatewayConfig::load(&args.config_path) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("[iot-daq-daemon] 配置加载失败 ({}): {e}", args.config_path.display());
+            eprintln!(
+                "[iot-daq-daemon] 配置加载失败 ({}): {e}",
+                args.config_path.display()
+            );
             return ExitCode::FAILURE;
         }
     };

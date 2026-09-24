@@ -43,8 +43,8 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{MgmtEvent, MgmtState};
 use super::rbac::{permission_for_ops_action, AuthRejection, AuthedRole};
+use super::{MgmtEvent, MgmtState};
 
 /// 审计环容量（超出按环形淘汰最旧）。
 pub const AUDIT_RING_CAPACITY: usize = 1024;
@@ -447,11 +447,7 @@ struct CollectorsBody {
 ///
 /// **诚实限制**：本端点只保证「优雅停机请求已受理」；重启是否成功取决于
 /// 外部 Supervisor 的拉起策略（与看门狗/task 51 的单次重启钩子同一契约）。
-pub async fn restart(
-    State(state): State<MgmtState>,
-    authed: AuthedRole,
-    body: Bytes,
-) -> Response {
+pub async fn restart(State(state): State<MgmtState>, authed: AuthedRole, body: Bytes) -> Response {
     let runtime = runtime_for(&state);
 
     let req: RestartBody = match serde_json::from_slice(&body) {
@@ -675,14 +671,26 @@ pub async fn logs(
     let since = match parse_opt_ms(params.get("since"), "since") {
         Ok(v) => v,
         Err(message) => {
-            runtime.record_audit(actor, OpsAction::LogsRead, true, OUTCOME_BAD_REQUEST, &message);
+            runtime.record_audit(
+                actor,
+                OpsAction::LogsRead,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &message,
+            );
             return bad_request("bad_request", &message);
         }
     };
     let until = match parse_opt_ms(params.get("until"), "until") {
         Ok(v) => v,
         Err(message) => {
-            runtime.record_audit(actor, OpsAction::LogsRead, true, OUTCOME_BAD_REQUEST, &message);
+            runtime.record_audit(
+                actor,
+                OpsAction::LogsRead,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &message,
+            );
             return bad_request("bad_request", &message);
         }
     };
@@ -983,7 +991,10 @@ frequency_ms = 100
             r#"{"actor":"ops-admin","confirm":"gw-test"}"#,
         )
         .await;
-        assert_eq!(status, 401, "unauthenticated ops request must be 401: {body}");
+        assert_eq!(
+            status, 401,
+            "unauthenticated ops request must be 401: {body}"
+        );
         assert!(
             ops_runtime(&state).audit_snapshot().is_empty(),
             "request rejected before the ops runtime must not forge audit entries"
@@ -1064,13 +1075,8 @@ frequency_ms = 100
         let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) = http_post_bearer(
-            port,
-            "/api/ops/restart",
-            r#"{"actor":"ops-admin"}"#,
-            &token,
-        )
-        .await;
+        let (status, _, body) =
+            http_post_bearer(port, "/api/ops/restart", r#"{"actor":"ops-admin"}"#, &token).await;
         assert_eq!(status, 400, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["error"], "confirm_required");
@@ -1156,7 +1162,8 @@ frequency_ms = 100
         let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, _) = http_post_bearer(port, "/api/ops/restart", "not-json{{{", &token).await;
+        let (status, _, _) =
+            http_post_bearer(port, "/api/ops/restart", "not-json{{{", &token).await;
         assert_eq!(status, 400);
         assert!(!state.daemon().shutdown_requested());
         assert!(ops_runtime(&state)
@@ -1232,21 +1239,25 @@ frequency_ms = 100
 
         for action in ["pause", "resume"] {
             let body = format!(r#"{{"actor":"ops-admin","action":"{action}"}}"#);
-            let (status, _, body) = http_post_bearer(port, "/api/ops/collectors", &body, &token).await;
+            let (status, _, body) =
+                http_post_bearer(port, "/api/ops/collectors", &body, &token).await;
             assert_eq!(status, 501, "{body}");
             let value: Value = serde_json::from_str(&body).expect("json");
             assert_eq!(value["error"], "not_implemented");
-            assert!(value["planned"].as_str().expect("planned").contains("task 37"));
+            assert!(value["planned"]
+                .as_str()
+                .expect("planned")
+                .contains("task 37"));
             assert!(value["reason"].as_str().expect("reason").contains("调度器"));
         }
 
         let audit = ops_runtime(&state).audit_snapshot();
-        assert!(audit
-            .iter()
-            .any(|e| e.action == "collectors_pause" && e.allowed && e.outcome == OUTCOME_NOT_IMPLEMENTED));
-        assert!(audit
-            .iter()
-            .any(|e| e.action == "collectors_resume" && e.allowed && e.outcome == OUTCOME_NOT_IMPLEMENTED));
+        assert!(audit.iter().any(|e| e.action == "collectors_pause"
+            && e.allowed
+            && e.outcome == OUTCOME_NOT_IMPLEMENTED));
+        assert!(audit.iter().any(|e| e.action == "collectors_resume"
+            && e.allowed
+            && e.outcome == OUTCOME_NOT_IMPLEMENTED));
     }
 
     // ---- logs ----
@@ -1258,7 +1269,8 @@ frequency_ms = 100
         let token = token_for(&state, Role::Ops);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) = http_get_bearer(port, "/api/ops/logs?actor=ops-admin", &token).await;
+        let (status, _, body) =
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin", &token).await;
         assert_eq!(status, 403, "{body}");
         let audit = ops_runtime(&state).audit_snapshot();
         assert!(audit.iter().any(|e| e.action == "logs_read" && !e.allowed));
@@ -1296,7 +1308,10 @@ frequency_ms = 100
         // 全部入审计（bad_request）。
         let audit = ops_runtime(&state).audit_snapshot();
         assert_eq!(
-            audit.iter().filter(|e| e.outcome == OUTCOME_BAD_REQUEST).count(),
+            audit
+                .iter()
+                .filter(|e| e.outcome == OUTCOME_BAD_REQUEST)
+                .count(),
             5,
             "every rejected query must be audited"
         );
@@ -1387,8 +1402,12 @@ frequency_ms = 100
         assert_eq!(rows[0]["device_id"], "dev-01");
 
         // level=lifecycle → 只 lifecycle_changed。
-        let (status, _, body) =
-            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&level=lifecycle", &token).await;
+        let (status, _, body) = http_get_bearer(
+            port,
+            "/api/ops/logs?actor=ops-admin&level=lifecycle",
+            &token,
+        )
+        .await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1396,9 +1415,12 @@ frequency_ms = 100
         assert_eq!(rows[0]["state"], "running");
 
         // 完整类型名同样接受。
-        let (status, _, body) =
-            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&level=device_changed", &token)
-                .await;
+        let (status, _, body) = http_get_bearer(
+            port,
+            "/api/ops/logs?actor=ops-admin&level=device_changed",
+            &token,
+        )
+        .await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1);
@@ -1422,10 +1444,19 @@ frequency_ms = 100
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0]["seq"].is_string(), "seq must be string: {rows:?}");
-        assert!(rows[0]["ts_ms"].is_string(), "ts_ms must be string: {rows:?}");
-        assert!(rows[0]["version"].is_string(), "version must be string: {rows:?}");
+        assert!(
+            rows[0]["ts_ms"].is_string(),
+            "ts_ms must be string: {rows:?}"
+        );
+        assert!(
+            rows[0]["version"].is_string(),
+            "version must be string: {rows:?}"
+        );
         assert_eq!(rows[0]["seq"], "1");
-        assert_eq!(rows[0]["ts_ms"], "1700000000000", "1.7e18 ns / 1e6 = 1.7e12 ms");
+        assert_eq!(
+            rows[0]["ts_ms"], "1700000000000",
+            "1.7e18 ns / 1e6 = 1.7e12 ms"
+        );
         assert_eq!(rows[0]["version"], u64::MAX.to_string());
     }
 

@@ -42,7 +42,7 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::config::{ConfigShared, ConfigHotReloader, GatewayConfig};
+use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig};
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
 use crate::ota::OtaBootDecision;
@@ -226,9 +226,7 @@ impl DaemonShared {
 
     /// 标记停机超时被中止（内部使用，诊断可读）。
     fn mark_shutdown_timed_out(&self) {
-        self.inner
-            .shutdown_timed_out
-            .store(true, Ordering::Relaxed);
+        self.inner.shutdown_timed_out.store(true, Ordering::Relaxed);
     }
 
     /// 停机是否超宽限期被中止。
@@ -546,7 +544,10 @@ async fn run_ota_boot_check(hook: &Option<OtaBootCheckHook>) {
                 info!("bootstrap: ota boot check: no pending firmware (no-op)");
             }
             Ok(OtaBootDecision::Committed { version }) => {
-                info!(version, "bootstrap: ota boot commit: pending firmware promoted");
+                info!(
+                    version,
+                    "bootstrap: ota boot commit: pending firmware promoted"
+                );
             }
             Ok(OtaBootDecision::RolledBackTo { version }) => {
                 warn!(
@@ -614,9 +615,7 @@ fn startup_integrity_check() -> Option<RestrictedMode> {
             Ok(exe) => {
                 let manifest = exe.with_file_name(format!(
                     "{}{INTEGRITY_MANIFEST_SUFFIX}",
-                    exe.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default()
+                    exe.file_name().and_then(|n| n.to_str()).unwrap_or_default()
                 ));
                 match read_expected_exe_hash(&manifest) {
                     Some(expected) => crate::hardening::verify_self_integrity(&expected),
@@ -641,20 +640,19 @@ async fn wait_for_signal(shared: &DaemonShared) {
     let mut shutdown_rx = shared.subscribe_shutdown();
     #[cfg(unix)]
     {
-        let mut sigterm = match
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(sigterm) => sigterm,
-            // 信号监听安装失败（受限环境）：降级为只等 ctrl_c 与编程式请求。
-            Err(err) => {
-                warn!(error = %err, "bootstrap: SIGTERM listener unavailable");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = shutdown_rx.changed() => {}
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(sigterm) => sigterm,
+                // 信号监听安装失败（受限环境）：降级为只等 ctrl_c 与编程式请求。
+                Err(err) => {
+                    warn!(error = %err, "bootstrap: SIGTERM listener unavailable");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = shutdown_rx.changed() => {}
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+            };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("bootstrap: ctrl-c received");
@@ -819,7 +817,10 @@ async fn forward_config_reload(
             // ConfigShared 内部原地换快照，这里刷新共享态句柄并对外广播。
             shared.set_config(config_shared.clone());
             shared.notify_config_reload(version);
-            info!(version, "bootstrap: config reload propagated to DaemonShared");
+            info!(
+                version,
+                "bootstrap: config reload propagated to DaemonShared"
+            );
         }
     }
 }
@@ -833,12 +834,10 @@ fn build_groups(config: &GatewayConfig) -> Vec<GroupConfig> {
     let mut devices: std::collections::HashMap<String, (u64, Vec<String>)> =
         std::collections::HashMap::new();
     for point in &config.points {
-        let entry = devices
-            .entry(point.device_id.clone())
-            .or_insert_with(|| {
-                order.push(point.device_id.clone());
-                (u64::MAX, Vec::new())
-            });
+        let entry = devices.entry(point.device_id.clone()).or_insert_with(|| {
+            order.push(point.device_id.clone());
+            (u64::MAX, Vec::new())
+        });
         entry.0 = entry.0.min(point.frequency_ms.max(1));
         if !entry.1.contains(&point.point_id) {
             entry.1.push(point.point_id.clone());
@@ -932,7 +931,10 @@ frequency_ms = 500
                 result.map(|r| r.map(|s| s.state().as_str().to_string()))
             );
         }
-        panic!("state did not reach {want:?} (current {:?})", shared.state());
+        panic!(
+            "state did not reach {want:?} (current {:?})",
+            shared.state()
+        );
     }
 
     /// QA Happy: 状态迁移顺序 Starting → Running → Stopping → Stopped 严格可观测；
@@ -962,8 +964,12 @@ frequency_ms = 500
             .with_offline_flusher(recording_hook(&log, "flush"))
             .with_north_stopper(recording_hook(&log, "north-stop"));
 
-        let handle =
-            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
 
         // Running 事件可被订阅端观测到（watch 的 changed 标志不丢失）。
         assert!(state_rx.changed().await.is_ok());
@@ -1028,8 +1034,12 @@ frequency_ms = 500
             .with_offline_flusher(recording_hook(&log, "flush"))
             .with_north_stopper(north_stopper);
 
-        let handle =
-            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
 
         shared.request_shutdown();
         // 推进虚拟时间直到 run 完成（宽限期 200ms 由超时计时器触发）。
@@ -1074,8 +1084,12 @@ frequency_ms = 500
             .with_heartbeat_stale_after(Duration::from_millis(200))
             .with_watchdog_restart(recording_hook(&log, "restart"));
 
-        let handle =
-            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
 
         // 注入「10s 前」的心跳 → 相对当前墙钟必然陈旧（> 200ms 阈值）。
         let stale_ns = utc_now_ns().saturating_sub(10_000_000_000);
@@ -1083,7 +1097,11 @@ frequency_ms = 500
 
         // 推进虚拟时间驱动看门狗 tick（首拍已消费，100ms 一拍）。
         for _ in 0..10 {
-            if log.lock().expect("log lock").contains(&"restart".to_string()) {
+            if log
+                .lock()
+                .expect("log lock")
+                .contains(&"restart".to_string())
+            {
                 break;
             }
             tokio::time::advance(Duration::from_millis(100)).await;
@@ -1206,7 +1224,10 @@ frequency_ms = 3000
 
         let garbage = dir.path().join("garbage.integrity-manifest");
         std::fs::write(&garbage, "zz-not-hex").expect("write garbage");
-        assert!(read_expected_exe_hash(&garbage).is_none(), "非 hex 必须拒绝");
+        assert!(
+            read_expected_exe_hash(&garbage).is_none(),
+            "非 hex 必须拒绝"
+        );
 
         let short = dir.path().join("short.integrity-manifest");
         std::fs::write(&short, "aabb").expect("write short");
@@ -1260,8 +1281,12 @@ frequency_ms = 3000
             .without_signal_handlers()
             .with_ota_boot_check(hook);
 
-        let handle =
-            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
         shared.request_shutdown();
         handle.await.expect("run task joins").expect("run ok");
         assert_eq!(
@@ -1296,8 +1321,12 @@ frequency_ms = 3000
             .without_signal_handlers()
             .with_ota_boot_check(hook);
 
-        let handle =
-            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
         assert_eq!(
             log.lock().expect("log lock").as_slice(),
             ["rollback-decision"],
@@ -1305,7 +1334,11 @@ frequency_ms = 3000
         );
         shared.request_shutdown();
         let result = handle.await.expect("run task joins").expect("run ok");
-        assert_eq!(result.state(), LifecycleState::Stopped, "回滚不阻断优雅停机");
+        assert_eq!(
+            result.state(),
+            LifecycleState::Stopped,
+            "回滚不阻断优雅停机"
+        );
     }
 
     /// QA 接线：未注入 OTA 判定钩子 → no-op warn，启动流程不受影响。
@@ -1316,8 +1349,12 @@ frequency_ms = 3000
         let builder = BootstrapBuilder::new(write_test_config(&dir))
             .with_shared(shared.clone())
             .without_signal_handlers();
-        let handle =
-            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
         shared.request_shutdown();
         handle.await.expect("run task joins").expect("run ok");
     }

@@ -718,8 +718,10 @@ fn find_cycle_path(rules: &[Rule], index: &HashMap<&str, usize>) -> String {
                 GRAY => {
                     // 环：从 path 中 next 首次出现处截断，再回到 next 闭合。
                     let start = path.iter().position(|&n| n == next).unwrap_or(0);
-                    let mut names: Vec<&str> =
-                        path[start..].iter().map(|&n| rules[n].id.as_str()).collect();
+                    let mut names: Vec<&str> = path[start..]
+                        .iter()
+                        .map(|&n| rules[n].id.as_str())
+                        .collect();
                     names.push(rules[next].id.as_str());
                     return Some(names.join("→"));
                 }
@@ -1079,7 +1081,8 @@ fn read_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 
 /// 写锁（毒化恢复：不 panic，取内部数据继续）。
 fn write_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 双槽位快照（active + staging + previous）。
@@ -1893,7 +1896,10 @@ mod tests {
     #[test]
     fn missing_version_defaults_to_v1_and_top_level_version_applies() {
         let without = r#"[{"id": "r", "actions": [{"kind": "publish", "topic": "t"}]}]"#;
-        assert!(RuleEngine::from_json(without).is_ok(), "no version field == v1");
+        assert!(
+            RuleEngine::from_json(without).is_ok(),
+            "no version field == v1"
+        );
 
         let top_level = r#"{"version": "1.0", "rules": [
             {"id": "a", "actions": [{"kind": "publish", "topic": "a"}]},
@@ -1954,7 +1960,11 @@ mod tests {
         let mut engine = RuleEngine::from_json(json).expect("valid dag");
         let out = engine.evaluate(raw("s", 36.5)).expect("ok");
         let ids: Vec<&str> = out.iter().map(|m| m.rule_id.as_str()).collect();
-        assert_eq!(ids, vec!["a_base", "b_enriched", "c_summary"], "topological order");
+        assert_eq!(
+            ids,
+            vec!["a_base", "b_enriched", "c_summary"],
+            "topological order"
+        );
         // 拓扑序下的 remap 语义不变：b_enriched 的精简 payload。
         assert_eq!(out[1].payload.as_object().expect("obj").len(), 1);
         assert_eq!(out[1].payload["t"].as_f64(), Some(36.5));
@@ -2005,8 +2015,7 @@ mod tests {
     /// 未知依赖 id → ConfigError。
     #[test]
     fn unknown_dependency_id_is_rejected() {
-        let json =
-            r#"[{"id": "a", "depends_on": ["ghost"], "actions": [{"kind": "publish", "topic": "t"}]}]"#;
+        let json = r#"[{"id": "a", "depends_on": ["ghost"], "actions": [{"kind": "publish", "topic": "t"}]}]"#;
         let err = RuleEngine::from_json(json).expect_err("unknown dep");
         assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
         assert!(err.to_string().contains("ghost"), "must name the id: {err}");
@@ -2051,7 +2060,10 @@ mod tests {
         );
 
         set.promote().expect("promote");
-        assert!(set.has_active() && !set.has_staging(), "staging consumed by promote");
+        assert!(
+            set.has_active() && !set.has_staging(),
+            "staging consumed by promote"
+        );
         assert_eq!(set.active_rule_count(), 1);
 
         let out = set.evaluate(raw("t", 1.0)).expect("ok");
@@ -2092,7 +2104,8 @@ mod tests {
 
         set.promote_json(r#"[{"id": "v1", "actions": [{"kind": "publish", "topic": "v1"}]}]"#)
             .expect("promote");
-        set.promote().expect_err("staging consumed by the first promote");
+        set.promote()
+            .expect_err("staging consumed by the first promote");
     }
 
     /// staging 校验失败（依赖环 / 未知大版本）→ ConfigError，active 保持原状。
@@ -2108,7 +2121,10 @@ mod tests {
         ]"#;
         let err = set.load_staging(cycle).expect_err("cycle in staging");
         assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
-        assert!(!set.has_staging(), "failed load must not leave staging behind");
+        assert!(
+            !set.has_staging(),
+            "failed load must not leave staging behind"
+        );
 
         let future =
             r#"[{"id": "r", "version": 2, "actions": [{"kind": "publish", "topic": "t"}]}]"#;
@@ -2166,7 +2182,11 @@ mod tests {
         // 首个样本：建立死区基线，三个规则按依赖序产出。
         let out = engine.evaluate(raw("s", 500.0)).expect("ok");
         let ids: Vec<&str> = out.iter().map(|m| m.rule_id.as_str()).collect();
-        assert_eq!(ids, vec!["normalized", "enriched", "summary"], "dependency order");
+        assert_eq!(
+            ids,
+            vec!["normalized", "enriched", "summary"],
+            "dependency order"
+        );
 
         // normalized：500 * 0.1 + 2.0 = 52.0 degC。
         assert_eq!(out[0].topic, "chain/normalized");
@@ -2177,7 +2197,11 @@ mod tests {
         assert_eq!(out[1].topic, "chain/enriched");
         assert!((out[1].payload["t"].as_f64().expect("num") - 52.0).abs() < 1e-9);
         assert_eq!(out[1].payload["dev"].as_str(), Some("m1"));
-        assert!(!out[1].payload.as_object().expect("obj").contains_key("value"));
+        assert!(!out[1]
+            .payload
+            .as_object()
+            .expect("obj")
+            .contains_key("value"));
 
         // summary：WHERE value < 100 命中（52.0）。
         assert_eq!(out[2].topic, "chain/summary");
@@ -2200,21 +2224,26 @@ mod tests {
     #[test]
     fn end_to_end_chain_via_rule_set_promote() {
         let set = RuleSet::new();
-        set.promote_json(r#"[{"id": "live", "actions": [{"kind": "publish", "topic": "live"}],
-            "transform": {"source_id": "s", "target_point": "p", "device_id": "d"}}]"#)
-            .expect("good version");
+        set.promote_json(
+            r#"[{"id": "live", "actions": [{"kind": "publish", "topic": "live"}],
+            "transform": {"source_id": "s", "target_point": "p", "device_id": "d"}}]"#,
+        )
+        .expect("good version");
 
         let broken = r#"[
             {"id": "a", "depends_on": ["b"], "actions": [{"kind": "publish", "topic": "x"}]},
             {"id": "b", "depends_on": ["a"], "actions": [{"kind": "publish", "topic": "x"}]}
         ]"#;
-        set.load_staging(broken).expect_err("cycle rejected at load time");
+        set.load_staging(broken)
+            .expect_err("cycle rejected at load time");
         assert!(!set.has_staging());
         assert_eq!(set.evaluate(raw("s", 1.0)).expect("ok")[0].topic, "live");
 
-        set.promote_json(r#"[{"id": "next", "depends_on": [], "actions": [
-            {"kind": "publish", "topic": "next"}]}]"#)
-            .expect("promote new chain");
+        set.promote_json(
+            r#"[{"id": "next", "depends_on": [], "actions": [
+            {"kind": "publish", "topic": "next"}]}]"#,
+        )
+        .expect("promote new chain");
         let out = set.evaluate(raw("s", 1.0)).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].topic, "next");

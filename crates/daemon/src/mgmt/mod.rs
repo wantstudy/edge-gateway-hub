@@ -188,8 +188,7 @@ impl MgmtState {
     /// `startup_config` 仅用于装配期鉴权凭证解析；REST 读侧统一走
     /// `daemon.config_snapshot()`（热重载感知，见 [`Self::config`]）。
     pub fn new(daemon: DaemonShared, startup_config: Arc<GatewayConfig>) -> Self {
-        let (auth, login) =
-            auth_login::build(&startup_config, &|key| std::env::var(key).ok());
+        let (auth, login) = auth_login::build(&startup_config, &|key| std::env::var(key).ok());
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(MgmtStateInner {
@@ -217,8 +216,8 @@ impl MgmtState {
     /// `auth_login::build` 环境变量装配）。与 [`Self::with_web_dist`] 同约束：
     /// 必须在 clone / 共享之前调用。
     pub fn with_auth(mut self, auth: rbac::RbacAuth, login: auth_login::MgmtAuth) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("with_auth must be called before cloning/sharing");
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("with_auth must be called before cloning/sharing");
         inner.auth = auth;
         inner.login = Arc::new(login);
         self
@@ -395,7 +394,10 @@ pub fn router(state: MgmtState) -> Router {
     // 本子路由已注册路由）。
     let ops = Router::new()
         .route("/api/ops/restart", axum::routing::post(remote_ops::restart))
-        .route("/api/ops/collectors", axum::routing::post(remote_ops::collectors))
+        .route(
+            "/api/ops/collectors",
+            axum::routing::post(remote_ops::collectors),
+        )
         .route("/api/ops/logs", get(remote_ops::logs))
         .route_layer(from_fn_with_state(state.clone(), ops_guard));
 
@@ -545,14 +547,12 @@ async fn devices(State(state): State<MgmtState>) -> Json<Value> {
     let rows: Vec<Value> = order
         .iter()
         .map(|device_id| {
-            let entry = config
-                .devices
-                .iter()
-                .find(|d| &d.device_id == device_id);
+            let entry = config.devices.iter().find(|d| &d.device_id == device_id);
             // 协议：点位行推导优先，回退登记段默认协议，再回退空串。
-            let protocol = agg.get(device_id).map(|(p, _)| p.clone()).or_else(|| {
-                entry.and_then(|d| d.protocol.clone())
-            });
+            let protocol = agg
+                .get(device_id)
+                .map(|(p, _)| p.clone())
+                .or_else(|| entry.and_then(|d| d.protocol.clone()));
             let name = entry
                 .and_then(|d| d.name.clone())
                 .unwrap_or_else(|| device_id.clone());
@@ -657,11 +657,7 @@ fn envelope_to_event(envelope: &EventEnvelope) -> Event {
 /// - 订阅先于前奏收集（中间窗口发布的事件由 cursor 去重，不丢不重）；
 /// - broadcast `Lagged`（积压超限）时从历史环补拉——历史环是唯一完整副本；
 /// - 通道关闭（SSE 客户端断开）即退出；发送端全部销毁（daemon 关停）亦退出。
-async fn merge_events(
-    state: MgmtState,
-    last_seq: u64,
-    tx: mpsc::Sender<EventEnvelope>,
-) {
+async fn merge_events(state: MgmtState, last_seq: u64, tx: mpsc::Sender<EventEnvelope>) {
     // 订阅先行，避免「收集前奏 ↔ 订阅」窗口丢事件；重复由 cursor 去重。
     let mut mgmt_rx = state.subscribe();
     let mut state_rx = state.daemon().subscribe_state();
@@ -746,10 +742,7 @@ struct MgmtEventStream {
 impl Stream for MgmtEventStream {
     type Item = Result<Event, Infallible>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(envelope)) => Poll::Ready(Some(Ok(envelope_to_event(&envelope)))),
             Poll::Ready(None) => Poll::Ready(None),
@@ -818,22 +811,23 @@ async fn serve_file(state: &MgmtState, rel: &str) -> Response {
         return ApiError::Forbidden(format!("rejected path {rel:?}")).into_response();
     };
     let full = root.join(rel_path);
-    let outcome = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, Vec<u8>), bool> {
-        // Ok = (规范化文件路径, 规范化根路径, 字节)；Err(true) = 穿越被拒，Err(false) = 不存在。
-        let (canonical, root_canonical) = match (full.canonicalize(), root.canonicalize()) {
-            (Ok(file), Ok(root_dir)) => (file, root_dir),
-            // 根目录不存在 / 文件不存在均按 404 处理。
-            _ => return Err(false),
-        };
-        if !canonical.starts_with(&root_canonical) {
-            return Err(true);
-        }
-        match std::fs::read(&canonical) {
-            Ok(bytes) => Ok((canonical, root_canonical, bytes)),
-            Err(_) => Err(false),
-        }
-    })
-    .await;
+    let outcome =
+        tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, Vec<u8>), bool> {
+            // Ok = (规范化文件路径, 规范化根路径, 字节)；Err(true) = 穿越被拒，Err(false) = 不存在。
+            let (canonical, root_canonical) = match (full.canonicalize(), root.canonicalize()) {
+                (Ok(file), Ok(root_dir)) => (file, root_dir),
+                // 根目录不存在 / 文件不存在均按 404 处理。
+                _ => return Err(false),
+            };
+            if !canonical.starts_with(&root_canonical) {
+                return Err(true);
+            }
+            match std::fs::read(&canonical) {
+                Ok(bytes) => Ok((canonical, root_canonical, bytes)),
+                Err(_) => Err(false),
+            }
+        })
+        .await;
 
     match outcome {
         Ok(Ok((canonical, _, bytes))) => (
@@ -1066,10 +1060,11 @@ frequency_ms = 500
 
     /// 建立 SSE 连接（不设 Connection: close，流保持打开）。
     async fn sse_connect(port: u16, path: &str) -> TcpStream {
-        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n"
-        );
+        let mut sock = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n");
         sock.write_all(req.as_bytes()).await.expect("write request");
         sock
     }
@@ -1079,7 +1074,8 @@ frequency_ms = 500
         let end = acc.find("\n\n")?;
         let frame: String = acc.drain(..end + 2).collect();
         frame.lines().find_map(|line| {
-            line.strip_prefix("data: ").and_then(|rest| serde_json::from_str(rest).ok())
+            line.strip_prefix("data: ")
+                .and_then(|rest| serde_json::from_str(rest).ok())
         })
     }
 
@@ -1166,8 +1162,7 @@ frequency_ms = 500
     #[tokio::test]
     async fn static_files_served_with_content_types() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("index.html"), "<html>iot-daq</html>")
-            .expect("write index");
+        std::fs::write(dir.path().join("index.html"), "<html>iot-daq</html>").expect("write index");
         std::fs::create_dir(dir.path().join("assets")).expect("mkdir");
         std::fs::write(dir.path().join("assets/app.js"), "console.log(1)").expect("write js");
         std::fs::write(dir.path().join("assets/logo.svg"), "<svg/>").expect("write svg");
@@ -1256,12 +1251,18 @@ frequency_ms = 500
     fn event_seq_monotonic_and_history_ring_evicts_oldest() {
         let state = test_state();
         assert_eq!(state.current_seq(), 0);
-        assert_eq!(state.publish(MgmtEvent::DeviceChanged {
-            device_id: "a".to_string()
-        }), 1);
-        assert_eq!(state.publish(MgmtEvent::DeviceChanged {
-            device_id: "b".to_string()
-        }), 2);
+        assert_eq!(
+            state.publish(MgmtEvent::DeviceChanged {
+                device_id: "a".to_string()
+            }),
+            1
+        );
+        assert_eq!(
+            state.publish(MgmtEvent::DeviceChanged {
+                device_id: "b".to_string()
+            }),
+            2
+        );
         assert_eq!(state.current_seq(), 2);
 
         // 回放完整。
@@ -1272,9 +1273,12 @@ frequency_ms = 500
         // 增量语义：seq=1 之后只有第二条。
         let replay = state.history_since(1);
         assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].event, MgmtEvent::DeviceChanged {
-            device_id: "b".to_string()
-        });
+        assert_eq!(
+            replay[0].event,
+            MgmtEvent::DeviceChanged {
+                device_id: "b".to_string()
+            }
+        );
 
         // 历史环满 → 淘汰最旧，序号不回退。
         for i in 0..(EVENT_HISTORY_CAPACITY + 8) {

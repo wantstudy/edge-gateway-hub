@@ -283,7 +283,10 @@ mod tests {
     #[test]
     fn parse_rejects_short_packet() {
         let err = parse_sntp_response(&[0x24u8; 20]).expect_err("short packet must fail");
-        assert!(matches!(err, LocalError::PacketTooShort { got: 20, need: 48 }));
+        assert!(matches!(
+            err,
+            LocalError::PacketTooShort { got: 20, need: 48 }
+        ));
     }
 
     /// QA 错误路径：Mode≠4（客户端请求包冒充应答）→ BadMode。
@@ -326,7 +329,10 @@ mod tests {
             Box::new(move || *load_store.lock().expect("lock")),
             Box::new(move |v| *save_store.lock().expect("lock") = Some(v)),
         );
-        assert_eq!(clock.check_rollback(1_000_000 - 90_000), RollbackVerdict::Ok);
+        assert_eq!(
+            clock.check_rollback(1_000_000 - 90_000),
+            RollbackVerdict::Ok
+        );
         assert_eq!(
             *store.lock().expect("lock"),
             Some(1_000_000 - 90_000),
@@ -376,11 +382,7 @@ mod tests {
     /// QA：单调锚点推进 —— tokio pause 下 advance 只推单调锚点，墙钟估计随之线性推进。
     #[tokio::test(start_paused = true)]
     async fn monotonic_anchor_advances_with_mock_time() {
-        let clock = TrustedClock::new(
-            10_000_000,
-            Box::new(|| None),
-            Box::new(|_| {}),
-        );
+        let clock = TrustedClock::new(10_000_000, Box::new(|| None), Box::new(|_| {}));
         assert_eq!(clock.now_ms(), 10_000_000, "锚点建立时刻即墙钟估计");
         assert_eq!(clock.elapsed_ms(), 0);
 

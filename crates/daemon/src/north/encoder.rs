@@ -1466,18 +1466,16 @@ mod tests {
     fn golden_protobuf_batch_bytes() {
         // DataPoint（字段号顺序）：1=device_id 2=point_id 3=value 4=unit 5=ts 6=quality。
         const GOLDEN_POINT_HEX: &str = concat!(
-            "0a026431",                             // 1: "d1"
-            "12027031",                             // 2: "p1"
-            "1a080000000000404240",                 // 3: value = 36.5 f64le
-            "220175",                               // 4: "u"
-            "28818080808080808001",                 // 5: ts = 2^56+1 (varint)
-            "3001",                                 // 6: quality = GOOD
+            "0a026431",             // 1: "d1"
+            "12027031",             // 2: "p1"
+            "1a080000000000404240", // 3: value = 36.5 f64le
+            "220175",               // 4: "u"
+            "28818080808080808001", // 5: ts = 2^56+1 (varint)
+            "3001",                 // 6: quality = GOOD
         );
         // TelemetryBatch：1=points(len 0x21) 2=ts(varint 2^56) 3=gateway_id。
         // （`concat!` 只接受字面量，const 片段用 `format!` 拼接。）
-        let golden_batch_hex = format!(
-            "0a21{GOLDEN_POINT_HEX}108080808080808080011a026731"
-        );
+        let golden_batch_hex = format!("0a21{GOLDEN_POINT_HEX}108080808080808080011a026731");
 
         // 单点 golden。
         let dp = sample_to_data_point(&ProcessedSample {
@@ -1527,8 +1525,8 @@ mod tests {
         );
 
         let batch = golden_batch();
-        let text = String::from_utf8(JsonEncoder.encode_batch(&batch).expect("encode"))
-            .expect("utf-8");
+        let text =
+            String::from_utf8(JsonEncoder.encode_batch(&batch).expect("encode")).expect("utf-8");
         assert_eq!(text, GOLDEN_JSON, "JSON 文本格式漂移");
 
         // 单点路径（带外层 enc 字段）同一 golden 点位。
@@ -1541,15 +1539,17 @@ mod tests {
             collected_ts_ns: (1u64 << 56) as i64 + 1,
             quality: Quality::Good,
         });
-        let point_text =
-            String::from_utf8(JsonEncoder.encode_batch(&TelemetryBatch {
-                points: vec![dp],
-                ts: 0,
-                gateway_id: String::new(),
-                auth: None,
-            })
-            .expect("encode"))
-            .expect("utf-8");
+        let point_text = String::from_utf8(
+            JsonEncoder
+                .encode_batch(&TelemetryBatch {
+                    points: vec![dp],
+                    ts: 0,
+                    gateway_id: String::new(),
+                    auth: None,
+                })
+                .expect("encode"),
+        )
+        .expect("utf-8");
         assert!(
             point_text.contains(r#""ts":"72057594037927937""#),
             "点内大整数 ts 必须字符串化: {point_text}"

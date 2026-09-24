@@ -53,9 +53,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::rbac::{AuthedRole, Permission};
-use super::remote_ops::{
-    self, OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED,
-};
+use super::remote_ops::{self, OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED};
 use super::{MgmtEvent, MgmtState};
 use crate::config::{DeviceConfig, PointConfig};
 use crate::driver::PointAddressParser;
@@ -70,7 +68,15 @@ fn write_guard() -> MutexGuard<'static, ()> {
 }
 
 /// 协议取值域（与 config.rs `PointConfig::protocol` 注释一致）。
-const PROTOCOLS: &[&str] = &["modbus-tcp", "modbus-rtu", "opcua", "s7", "mc", "http", "mqtt"];
+const PROTOCOLS: &[&str] = &[
+    "modbus-tcp",
+    "modbus-rtu",
+    "opcua",
+    "s7",
+    "mc",
+    "http",
+    "mqtt",
+];
 
 /// 地址需过结构化解析器校验的协议；其余（opcua / http / mqtt）地址为
 /// endpoint / URL 语义，仅做非空校验（诚实限制，见模块注释）。
@@ -662,9 +668,7 @@ pub async fn device_delete(
         config,
         &actor,
         OpsAction::DeviceDelete,
-        &format!(
-            "delete device {device_id:?} (cascade={cascade}, removed {point_rows} point(s))"
-        ),
+        &format!("delete device {device_id:?} (cascade={cascade}, removed {point_rows} point(s))"),
         &device_id,
         None,
     )
@@ -880,7 +884,9 @@ pub async fn point_update(
             OUTCOME_BAD_REQUEST,
             &format!("unknown point {device_id:?}/{point_id:?}"),
         );
-        return not_found(&format!("point {point_id:?} not found on device {device_id:?}"));
+        return not_found(&format!(
+            "point {point_id:?} not found on device {device_id:?}"
+        ));
     };
     let (cur_protocol, cur_address) = (
         config.points[idx].protocol.clone(),
@@ -972,7 +978,9 @@ pub async fn point_delete(
             OUTCOME_BAD_REQUEST,
             &format!("unknown point {device_id:?}/{point_id:?}"),
         );
-        return not_found(&format!("point {point_id:?} not found on device {device_id:?}"));
+        return not_found(&format!(
+            "point {point_id:?} not found on device {device_id:?}"
+        ));
     };
     config.points.remove(idx);
     persist(
@@ -1135,11 +1143,7 @@ frequency_ms = 100
         http_request(port, "PUT", path, Some(body), Some(token)).await
     }
 
-    async fn http_delete_bearer(
-        port: u16,
-        path: &str,
-        token: &str,
-    ) -> (u16, String, String) {
+    async fn http_delete_bearer(port: u16, path: &str, token: &str) -> (u16, String, String) {
         http_request(port, "DELETE", path, None, Some(token)).await
     }
 
@@ -1211,9 +1215,13 @@ frequency_ms = 100
         let port = spawn_server(state.clone()).await;
 
         // 重复 id（点位聚合命中 dev-01）。
-        let (status, _, body) =
-            http_post_bearer(port, "/api/devices", r#"{"id":"dev-01","protocol":"s7"}"#, &token)
-                .await;
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/devices",
+            r#"{"id":"dev-01","protocol":"s7"}"#,
+            &token,
+        )
+        .await;
         assert_eq!(status, 400, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["error"], "validation_failed");
@@ -1237,7 +1245,10 @@ frequency_ms = 100
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["field"], "protocol");
         assert!(
-            value["allowed"].as_str().expect("allowed").contains("modbus-tcp"),
+            value["allowed"]
+                .as_str()
+                .expect("allowed")
+                .contains("modbus-tcp"),
             "allowed must enumerate protocols: {value}"
         );
 
@@ -1412,7 +1423,10 @@ frequency_ms = 100
         assert_eq!(value["error"], "validation_failed");
         assert_eq!(value["field"], "address");
         assert!(
-            value["reason"].as_str().expect("reason").contains("invalid point address"),
+            value["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("invalid point address"),
             "reason must carry parser detail: {value}"
         );
 
@@ -1529,9 +1543,13 @@ frequency_ms = 100
         assert_eq!(row.frequency_ms, 500);
 
         // 未知点位 → 404。
-        let (status, _, _) =
-            http_put_bearer(port, "/api/points/dev-01/nope", r#"{"address":"40002"}"#, &token)
-                .await;
+        let (status, _, _) = http_put_bearer(
+            port,
+            "/api/points/dev-01/nope",
+            r#"{"address":"40002"}"#,
+            &token,
+        )
+        .await;
         assert_eq!(status, 404);
 
         // 未知设备上新增点位 → 404。
@@ -1548,7 +1566,10 @@ frequency_ms = 100
         let (status, _, _) = http_delete_bearer(port, "/api/points/dev-01/p_temp", &token).await;
         assert_eq!(status, 200);
         assert!(
-            !load_config(&path).points.iter().any(|p| p.point_id == "p_temp"),
+            !load_config(&path)
+                .points
+                .iter()
+                .any(|p| p.point_id == "p_temp"),
             "point row removed from disk"
         );
         let (status, _, _) = http_delete_bearer(port, "/api/points/dev-01/p_temp", &token).await;
@@ -1607,13 +1628,17 @@ frequency_ms = 100
         let (state, path) = make_state(&dir);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, _) =
-            http_request(port, "POST", "/api/devices", Some(r#"{"id":"x","protocol":"s7"}"#), None)
-                .await;
+        let (status, _, _) = http_request(
+            port,
+            "POST",
+            "/api/devices",
+            Some(r#"{"id":"x","protocol":"s7"}"#),
+            None,
+        )
+        .await;
         assert_eq!(status, 401);
 
-        let (status, _, _) =
-            http_delete_bearer(port, "/api/points/dev-01/p_temp", "").await;
+        let (status, _, _) = http_delete_bearer(port, "/api/points/dev-01/p_temp", "").await;
         assert_eq!(status, 401, "invalid token must be 401");
 
         assert!(
@@ -1652,7 +1677,10 @@ frequency_ms = 100
         assert_eq!(config.devices.len(), 7, "6 created + 1 seed");
         for i in 0..6 {
             assert!(
-                config.devices.iter().any(|d| d.device_id == format!("dev-c{i}")),
+                config
+                    .devices
+                    .iter()
+                    .any(|d| d.device_id == format!("dev-c{i}")),
                 "dev-c{i} must be persisted"
             );
         }
@@ -1688,9 +1716,16 @@ frequency_ms = 100
                     .unwrap_or(false)
             })
             .collect();
-        assert_eq!(backups.len(), 1, "exactly one backup after one write: {backups:?}");
+        assert_eq!(
+            backups.len(),
+            1,
+            "exactly one backup after one write: {backups:?}"
+        );
         let backup_raw = std::fs::read_to_string(backups.remove(0)).expect("read backup");
-        assert_eq!(backup_raw, before_raw, "backup must be the pre-write snapshot");
+        assert_eq!(
+            backup_raw, before_raw,
+            "backup must be the pre-write snapshot"
+        );
     }
 
     /// QA: 写路径快照与落盘一致性——写后 `ConfigShared::replace` 即时生效，
@@ -1723,6 +1758,9 @@ frequency_ms = 100
         let (status, _, body) = http_get(port, "/api/status").await;
         assert_eq!(status, 200);
         let value: Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(value["device_count"], "2", "two devices with points: {value}");
+        assert_eq!(
+            value["device_count"], "2",
+            "two devices with points: {value}"
+        );
     }
 }

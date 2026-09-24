@@ -742,7 +742,11 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         let backups: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read_dir")
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("config.toml.bak-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak-")
+            })
             .collect();
         assert!(!backups.is_empty(), "backup file must be created");
         let backup_raw = std::fs::read_to_string(backups[0].path()).expect("read backup");
@@ -779,10 +783,14 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         );
 
         // 带 devices 段的配置序列化 → `[[devices]]` 数组表。
-        let with_devices = GatewayConfig::parse("[[devices]]\ndevice_id = \"dev-x\"\nenabled = true\n")
-            .expect("parse devices");
+        let with_devices =
+            GatewayConfig::parse("[[devices]]\ndevice_id = \"dev-x\"\nenabled = true\n")
+                .expect("parse devices");
         let raw = toml::to_string_pretty(&with_devices).expect("serialize");
-        assert!(raw.contains("[[devices]]"), "devices section emitted: {raw}");
+        assert!(
+            raw.contains("[[devices]]"),
+            "devices section emitted: {raw}"
+        );
         assert!(raw.contains("device_id = \"dev-x\""));
         // mgmt_auth None 不产生空表垃圾。
         assert!(!raw.contains("mgmt_auth"));

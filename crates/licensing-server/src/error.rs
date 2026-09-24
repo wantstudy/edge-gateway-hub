@@ -98,7 +98,6 @@ impl std::fmt::Display for PrebindKind {
     }
 }
 
-
 impl LicenseError {
     /// 构造预绑定冲突错误（语法糖，避免调用方写嵌套结构体字面量）。
     pub fn prebind_conflict(kind: PrebindKind) -> Self {

@@ -132,8 +132,8 @@ impl TryFrom<ClaimsRaw> for Claims {
         if raw.role.is_empty() {
             return Err(JwtError::MissingClaim("role"));
         }
-        let role = Role::from_str(&raw.role)
-            .ok_or_else(|| JwtError::UnknownRole(raw.role.clone()))?;
+        let role =
+            Role::from_str(&raw.role).ok_or_else(|| JwtError::UnknownRole(raw.role.clone()))?;
         let exp = raw.exp.ok_or(JwtError::MissingClaim("exp"))?;
         let iat = raw.iat.ok_or(JwtError::MissingClaim("iat"))?;
         if raw.jti.is_empty() {
@@ -291,10 +291,7 @@ pub fn verify(
     }
     if let Some(nbf) = claims.nbf {
         if now_secs < nbf.saturating_sub(leeway_secs) {
-            return Err(JwtError::NotYetValid {
-                nbf,
-                now: now_secs,
-            });
+            return Err(JwtError::NotYetValid { nbf, now: now_secs });
         }
     }
     if now_secs < claims.iat.saturating_sub(leeway_secs) {
@@ -393,7 +390,12 @@ mod tests {
         let mut chars: Vec<char> = parts[2].chars().collect();
         let last = chars.len() - 1;
         chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
-        let tampered_sig = format!("{}.{}.{}", parts[0], parts[1], chars.iter().collect::<String>());
+        let tampered_sig = format!(
+            "{}.{}.{}",
+            parts[0],
+            parts[1],
+            chars.iter().collect::<String>()
+        );
         assert!(matches!(
             verify(&tampered_sig, KEY, NOW, DEFAULT_LEEWAY_SECS),
             Err(JwtError::SignatureMismatch)
@@ -565,7 +567,10 @@ mod tests {
             let input = format!("{h}.{payload_b64}");
             let mut mac = HmacSha256::new_from_slice(&KEY.0).expect("hmac init");
             mac.update(input.as_bytes());
-            format!("{input}.{}", B64.encode(mac.finalize().into_bytes().as_slice()))
+            format!(
+                "{input}.{}",
+                B64.encode(mac.finalize().into_bytes().as_slice())
+            )
         };
 
         // 签名有效但 payload 非 JSON → Malformed。

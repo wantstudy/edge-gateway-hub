@@ -564,13 +564,11 @@ fn decode_chunked(mut data: &[u8]) -> DaemonResult<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         let line_end = find_crlf(data)?;
-        let line = std::str::from_utf8(&data[..line_end]).map_err(|_| {
-            DaemonError::ProtocolError("chunk size line is not utf-8".to_string())
-        })?;
+        let line = std::str::from_utf8(&data[..line_end])
+            .map_err(|_| DaemonError::ProtocolError("chunk size line is not utf-8".to_string()))?;
         let size_str = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_str, 16).map_err(|_| {
-            DaemonError::ProtocolError(format!("invalid chunk size {size_str:?}"))
-        })?;
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| DaemonError::ProtocolError(format!("invalid chunk size {size_str:?}")))?;
         data = &data[line_end + 2..];
         if size == 0 {
             return Ok(out);
@@ -852,7 +850,10 @@ impl ReceiptReporter {
         self.ensure_worker();
         let identity = format!(
             "{}|{}|[{},{}]",
-            signed.batch.device_mid, signed.batch.lease_id, signed.batch.seq_from, signed.batch.seq_to
+            signed.batch.device_mid,
+            signed.batch.lease_id,
+            signed.batch.seq_from,
+            signed.batch.seq_to
         );
         {
             let mut queue = lock_recover(&self.inner.queue);
@@ -1020,8 +1021,7 @@ mod tests {
 
     /// 构造一个常规批次。
     fn batch() -> ReceiptBatch {
-        ReceiptBatch::new("MID-0001", "lease-0001", 1, 100, "sha256:abcdef")
-            .expect("valid batch")
+        ReceiptBatch::new("MID-0001", "lease-0001", 1, 100, "sha256:abcdef").expect("valid batch")
     }
 
     /// 构造客户端（默认配置 + 指定传输）。
@@ -1260,14 +1260,12 @@ mod tests {
         let signed = sign_batch(&batch, T0, signer().as_ref()).expect("sign ok");
         let body: Value = serde_json::from_str(&signed.body_json).expect("valid json");
 
-        let mut keys: Vec<String> = body
-            .as_object()
-            .expect("object")
-            .keys()
-            .cloned()
-            .collect();
+        let mut keys: Vec<String> = body.as_object().expect("object").keys().cloned().collect();
         keys.sort();
-        let mut expected: Vec<String> = RECEIPT_FIELD_WHITELIST.iter().map(|s| (*s).to_string()).collect();
+        let mut expected: Vec<String> = RECEIPT_FIELD_WHITELIST
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         expected.sort();
         assert_eq!(keys, expected, "body keys must equal the 8-field whitelist");
         assert_eq!(keys.len(), 8);
@@ -1396,9 +1394,8 @@ mod tests {
     fn parse_response_rejects_invalid_bodies() {
         assert!(parse_receipt_response("not-json").is_err());
         assert!(parse_receipt_response("{}").is_err(), "缺 accepted");
-        let rejected =
-            parse_receipt_response(r#"{"code":"AUTH_FAILED","message":"sig invalid"}"#)
-                .expect_err("envelope 拒绝必须报错");
+        let rejected = parse_receipt_response(r#"{"code":"AUTH_FAILED","message":"sig invalid"}"#)
+            .expect_err("envelope 拒绝必须报错");
         assert!(rejected.to_string().contains("AUTH_FAILED"), "{rejected}");
     }
 
@@ -1411,16 +1408,16 @@ mod tests {
         )));
         let reporter = reporter(fake);
         reporter.submit(&batch()).await.expect("submit ok");
-        wait_until(
-            || reporter.stats().sent_ok == 1,
-            "receipt to be sent",
-        )
-        .await;
+        wait_until(|| reporter.stats().sent_ok == 1, "receipt to be sent").await;
 
         assert_eq!(reporter.stats().warnings_total, 1);
         let warnings = reporter.last_warnings();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("expected seq_from 11"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("expected seq_from 11"),
+            "{}",
+            warnings[0]
+        );
         reporter.shutdown().await;
     }
 
@@ -1519,7 +1516,10 @@ mod tests {
             "保留的必须是最新两条（FIFO 丢最旧）"
         );
         // 总账：in_flight + queued + dropped == 4。
-        assert_eq!(stats.in_flight + reporter.queue_len() as u64 + stats.dropped_overflow, 4);
+        assert_eq!(
+            stats.in_flight + reporter.queue_len() as u64 + stats.dropped_overflow,
+            4
+        );
         // Pending 传输下 worker 永不返回，不能 shutdown().await；运行时结束即回收。
     }
 

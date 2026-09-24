@@ -226,7 +226,9 @@ impl PointAddressParser {
                     bit_index: 0,
                 })
             }
-            _ => Err(format!("unknown S7 access type {access:?} (expected DBX/DBB/DBW/DBD)")),
+            _ => Err(format!(
+                "unknown S7 access type {access:?} (expected DBX/DBB/DBW/DBD)"
+            )),
         }
     }
 
@@ -630,7 +632,10 @@ mod tests {
             (0, Some('I'), 0, true, 1)
         );
         let q = PointAddressParser::parse("Q2.7").expect("valid Q bit address");
-        assert_eq!((q.area, q.start, q.bit, q.bit_index), (Some('Q'), 2, true, 7));
+        assert_eq!(
+            (q.area, q.start, q.bit, q.bit_index),
+            (Some('Q'), 2, true, 7)
+        );
         let padded = PointAddressParser::parse(" i0.1 ").expect("normalized");
         assert_eq!(padded, i, "trim/case must not change result");
     }

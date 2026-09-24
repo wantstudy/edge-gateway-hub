@@ -161,7 +161,9 @@ impl MgmtAuth {
 /// `(key, false)`；未提供或非法 → 回退 dev 常量密钥并 warn（返回 `(key, true)`）。
 pub fn resolve_issuer_key(env: &dyn Fn(&str) -> Option<String>) -> (IssuerKey, bool) {
     if let Some(raw) = env(JWT_SECRET_ENV) {
-        let decoded = hex::decode(raw.trim()).ok().and_then(|b| IssuerKey::from_slice(&b));
+        let decoded = hex::decode(raw.trim())
+            .ok()
+            .and_then(|b| IssuerKey::from_slice(&b));
         if let Some(key) = decoded {
             return (key, false);
         }
@@ -365,10 +367,7 @@ frequency_ms = 100
     }
 
     /// 装配 MgmtState：显式 build（注入受控 env 闭包）+ with_auth，避免测试间环境变量竞争。
-    fn make_state_with(
-        config: &GatewayConfig,
-        env: &dyn Fn(&str) -> Option<String>,
-    ) -> MgmtState {
+    fn make_state_with(config: &GatewayConfig, env: &dyn Fn(&str) -> Option<String>) -> MgmtState {
         let (auth, login) = build(config, env);
         let daemon = DaemonShared::new();
         daemon.set_config(Arc::new(ConfigShared::new(config.clone())));
@@ -515,8 +514,12 @@ frequency_ms = 100
         let state = make_state_with(&config, &no_env);
         let port = spawn_server(state).await;
 
-        for body in ["not-json{{{", "{}", r#"{"username":"alice"}"#,
-                     r#"{"username":"","password":"abc"}"#] {
+        for body in [
+            "not-json{{{",
+            "{}",
+            r#"{"username":"alice"}"#,
+            r#"{"username":"","password":"abc"}"#,
+        ] {
             let (status, _, resp) = http_post(port, "/api/auth/login", body).await;
             assert_eq!(status, 401, "body {body:?} must be 401, got {resp}");
         }
@@ -591,8 +594,7 @@ frequency_ms = 100
         let port = spawn_server(state).await;
 
         let (_, login_body) = try_login(port, "alice", "abc").await;
-        let token: String = serde_json::from_str::<Value>(&login_body)
-            .expect("json")["token"]
+        let token: String = serde_json::from_str::<Value>(&login_body).expect("json")["token"]
             .as_str()
             .expect("token")
             .to_string();
@@ -617,8 +619,12 @@ frequency_ms = 100
         let state = make_state_with(&config, &no_env);
         let port = spawn_server(state).await;
 
-        let (status, _, body) =
-            http_post(port, "/api/ops/restart", r#"{"actor":"alice","confirm":"gw-auth"}"#).await;
+        let (status, _, body) = http_post(
+            port,
+            "/api/ops/restart",
+            r#"{"actor":"alice","confirm":"gw-auth"}"#,
+        )
+        .await;
         assert_eq!(status, 401, "{body}");
     }
 
@@ -631,8 +637,7 @@ frequency_ms = 100
         let port = spawn_server(state).await;
 
         let (_, login_body) = try_login(port, "oliver", "abc").await; // role=ops
-        let token: String = serde_json::from_str::<Value>(&login_body)
-            .expect("json")["token"]
+        let token: String = serde_json::from_str::<Value>(&login_body).expect("json")["token"]
             .as_str()
             .expect("token")
             .to_string();
@@ -671,8 +676,7 @@ frequency_ms = 100
         let port = spawn_server(state.clone()).await;
 
         let (_, login_body) = try_login(port, "alice", "abc").await;
-        let token: String = serde_json::from_str::<Value>(&login_body)
-            .expect("json")["token"]
+        let token: String = serde_json::from_str::<Value>(&login_body).expect("json")["token"]
             .as_str()
             .expect("token")
             .to_string();
@@ -682,7 +686,10 @@ frequency_ms = 100
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["role"], "system");
         assert_eq!(value["sub"], "alice");
-        assert!(value["exp"].is_string(), "exp must be string (大数红线): {value}");
+        assert!(
+            value["exp"].is_string(),
+            "exp must be string (大数红线): {value}"
+        );
 
         let claims = verify(&token, state.login_auth().key(), now_unix_secs(), 60).expect("verify");
         assert_eq!(value["exp"], claims.exp.to_string());
@@ -716,16 +723,17 @@ frequency_ms = 100
     #[test]
     fn issuer_key_resolution_env_and_fallback() {
         let hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let (key, fallback) = resolve_issuer_key(&|k| {
-            (k == JWT_SECRET_ENV).then(|| hex64.to_string())
-        });
+        let (key, fallback) =
+            resolve_issuer_key(&|k| (k == JWT_SECRET_ENV).then(|| hex64.to_string()));
         assert!(!fallback);
-        assert_eq!(key, IssuerKey::from_slice(&hex::decode(hex64).expect("hex")).expect("32b"));
+        assert_eq!(
+            key,
+            IssuerKey::from_slice(&hex::decode(hex64).expect("hex")).expect("32b")
+        );
 
         for bad in ["zz", "0123", "", "00".repeat(31).as_str()] {
-            let (_, fallback) = resolve_issuer_key(&|k| {
-                (k == JWT_SECRET_ENV).then(|| bad.to_string())
-            });
+            let (_, fallback) =
+                resolve_issuer_key(&|k| (k == JWT_SECRET_ENV).then(|| bad.to_string()));
             assert!(fallback, "invalid secret {bad:?} must fall back to dev key");
         }
         let (_, fallback) = resolve_issuer_key(&|_| None);

@@ -128,12 +128,10 @@ impl AckSink for MemoryAckSink {
             if seq <= cur {
                 return Ok(());
             }
-            match self.cursor.compare_exchange_weak(
-                cur,
-                seq,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .cursor
+                .compare_exchange_weak(cur, seq, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => return Ok(()),
                 Err(seen) => cur = seen,
             }
@@ -294,12 +292,9 @@ impl ReliableDispatch {
 
         // 批次级位点：ReplayController（先落 Ack 后推位点）+ 独立 IdempotencyLedger（去重）。
         let ack_sink: Arc<dyn AckSink> = MemoryAckSink::new(cfg.start_high_water);
-        let replay =
-            ReplayController::new(cfg.gateway_id.clone(), ack_sink, cfg.start_high_water);
-        let ledger = IdempotencyLedger::new(
-            cfg.gateway_id.clone(),
-            cfg.audit_capacity.saturating_mul(4),
-        );
+        let replay = ReplayController::new(cfg.gateway_id.clone(), ack_sink, cfg.start_high_water);
+        let ledger =
+            IdempotencyLedger::new(cfg.gateway_id.clone(), cfg.audit_capacity.saturating_mul(4));
 
         // 控制面回执：submit 仅签名 + 入队，绝不阻塞；签名域与端点由装配注入。
         let signer: Arc<dyn ReceiptSigner> =
@@ -394,10 +389,7 @@ impl ReliableDispatch {
 
         // 构造 protobuf 载荷：质量码经 codec 归一（见 encoder::sample_to_data_point 改造）。
         let points: Vec<DataPoint> = samples.iter().map(sample_to_data_point).collect();
-        let batch_ts = samples
-            .first()
-            .map(|s| s.collected_ts_ns)
-            .unwrap_or(0);
+        let batch_ts = samples.first().map(|s| s.collected_ts_ns).unwrap_or(0);
         let batch = TelemetryBatch {
             points,
             ts: batch_ts,
@@ -539,8 +531,7 @@ impl ReliableDispatch {
             })
             .collect();
         let queued = queued?;
-        let to_resend: Vec<&QueuedBatch> =
-            replay_selection(&queued, self.replay.high_water_mark());
+        let to_resend: Vec<&QueuedBatch> = replay_selection(&queued, self.replay.high_water_mark());
         let items: Vec<PendingSend> = to_resend
             .into_iter()
             .map(|b| PendingSend::new(b.seq, b.payload.clone(), b.enqueued_ns))
@@ -561,7 +552,11 @@ impl ReliableDispatch {
 
     /// 批次发布主题（gateway_id 维度；设备级路由由 broker 侧完成）。
     fn topic_for_batch(&self) -> String {
-        format!("{}/{}", self.client.endpoint().topic_prefix, self.gateway_id)
+        format!(
+            "{}/{}",
+            self.client.endpoint().topic_prefix,
+            self.gateway_id
+        )
     }
 
     /// 排空 [`AuditLog`]（落盘 / 溢出 / 降级事件）并转发到控制面审计日志。
@@ -636,7 +631,8 @@ mod tests {
             signer_seed: [7u8; 32],
             ..ReliableDispatchConfig::default()
         };
-        ReliableDispatch::with_transport(endpoint, cfg, Arc::new(StubTransport)).expect("build dispatch")
+        ReliableDispatch::with_transport(endpoint, cfg, Arc::new(StubTransport))
+            .expect("build dispatch")
     }
 
     fn telemetry_batch(_seq: u64) -> TelemetryBatch {
@@ -682,7 +678,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_enqueues_to_send_queue() {
         let mut dx = make_dispatch();
-        dx.dispatch_batch(&[sample(1.0), sample(2.0)]).await.unwrap();
+        dx.dispatch_batch(&[sample(1.0), sample(2.0)])
+            .await
+            .unwrap();
         // 一个批次进入 ready 层；序号自增。
         assert_eq!(dx.pending(), 1);
         assert_eq!(dx.next_seq(), 2);

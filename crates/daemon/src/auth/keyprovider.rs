@@ -235,7 +235,11 @@ fn generate_nonce() -> [u8; NONCE_LEN] {
 /// 密封：种子 → 容器（加密 + MAC）。
 ///
 /// 纯函数（nonce 由调用方注入），便于测试确定性与密文不泄密。
-fn seal_container(seed: &[u8; SEED_LEN], nonce: &[u8; NONCE_LEN], keys: &ContainerKeys) -> [u8; CONTAINER_LEN] {
+fn seal_container(
+    seed: &[u8; SEED_LEN],
+    nonce: &[u8; NONCE_LEN],
+    keys: &ContainerKeys,
+) -> [u8; CONTAINER_LEN] {
     let mut out = [0u8; CONTAINER_LEN];
     out[..MAGIC.len()].copy_from_slice(MAGIC);
     out[MAGIC.len()] = CONTAINER_VERSION;
@@ -740,8 +744,8 @@ mod tests {
             "got {err}"
         );
 
-        let err = FileKeyProvider::new(path.clone(), "")
-            .expect_err("empty fingerprint must be rejected");
+        let err =
+            FileKeyProvider::new(path.clone(), "").expect_err("empty fingerprint must be rejected");
         assert!(matches!(err, KeyError::BadFingerprint { got: 0, .. }));
 
         // 长度对但含非 hex 字符。
@@ -759,8 +763,7 @@ mod tests {
     fn unwritable_path_yields_io_error_without_panic() {
         let dir = TempDir::new().expect("tempdir");
         let bad_path = dir.path().join("no_such_dir").join("gw.key");
-        let provider = FileKeyProvider::new(bad_path.clone(), &fingerprint_a())
-            .expect("valid fp");
+        let provider = FileKeyProvider::new(bad_path.clone(), &fingerprint_a()).expect("valid fp");
 
         let err = provider
             .load_or_create()
