@@ -225,6 +225,13 @@ impl fmt::Debug for FingerprintKey {
     }
 }
 
+/// 单锚点哈希的**域分隔前缀**（与机器码的 HMAC 输入不同域，保证任一锚点哈希
+/// **永不等于** `machine_code`）。
+const ANCHOR_HASH_DOMAIN: &[u8] = b"iotdaq.anchor.v1|";
+
+/// 单锚点哈希的**截断长度**（字节）：16 → 32 个 hex 字符（对应设计「HMAC 加盐截断」）。
+const ANCHOR_HASH_LEN: usize = 16;
+
 /// 机器身份：多源锚点 + N-of-M 容错聚合 + HMAC-SHA256 稳定指纹。
 ///
 /// 聚合规则：采集成功的锚点按名称排序（`BTreeMap`，同名后注册者覆盖先注册者），
@@ -307,6 +314,46 @@ impl MachineIdentity {
             .expect("HMAC accepts any non-empty key; empty key rejected at construction");
         mac.update(&digest);
         Ok(hex::encode(mac.finalize().into_bytes()))
+    }
+
+    /// **逐锚点哈希集**（N-of-M 同机判定的输入）。
+    ///
+    /// 与机器码**同键**盐化，但**域分隔**：`hex(HMAC-SHA256(key, b"iotdaq.anchor.v1|" ++ name ++ b"|" ++ value))`
+    /// 截断到 16 字节（32 hex 字符）。域前缀与机器码路径不同，保证任一锚点哈希
+    /// **永不等于** `machine_code`。
+    ///
+    /// 语义与 [`MachineIdentity::machine_digest`] 严格对齐：
+    /// 1. **先做 quorum 校验**（`usable < min_anchors` → [`FingerprintError::QuorumFailed`]）；
+    /// 2. 锚点顺序取同一份 `collected_anchors()`（`BTreeMap` 名称序），保证同机多次调用稳定；
+    /// 3. 逐个独立哈希：**单个锚点值变化不影响其它锚点的哈希**；
+    /// 4. 输出**只是哈希**，绝不回显锚点原值。
+    ///
+    /// # Errors
+    /// 配额不足返回 [`FingerprintError::QuorumFailed`]。
+    pub fn get_anchor_hashes(&self) -> Result<Vec<String>, FingerprintError> {
+        let collected = self.collected_anchors();
+        let usable = collected.len();
+        if usable < self.min_anchors {
+            return Err(FingerprintError::QuorumFailed {
+                collected: usable,
+                required: self.min_anchors,
+                total: self.providers.len(),
+            });
+        }
+        let mut hashes = Vec::with_capacity(collected.len());
+        for (name, value) in &collected {
+            let mut mac = HmacSha256::new_from_slice(&self.key.0)
+                .expect("HMAC accepts any non-empty key; empty key rejected at construction");
+            // 域分隔：`iotdaq.anchor.v1|` ++ name ++ `|` ++ value。
+            mac.update(ANCHOR_HASH_DOMAIN);
+            mac.update(name.as_bytes());
+            mac.update(b"|");
+            mac.update(value.as_bytes());
+            let full = mac.finalize().into_bytes();
+            // 截断到 16 字节 → 32 hex 字符（不完整暴露 HMAC 输出）。
+            hashes.push(hex::encode(&full[..ANCHOR_HASH_LEN]));
+        }
+        Ok(hashes)
     }
 }
 
@@ -456,6 +503,113 @@ mod tests {
             key_a.get_machine_id().expect("ok"),
             key_b.get_machine_id().expect("ok")
         );
+    }
+
+    // ---- 逐锚点哈希集（N-of-M 同机判定输入） ----
+
+    /// 5 锚点 → 5 个哈希；稳定一致；长度恒 32 hex；互不相同。
+    #[test]
+    fn anchor_hashes_are_five_distinct_hex32_stable() {
+        let id = identity(windows_fake_anchors(), 3);
+        let h1 = id.get_anchor_hashes().expect("quorum ok");
+        let h2 = id.get_anchor_hashes().expect("quorum ok");
+        assert_eq!(h1, h2, "same machine must yield same anchor hashes");
+        assert_eq!(h1.len(), 5, "5 anchors → 5 hashes");
+        for h in &h1 {
+            assert_eq!(h.len(), 32, "must be 16-byte truncated HMAC hex: {h}");
+            assert!(h.bytes().all(|b| b.is_ascii_hexdigit()), "must be hex: {h}");
+        }
+        let unique: std::collections::BTreeSet<&String> = h1.iter().collect();
+        assert_eq!(unique.len(), 5, "anchor hashes must be distinct: {h1:?}");
+    }
+
+    /// **域分隔守护**：任一锚点哈希永不等于 `machine_code`。
+    #[test]
+    fn anchor_hashes_never_equal_machine_code() {
+        let id = identity(windows_fake_anchors(), 3);
+        let machine_code = id.get_machine_fingerprint().expect("ok");
+        for h in id.get_anchor_hashes().expect("ok") {
+            assert_ne!(
+                h, machine_code,
+                "domain separation must keep anchor hash != machine_code"
+            );
+        }
+    }
+
+    /// 逐点独立性：单个锚点值变化 → 只有对应位置的哈希改变。
+    #[test]
+    fn changing_one_anchor_only_changes_its_hash() {
+        let base = identity(windows_fake_anchors(), 3)
+            .get_anchor_hashes()
+            .expect("ok");
+        let mut anchors = windows_fake_anchors();
+        // 只改 `csproduct-uuid` 的值；名称序不变 → 仅该锚点的哈希应变化。
+        anchors[1] = Box::new(StaticAnchor::new("csproduct-uuid", Some("uuid-XXXX")));
+        let changed = identity(anchors, 3).get_anchor_hashes().expect("ok");
+
+        assert_eq!(base.len(), changed.len());
+        let diffs: Vec<usize> = (0..base.len()).filter(|&i| base[i] != changed[i]).collect();
+        assert_eq!(
+            diffs.len(),
+            1,
+            "only the changed anchor's hash may differ: {diffs:?}"
+        );
+    }
+
+    /// 换 key → 全部锚点哈希改变（密钥轮换语义）。
+    #[test]
+    fn changing_key_rotates_all_anchor_hashes() {
+        let a = identity(windows_fake_anchors(), 3)
+            .get_anchor_hashes()
+            .expect("ok");
+        let b = MachineIdentity::new(
+            windows_fake_anchors(),
+            3,
+            FingerprintKey::from_bytes(TEST_ONLY_FINGERPRINT_KEY_B.to_vec()).expect("non-empty"),
+        )
+        .get_anchor_hashes()
+        .expect("ok");
+        assert!(
+            a.iter().zip(&b).all(|(x, y)| x != y),
+            "key change must rotate all anchor hashes"
+        );
+    }
+
+    /// quorum 不足 → `Err(QuorumFailed)`（与 machine_digest 同口径）。
+    #[test]
+    fn anchor_hashes_quorum_failure_is_explicit() {
+        let mut anchors = windows_fake_anchors();
+        anchors.truncate(2);
+        let id = identity(anchors, 3);
+        let err = id.get_anchor_hashes().expect_err("2 < 3 must fail");
+        assert!(matches!(
+            err,
+            FingerprintError::QuorumFailed {
+                collected: 2,
+                required: 3,
+                ..
+            }
+        ));
+    }
+
+    /// 输出**只是哈希**：不含任何锚点原值。
+    #[test]
+    fn anchor_hashes_do_not_leak_raw_values() {
+        let id = identity(windows_fake_anchors(), 3);
+        let hashes = id.get_anchor_hashes().expect("ok");
+        let raws = [
+            "guid-1111",
+            "uuid-2222",
+            "bios-3333",
+            "board-4444",
+            "vol-5555",
+        ];
+        for raw in raws {
+            assert!(
+                !hashes.iter().any(|h| h.contains(raw)),
+                "raw anchor value leaked into hash output: {raw}"
+            );
+        }
     }
 
     /// 空串 / 空白锚点值视为不可用，不计入配额。

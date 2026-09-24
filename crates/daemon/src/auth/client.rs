@@ -79,6 +79,79 @@ pub const LEASE_SIGNING_DOMAIN: &str = "iotdaq.lease.v1";
 /// 与 `LEASE_SIGNING_DOMAIN` 同风格：**不带**尾随 `|`（分隔符由 `push_len_field` 前置），
 /// 渲染结果为 `iotdaq.receipt.v1|mid=...|...|ts=...`。
 pub const RECEIPT_SIGNING_DOMAIN: &str = "iotdaq.receipt.v1";
+
+/// 回执语义哈希的二级域前缀（**以 `|` 结尾**）。
+///
+/// 与 `licensing-server/src/receipt.rs` 的 `RECEIPT_SEMANTIC_DOMAIN` **逐字节一致**；
+/// 改任一字节即跨端漂移（回执验签全部失败）。
+pub const RECEIPT_SEMANTIC_DOMAIN: &[u8] = b"iotdaq.receipt.semantic.v1|";
+
+// ---- 心跳 / A 档校验 / 激活的签名域（daemon 本地镜像，与服务端逐字节一致） ----
+//
+// ⚠️ 以下四组常量与函数是 `licensing-server/src/device_auth.rs` 的**逐字节镜像**：
+// 域前缀、二级域前缀、`push_len_field` 长度前缀规则、字段顺序**全部必须一致**。
+// **改任一字节即跨端漂移**（服务端 `verify_device_signature` 会拒签）。
+// 跨端一致性由 `tests/licensing_contract_conformance.rs` 的逐字节比对测试守护。
+
+/// `/heartbeat` 签名域前缀（与服务端 `HEARTBEAT_SIGNING_DOMAIN` 逐字节一致）。
+pub const HEARTBEAT_SIGNING_DOMAIN: &str = "iotdaq.heartbeat.v1";
+
+/// `/heartbeat` 语义哈希的二级域前缀（**以 `|` 结尾**，与服务端逐字节一致）。
+pub const HEARTBEAT_SEMANTIC_DOMAIN: &[u8] = b"iotdaq.heartbeat.semantic.v1|";
+
+/// `/verify` 签名域前缀（与服务端 `VERIFY_SIGNING_DOMAIN` 逐字节一致）。
+pub const VERIFY_SIGNING_DOMAIN: &str = "iotdaq.verify.v1";
+
+/// `/verify` 语义哈希的二级域前缀（**以 `|` 结尾**，与服务端逐字节一致）。
+pub const VERIFY_SEMANTIC_DOMAIN: &[u8] = b"iotdaq.verify.semantic.v1|";
+
+/// `/activation` 签名域前缀（与服务端 `ACTIVATION_SIGNING_DOMAIN` 逐字节一致）。
+///
+/// 服务端 `activate` **不验** `req_sig`，但形状要对；为保持「签名域单源且双端可重建」
+/// 的既有纪律，双端共享同一域常量与渲染函数。
+pub const ACTIVATION_SIGNING_DOMAIN: &str = "iotdaq.activation.v1";
+
+/// `/activation` 语义哈希的二级域前缀（**以 `|` 结尾**，与服务端逐字节一致）。
+pub const ACTIVATION_SEMANTIC_DOMAIN: &[u8] = b"iotdaq.activation.semantic.v1|";
+
+/// `receipt_cursor` 为空时在签名域中占位的字面量（与服务端 `CURSOR_NONE` 一致）。
+pub const CURSOR_NONE: &str = "none";
+
+/// `/heartbeat` 请求体的字段集合（恰好 5 个，镜像服务端 `HeartbeatRequest`）。
+pub const HEARTBEAT_FIELD_WHITELIST: [&str; 5] =
+    ["lease_id", "ts", "nonce", "receipt_cursor", "device_sig"];
+
+/// `/verify` 请求体的字段集合（恰好 6 个，**等于服务端 `VERIFY_WHITELIST`**）。
+pub const VERIFY_FIELD_WHITELIST: [&str; 6] = [
+    "device_mid",
+    "lease_id",
+    "payload_digest",
+    "ts",
+    "nonce",
+    "device_sig",
+];
+
+/// `/activation` 请求体的字段集合（恰好 7 个，镜像服务端 `ActivationRequest`）。
+pub const ACTIVATION_FIELD_WHITELIST: [&str; 7] = [
+    "activation_code",
+    "machine_code",
+    "anchor_hashes",
+    "device_pubkey",
+    "nonce",
+    "ts",
+    "req_sig",
+];
+
+/// 设计口径的锚点数量 **M**（`docs/design/licensing-api.md`：`anchor_hashes[5]`）。
+///
+/// ⚠️ 服务端**同机判定阈值**是 **≥4/5**（`docs/design/machine-fingerprint.md` §3，N=4/M=5，
+/// 允许 1 项合法漂移）；该阈值由**服务端**计算，客户端**不**参与判定 —— 客户端只负责产出并上传
+/// 逐锚点哈希集。切勿把 M=5 误当成阈值。
+///
+/// 仅用于诊断告警：客户端**不强制**该数量（不同平台可暴露的锚点数不同），但数量不等于此值时
+/// [`LicensingClient::activate`] 会 `tracing::warn!` 记录实际数量。
+pub const ANCHOR_COUNT: usize = 5;
+
 /// Ed25519 公钥原始字节长度。
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
 /// Ed25519 签名原始字节长度。
@@ -387,12 +460,23 @@ pub struct LicensingClient {
     machine_code: String,
     /// 网络传输实现（生产 HTTPS / 测试 fake）。
     transport: Arc<dyn LicenseTransport>,
-    /// 回执签名密钥提供者（**可选**；未注入时回执签名置空 → 服务端明确拒绝）。
+    /// **设备私钥签名者**（可选；未注入时各签名字段置空 → 服务端明确拒绝）。
+    ///
+    /// 承载全部「服务端可重建验签」的设备签名：`/activation` 的 `req_sig`、
+    /// `/heartbeat` 的 `device_sig`、`/verify` 的 `device_sig`、`/audit/receipt` 的 `sig`——
+    /// 四者共用**同一把设备私钥**，故名 `device_signer`（历史命名 `receipt_signer` 由
+    /// [`LicensingClient::with_receipt_signer`] 兼容保留）。
     ///
     /// 与 [`AuthSigner`] 使用**同一把设备私钥**（生产由宿主注入同一个 `HandleSigner`）；
-    /// 之所以单独持有：回执签名必须是**确定性、可被服务端用设备公钥重建验签**的签名，
+    /// 之所以单独持有：这些签名必须是**确定性、可被服务端用设备公钥重建验签**的签名，
     /// 而 [`AuthSigner::sign_semantic`] 会掺入随机 nonce（服务端无法重建），故不经其签名。
-    receipt_signer: Option<Arc<dyn HandleSigner>>,
+    device_signer: Option<Arc<dyn HandleSigner>>,
+    /// 本机**逐锚点哈希集**（供 `/activation` 的 `anchor_hashes`，承载 N-of-M 同机判定）。
+    ///
+    /// 由宿主经 [`LicensingClient::with_anchor_hashes`] 注入
+    /// （来源：`auth::machine_id::MachineIdentity::get_anchor_hashes`）。
+    /// 默认空——此时 [`LicensingClient::activate`] **fail-closed 拒绝激活**，绝不静默退化为 M=1。
+    anchor_hashes: Vec<String>,
     /// 内置公钥集：`kid → Ed25519 公钥`（支持多 kid 轮换）。
     public_keys: BTreeMap<String, VerifyingKey>,
     /// 状态机内部数据。
@@ -437,7 +521,8 @@ impl LicensingClient {
             signer,
             machine_code,
             transport,
-            receipt_signer: None,
+            device_signer: None,
+            anchor_hashes: Vec::new(),
             public_keys: BTreeMap::new(),
             inner: Mutex::new(ClientInner {
                 state: LicenseState::Unlicensed,
@@ -450,16 +535,35 @@ impl LicensingClient {
         }
     }
 
-    /// **增量、可选**：注入回执签名密钥（与 [`AuthSigner`] 用同一把设备私钥）。
+    /// **增量、可选**：注入设备私钥签名者（与 [`AuthSigner`] 用同一把设备私钥）。
     ///
-    /// 未注入时 [`LicensingClient::report_receipt`] 产出的 `sig` 为空串——这是
-    /// **明确的失败信号**（服务端收到空签名会拒绝），绝非「无签名冒充有效签名」。
-    /// 注入后回执签名是**确定性**的：服务端可用设备公钥从回执字段独立重建并验签。
+    /// 承载 `/activation` 的 `req_sig`、`/heartbeat` 的 `device_sig`、`/verify` 的 `device_sig`
+    /// 与 `/audit/receipt` 的 `sig`——四者共用同一把设备私钥，故名 `device_signer`。
     ///
-    /// 该方法是**新增**的（不改动 [`LicensingClient::new`] / [`LicensingClient::with_transport`]
-    /// 签名，避免破坏既有调用方）。
-    pub fn with_receipt_signer(mut self, provider: Arc<dyn HandleSigner>) -> Self {
-        self.receipt_signer = Some(provider);
+    /// 未注入时上述签名字段产出**空串**——这是**明确的失败信号**（服务端收到空签名会拒绝），
+    /// 绝非「无签名冒充有效签名」；不伪造、不 panic。
+    pub fn with_device_signer(mut self, provider: Arc<dyn HandleSigner>) -> Self {
+        self.device_signer = Some(provider);
+        self
+    }
+
+    /// 兼容入口：与 [`LicensingClient::with_device_signer`] 等价。
+    ///
+    /// 保留历史命名 `receipt_signer` 的注入入口，避免破坏既有调用方（该私钥同时用于回执）。
+    pub fn with_receipt_signer(self, provider: Arc<dyn HandleSigner>) -> Self {
+        self.with_device_signer(provider)
+    }
+
+    /// **增量、可选**：注入本机**逐锚点哈希集**（供 `/activation` 的 `anchor_hashes`）。
+    ///
+    /// 来源：`crate::auth::machine_id::MachineIdentity::get_anchor_hashes()`（该 API 与机器码
+    /// **同键盐化、域分隔**，逐点独立、截断 32 hex）。
+    ///
+    /// **fail-closed**：未注入（或注入为空）时 [`LicensingClient::activate`] 立即返回
+    /// `ConfigError`——**绝不**用机器码冒充单个锚点（那会把服务端 N-of-M 判定静默退化为 M=1，
+    /// 削弱一机一码绑定）。
+    pub fn with_anchor_hashes(mut self, anchor_hashes: Vec<String>) -> Self {
+        self.anchor_hashes = anchor_hashes;
         self
     }
 
@@ -531,10 +635,16 @@ impl LicensingClient {
 
     /// 激活（**必须联网**；离线激活不允许）。
     ///
-    /// 请求体：`{ device_mid, machine_code, activation_code, ts }`；
+    /// 请求体**严格等于**服务端 `ActivationRequest` 形状（7 字段）：
+    /// `{ activation_code, machine_code, anchor_hashes, device_pubkey, nonce, ts, req_sig }`
+    /// （`ts` 为**字符串**，大整数红线）。`req_sig` = 对
+    /// [`activation_payload_hash`] 的设备私钥 Ed25519 签名（服务端当前不验，但形状要对）。
     /// 响应体须含 `lease_token` 字段（三段式串）。成功即本地验签 → 写入 `Licensed`。
     ///
+    /// `anchor_hashes` 取注入的逐锚点哈希集（`with_anchor_hashes`）：**缺失即 fail-closed**。
+    ///
     /// # Errors
+    /// - 激活码为空 / **未注入锚点哈希集** → `ConfigError`；
     /// - 网络失败 / 超时 → `NetworkError`；
     /// - 服务端拒绝 → `AuthError`；
     /// - 响应缺 `lease_token` / 本地验签失败 → `AuthError` / `SecurityError`。
@@ -546,15 +656,58 @@ impl LicensingClient {
             ));
         }
 
-        let url = self.cfg.endpoint("activate");
         let now = self.observed_now();
-        let body = serde_json::json!({
-            "device_mid": self.machine_code,
-            "machine_code": self.machine_code,
-            "activation_code": code,
-            "ts": now.to_string(),
-        });
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
 
+        // **fail-closed**：必须有真实「逐锚点哈希集」。缺失即拒绝激活——用 machine_code 冒充
+        // 单个锚点会把服务端 N-of-M 同机判定静默退化为 M=1，削弱一机一码绑定。
+        let anchor_hashes = self.anchor_hashes.clone();
+        if anchor_hashes.is_empty() {
+            return Err(DaemonError::ConfigError(
+                "activation requires the per-anchor hash set; sending the machine code as a \
+                 single anchor would silently degrade N-of-M to M=1. Inject it via \
+                 LicensingClient::with_anchor_hashes (see \
+                 auth::machine_id::MachineIdentity::get_anchor_hashes)."
+                    .to_string(),
+            ));
+        }
+        // 数量不为设计口径（5）时**不拒绝**（平台可暴露的锚点数不同），仅告警以便诊断。
+        if anchor_hashes.len() != ANCHOR_COUNT {
+            tracing::warn!(
+                anchor_count = anchor_hashes.len(),
+                expected = ANCHOR_COUNT,
+                "activation anchor hash count differs from the designed ANCHOR_COUNT; not \
+                 rejecting (platform may expose fewer anchors than designed)"
+            );
+        }
+
+        let device_pubkey = self.device_public_key_b64();
+        let req_sig = self.sign_payload_hash(&activation_payload_hash(
+            code,
+            &self.machine_code,
+            &anchor_hashes,
+            &device_pubkey,
+            &nonce,
+            now,
+        ));
+
+        let body = activation_request_body(
+            code,
+            &self.machine_code,
+            &anchor_hashes,
+            &device_pubkey,
+            &nonce,
+            now,
+            &req_sig,
+        );
+        // 白名单守护：构造出的 request 的 key 集合必须恰好等于 7 字段白名单。
+        debug_assert_eq!(
+            object_keys(&body).len(),
+            ACTIVATION_FIELD_WHITELIST.len(),
+            "activation request must have exactly 7 fields"
+        );
+
+        let url = self.cfg.endpoint("activate");
         let resp = self.transport.post_json(&url, &body)?;
         let raw = resp
             .get("lease_token")
@@ -574,53 +727,167 @@ impl LicensingClient {
 
     /// 24h 心跳。B 档必须携带最近回执序号区间（`cursor = Some((seq_from, seq_to))`）。
     ///
+    /// 请求体**严格等于**服务端 `HeartbeatRequest` 形状（5 字段）：
+    /// `{ lease_id, ts, nonce, receipt_cursor, device_sig }`；`receipt_cursor` 在无游标时为
+    /// `null`，有游标时为**嵌套对象** `{seq_from, seq_to}`（两侧均为字符串，大整数红线）。
+    /// `device_sig` = 对 [`heartbeat_payload_hash`] 的设备私钥 Ed25519 签名。
+    ///
+    /// **服务端心跳响应不含新 Token**（`HeartbeatResponse` =
+    /// `{server_time, next_deadline, valid_until, verify_mode, tier, sig}`），
+    /// 故本方法按 `valid_until` / `server_time` 更新状态，**不再要求响应携带 `lease_token`**。
+    ///
     /// **关键**：网络失败**不得**降级——错误直接返回给调用方；状态机只在
     /// **宽限期耗尽**时才降级。B 档断网时由调用方继续采集与转发，稍后补报。
     ///
     /// # Errors
-    /// 网络失败 / 超时 → `NetworkError`；服务端拒绝 → `AuthError`；验签失败 → `SecurityError`。
+    /// 网络失败 / 超时 → `NetworkError`；服务端拒绝 / 响应缺字段 → `AuthError`；无租约 → `AuthError`。
     pub async fn heartbeat(&self, cursor: Option<(i64, i64)>) -> DaemonResult<LicenseState> {
-        let url = self.cfg.endpoint("heartbeat");
+        let lease = self.active_lease().ok_or_else(|| {
+            DaemonError::AuthError("heartbeat requires an activated lease".to_string())
+        })?;
+
         let now = self.observed_now();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let device_sig = self.sign_payload_hash(&heartbeat_payload_hash(
+            &lease.lease_id,
+            now,
+            &nonce,
+            cursor,
+        ));
 
-        let mut body = serde_json::json!({
-            "device_mid": self.machine_code,
-            "machine_code": self.machine_code,
-            "ts": now.to_string(),
-        });
-        // B 档必须携带最近回执序号区间（大整数走字符串）。
-        if let Some((from, to)) = cursor {
-            let obj = body
-                .as_object_mut()
-                .ok_or_else(|| DaemonError::AuthError("heartbeat body is not an object".into()))?;
-            obj.insert(
-                "cursor_from".to_string(),
-                serde_json::json!(from.to_string()),
-            );
-            obj.insert("cursor_to".to_string(), serde_json::json!(to.to_string()));
-        }
+        let body = heartbeat_request_body(&lease.lease_id, now, &nonce, cursor, &device_sig);
+        debug_assert_eq!(
+            object_keys(&body).len(),
+            HEARTBEAT_FIELD_WHITELIST.len(),
+            "heartbeat request must have exactly 5 fields"
+        );
 
+        let url = self.cfg.endpoint("heartbeat");
         let resp = self.transport.post_json(&url, &body)?;
-        let raw = resp
-            .get("lease_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                DaemonError::AuthError(
-                    "heartbeat response is missing 'lease_token' field".to_string(),
-                )
-            })?;
 
-        let lease = self.verify_lease_locally(raw)?;
+        // 服务端权威时间与租约失效时刻（均为秒字符串）。
+        let server_time = require_secs_field(&resp, "server_time", "heartbeat")?;
+        let server_valid_until = require_secs_field(&resp, "valid_until", "heartbeat")?;
 
-        // 心跳成功 → 视为「已联网」：刷新宽限基准，回到 Licensed。
+        // 以服务端权威 `valid_until` 刷新本地租约有效期（服务端在激活时固定该值，心跳回显；
+        // 若两者漂移，以服务端为准）。`raw` 原文保留不变（审计与再验签用）。
+        let mut updated = lease;
+        updated.valid_until = server_valid_until;
+
+        // 心跳成功 → 视为「已联网」：以服务端时间校准单调时钟，刷新宽限基准，回到 Licensed。
+        // 时钟校准仅**前进**（`max`），不因服务端报出更早时间而后退——回拨防御不变。
         if let Ok(mut guard) = self.inner.lock() {
-            guard.grace_anchor_secs = now;
+            if server_time > guard.max_observed_secs {
+                guard.max_observed_secs = server_time;
+            }
+            guard.grace_anchor_secs = guard.max_observed_secs;
             guard.last_cursor = cursor;
             guard.state = LicenseState::Licensed {
-                lease: lease.clone(),
+                lease: updated.clone(),
             };
         }
-        Ok(LicenseState::Licensed { lease })
+        Ok(LicenseState::Licensed { lease: updated })
+    }
+
+    // ---- A 档二次校验 ----
+
+    /// A 档业务消息级二次校验（`POST /verify`，**仅 A 档**）。
+    ///
+    /// 请求体**严格等于**服务端 `VerifyRequest` 形状（6 字段，**出现白名单外字段即 422**）：
+    /// `{ device_mid, lease_id, payload_digest, ts, nonce, device_sig }`（`ts` 为字符串）。
+    /// `device_sig` = 对 [`verify_payload_hash`] 的设备私钥 Ed25519 签名。
+    ///
+    /// **响应必须回显请求 nonce**：`VerifyResponse{ok, server_time, nonce}`；回显不一致 →
+    /// [`DaemonError::SecurityError`]（防响应重放 / 串扰）。返回服务端判定的 `ok`。
+    ///
+    /// # Errors
+    /// - 无租约（Trial / Unlicensed / Degraded）→ `AuthError`；
+    /// - 网络失败 → `NetworkError`；响应缺字段 → `AuthError`；
+    /// - nonce 回显不一致 → `SecurityError`。
+    pub async fn verify(&self, payload_digest: &str) -> DaemonResult<bool> {
+        let lease = self.active_lease().ok_or_else(|| {
+            DaemonError::AuthError("verify requires an activated lease".to_string())
+        })?;
+
+        let now = self.observed_now();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let device_sig = self.sign_payload_hash(&verify_payload_hash(
+            &self.machine_code,
+            &lease.lease_id,
+            payload_digest,
+            now,
+            &nonce,
+        ));
+
+        let body = verify_request_body(
+            &self.machine_code,
+            &lease.lease_id,
+            payload_digest,
+            now,
+            &nonce,
+            &device_sig,
+        );
+        debug_assert_eq!(
+            object_keys(&body).len(),
+            VERIFY_FIELD_WHITELIST.len(),
+            "verify request must have exactly 6 fields"
+        );
+
+        let url = self.cfg.endpoint("verify");
+        let resp = self.transport.post_json(&url, &body)?;
+
+        let ok = resp.get("ok").and_then(|v| v.as_bool()).ok_or_else(|| {
+            DaemonError::AuthError("verify response is missing 'ok' field".to_string())
+        })?;
+        let echoed = resp.get("nonce").and_then(|v| v.as_str()).ok_or_else(|| {
+            DaemonError::AuthError("verify response is missing 'nonce' field".to_string())
+        })?;
+        if echoed != nonce {
+            return Err(DaemonError::SecurityError(
+                "verify response nonce does not match the request nonce".to_string(),
+            ));
+        }
+        Ok(ok)
+    }
+
+    // ---- 内部辅助 ----
+
+    /// 当前授权状态所持有的租约（`Licensed` / `Grace` 持有；其余为 `None`）。
+    fn active_lease(&self) -> Option<LeaseToken> {
+        match self.snapshot() {
+            LicenseState::Licensed { lease } | LicenseState::Grace { lease, .. } => Some(lease),
+            _ => None,
+        }
+    }
+
+    /// 设备公钥 STANDARD base64（从注入的 [`HandleSigner`] 导出）。
+    ///
+    /// 密钥不可用（未注入 / 导出失败）时返回**空串**——明确的失败信号，不伪造、不 panic。
+    fn device_public_key_b64(&self) -> String {
+        match &self.device_signer {
+            Some(p) => match p.public_key() {
+                Ok(vk) => B64.encode(vk.to_bytes()),
+                Err(_) => String::new(),
+            },
+            None => String::new(),
+        }
+    }
+
+    /// 对 32 字节待验数据用设备私钥签名（STANDARD base64）。
+    ///
+    /// 密钥不可用（未注入 / 签名失败）时返回**空串**——明确的失败信号（服务端拒绝），
+    /// 绝不用「无签名」冒充有效签名；生产路径零 panic。
+    fn sign_payload_hash(&self, payload_hash: &[u8; 32]) -> String {
+        let provider = match &self.device_signer {
+            Some(p) => p,
+            // 未注入设备签名密钥：置空（明确失败信号）。
+            None => return String::new(),
+        };
+        match provider.sign_message(payload_hash) {
+            Ok(signature) => B64.encode(signature.to_bytes()),
+            // 密钥不可用：置空（明确失败信号）。
+            Err(_) => String::new(),
+        }
     }
 
     // ---- 回执上报 ----
@@ -725,18 +992,7 @@ impl LicensingClient {
             ts,
         );
         let payload_hash = semantic_digest(msg.as_bytes());
-
-        let provider = match &self.receipt_signer {
-            Some(p) => p,
-            // 未注入回执签名密钥：置空（明确失败信号），不伪造签名、不 panic。
-            None => return String::new(),
-        };
-        let signature: Signature = match provider.sign_message(&payload_hash) {
-            Ok(s) => s,
-            // 密钥不可用：置空（明确失败信号）。
-            Err(_) => return String::new(),
-        };
-        B64.encode(signature.to_bytes())
+        self.sign_payload_hash(&payload_hash)
     }
 
     // ---- 本地验签 ----
@@ -974,10 +1230,22 @@ fn push_len_field(out: &mut String, name: &str, value: &str) {
 }
 
 /// 对语义规范化串做 SHA-256（与 `signing::semantic_hash` 同族，不签序列化字节）。
+///
+/// 回执的二级域前缀固定为 [`RECEIPT_SEMANTIC_DOMAIN`]，经 [`domain_separated_digest`] 计算，
+/// **行为与历史实现逐字节一致**（回执路径不可回归）。
 fn semantic_digest(bytes: &[u8]) -> [u8; 32] {
+    domain_separated_digest(RECEIPT_SEMANTIC_DOMAIN, bytes)
+}
+
+/// 通用「二级域前缀 + 数据」SHA-256：`SHA-256(domain ++ bytes)`。
+///
+/// 用于心跳 / 校验 / 激活等**参数化二级域**的语义哈希；`domain` 由调用方给定
+/// （回执走 [`RECEIPT_SEMANTIC_DOMAIN`]，心跳走 [`HEARTBEAT_SEMANTIC_DOMAIN`]，……）。
+/// 单一实现保证「先哈希、对哈希签」的口径在所有端点一致。
+fn domain_separated_digest(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"iotdaq.receipt.semantic.v1|");
+    hasher.update(domain);
     hasher.update(bytes);
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
@@ -1014,6 +1282,234 @@ fn receipt_signing_message(
     push_len_field(&mut msg, "payload_digest", payload_digest);
     push_len_field(&mut msg, "ts", &ts.to_string());
     msg
+}
+
+// ---- 心跳 / 校验 / 激活的签名域渲染（与服务端 device_auth.rs 逐字节一致） ----
+
+/// 渲染 `/heartbeat` 签名域串（**未哈希**；与服务端 `render_heartbeat_signing_message` 逐字节一致）。
+///
+/// 形状（5 字段，顺序固定）：
+/// ```text
+/// iotdaq.heartbeat.v1|lease_id=<len>:<id>|ts=<len>:<ts>|nonce=<len>:<n>|cursor_from=<len>:<f>|cursor_to=<len>:<t>
+/// ```
+/// `cursor` 为 `Some((from, to))` 时以十进制落域；`None` 时两端均为 [`CURSOR_NONE`]（`"none"`）。
+#[must_use]
+pub fn render_heartbeat_signing_message(
+    lease_id: &str,
+    ts: i64,
+    nonce: &str,
+    cursor: Option<(i64, i64)>,
+) -> String {
+    let (from, to) = match cursor {
+        Some((f, t)) => (f.to_string(), t.to_string()),
+        None => (CURSOR_NONE.to_string(), CURSOR_NONE.to_string()),
+    };
+    let mut out = String::with_capacity(160);
+    out.push_str(HEARTBEAT_SIGNING_DOMAIN);
+    push_len_field(&mut out, "lease_id", lease_id);
+    push_len_field(&mut out, "ts", &ts.to_string());
+    push_len_field(&mut out, "nonce", nonce);
+    push_len_field(&mut out, "cursor_from", &from);
+    push_len_field(&mut out, "cursor_to", &to);
+    out
+}
+
+/// `/heartbeat` 待验数据：`SHA-256(HEARTBEAT_SEMANTIC_DOMAIN ++ 域串)`（32 字节）。
+///
+/// 与服务端 `device_auth::heartbeat_payload_hash` 逐字节一致。
+#[must_use]
+pub fn heartbeat_payload_hash(
+    lease_id: &str,
+    ts: i64,
+    nonce: &str,
+    cursor: Option<(i64, i64)>,
+) -> [u8; 32] {
+    let message = render_heartbeat_signing_message(lease_id, ts, nonce, cursor);
+    domain_separated_digest(HEARTBEAT_SEMANTIC_DOMAIN, message.as_bytes())
+}
+
+/// 渲染 `/verify` 签名域串（**未哈希**；与服务端 `render_verify_signing_message` 逐字节一致）。
+///
+/// 形状（5 字段，顺序固定）：
+/// ```text
+/// iotdaq.verify.v1|mid=<len>:<mid>|lease_id=<len>:<id>|payload_digest=<len>:<d>|ts=<len>:<ts>|nonce=<len>:<n>
+/// ```
+#[must_use]
+pub fn render_verify_signing_message(
+    device_mid: &str,
+    lease_id: &str,
+    payload_digest: &str,
+    ts: i64,
+    nonce: &str,
+) -> String {
+    let mut out = String::with_capacity(160);
+    out.push_str(VERIFY_SIGNING_DOMAIN);
+    push_len_field(&mut out, "mid", device_mid);
+    push_len_field(&mut out, "lease_id", lease_id);
+    push_len_field(&mut out, "payload_digest", payload_digest);
+    push_len_field(&mut out, "ts", &ts.to_string());
+    push_len_field(&mut out, "nonce", nonce);
+    out
+}
+
+/// `/verify` 待验数据：`SHA-256(VERIFY_SEMANTIC_DOMAIN ++ 域串)`（32 字节）。
+///
+/// 与服务端 `device_auth::verify_payload_hash` 逐字节一致。
+#[must_use]
+pub fn verify_payload_hash(
+    device_mid: &str,
+    lease_id: &str,
+    payload_digest: &str,
+    ts: i64,
+    nonce: &str,
+) -> [u8; 32] {
+    let message = render_verify_signing_message(device_mid, lease_id, payload_digest, ts, nonce);
+    domain_separated_digest(VERIFY_SEMANTIC_DOMAIN, message.as_bytes())
+}
+
+/// 渲染 `/activation` 签名域串（**未哈希**；与服务端 `render_activation_signing_message` 逐字节一致）。
+///
+/// 形状（字段顺序固定；`anchor_hashes` 用 `anchors=<count>` + 逐个 `anchor_<i>` 定界编码，
+/// 保证空集与含 `|` 的值都不产生歧义）：
+/// ```text
+/// iotdaq.activation.v1|activation_code=<len>:<c>|machine_code=<len>:<m>|anchors=<len>:<n>|
+///   anchor_0=<len>:<a0>|...|device_pubkey=<len>:<pk>|nonce=<len>:<n>|ts=<len>:<ts>
+/// ```
+#[must_use]
+pub fn render_activation_signing_message(
+    activation_code: &str,
+    machine_code: &str,
+    anchor_hashes: &[String],
+    device_pubkey: &str,
+    nonce: &str,
+    ts: i64,
+) -> String {
+    let mut out = String::with_capacity(192);
+    out.push_str(ACTIVATION_SIGNING_DOMAIN);
+    push_len_field(&mut out, "activation_code", activation_code);
+    push_len_field(&mut out, "machine_code", machine_code);
+    push_len_field(&mut out, "anchors", &anchor_hashes.len().to_string());
+    for (i, anchor) in anchor_hashes.iter().enumerate() {
+        push_len_field(&mut out, &format!("anchor_{i}"), anchor);
+    }
+    push_len_field(&mut out, "device_pubkey", device_pubkey);
+    push_len_field(&mut out, "nonce", nonce);
+    push_len_field(&mut out, "ts", &ts.to_string());
+    out
+}
+
+/// `/activation` 待验数据：`SHA-256(ACTIVATION_SEMANTIC_DOMAIN ++ 域串)`（32 字节）。
+///
+/// 与服务端 `device_auth::activation_payload_hash` 逐字节一致。
+#[must_use]
+pub fn activation_payload_hash(
+    activation_code: &str,
+    machine_code: &str,
+    anchor_hashes: &[String],
+    device_pubkey: &str,
+    nonce: &str,
+    ts: i64,
+) -> [u8; 32] {
+    let message = render_activation_signing_message(
+        activation_code,
+        machine_code,
+        anchor_hashes,
+        device_pubkey,
+        nonce,
+        ts,
+    );
+    domain_separated_digest(ACTIVATION_SEMANTIC_DOMAIN, message.as_bytes())
+}
+
+// ---- 请求体构造（纯函数；形状即服务端 proto 结构，供跨端一致性测试断言） ----
+
+/// 构造 `/heartbeat` 请求体（**严格等于服务端 `HeartbeatRequest` 形状**，恰好 5 字段）。
+///
+/// `ts` 为秒字符串；`receipt_cursor` 无游标时为 `null`，有游标时为嵌套对象
+/// `{seq_from, seq_to}`（均为秒/序号字符串，大整数红线）。`device_sig` 为标准 base64。
+#[must_use]
+pub fn heartbeat_request_body(
+    lease_id: &str,
+    ts: i64,
+    nonce: &str,
+    cursor: Option<(i64, i64)>,
+    device_sig: &str,
+) -> serde_json::Value {
+    let receipt_cursor = match cursor {
+        Some((from, to)) => serde_json::json!({
+            "seq_from": from.to_string(),
+            "seq_to": to.to_string(),
+        }),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "lease_id": lease_id,
+        "ts": ts.to_string(),
+        "nonce": nonce,
+        "receipt_cursor": receipt_cursor,
+        "device_sig": device_sig,
+    })
+}
+
+/// 构造 `/verify` 请求体（**严格等于服务端 `VerifyRequest` 形状**，恰好 6 字段）。
+///
+/// 出现白名单外字段服务端即 422；`ts` 为秒字符串。
+#[must_use]
+pub fn verify_request_body(
+    device_mid: &str,
+    lease_id: &str,
+    payload_digest: &str,
+    ts: i64,
+    nonce: &str,
+    device_sig: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "device_mid": device_mid,
+        "lease_id": lease_id,
+        "payload_digest": payload_digest,
+        "ts": ts.to_string(),
+        "nonce": nonce,
+        "device_sig": device_sig,
+    })
+}
+
+/// 构造 `/activation` 请求体（**严格等于服务端 `ActivationRequest` 形状**，恰好 7 字段）。
+///
+/// `ts` 为秒字符串；`anchor_hashes` 为字符串数组；`req_sig` 为标准 base64。
+#[must_use]
+pub fn activation_request_body(
+    activation_code: &str,
+    machine_code: &str,
+    anchor_hashes: &[String],
+    device_pubkey: &str,
+    nonce: &str,
+    ts: i64,
+    req_sig: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "activation_code": activation_code,
+        "machine_code": machine_code,
+        "anchor_hashes": anchor_hashes,
+        "device_pubkey": device_pubkey,
+        "nonce": nonce,
+        "ts": ts.to_string(),
+        "req_sig": req_sig,
+    })
+}
+
+/// 读取服务端响应中的「秒字符串」字段并解析为 `i64`（大整数走字符串红线）。
+///
+/// # Errors
+/// 字段缺失（非字符串）或不是合法 `i64` 十进制字符串 → [`DaemonError::AuthError`]。
+fn require_secs_field(resp: &serde_json::Value, field: &str, context: &str) -> DaemonResult<i64> {
+    let raw = resp.get(field).and_then(|v| v.as_str()).ok_or_else(|| {
+        DaemonError::AuthError(format!("{context} response is missing '{field}' field"))
+    })?;
+    raw.trim().parse::<i64>().map_err(|_| {
+        DaemonError::AuthError(format!(
+            "{context} response field '{field}' is not integer seconds"
+        ))
+    })
 }
 
 /// 渲染 Lease Token 签名域（与 licensing-server 的 `render_signing_message` **逐字节一致**）。
@@ -1209,17 +1705,23 @@ mod tests {
         )
     }
 
+    /// 便捷：5 个测试用逐锚点哈希（32 hex，互不相同；**仅测试**）。
+    fn test_anchor_hashes() -> Vec<String> {
+        (0..ANCHOR_COUNT).map(|i| format!("{i:032x}")).collect()
+    }
+
     /// 构造带公钥集（A / B 两把 kid）的客户端；传输来自共享的 [`FakeTransport`]。
     ///
     /// 注入回执签名密钥（私钥 A，与 [`test_signer`] 同一把设备私钥），
-    /// 使回执签名路径可用（正常路径）。
+    /// 并注入逐锚点哈希集（使 `activate` 的 fail-closed 不触发）。
     fn client_with_fake(fake: &Arc<FakeTransport>) -> LicensingClient {
         let cfg = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30)
             .expect("non-empty url");
         let signer = test_signer();
         let transport: Arc<dyn LicenseTransport> = Arc::clone(fake) as Arc<dyn LicenseTransport>;
         let mut client = LicensingClient::with_transport(cfg, signer, test_mid(), transport)
-            .with_receipt_signer(Arc::new(StaticKeyProvider::new(TEST_ONLY_KEY_A)));
+            .with_receipt_signer(Arc::new(StaticKeyProvider::new(TEST_ONLY_KEY_A)))
+            .with_anchor_hashes(test_anchor_hashes());
         client
             .register_public_key("kid-a", &public_key_bytes(TEST_ONLY_KEY_A))
             .expect("register kid-a");
@@ -1235,7 +1737,8 @@ mod tests {
             .expect("non-empty url");
         let signer = test_signer();
         let transport: Arc<dyn LicenseTransport> = Arc::clone(fake) as Arc<dyn LicenseTransport>;
-        let mut client = LicensingClient::with_transport(cfg, signer, test_mid(), transport);
+        let mut client = LicensingClient::with_transport(cfg, signer, test_mid(), transport)
+            .with_anchor_hashes(test_anchor_hashes());
         client
             .register_public_key("kid-a", &public_key_bytes(TEST_ONLY_KEY_A))
             .expect("register kid-a");
@@ -1306,9 +1809,21 @@ mod tests {
         )
     }
 
-    /// 构造激活成功响应。
+    /// 构造激活成功响应（服务端 `ActivationResponse` 关键字段）。
     fn activate_ok_response(token: &str) -> serde_json::Value {
         serde_json::json!({ "lease_token": token })
+    }
+
+    /// 构造心跳成功响应（服务端 `HeartbeatResponse` 形状，**不含新 Token**）。
+    fn heartbeat_ok_response(server_time: i64, valid_until: i64) -> serde_json::Value {
+        serde_json::json!({
+            "server_time": server_time.to_string(),
+            "next_deadline": (server_time + 86_400).to_string(),
+            "valid_until": valid_until.to_string(),
+            "verify_mode": "B",
+            "tier": "standard",
+            "sig": "server-response-sig",
+        })
     }
 
     // ---- FakeTransport ----
@@ -1333,6 +1848,11 @@ mod tests {
         NetFail(String),
         /// 返回服务端拒绝（AuthError）。
         Reject(String),
+        /// 回显请求 nonce 的 `/verify` 成功响应（供测试 nonce 回显校验）。
+        VerifyEcho {
+            /// 服务端判定的 `ok`。
+            ok: bool,
+        },
         /// 未编程（默认）。
         #[default]
         Unset,
@@ -1342,6 +1862,11 @@ mod tests {
         /// 编程：下一次请求返回给定响应体。
         fn respond_with(&self, value: serde_json::Value) {
             *self.action.lock().expect("fake action lock") = FakeAction::Ok(value);
+        }
+
+        /// 编程：下一次 `/verify` 请求返回**回显请求 nonce** 的成功响应。
+        fn respond_with_verify_echo(&self, ok: bool) {
+            *self.action.lock().expect("fake action lock") = FakeAction::VerifyEcho { ok };
         }
 
         /// 编程：下一次请求返回网络错误。
@@ -1377,6 +1902,17 @@ mod tests {
                 FakeAction::Ok(v) => Ok(v.clone()),
                 FakeAction::NetFail(m) => Err(DaemonError::NetworkError(m.clone())),
                 FakeAction::Reject(m) => Err(DaemonError::AuthError(m.clone())),
+                FakeAction::VerifyEcho { ok } => {
+                    let echoed = body
+                        .get("nonce")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    Ok(serde_json::json!({
+                        "ok": ok,
+                        "server_time": "1700000000",
+                        "nonce": echoed,
+                    }))
+                }
                 FakeAction::Unset => Err(DaemonError::NetworkError(
                     "fake transport not programmed".to_string(),
                 )),
@@ -1494,7 +2030,7 @@ mod tests {
         }
     }
 
-    /// B 档心跳携带回执游标 → 请求体含 cursor 字段，且大整数走字符串。
+    /// B 档心跳携带回执游标 → 请求体含 **嵌套** `receipt_cursor`，且大整数走字符串。
     #[tokio::test]
     async fn heartbeat_with_cursor_sends_string_numbers() {
         let (client, fake) = setup();
@@ -1502,17 +2038,25 @@ mod tests {
         fake.respond_with(activate_ok_response(&token));
         client.activate("ACT-1").await.expect("activate ok");
 
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with(heartbeat_ok_response(T0, T0 + 365 * 86_400));
         client
             .heartbeat(Some((100, 9007199254740991)))
             .await
             .expect("heartbeat ok with big cursor");
 
         let body = fake.last_body().expect("body recorded");
-        // cursor 是字符串（大整数不走 JSON number）。
-        assert_eq!(body["cursor_from"], serde_json::json!("100"));
-        assert_eq!(body["cursor_to"], serde_json::json!("9007199254740991"));
-        assert!(body["cursor_to"].is_string(), "big int must be string");
+        // `receipt_cursor` 是**嵌套对象**，序号是字符串（大整数不走 JSON number）。
+        assert_eq!(body["receipt_cursor"]["seq_from"], serde_json::json!("100"));
+        assert_eq!(
+            body["receipt_cursor"]["seq_to"],
+            serde_json::json!("9007199254740991")
+        );
+        assert!(
+            body["receipt_cursor"]["seq_to"].is_string(),
+            "big int must be string"
+        );
+        // `ts` 同样是字符串。
+        assert!(body["ts"].is_string(), "ts must be a JSON string");
     }
 
     /// 要求 7：回执请求体 key 集合**恰好等于** 8 个白名单字段。
@@ -2004,7 +2548,7 @@ mod tests {
         }
     }
 
-    /// 心跳成功后刷新宽限基准：验证「重连回到 Licensed」。
+    /// 心跳成功后刷新宽限基准：验证「重连回到 Licensed」（响应**不含新 Token**）。
     #[tokio::test]
     async fn successful_heartbeat_restores_licensed() {
         let (client, fake) = setup();
@@ -2016,31 +2560,52 @@ mod tests {
         client.tick(T0 + SECS_PER_DAY);
         assert_eq!(client.current_state().name(), "Grace");
 
-        // 心跳成功（新租约，有效期更长）→ 回到 Licensed。
-        let fresh = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&fresh));
+        // 心跳成功（服务端回显更长的 valid_until）→ 回到 Licensed；**不要求响应含新 Token**。
+        fake.respond_with(heartbeat_ok_response(T0 + SECS_PER_DAY, T0 + 365 * 86_400));
         let state = client.heartbeat(None).await.expect("heartbeat ok");
         assert_eq!(state.name(), "Licensed");
         assert_eq!(client.current_state().name(), "Licensed");
+        match state {
+            LicenseState::Licensed { lease } => {
+                assert_eq!(lease.lease_id, "lease-0001");
+                // 本地租约有效期以服务端权威 `valid_until` 刷新。
+                assert_eq!(lease.valid_until, T0 + 365 * 86_400);
+            }
+            other => panic!("expected Licensed, got {other:?}"),
+        }
     }
 
-    /// 心跳验签失败（服务端返回被篡改 Token）→ SecurityError，状态不变。
+    /// 心跳响应缺 `valid_until` → AuthError，状态不变（**不再要求响应携带 Token**）。
     #[tokio::test]
-    async fn heartbeat_with_invalid_token_errors_and_keeps_state() {
+    async fn heartbeat_missing_server_fields_errors_and_keeps_state() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
         fake.respond_with(activate_ok_response(&token));
         client.activate("ACT-1").await.expect("activate ok");
 
-        let bad = build_token_full(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 86_400, false, true);
-        fake.respond_with(activate_ok_response(&bad));
+        // 心跳响应只有 server_time，缺 valid_until → AuthError。
+        fake.respond_with(serde_json::json!({ "server_time": "1700000000" }));
         let err = client
             .heartbeat(None)
             .await
-            .expect_err("invalid token must error");
-        assert_eq!(err.error_code(), ERR_SECURITY);
+            .expect_err("missing valid_until must error");
+        assert_eq!(err.error_code(), ERR_AUTH);
         // 状态保持 Licensed（心跳失败不降级）。
         assert_eq!(client.current_state().name(), "Licensed");
+    }
+
+    /// 无租约（未激活）时心跳 → AuthError（心跳必须有租约）。
+    #[tokio::test]
+    async fn heartbeat_without_lease_is_auth_error() {
+        let (client, _fake) = setup();
+        let err = client
+            .heartbeat(None)
+            .await
+            .expect_err("no lease must reject heartbeat");
+        assert_eq!(err.error_code(), ERR_AUTH);
+        assert!(err
+            .to_string()
+            .contains("heartbeat requires an activated lease"));
     }
 
     /// 要求 6（信号守护）：`LicenseGate` 实现与 `current_state().can_sign()` 一致。
@@ -2119,13 +2684,42 @@ mod tests {
     #[tokio::test]
     async fn default_transport_is_unavailable() {
         let cfg = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30).expect("ok");
-        let client = LicensingClient::new(cfg, test_signer(), test_mid());
+        let client = LicensingClient::new(cfg, test_signer(), test_mid())
+            .with_anchor_hashes(test_anchor_hashes());
         let err = client
             .activate("ACT-1")
             .await
             .expect_err("default transport unavailable");
         assert_eq!(err.error_code(), ERR_NETWORK);
         assert_eq!(client.current_state(), LicenseState::Unlicensed);
+    }
+
+    /// **fail-closed**：未注入逐锚点哈希集 → `activate` 立即 ConfigError，绝不退化为 M=1。
+    #[tokio::test]
+    async fn activate_without_anchor_hashes_is_config_error() {
+        let cfg = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30).expect("ok");
+        // 不调用 with_anchor_hashes ⇒ 锚点集为空。
+        let client = LicensingClient::new(cfg, test_signer(), test_mid());
+        let err = client
+            .activate("ACT-1")
+            .await
+            .expect_err("missing anchors must be fail-closed");
+        assert_eq!(err.error_code(), ERR_CONFIG);
+        assert!(
+            err.to_string().contains("per-anchor hash set"),
+            "error must explain the N-of-M degradation risk: {err}"
+        );
+        assert_eq!(client.current_state(), LicenseState::Unlicensed);
+
+        // 注入**空**集合同样 fail-closed。
+        let cfg2 = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30).expect("ok");
+        let client2 =
+            LicensingClient::new(cfg2, test_signer(), test_mid()).with_anchor_hashes(Vec::new());
+        let err2 = client2
+            .activate("ACT-1")
+            .await
+            .expect_err("empty anchors must be fail-closed");
+        assert_eq!(err2.error_code(), ERR_CONFIG);
     }
 
     /// 签名域渲染与 licensing-server **逐字节一致**（跨端一致性的关键守护）。
@@ -2220,5 +2814,326 @@ mod tests {
         assert!(rendered.contains("LicensingClient"), "{rendered}");
         assert!(rendered.contains("kid_count"), "{rendered}");
         assert!(!rendered.contains("1a1a"), "no key material in Debug");
+    }
+
+    // ================= 协议契约（daemon ↔ licensing-server 对齐） =================
+
+    /// 心跳签名域**逐字节**钉死形状（反向守护：改域串即红）。
+    #[test]
+    fn heartbeat_signing_message_layout_is_pinned() {
+        let got =
+            render_heartbeat_signing_message("lease-0001", 1_700_000_000, "n-1", Some((1, 100)));
+        assert_eq!(
+            got,
+            concat!(
+                "iotdaq.heartbeat.v1",
+                "|lease_id=10:lease-0001",
+                "|ts=10:1700000000",
+                "|nonce=3:n-1",
+                "|cursor_from=1:1",
+                "|cursor_to=3:100",
+            )
+        );
+
+        // cursor 为空 → 双端字面量 "none"。
+        let none = render_heartbeat_signing_message("lease-0001", 1_700_000_000, "n-1", None);
+        assert!(
+            none.contains("|cursor_from=4:none|cursor_to=4:none"),
+            "{none}"
+        );
+    }
+
+    /// 校验签名域**逐字节**钉死形状。
+    #[test]
+    fn verify_signing_message_layout_is_pinned() {
+        let got = render_verify_signing_message(
+            "MID-0001",
+            "lease-0001",
+            "sha256:abcdef",
+            1_700_000_000,
+            "n-1",
+        );
+        assert_eq!(
+            got,
+            concat!(
+                "iotdaq.verify.v1",
+                "|mid=8:MID-0001",
+                "|lease_id=10:lease-0001",
+                "|payload_digest=13:sha256:abcdef",
+                "|ts=10:1700000000",
+                "|nonce=3:n-1",
+            )
+        );
+    }
+
+    /// 激活签名域**逐字节**钉死形状（含 anchor 计数 + 逐个定界）。
+    #[test]
+    fn activation_signing_message_layout_is_pinned() {
+        let hashes = vec!["a".to_string(), "b".to_string()];
+        let got = render_activation_signing_message(
+            "ACT-CODE",
+            "mid-1",
+            &hashes,
+            "PUBKEY",
+            "n-1",
+            1_700_000_000,
+        );
+        assert_eq!(
+            got,
+            concat!(
+                "iotdaq.activation.v1",
+                "|activation_code=8:ACT-CODE",
+                "|machine_code=5:mid-1",
+                "|anchors=1:2",
+                "|anchor_0=1:a",
+                "|anchor_1=1:b",
+                "|device_pubkey=6:PUBKEY",
+                "|nonce=3:n-1",
+                "|ts=10:1700000000",
+            )
+        );
+    }
+
+    /// 心跳哈希确实带二级域前缀（`SHA256(域串)` ≠ `heartbeat_payload_hash`）。
+    #[test]
+    fn heartbeat_hash_carries_second_level_domain() {
+        use sha2::{Digest, Sha256};
+        let message = render_heartbeat_signing_message("l", 1, "n", None);
+        let bare: [u8; 32] = Sha256::digest(message.as_bytes()).into();
+        assert_ne!(heartbeat_payload_hash("l", 1, "n", None), bare);
+    }
+
+    /// 心跳请求体 key 集合**恰好等于** 5 字段白名单，且 `device_sig` 非空且真能验签。
+    #[tokio::test]
+    async fn heartbeat_body_has_exactly_whitelisted_keys_and_valid_sig() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-1").await.expect("activate ok");
+
+        fake.respond_with(heartbeat_ok_response(T0, T0 + 365 * 86_400));
+        client
+            .heartbeat(Some((1, 100)))
+            .await
+            .expect("heartbeat ok");
+
+        let body = fake.last_body().expect("body recorded");
+        let mut keys = object_keys(&body);
+        keys.sort();
+        let mut expected: Vec<String> = HEARTBEAT_FIELD_WHITELIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(keys, expected, "heartbeat body must have exactly 5 fields");
+
+        // `device_sig` 非空且真能验签（独立重建 + 设备公钥验签）。
+        let lease_id = body["lease_id"].as_str().expect("lease_id");
+        let ts = body["ts"]
+            .as_str()
+            .expect("ts string")
+            .parse::<i64>()
+            .expect("ts i64");
+        let nonce = body["nonce"].as_str().expect("nonce");
+        let sig_b64 = body["device_sig"].as_str().expect("device_sig");
+        assert!(!sig_b64.is_empty(), "device_sig must not be empty");
+        let hash = heartbeat_payload_hash(lease_id, ts, nonce, Some((1, 100)));
+        let sig_bytes: [u8; ED25519_SIGNATURE_LEN] = B64
+            .decode(sig_b64)
+            .expect("valid base64")
+            .as_slice()
+            .try_into()
+            .expect("64 bytes");
+        let signature = Signature::from_bytes(&sig_bytes);
+        SigningKey::from_bytes(&TEST_ONLY_KEY_A)
+            .verifying_key()
+            .verify(&hash, &signature)
+            .expect("heartbeat device_sig must verify against device public key");
+    }
+
+    /// 未注入设备签名者 → 心跳 `device_sig` 为空串（明确失败信号，不伪造）。
+    #[tokio::test]
+    async fn heartbeat_device_sig_empty_when_signer_unavailable() {
+        let fake = Arc::new(FakeTransport::default());
+        let client = client_with_fake_no_receipt_signer(&fake);
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-1").await.expect("activate ok");
+
+        fake.respond_with(heartbeat_ok_response(T0, T0 + 365 * 86_400));
+        client
+            .heartbeat(None)
+            .await
+            .expect("transport still called");
+
+        let body = fake.last_body().expect("body recorded");
+        assert_eq!(
+            body["device_sig"].as_str().expect("device_sig is string"),
+            "",
+            "unavailable signer must emit an EMPTY device_sig (failure signal)"
+        );
+    }
+
+    /// `/verify` 成功：请求打到 verify 端点、nonce 回显一致 → 返回 `ok`。
+    #[tokio::test]
+    async fn verify_ok_echoes_nonce_and_returns_ok() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "A", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-1").await.expect("activate ok");
+
+        fake.respond_with_verify_echo(true);
+        let ok = client.verify("sha256:deadbeef").await.expect("verify ok");
+        assert!(ok);
+        assert!(fake
+            .calls()
+            .last()
+            .expect("a call happened")
+            .ends_with("/verify"));
+
+        let body = fake.last_body().expect("body recorded");
+        let mut keys = object_keys(&body);
+        keys.sort();
+        let mut expected: Vec<String> = VERIFY_FIELD_WHITELIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(keys, expected, "verify body must have exactly 6 fields");
+        assert!(body["ts"].is_string(), "ts must be a JSON string");
+        assert!(
+            !body["device_sig"].as_str().expect("device_sig").is_empty(),
+            "verify device_sig must not be empty"
+        );
+    }
+
+    /// `/verify` nonce 回显不一致 → SecurityError（防响应重放 / 串扰）。
+    #[tokio::test]
+    async fn verify_nonce_mismatch_is_security_error() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "A", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-1").await.expect("activate ok");
+
+        fake.respond_with(serde_json::json!({
+            "ok": true, "server_time": "1700000000", "nonce": "not-the-request-nonce"
+        }));
+        let err = client
+            .verify("sha256:x")
+            .await
+            .expect_err("nonce mismatch must error");
+        assert_eq!(err.error_code(), ERR_SECURITY);
+    }
+
+    /// 无租约时 `verify` → AuthError。
+    #[tokio::test]
+    async fn verify_without_lease_is_auth_error() {
+        let (client, _fake) = setup();
+        let err = client.verify("sha256:x").await.expect_err("no lease");
+        assert_eq!(err.error_code(), ERR_AUTH);
+    }
+
+    /// 激活请求体 key 集合**恰好等于** 7 字段白名单；`device_pubkey` / `req_sig` 非空。
+    #[tokio::test]
+    async fn activation_body_has_exactly_whitelisted_keys() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-CODE").await.expect("activate ok");
+
+        let body = fake.last_body().expect("body recorded");
+        let mut keys = object_keys(&body);
+        keys.sort();
+        let mut expected: Vec<String> = ACTIVATION_FIELD_WHITELIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(keys, expected, "activation body must have exactly 7 fields");
+
+        // anchor_hashes 是数组（未注入时退化为仅机器码指纹，故长度 ≥ 1）。
+        assert!(body["anchor_hashes"].is_array(), "{body}");
+        assert!(
+            !body["anchor_hashes"].as_array().expect("array").is_empty(),
+            "anchor_hashes must not be empty"
+        );
+        assert!(body["ts"].is_string(), "ts must be a JSON string");
+        assert!(!body["device_pubkey"].as_str().expect("pk").is_empty());
+        assert!(!body["req_sig"].as_str().expect("req_sig").is_empty());
+    }
+
+    /// 激活 `req_sig` 真能验签（独立重建 + 设备公钥），且 `device_pubkey` 与私钥一致。
+    #[tokio::test]
+    async fn activation_req_sig_verifies_and_pubkey_matches() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-CODE").await.expect("activate ok");
+
+        let body = fake.last_body().expect("body recorded");
+        let code = body["activation_code"].as_str().expect("code");
+        let machine = body["machine_code"].as_str().expect("machine");
+        let nonce = body["nonce"].as_str().expect("nonce");
+        let ts = body["ts"]
+            .as_str()
+            .expect("ts string")
+            .parse::<i64>()
+            .expect("ts i64");
+        let pk_b64 = body["device_pubkey"].as_str().expect("pk");
+        let anchors: Vec<String> = body["anchor_hashes"]
+            .as_array()
+            .expect("anchors array")
+            .iter()
+            .map(|v| v.as_str().expect("anchor string").to_string())
+            .collect();
+
+        // device_pubkey 必须等于设备私钥对应公钥。
+        let expected_pk = B64.encode(
+            SigningKey::from_bytes(&TEST_ONLY_KEY_A)
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert_eq!(pk_b64, expected_pk, "device_pubkey must match device key");
+
+        let hash = activation_payload_hash(code, machine, &anchors, pk_b64, nonce, ts);
+        let sig_b64 = body["req_sig"].as_str().expect("req_sig");
+        let sig_bytes: [u8; ED25519_SIGNATURE_LEN] = B64
+            .decode(sig_b64)
+            .expect("valid base64")
+            .as_slice()
+            .try_into()
+            .expect("64 bytes");
+        let signature = Signature::from_bytes(&sig_bytes);
+        SigningKey::from_bytes(&TEST_ONLY_KEY_A)
+            .verifying_key()
+            .verify(&hash, &signature)
+            .expect("activation req_sig must verify");
+    }
+
+    /// `with_anchor_hashes` 注入后，激活请求体带注入的真实锚点哈希。
+    #[tokio::test]
+    async fn activation_uses_injected_anchor_hashes() {
+        let fake = Arc::new(FakeTransport::default());
+        let cfg = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30)
+            .expect("non-empty url");
+        let signer = test_signer();
+        let transport: Arc<dyn LicenseTransport> = Arc::clone(&fake) as Arc<dyn LicenseTransport>;
+        let mut client = LicensingClient::with_transport(cfg, signer, test_mid(), transport)
+            .with_device_signer(Arc::new(StaticKeyProvider::new(TEST_ONLY_KEY_A)))
+            .with_anchor_hashes(vec!["h0".to_string(), "h1".to_string()]);
+        client
+            .register_public_key("kid-a", &public_key_bytes(TEST_ONLY_KEY_A))
+            .expect("register kid-a");
+
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with(activate_ok_response(&token));
+        client.activate("ACT-CODE").await.expect("activate ok");
+
+        let body = fake.last_body().expect("body recorded");
+        assert_eq!(
+            body["anchor_hashes"],
+            serde_json::json!(["h0", "h1"]),
+            "injected anchor hashes must be sent verbatim"
+        );
     }
 }

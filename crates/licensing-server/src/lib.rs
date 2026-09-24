@@ -17,6 +17,7 @@
 //! | [`store`] | 仓储层：全部 SQL 集中于此，API/业务层不写 SQL |
 //! | [`proto`] | 端点请求 / 响应结构（对齐 `docs/design/licensing-api.md`） |
 //! | [`receipt`] | B 档回执验签：域串重建 / 语义哈希 / Ed25519 验签（跨端一致锚点） |
+//! | [`device_auth`] | 心跳 / A 档校验请求的签名域（规范化摘要）与设备验签入口 |
 //! | [`audit`] | 回执批次账本（task 48）：批次头幂等仲裁 / 设备级序号 cursor / 告警记录 |
 //! | [`service`] | 业务规则：配额、幂等、时序、跳空检测、一机一码判定 |
 //! | [`http`] | HTTP 层（axum 路由）：认证 / 反序列化 / 调用 service / 错误映射 |
@@ -33,6 +34,7 @@
 //! 绝不写入数据库、绝不写入日志、绝不进仓库（[`model::SigningKey`] 只存公钥与 `hsm_ref`）。
 
 pub mod audit;
+pub mod device_auth;
 pub mod error;
 pub mod http;
 pub mod keys;

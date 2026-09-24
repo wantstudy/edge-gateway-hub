@@ -141,6 +141,72 @@ pub struct VerifyResponse {
     pub nonce: String,
 }
 
+/// `/verify` 请求体字段白名单（设计 §1.3「字段白名单」）。
+///
+/// 与 §1.4 回执白名单同理：请求体出现白名单外字段 → `422 FIELD_WHITELIST_VIOLATION`。
+pub const VERIFY_WHITELIST: [&str; 6] = [
+    "device_mid",
+    "lease_id",
+    "payload_digest",
+    "ts",
+    "nonce",
+    "device_sig",
+];
+
+impl VerifyRequest {
+    /// 结构体自检：六个业务字段均非空白（`trim().is_empty()` 判定）。
+    ///
+    /// 用 `trim().is_empty()` 而非 `is_empty()`——纯空白串不算「已提供」。
+    pub fn validate_whitelist(&self) -> LicenseResult<()> {
+        fn missing(s: &str) -> bool {
+            s.trim().is_empty()
+        }
+        if missing(&self.device_mid) {
+            return Err(LicenseError::field_whitelist_violation(
+                "verify field whitelist violation: device_mid missing",
+            ));
+        }
+        if missing(&self.lease_id) {
+            return Err(LicenseError::field_whitelist_violation(
+                "verify field whitelist violation: lease_id missing",
+            ));
+        }
+        if missing(&self.payload_digest) {
+            return Err(LicenseError::field_whitelist_violation(
+                "verify field whitelist violation: payload_digest missing",
+            ));
+        }
+        if missing(&self.nonce) {
+            return Err(LicenseError::field_whitelist_violation(
+                "verify field whitelist violation: nonce missing",
+            ));
+        }
+        if missing(&self.device_sig) {
+            return Err(LicenseError::field_whitelist_violation(
+                "verify field whitelist violation: device_sig missing",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 对**原始 JSON 对象**做白名单校验：出现白名单外 key → `FieldWhitelistViolation`。
+    ///
+    /// serde 默认忽略未知字段，故上层解析请求时**必须先**用本方法校验原始 JSON。
+    pub fn validate_whitelist_value(value: &serde_json::Value) -> LicenseResult<()> {
+        let obj = value.as_object().ok_or_else(|| {
+            LicenseError::field_whitelist_violation("verify body must be a JSON object")
+        })?;
+        for key in obj.keys() {
+            if !VERIFY_WHITELIST.contains(&key.as_str()) {
+                return Err(LicenseError::field_whitelist_violation(format!(
+                    "verify contains non-whitelisted field: {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `POST /audit/receipt` 请求体（设计 §1.4，**B 档审计回执**）。
 ///
 /// # 字段白名单（**恰好 8 个字段，一个不能多**）
@@ -200,27 +266,30 @@ impl AuditReceiptRequest {
         // `sig = "   "` 曾通过白名单校验，只因下游 `decode_signature` 也做 trim 才
         // 侥幸拦住。**不能依赖下游兜底来补上游的存在性判定**——否则一旦下游放松，
         // 空白就成了一条完整绕过面。此处统一把「纯空白」视同「未提供」。
+        //
+        // 违反 → 结构化 [`LicenseError::FieldWhitelistViolation`]（→ HTTP 422），
+        // **绝不**降级为泛化 `ActivationRejected`（那会被映射成 400，掩盖越界语义）。
         fn missing(s: &str) -> bool {
             s.trim().is_empty()
         }
         if missing(&self.device_mid) {
-            return Err(LicenseError::ActivationRejected(
-                "audit receipt field whitelist violation: device_mid missing".into(),
+            return Err(LicenseError::field_whitelist_violation(
+                "audit receipt field whitelist violation: device_mid missing",
             ));
         }
         if missing(&self.lease_id) {
-            return Err(LicenseError::ActivationRejected(
-                "audit receipt field whitelist violation: lease_id missing".into(),
+            return Err(LicenseError::field_whitelist_violation(
+                "audit receipt field whitelist violation: lease_id missing",
             ));
         }
         if missing(&self.payload_digest) {
-            return Err(LicenseError::ActivationRejected(
-                "audit receipt field whitelist violation: payload_digest missing".into(),
+            return Err(LicenseError::field_whitelist_violation(
+                "audit receipt field whitelist violation: payload_digest missing",
             ));
         }
         if missing(&self.sig) {
-            return Err(LicenseError::ActivationRejected(
-                "audit receipt field whitelist violation: sig missing".into(),
+            return Err(LicenseError::field_whitelist_violation(
+                "audit receipt field whitelist violation: sig missing",
             ));
         }
         Ok(())
@@ -232,11 +301,11 @@ impl AuditReceiptRequest {
     /// 上层解析请求时**必须先**用本方法校验原始 JSON，再反序列化为结构体。
     pub fn validate_whitelist_value(value: &serde_json::Value) -> LicenseResult<()> {
         let obj = value.as_object().ok_or_else(|| {
-            LicenseError::ActivationRejected("audit receipt body must be a JSON object".into())
+            LicenseError::field_whitelist_violation("audit receipt body must be a JSON object")
         })?;
         for key in obj.keys() {
             if !AUDIT_RECEIPT_WHITELIST.contains(&key.as_str()) {
-                return Err(LicenseError::ActivationRejected(format!(
+                return Err(LicenseError::field_whitelist_violation(format!(
                     "audit receipt contains non-whitelisted field: {key}"
                 )));
             }
@@ -741,7 +810,7 @@ mod tests {
         });
         let err = AuditReceiptRequest::validate_whitelist_value(&with_extra).unwrap_err();
         assert!(
-            matches!(err, LicenseError::ActivationRejected(_)),
+            matches!(err, LicenseError::FieldWhitelistViolation(_)),
             "{err:?}"
         );
         assert!(err.to_string().contains("flow_rate"), "{err}");
@@ -752,6 +821,49 @@ mod tests {
             "count": "2", "payload_digest": "d", "ts": "3", "sig": "s"
         });
         assert!(AuditReceiptRequest::validate_whitelist_value(&clean).is_ok());
+    }
+
+    /// `/verify` 白名单：越界字段 → `FieldWhitelistViolation`；恰好 6 字段 → 通过；
+    /// 纯空白必填字段视为未提供。
+    #[test]
+    fn verify_whitelist_rejects_extra_field_and_blank_required() {
+        let with_extra = serde_json::json!({
+            "device_mid": "m",
+            "lease_id": "l",
+            "payload_digest": "d",
+            "ts": "3",
+            "nonce": "n",
+            "device_sig": "s",
+            // 业务字段：不得出现。
+            "flow_rate": "42"
+        });
+        let err = VerifyRequest::validate_whitelist_value(&with_extra).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::FieldWhitelistViolation(_)),
+            "{err:?}"
+        );
+
+        let clean = serde_json::json!({
+            "device_mid": "m", "lease_id": "l", "payload_digest": "d",
+            "ts": "3", "nonce": "n", "device_sig": "s"
+        });
+        assert!(VerifyRequest::validate_whitelist_value(&clean).is_ok());
+
+        // 纯空白必填字段 → 视为未提供 → 拒绝。
+        let mut req = VerifyRequest {
+            device_mid: "m".into(),
+            lease_id: "l".into(),
+            payload_digest: "d".into(),
+            ts: "3".into(),
+            nonce: "n".into(),
+            device_sig: "s".into(),
+        };
+        assert!(req.validate_whitelist().is_ok());
+        req.nonce = "   ".into();
+        assert!(matches!(
+            req.validate_whitelist().unwrap_err(),
+            LicenseError::FieldWhitelistViolation(_)
+        ));
     }
 
     /// 结构体自检：必填字段为空 → 白名单校验失败。
