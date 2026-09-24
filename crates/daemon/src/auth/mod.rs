@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod clock;
+pub mod keyprovider;
 pub mod limits;
 pub mod machine_id;
 pub mod receipt_reporter;
