@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use crate::audit::{BatchOutcome, BatchRecord, ReceiptLedger};
 use crate::error::{LicenseError, LicenseResult};
 use crate::keys::KeyRing;
 use crate::model::{
@@ -68,6 +69,9 @@ pub struct ServiceConfig {
     pub max_devices_per_tenant: u64,
     /// 是否开启双人复核（废弃 / 重发高危操作）。
     pub dual_approval_required: bool,
+    /// 回执批次账本的 SQLite 路径（task 48）。`None` → 内存库（幂等记忆退化为
+    /// 进程生命周期）。生产部署应指向与 `Store` 相同的库文件（SQLite WAL 多连接安全）。
+    pub receipt_ledger_path: Option<String>,
 }
 
 impl Default for ServiceConfig {
@@ -81,6 +85,7 @@ impl Default for ServiceConfig {
             clock_skew_secs: 300,
             max_devices_per_tenant: 10_000,
             dual_approval_required: false,
+            receipt_ledger_path: None,
         }
     }
 }
@@ -90,6 +95,8 @@ pub struct LicensingService {
     store: Arc<Store>,
     ring: Arc<KeyRing>,
     cfg: ServiceConfig,
+    /// 回执批次账本（task 48）：批次头幂等仲裁 + 设备级序号 cursor + 告警记录。
+    ledger: ReceiptLedger,
 }
 
 /// 从请求的 String 时间戳解析为 `i64`（大整数纪律的边界转换点）。
@@ -112,8 +119,17 @@ fn parse_seq(raw: &str, field: &str) -> LicenseResult<u64> {
 
 impl LicensingService {
     /// 构造服务实例。
+    ///
+    /// 批次账本按 [`ServiceConfig::receipt_ledger_path`] 打开；打开失败自动降级
+    /// 内存库（`ReceiptLedger::open` 内部处理，**绝不 panic**，零 panic 红线）。
     pub fn new(store: Arc<Store>, ring: Arc<KeyRing>, cfg: ServiceConfig) -> Self {
-        LicensingService { store, ring, cfg }
+        let ledger = ReceiptLedger::open(cfg.receipt_ledger_path.as_deref());
+        LicensingService {
+            store,
+            ring,
+            cfg,
+            ledger,
+        }
     }
 
     /// 只读配置（供上层展示 / 测试）。
@@ -624,14 +640,14 @@ impl LicensingService {
     /// 规则顺序：
     /// 1. **字段白名单强制**：`validate_whitelist()` 不过 → `FieldWhitelistViolation` 并记审计，整单拒收
     /// 2. 租约校验（不存在 / 已废弃）
-    /// 3. **跳空检测**：`expected = last.seq_to + 1`
-    ///    - `seq_from > expected` → `Gap`（跳空）
-    ///    - `seq_from <= last.seq_to` → `Overlap`（回退 / 重叠）
-    ///    - 无历史且 `seq_from > 1` → `Gap`
-    ///    - 否则 `None`
-    ///    - 置 `gap_flag = (kind != None)` 并写 `audit_log`（action=`receipt_anomaly`）——**人工核实，不自动封禁**
-    /// 4. **幂等**：相同区间重复上报 → `accepted=true` + `GapKind::None`，**不重复告警**
-    /// 5. 允许**延迟补报**（`received_at` 可远晚于 `ts`，按 `ts` 排序评估）
+    /// 4. **幂等**（task 48 红线）：批次头表主键仲裁（账本单事务 `INSERT OR IGNORE` +
+    ///    `rows_affected`，原子线性化）——同批次重放 → `accepted=true` + `GapKind::None`
+    ///    + 空 `warnings`，**不重复落库、不重复告警**，且无「先读后写」竞态窗口
+    /// 5. **序号区间检测**（与该 `device_mid` 最近一次 accepted 回执比较，跨租约延续）：
+    ///    跳空（`seq_from > last_seq_to + 1`）/ 回退（`seq_to < last_seq_to`）/
+    ///    重叠（可接受，记录）→ 告警写账本 `audit_receipt_warning` 表 + 返回体
+    ///    `warnings` 字段 + `audit_log`（action=`receipt_anomaly`）——**人工核实，不自动封禁**
+    /// 6. 允许**延迟补报**（`received_at` 可远晚于 `ts`，按 `ts` 排序评估）
     pub fn audit_receipt(&self, req: &AuditReceiptRequest) -> LicenseResult<AuditReceiptResponse> {
         let now = now_unix_secs();
 
@@ -706,41 +722,42 @@ impl LicensingService {
             }
         }
 
-        // 规则 4（幂等）：相同区间重复上报 → 幂等接受，不重复告警。
-        if let Some(last) = self.store.last_receipt_for_lease(&lease.lease_id)? {
-            if last.seq_from == seq_from as i64 && last.seq_to == seq_to as i64 {
+        // 规则 4（幂等，task 48 红线）：**批次头表主键仲裁**——在账本单事务内
+        // `INSERT OR IGNORE` + 检查 `rows_affected`，原子判定「首批 / 重放」，
+        // 不存在旧实现「先读后写」的竞态窗口（并发同批次恰好入库一次）。
+        // 规则 3（跳空 / 回退 / 重叠检测）与 cursor 更新**同事务**完成，
+        // 比较基准是**该 device_mid 最近一次 accepted 回执**（设备级 cursor，
+        // 跨租约延续；last_seq_to 单调取 max 作为窗口前沿）。
+        // 告警明细同步写入账本 `audit_receipt_warning` 表 + 返回体 `warnings` 字段。
+        let outcome = self.ledger.record_batch(&BatchRecord {
+            device_mid: &req.device_mid,
+            lease_id: &lease.lease_id,
+            seq_from,
+            seq_to,
+            count: _count,
+            payload_digest: &req.payload_digest,
+            ts: client_ts,
+            accepted_at: now,
+        })?;
+        let (gap, warnings, last_to) = match outcome {
+            // 幂等重放：accepted=true + gap=None + 无告警，**不**重复落库 / **不**重复告警
+            //（与旧实现「相同区间重复上报」短路语义一致，但仲裁是原子的）。
+            BatchOutcome::Replay => {
                 return Ok(AuditReceiptResponse {
                     accepted: true,
                     gap: GapKind::None,
                     server_time: now.to_string(),
+                    warnings: Vec::new(),
                 });
             }
-        }
-
-        // 规则 3：跳空检测（基于最近一次回执）。
-        let last = self.store.last_receipt_for_lease(&lease.lease_id)?;
-        let gap = match &last {
-            Some(l) => {
-                let last_to = l.seq_to.max(0) as u64;
-                if seq_from > last_to.saturating_add(1) {
-                    GapKind::Gap
-                } else if seq_from <= last_to {
-                    GapKind::Overlap
-                } else {
-                    GapKind::None
-                }
-            }
-            None => {
-                // 无历史：起始序号若 > 1，则 1..seq_from 之间的回执缺失。
-                if seq_from > 1 {
-                    GapKind::Gap
-                } else {
-                    GapKind::None
-                }
-            }
+            BatchOutcome::Recorded {
+                gap,
+                warnings,
+                last_seq_to,
+            } => (gap, warnings, last_seq_to),
         };
 
-        // 落回执记录（gap_flag = 是否异常）。
+        // 落回执记录（gap_flag = 是否异常；仅**新批次**落库，重放不重复入库）。
         let receipt = AuditReceipt {
             id: now_ns_id("rcpt"),
             lease_id: lease.lease_id.clone(),
@@ -756,10 +773,12 @@ impl LicensingService {
         };
         self.store.insert_audit_receipt(&receipt)?;
 
-        // 异常 → 风控告警（人工核实，不自动封禁）。
+        // 异常 → 风控告警（人工核实，不自动封禁）。告警明细与账本
+        // `audit_receipt_warning` 表及返回体 `warnings` 字段同源。
         if gap.is_anomaly() {
             self.store.update_receipt_gap_flag(&receipt.id, true)?;
-            let last_to = last.as_ref().map(|l| l.seq_to).unwrap_or(0);
+            let warnings_json: Vec<String> =
+                warnings.iter().map(|w| escape_json(w)).collect();
             self.write_audit(
                 ActorType::Device,
                 &req.device_mid,
@@ -767,11 +786,16 @@ impl LicensingService {
                 "lease",
                 &lease.lease_id,
                 &format!(
-                    "{{\"kind\":\"{}\",\"seq_from\":{},\"seq_to\":{},\"last_seq_to\":{}}}",
+                    "{{\"kind\":\"{}\",\"seq_from\":{},\"seq_to\":{},\"last_seq_to\":{},\"warnings\":[{}]}}",
                     gap.as_str(),
                     seq_from,
                     seq_to,
-                    last_to
+                    last_to,
+                    warnings_json
+                        .iter()
+                        .map(|w| format!("\"{w}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ),
                 "",
             )?;
@@ -796,6 +820,7 @@ impl LicensingService {
             accepted: true,
             gap,
             server_time: now.to_string(),
+            warnings,
         })
     }
 
@@ -2909,5 +2934,171 @@ mod tests {
         let _ = _HB::Ok;
         let _ = SigningKeyStatus::Active;
         let _: ActivationCode;
+    }
+
+    // ---------------- audit_receipt（task 48：批次账本 + warnings） ----------------
+
+    /// **安全红线（task 48）**：伪造回执**不得**借「与已接受批次同区间」的幂等路径
+    /// 拿到 `accepted=true`。验签必须先于一切幂等仲裁；失败 → 拒绝且账本 / 库
+    /// **零写入**（幂等命中绝不能发生在验签之前）。
+    #[test]
+    fn forged_same_range_as_accepted_batch_is_rejected_before_idempotent_shortcut() {
+        let (svc, store, ring) = service();
+        let lease = activate_device(&svc, "rc-forged-replay", "rcfr0");
+
+        // 先接受一个合法批次 1..10（建立批次头 + cursor）。
+        let ok = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 1, 10, "rc-forged-replay"))
+            .unwrap();
+        assert!(ok.accepted);
+
+        // 伪造同区间回执（sig 非法）。若幂等短路先于验签，这里会返回 accepted=true。
+        let mut forged = receipt_req(&lease, 1, 10, "rc-forged-replay");
+        forged.sig = "x".into();
+        let err = svc.audit_receipt(&forged).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::TokenInvalid(_)),
+            "伪造签名必须是 TokenInvalid（验签先于幂等），实际: {err:?}"
+        );
+
+        // 状态零污染：批次头 / 回执行 / cursor 都停留在首次合法批次上。
+        assert_eq!(svc.ledger.batch_count().unwrap(), 1, "伪造回执不得落批次头");
+        assert_eq!(svc.ledger.warnings_for("rc-forged-replay").unwrap().len(), 0);
+        let receipts = store.list_receipts_by_lease(&lease).unwrap();
+        assert_eq!(receipts.len(), 1, "伪造回执不得落回执行");
+
+        // 合法重放（真实签名同区间）仍幂等通过 —— 证明拦截只针对伪造。
+        let replay = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 1, 10, "rc-forged-replay"))
+            .unwrap();
+        assert!(replay.accepted);
+        assert_eq!(replay.gap, GapKind::None);
+    }
+
+    /// **幂等红线（task 48）**：同批次重放恰好入库一次——批次头 1 行、回执行 1 行、
+    /// 告警 0 条，重放响应 `warnings` 为空。
+    #[test]
+    fn replay_records_exactly_one_batch_head_and_one_receipt_row() {
+        let (svc, store, ring) = service();
+        let lease = activate_device(&svc, "rc-exactly-once", "rceo0");
+
+        let r1 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 1, 10, "rc-exactly-once"))
+            .unwrap();
+        assert!(r1.accepted);
+        let r2 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 1, 10, "rc-exactly-once"))
+            .unwrap();
+        assert!(r2.accepted, "重放也必须 accepted=true");
+        assert_eq!(r2.gap, GapKind::None);
+        assert!(r2.warnings.is_empty(), "重放不得携带告警: {:?}", r2.warnings);
+
+        assert_eq!(svc.ledger.batch_count().unwrap(), 1, "批次头恰好 1 行");
+        assert_eq!(store.list_receipts_by_lease(&lease).unwrap().len(), 1, "回执行恰好 1 行");
+    }
+
+    /// `warnings` 字段：跳空 / 回退响应**非空**且与账本告警表同源；连续响应为空。
+    #[test]
+    fn response_carries_warnings_for_gap_and_regress_only() {
+        let (svc, _store, ring) = service();
+        let lease = activate_device(&svc, "rc-warn", "rcw0");
+
+        // 连续首批 → warnings 为空。
+        let r0 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 1, 10, "rc-warn"))
+            .unwrap();
+        assert_eq!(r0.gap, GapKind::None);
+        assert!(r0.warnings.is_empty(), "连续批次不得携带告警");
+
+        // 跳空 25..30 → warnings 非空，gap=gap。
+        let r1 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 25, 30, "rc-warn"))
+            .unwrap();
+        assert_eq!(r1.gap, GapKind::Gap);
+        assert_eq!(r1.warnings.len(), 1, "{:?}", r1.warnings);
+        assert!(r1.warnings[0].starts_with("gap:"), "{}", r1.warnings[0]);
+
+        // 回退 12..18（前沿 30）→ gap=overlap，warnings 携带 regress 明细。
+        let r2 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 12, 18, "rc-warn"))
+            .unwrap();
+        assert_eq!(r2.gap, GapKind::Overlap);
+        assert!(r2.warnings[0].starts_with("regress:"), "{}", r2.warnings[0]);
+
+        // 幂等重放跳空批次 → 不重复告警，warnings 为空。
+        let r3 = svc
+            .audit_receipt(&signed_receipt_req(&ring, &lease, 25, 30, "rc-warn"))
+            .unwrap();
+        assert!(r3.accepted);
+        assert!(r3.warnings.is_empty(), "重放不得二次告警: {:?}", r3.warnings);
+
+        // 账本告警表与响应同源：恰 2 条（gap + regress）。
+        let rows = svc.ledger.warnings_for("rc-warn").unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+    }
+
+    /// **并发安全（task 48）**：N 个线程并发提交**同一**已签名批次（批次级幂等，
+    /// 一批多码共用），恰好入库一次；响应全部 accepted=true。
+    #[test]
+    fn concurrent_duplicate_batches_are_arbitrated_atomically() {
+        let (svc, store, ring) = service();
+        let lease = activate_device(&svc, "rc-concurrent", "rcc0");
+        let signed = signed_receipt_req(&ring, &lease, 1, 100, "rc-concurrent");
+
+        const THREADS: usize = 8;
+        let svc_ref = &svc;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let signed = signed.clone();
+                    scope.spawn(move || {
+                        svc_ref.audit_receipt(&signed).expect("concurrent receipt")
+                    })
+                })
+                .collect();
+            let mut replay = 0usize;
+            for h in handles {
+                let r = h.join().expect("thread must not panic");
+                assert!(r.accepted, "并发重放也必须 accepted=true");
+                assert_eq!(r.gap, GapKind::None);
+                assert!(r.warnings.is_empty(), "并发重放不得携带告警: {:?}", r.warnings);
+                replay += 1;
+            }
+            assert_eq!(replay, THREADS);
+        });
+        // 恰好入库一次：批次头 1 行、回执行 1 行。
+        assert_eq!(svc.ledger.batch_count().unwrap(), 1, "批次头恰好 1 行");
+        assert_eq!(store.list_receipts_by_lease(&lease).unwrap().len(), 1, "回执行恰好 1 行");
+    }
+
+    /// 大数红线（task 48）：2^53 以上的序号经 HTTP 契约字符串 → 服务 → 账本**无损往返**。
+    #[test]
+    fn big_seq_numbers_round_trip_through_service_losslessly() {
+        let (svc, store, ring) = service();
+        let lease = activate_device(&svc, "rc-bignum", "rcbn0");
+        let base: u64 = 9_007_199_254_740_993; // 2^53 + 1（JSON number 丢精度区间）
+
+        let mut req = receipt_req(&lease, base, base + 9, "rc-bignum");
+        req.count = "10".into();
+        sign_receipt_req(&ring, &mut req);
+        let r = svc.audit_receipt(&req).unwrap();
+        assert!(r.accepted);
+        // 无历史且 seq_from > 1 → 前缀缺失判 Gap（连续性语义正确，且大数比较不溢出）。
+        assert_eq!(r.gap, GapKind::Gap);
+        assert_eq!(r.warnings.len(), 1);
+
+        // 落库值精确（i64 承载，无浮点 / 截断）。
+        let receipts = store.list_receipts_by_lease(&lease).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].seq_from, base as i64);
+        assert_eq!(receipts[0].seq_to, (base + 9) as i64);
+
+        // 续窗 base+10..base+19 → 连续（响应 gap=none，无告警）。
+        let mut req2 = receipt_req(&lease, base + 10, base + 19, "rc-bignum");
+        req2.count = "10".into();
+        sign_receipt_req(&ring, &mut req2);
+        let r2 = svc.audit_receipt(&req2).unwrap();
+        assert_eq!(r2.gap, GapKind::None, "{:?}", r2.warnings);
+        assert!(r2.warnings.is_empty());
     }
 }

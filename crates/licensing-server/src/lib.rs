@@ -16,6 +16,8 @@
 //! | [`model`] | 9 表数据模型与状态枚举（对齐 `docs/design/licensing-data-model.md`） |
 //! | [`store`] | 仓储层：全部 SQL 集中于此，API/业务层不写 SQL |
 //! | [`proto`] | 端点请求 / 响应结构（对齐 `docs/design/licensing-api.md`） |
+//! | [`receipt`] | B 档回执验签：域串重建 / 语义哈希 / Ed25519 验签（跨端一致锚点） |
+//! | [`audit`] | 回执批次账本（task 48）：批次头幂等仲裁 / 设备级序号 cursor / 告警记录 |
 //! | [`service`] | 业务规则：配额、幂等、时序、跳空检测、一机一码判定 |
 //! | [`http`] | HTTP 层（axum 路由）：认证 / 反序列化 / 调用 service / 错误映射 |
 //!
@@ -30,6 +32,7 @@
 //! 签名私钥**只经环境变量注入**（[`keys::KeyRing::register_from_b64`]），
 //! 绝不写入数据库、绝不写入日志、绝不进仓库（[`model::SigningKey`] 只存公钥与 `hsm_ref`）。
 
+pub mod audit;
 pub mod error;
 pub mod http;
 pub mod keys;

@@ -254,6 +254,11 @@ pub struct AuditReceiptResponse {
     pub gap: GapKind,
     /// 服务端时间（UTC 秒，**String**）。
     pub server_time: String,
+    /// 告警明细（task 48）：跳空 / 回退 / 重叠时**非空**，逐条与
+    /// `audit_receipt_warning` 表对应；连续与幂等重放为空数组。
+    /// `serde(default)` 保证旧客户端 / 旧测试构造不受影响（缺省 = 无告警）。
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// 回执连续性判定结果（设计 §1.4 跳空检测）。
