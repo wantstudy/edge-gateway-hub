@@ -291,6 +291,40 @@ pub fn parse_encoding(s: &str) -> DaemonResult<Encoding> {
     Encoding::parse(s)
 }
 
+// ---- 语义摘要（验签解耦契约，编码无关） ----
+
+/// 业务语义确定性哈希（北向编解码侧的**唯一入口**）。
+///
+/// 红线约定：签名/验签**绝不**以 protobuf / JSON 序列化字节为对象，而是以
+/// 「语义字段按固定顺序规范化后哈希」的摘要为对象——字段固定顺序
+/// （点位按 `(device_id, point_id, ts)` 稳定排序 → 逐点
+/// `device_id/point_id/unit/ts/quality/value` → `gateway_id` → `batch_ts`），
+/// `i64` 一律十进制字符串，`bytes` 原样写入，`auth` 块不参与（防自指）。
+/// 因此**同一业务数据无论走 protobuf 还是 JSON 编码，摘要必须逐字节相等**。
+///
+/// 单一定义：规范化算法只存在于 `crate::auth::signing::semantic_hash`（task 21），
+/// 本函数是该算法对北向编码/验签路径的**委托再导出**，禁止在本模块复制第二份
+/// 规范化实现（两份实现必然漂移）。
+pub fn semantic_digest(batch: &TelemetryBatch) -> [u8; 32] {
+    crate::auth::signing::semantic_hash(batch)
+}
+
+/// [`semantic_digest`] 的小写 hex 文本形态（日志 / 平台侧比对用）。
+pub fn semantic_digest_hex(batch: &TelemetryBatch) -> String {
+    hex::encode(semantic_digest(batch))
+}
+
+/// 从一段已编码载荷一步还原语义摘要（decode → digest）。
+///
+/// 用途：接收侧拿到任意编码的载荷后，无需关心编码格式即可参与验签比对。
+///
+/// # Errors
+/// 解码失败（截断 / 垃圾字节 / JSON 结构非法）→ [`DaemonError::ProtocolError`]
+/// 或 `ConfigError`（见 [`decode_batch`]），不 panic。
+pub fn digest_of_encoded(enc: Encoding, bytes: &[u8]) -> DaemonResult<[u8; 32]> {
+    Ok(semantic_digest(&decode_batch(enc, bytes)?))
+}
+
 /// 把一个 [`ProcessedSample`] 归一化为 [`DataPoint`]（protobuf 与 JSON **共用**同一函数）。
 ///
 /// 约定：
@@ -1284,7 +1318,252 @@ mod tests {
         );
     }
 
-    // ---- 12. 性能基线（task 39 压测对比用） ----
+    // ---- 12. 语义摘要（验签解耦契约） ----
+
+    /// QA：语义摘要与编码无关——同一批次（含 NaN / ±Inf / `u64::MAX` / `i64::MAX`
+    /// 边界点位）经 protobuf 与 JSON 两条编码路径往返后，`semantic_digest` 逐字节相等。
+    #[test]
+    fn semantic_digest_is_identical_across_encodings_at_boundaries() {
+        // 非有限浮点：经 sample_to_data_point 归一化（quality 强制 BAD，两条路径同一规则）。
+        let mut points = Vec::new();
+        for (name, value) in [
+            ("nan", f64::NAN),
+            ("pos_inf", f64::INFINITY),
+            ("neg_inf", f64::NEG_INFINITY),
+        ] {
+            points.push(sample_to_data_point(&ProcessedSample {
+                device_id: "dev-1".to_string(),
+                point_id: name.to_string(),
+                value,
+                unit: "kPa".to_string(),
+                device_ts_ns: None,
+                collected_ts_ns: i64::MAX,
+                quality: Quality::Good,
+            }));
+        }
+        // u64::MAX 计数器（位模式形如 NaN，必须按 blob 走，绝不被误判）。
+        points.push(point(
+            "meter-01",
+            "counter_u64max",
+            u64::MAX.to_le_bytes().to_vec(),
+            i64::MAX,
+            Quality::Good,
+        ));
+        // 正常数值点。
+        points.push(point(
+            "pump-01",
+            "inlet_temp",
+            36.6_f64.to_le_bytes().to_vec(),
+            1_762_999_999_000_000_001,
+            Quality::Good,
+        ));
+        // 点位故意乱序（语义哈希按 (device_id, point_id, ts) 排序，与顺序无关）。
+        points.reverse();
+        let batch = TelemetryBatch {
+            points,
+            ts: i64::MAX,
+            gateway_id: "gw-digest-001".to_string(),
+            auth: None,
+        };
+
+        let expected = semantic_digest(&batch);
+        let from_pb = digest_of_encoded(
+            Encoding::Protobuf,
+            &ProtobufEncoder.encode_batch(&batch).expect("pb encode"),
+        )
+        .expect("pb decode");
+        let from_json = digest_of_encoded(
+            Encoding::Json,
+            &JsonEncoder.encode_batch(&batch).expect("json encode"),
+        )
+        .expect("json decode");
+
+        assert_eq!(expected, from_pb, "protobuf 往返后语义摘要必须不变");
+        assert_eq!(expected, from_json, "JSON 往返后语义摘要必须与原批次一致");
+        assert_eq!(from_pb, from_json, "两条编码路径的摘要必须逐字节相等");
+        assert_eq!(
+            semantic_digest_hex(&batch).len(),
+            64,
+            "hex 摘要必须是 64 字符"
+        );
+    }
+
+    /// QA：语义摘要的确定性与字段敏感性——同一批次两次摘要相同；`auth` 块
+    /// 不参与摘要（防自指）；任一语义字段（gateway_id / value / ts）被篡改即漂移。
+    #[test]
+    fn semantic_digest_is_deterministic_and_auth_agnostic() {
+        let batch = sample_batch();
+        let baseline = semantic_digest(&batch);
+
+        // 确定性：同一批次重复计算结果一致。
+        assert_eq!(baseline, semantic_digest(&batch));
+
+        // auth 不参与摘要：附加签名块后摘要不变（验签对象不含签名块本身）。
+        let (signer, _public_key) = test_signer();
+        let mut signed = batch.clone();
+        signer.attach(&mut signed, TEST_TS_NS).expect("attach");
+        assert!(
+            signed.auth.is_some(),
+            "前置条件：attach 后必须真的带了 auth 块"
+        );
+        assert_eq!(
+            baseline,
+            semantic_digest(&signed),
+            "auth 块不得影响语义摘要"
+        );
+
+        // 字段敏感性：篡改 gateway_id / value / 点位 ts 任一项，摘要必须漂移。
+        let mut tampered = batch.clone();
+        tampered.gateway_id = "gw-tampered".to_string();
+        assert_ne!(baseline, semantic_digest(&tampered), "gateway_id 敏感");
+
+        let mut tampered = batch.clone();
+        tampered.points[0].value = 43.0_f64.to_le_bytes().to_vec();
+        assert_ne!(baseline, semantic_digest(&tampered), "value 敏感");
+
+        let mut tampered = batch.clone();
+        tampered.points[0].ts += 1;
+        assert_ne!(baseline, semantic_digest(&tampered), "点位 ts 敏感");
+
+        // 顺序无关性：打乱点位顺序后摘要不变。
+        let mut shuffled = batch.clone();
+        shuffled.points.reverse();
+        assert_eq!(
+            baseline,
+            semantic_digest(&shuffled),
+            "点位顺序不得影响语义摘要"
+        );
+    }
+
+    // ---- 13. golden bytes（protobuf 线格式冻结） ----
+
+    /// test-only：golden 批次（字段取值刻意选在 varint/base64 可手算验证的位置）：
+    /// - 批次 `ts` = 2^56（varint：`80 80 80 80 80 80 80 80 01`，且超出 2^53−1 → JSON 字符串）；
+    /// - 点位 `ts` = 2^56 + 1（varint：`81 80 80 80 80 80 80 80 01`）；
+    /// - `value` = 36.5（f64 = 0x4042400000000000，小端 = `00 00 00 00 00 40 42 40`）。
+    fn golden_batch() -> TelemetryBatch {
+        TelemetryBatch {
+            points: vec![DataPoint {
+                device_id: "d1".to_string(),
+                point_id: "p1".to_string(),
+                value: 36.5_f64.to_le_bytes().to_vec(),
+                unit: "u".to_string(),
+                ts: (1u64 << 56) as i64 + 1,
+                quality: Quality::Good as i32,
+            }],
+            ts: (1u64 << 56) as i64,
+            gateway_id: "g1".to_string(),
+            auth: None,
+        }
+    }
+
+    /// QA：protobuf 编码字节流**冻结**为 golden 十六进制（跨版本防漂移；
+    /// wire 格式由 prost 按字段号顺序编码，golden 手工推导可逐字段核对）。
+    #[test]
+    fn golden_protobuf_batch_bytes() {
+        // DataPoint（字段号顺序）：1=device_id 2=point_id 3=value 4=unit 5=ts 6=quality。
+        const GOLDEN_POINT_HEX: &str = concat!(
+            "0a026431",                             // 1: "d1"
+            "12027031",                             // 2: "p1"
+            "1a080000000000404240",                 // 3: value = 36.5 f64le
+            "220175",                               // 4: "u"
+            "28818080808080808001",                 // 5: ts = 2^56+1 (varint)
+            "3001",                                 // 6: quality = GOOD
+        );
+        // TelemetryBatch：1=points(len 0x21) 2=ts(varint 2^56) 3=gateway_id。
+        // （`concat!` 只接受字面量，const 片段用 `format!` 拼接。）
+        let golden_batch_hex = format!(
+            "0a21{GOLDEN_POINT_HEX}108080808080808080011a026731"
+        );
+
+        // 单点 golden。
+        let dp = sample_to_data_point(&ProcessedSample {
+            device_id: "d1".to_string(),
+            point_id: "p1".to_string(),
+            value: 36.5,
+            unit: "u".to_string(),
+            device_ts_ns: None,
+            collected_ts_ns: (1u64 << 56) as i64 + 1,
+            quality: Quality::Good,
+        });
+        assert_eq!(
+            hex::encode(dp.encode_to_vec()),
+            GOLDEN_POINT_HEX,
+            "DataPoint wire 格式漂移"
+        );
+
+        // 批级 golden。
+        let batch = golden_batch();
+        assert_eq!(
+            hex::encode(ProtobufEncoder.encode_batch(&batch).expect("encode")),
+            golden_batch_hex,
+            "TelemetryBatch wire 格式漂移"
+        );
+
+        // golden 字节可解码回等值结构（冻结的同时保证自洽）。
+        let bytes = hex::decode(&golden_batch_hex).expect("golden hex");
+        let decoded = decode_batch(Encoding::Protobuf, &bytes).expect("decode golden");
+        assert_eq!(decoded.points, batch.points);
+        assert_eq!(decoded.ts, batch.ts);
+        assert_eq!(decoded.gateway_id, batch.gateway_id);
+        assert!(decoded.auth.is_none());
+    }
+
+    // ---- 14. golden json（文本格式冻结） ----
+
+    /// QA：JSON 编码文本**冻结**为 golden 字符串（serde_json Map 键序为字典序、
+    /// 字段恒齐全输出，故文本字节级确定）。同时覆盖大整数字符串化与 base64 golden。
+    #[test]
+    fn golden_json_batch_text() {
+        const GOLDEN_JSON: &str = concat!(
+            r#"{"auth":null,"enc":"json","gateway_id":"g1","points":[{"device_id":"d1",""#,
+            r#"point_id":"p1","quality":"GOOD","quality_code":1,"ts":"72057594037927937","#,
+            r#""unit":"u","#,
+            r#""value":{"b64":"AAAAAABAQkA=","t":"f64le"}}],"#,
+            r#""ts":"72057594037927936"}"#,
+        );
+
+        let batch = golden_batch();
+        let text = String::from_utf8(JsonEncoder.encode_batch(&batch).expect("encode"))
+            .expect("utf-8");
+        assert_eq!(text, GOLDEN_JSON, "JSON 文本格式漂移");
+
+        // 单点路径（带外层 enc 字段）同一 golden 点位。
+        let dp = sample_to_data_point(&ProcessedSample {
+            device_id: "d1".to_string(),
+            point_id: "p1".to_string(),
+            value: 36.5,
+            unit: "u".to_string(),
+            device_ts_ns: None,
+            collected_ts_ns: (1u64 << 56) as i64 + 1,
+            quality: Quality::Good,
+        });
+        let point_text =
+            String::from_utf8(JsonEncoder.encode_batch(&TelemetryBatch {
+                points: vec![dp],
+                ts: 0,
+                gateway_id: String::new(),
+                auth: None,
+            })
+            .expect("encode"))
+            .expect("utf-8");
+        assert!(
+            point_text.contains(r#""ts":"72057594037927937""#),
+            "点内大整数 ts 必须字符串化: {point_text}"
+        );
+        assert!(
+            point_text.contains(r#""value":{"b64":"AAAAAABAQkA=","t":"f64le"}"#),
+            "value base64 golden 必须一致: {point_text}"
+        );
+
+        // golden 文本可解码回等值结构（ts 从字符串精确还原 2^56 / 2^56+1）。
+        let decoded = decode_batch(Encoding::Json, GOLDEN_JSON.as_bytes()).expect("decode golden");
+        assert_eq!(decoded.points, batch.points);
+        assert_eq!(decoded.ts, batch.ts);
+        assert_eq!(decoded.gateway_id, batch.gateway_id);
+    }
+
+    // ---- 15. 性能基线（task 39 压测对比用） ----
 
     /// 性能基线：`cargo test -p daemon encoder -- --ignored --nocapture`。
     ///
