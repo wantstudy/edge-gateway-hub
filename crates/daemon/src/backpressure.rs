@@ -902,10 +902,16 @@ impl WaterMarkConfig {
     }
 
     /// 重新夹紧（配置被外部改动后调用）。
+    ///
+    /// **保留禁用哨兵**：`usize::MAX` 表示该维度**不启用**（见 [`Self::new`]）。
+    /// 若对其做 `× 4/5` 重缩放，会把「禁用」变成一个真实的超大阈值（≈ 3.68e18），
+    /// 从而在 [`Self::level`] 中误激活字节维度判定。
     pub fn clamp(&mut self) {
         self.high_water_rows = clamp_high_water(self.high_water_rows, self.hard_limit_rows.max(1));
-        self.high_water_bytes =
-            clamp_high_water(self.high_water_bytes, self.hard_limit_bytes.max(1));
+        if self.high_water_bytes != usize::MAX {
+            self.high_water_bytes =
+                clamp_high_water(self.high_water_bytes, self.hard_limit_bytes.max(1));
+        }
     }
 
     /// 水位等级判定（行数 / 字节数任一触达即升级）。
@@ -1590,8 +1596,23 @@ impl SendQueue {
     }
 
     /// 发布失败回灌（`sent` → `ready` 头部），水位占用不变。
+    ///
+    /// `items` 有两种来源：
+    /// - 来自 [`Self::take_ready`] 的**已取出**条目——它们此刻同时存在于 `sent`，
+    ///   必须先按 `seq` 从 `sent` 移除，否则同一批次被**两层重复计数**，
+    ///   使 `pending()` / `bytes()` 水位虚高（⇒ 过早降级 / 误拒）；
+    /// - 来自补发路径的**从未取出**条目——`sent` 中无同 `seq` 项，移除为 no-op。
+    ///
+    /// 两种来源都只做「移除同 `seq` 条目 + `push_front` 回 `ready` 头部」，
+    /// `bytes` 字段自始至终不变（条目在 `admit` 时已计入，`take_ready` 不改动）。
+    ///
+    /// 为保持回灌后 `ready` 内的相对顺序与出队前一致，按 `items` **逆序** `push_front`
+    /// （`[a, b, c]` → 依次压入 `c, b, a` → 头部序列仍为 `[a, b, c]`）。
     pub fn requeue_failed(&mut self, items: Vec<PendingSend>) {
-        for item in items {
+        for item in items.into_iter().rev() {
+            if let Some(pos) = self.sent.iter().position(|s| s.seq == item.seq) {
+                self.sent.remove(pos);
+            }
             self.ready.push_front(item);
         }
         self.note_level(self.gauge());
@@ -2510,5 +2531,203 @@ mod tests {
         // 收尾：解除故障注入再关闭（close 会 flush 内存残留批次）。
         queue.set_persist_failure(false);
         queue.close().expect("close queue");
+    }
+
+    // ================= QA 独立验收（task 54 边界 / 反例） =================
+
+    /// 审计事件构造（仅用于计数与顺序断言）。
+    fn audit_ev(n: u64) -> BackpressureAudit {
+        BackpressureAudit::HighWaterEntered {
+            rows: n,
+            bytes: 0,
+            high_water_rows: 1,
+            ts_ns: i64::try_from(n).unwrap_or(0),
+        }
+    }
+
+    /// QA 边界：水位判定是 `>=` 语义（恰好等于阈值即升级），行 / 字节任一触达即升级。
+    #[test]
+    fn qa_water_level_exact_threshold_off_by_one() {
+        let marks = WaterMarkConfig::new(4, 8);
+        assert_eq!(marks.high_water_rows, 4, "4/5 夹紧后仍为 4");
+        assert_eq!(marks.hard_limit_rows, 8);
+        assert_eq!(marks.level(Gauge::new(3, 0)), WaterLevel::Normal);
+        assert_eq!(
+            marks.level(Gauge::new(4, 0)),
+            WaterLevel::High,
+            "恰好等于高水位即 High（>= 语义，非 >）"
+        );
+        assert_eq!(marks.level(Gauge::new(7, 0)), WaterLevel::High);
+        assert_eq!(
+            marks.level(Gauge::new(8, 0)),
+            WaterLevel::Critical,
+            "恰好等于硬上限即 Critical"
+        );
+        // 字节维度触达（默认字节上限为 usize::MAX）。
+        assert_eq!(marks.level(Gauge::new(0, usize::MAX)), WaterLevel::Critical);
+
+        let mut byte_marks = WaterMarkConfig::new(4, 8);
+        byte_marks.high_water_bytes = 10;
+        byte_marks.hard_limit_bytes = 20;
+        assert_eq!(byte_marks.level(Gauge::new(0, 9)), WaterLevel::Normal);
+        assert_eq!(byte_marks.level(Gauge::new(0, 10)), WaterLevel::High);
+        assert_eq!(byte_marks.level(Gauge::new(0, 20)), WaterLevel::Critical);
+        // 行数 Normal 但字节 High → 取更严者。
+        assert_eq!(byte_marks.level(Gauge::new(1, 10)), WaterLevel::High);
+        // 硬上限为 0 的退化配置：任何行数都是 Critical（不得 panic / 除零）。
+        let degenerate = WaterMarkConfig::new(0, 0);
+        assert_eq!(degenerate.hard_limit_rows, 1);
+        assert_eq!(degenerate.level(Gauge::new(1, 0)), WaterLevel::Critical);
+        assert_eq!(clamp_high_water(0, 0), 1);
+    }
+
+    /// QA 边界：审计环形缓冲满容量后 `dropped()` 必须真的计数，且保留最新条目。
+    #[test]
+    fn qa_audit_log_dropped_counts_after_capacity() {
+        let log = AuditLog::new(3);
+        for n in 0..5u64 {
+            log.record(audit_ev(n));
+        }
+        assert_eq!(log.emitted(), 5);
+        assert_eq!(log.dropped(), 2, "超容量淘汰必须计数");
+        assert_eq!(log.len(), 3);
+        let snap = log.snapshot();
+        assert_eq!(snap.len(), 3);
+        match &snap[0] {
+            BackpressureAudit::HighWaterEntered { rows, .. } => {
+                assert_eq!(*rows, 2, "保留最新 3 条（2/3/4）")
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+        assert_eq!(log.drain().len(), 3);
+        assert!(log.is_empty());
+
+        // 默认容量 4096：恰好写满不得计淘汰，第 4097 条起才淘汰。
+        let big = AuditLog::default();
+        for n in 0..DEFAULT_AUDIT_CAPACITY {
+            big.record(audit_ev(u64::try_from(n).unwrap_or(0)));
+        }
+        assert_eq!(big.len(), DEFAULT_AUDIT_CAPACITY);
+        assert_eq!(big.dropped(), 0, "恰好写满不得计淘汰");
+        big.record(audit_ev(9_999));
+        assert_eq!(big.dropped(), 1);
+        assert_eq!(big.len(), DEFAULT_AUDIT_CAPACITY);
+        assert_eq!(big.emitted(), DEFAULT_AUDIT_CAPACITY as u64 + 1);
+    }
+
+    /// QA 边界：`batch_seq = u64::MAX` 的键解析与位点饱和。
+    #[test]
+    fn qa_batch_seq_u64_max_and_high_water_saturation() {
+        assert_eq!(
+            parse_idempotency_key("gw:18446744073709551615"),
+            Some(("gw", u64::MAX))
+        );
+        assert_eq!(batch_seq_of_key("gw:18446744073709551615"), Some(u64::MAX));
+        // 2^64 溢出 / 空字段 / 缺分隔符一律不可解析（不得 panic）。
+        assert_eq!(parse_idempotency_key("gw:18446744073709551616"), None);
+        assert_eq!(parse_idempotency_key("gw:"), None);
+        assert_eq!(parse_idempotency_key(":5"), None);
+        assert_eq!(parse_idempotency_key("no-colon"), None);
+        assert_eq!(parse_idempotency_key("gw:-1"), None);
+        // 网关标识自身含冒号 → 取最后一节作序号。
+        assert_eq!(parse_idempotency_key("a:b:7"), Some(("a:b", 7)));
+
+        let mut ledger = IdempotencyLedger::new("gw", 8);
+        assert!(ledger.apply_seq(1).is_applied());
+        ledger.confirm_up_to(u64::MAX);
+        assert_eq!(ledger.high_water(), u64::MAX);
+        assert_eq!(ledger.stats().tracked, 0, "位点推进到 MAX 后窗口必须清空");
+        assert!(
+            ledger.apply_seq(u64::MAX).is_duplicate(),
+            "seq <= high_water 一律判重复"
+        );
+        // 位点只增不减。
+        ledger.confirm_up_to(1);
+        assert_eq!(ledger.high_water(), u64::MAX);
+    }
+
+    /// QA 边界：去重窗口有界——被淘汰的旧 seq 会再次被判为「新数据」（已知折衷）。
+    #[test]
+    fn qa_ledger_window_is_bounded_and_evicts_oldest() {
+        let mut ledger = IdempotencyLedger::new("gw", 2);
+        assert!(ledger.apply_seq(1).is_applied());
+        assert!(ledger.apply_seq(2).is_applied());
+        assert!(ledger.apply_seq(3).is_applied());
+        assert_eq!(ledger.stats().tracked, 2, "窗口必须有界");
+        // 2 仍在窗口内 → 重复。
+        assert_eq!(
+            ledger.apply_seq(2),
+            DedupOutcome::Duplicate {
+                reason: DedupReason::AlreadyApplied
+            }
+        );
+        // 1 已被淘汰 → 窗口外无法判定，再次入库（已知折衷，需靠位点推进兜住）。
+        assert!(
+            ledger.apply_seq(1).is_applied(),
+            "窗口外条目无法判重（文档化折衷）"
+        );
+        assert_eq!(ledger.stats().duplicate_rows, 1);
+    }
+
+    /// QA 顺序：**先落 Ack 后推位点**——落盘失败时位点与去重窗口都不许动。
+    #[test]
+    fn qa_ack_persist_failure_freezes_cursor_and_window() {
+        let sink = Arc::new(InMemoryAckSink::new(0));
+        sink.set_fail(true);
+        let mut ctrl = ReplayController::new("gw", sink.clone(), 0);
+        assert!(ctrl.mark_sent(7).is_applied());
+
+        assert!(ctrl.ack(7).is_err(), "Ack 落盘失败必须返回 Err");
+        assert_eq!(sink.calls(), 1, "必须真的尝试落盘");
+        assert_eq!(sink.persisted(), 0);
+        assert_eq!(ctrl.high_water_mark(), 0, "位点一步不动");
+        assert_eq!(ctrl.ledger().stats().high_water, 0, "去重窗口不得裁剪");
+        assert!(
+            ctrl.ledger().stats().tracked > 0,
+            "窗口条目必须保留（否则重复会被当新数据）"
+        );
+
+        sink.set_fail(false);
+        assert_eq!(
+            ctrl.ack(7).expect("retry ack"),
+            AckOutcome::Advanced { from: 0, to: 7 }
+        );
+        assert_eq!(ctrl.high_water_mark(), 7);
+        assert_eq!(
+            ctrl.ack(7).expect("idempotent ack"),
+            AckOutcome::AlreadyAcked { cursor: 7 },
+            "重复 Ack 幂等，不得重复落盘"
+        );
+        assert_eq!(sink.calls(), 2);
+    }
+
+    /// QA 回归（**RED**）：`requeue_failed` 只把条目推回 `ready` 头部，
+    /// **却没有从 `sent` 移除**——同一批次同时计入两层，`pending()` / `bytes()`
+    /// 被放大一倍（水位虚高 ⇒ 过早降级 / 误拒）。
+    ///
+    /// 契约（见 `requeue_failed` / `take_ready` 文档）：回灌 `sent → ready` 头部，
+    /// **水位占用不变**。正确实现应 `self.sent` 中移除对应 `seq` 后再 `push_front`
+    /// （或让 `take_ready` 不预先计入 `sent`）。
+    #[test]
+    fn qa_requeue_failed_must_keep_occupancy_unchanged() {
+        let sink = Arc::new(RecordingSpillSink::new(true));
+        let audit = Arc::new(AuditLog::new(8));
+        let clock = Arc::new(ManualClock::new(1_000));
+        let mut queue = SendQueue::new(WaterMarkConfig::new(4, 8), sink, audit, clock);
+
+        assert!(queue.push(pending(1, 300, 1_000)).is_admitted());
+        assert_eq!(queue.pending(), 1);
+        let taken = queue.take_ready(1);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(queue.pending(), 1, "take_ready 只搬队列，不计两次");
+        assert_eq!(queue.bytes(), 300);
+
+        queue.requeue_failed(taken);
+        assert_eq!(
+            queue.pending(),
+            1,
+            "requeue_failed 回灌同一批次后水位占用必须不变（当前实现重复计数）"
+        );
+        assert_eq!(queue.bytes(), 300, "字节水位同样不得翻倍");
     }
 }

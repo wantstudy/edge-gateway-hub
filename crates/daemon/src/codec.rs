@@ -444,7 +444,10 @@ impl ValueDecoder {
             quality = Quality::Bad;
         }
         if let Some((min, max)) = self.spec.valid_range {
-            if !(min..=max).contains(&scaled) {
+            // 仅对**数值**量做范围判定：文本 / 布尔 / 位串的工程量为 `NaN`，
+            // 而 `!(min..=max).contains(&NaN)` 恒为真——若不判数值性，任何配置了
+            // `valid_range` 的非数值点位都会被**永久**误判为 `OutOfRange`。
+            if value.is_numeric() && !(min..=max).contains(&scaled) {
                 quality = quality.worst(Quality::OutOfRange);
             }
         }
@@ -1471,5 +1474,279 @@ mod tests {
             .decode(bytes)
             .expect("decode")
             .scaled
+    }
+
+    // ================= QA 独立验收（task 53 边界 / 反例） =================
+
+    /// 按完整规格构造解码器。
+    fn dec_full(spec: DecodeSpec) -> ValueDecoder {
+        ValueDecoder::new(spec).expect("spec")
+    }
+
+    /// QA 边界：空负载 / 长度不足 / 多字节奇数长度一律 ProtocolError；
+    /// 位访问不受「寄存器偶数」约束（该约束只针对定长数值）。
+    #[test]
+    fn qa_empty_odd_and_undersized_payloads_are_rejected() {
+        for dt in [
+            DataType::Bool,
+            DataType::Bits,
+            DataType::Int16,
+            DataType::Uint16,
+            DataType::Int32,
+            DataType::Uint32,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let err = dec(dt, ByteOrder::Abcd)
+                .decode(&[])
+                .expect_err("empty payload must fail");
+            assert_eq!(err.error_code(), crate::error::ERR_PROTOCOL, "{dt:?}");
+        }
+        // 定长数值：长度不足（3 < 4）。
+        assert!(dec(DataType::Uint32, ByteOrder::Abcd)
+            .decode(&[1, 2, 3])
+            .is_err());
+        // 多字节数值：奇数长度（5 字节 / 9 字节）必须显式报错，不静默截断或补零。
+        let odd = dec(DataType::Int32, ByteOrder::Abcd)
+            .decode(&[1, 2, 3, 4, 5])
+            .expect_err("odd length must fail");
+        assert!(
+            odd.to_string().contains("odd payload length"),
+            "actual: {odd}"
+        );
+        assert!(dec(DataType::Float64, ByteOrder::Dcba)
+            .decode(&[0; 9])
+            .is_err());
+        // 8 位定长类型只取首字节，多余字节不构成错误。
+        let out = dec(DataType::Uint8, ByteOrder::Abcd)
+            .decode(&[7, 9, 9])
+            .expect("u8");
+        assert_eq!(out.value, DecodedValue::Uint(7));
+        // 位串：奇数长度合法（3 字节 = 0x123456，取低 12 位 = 0x456）。
+        let bits = dec_full(DecodeSpec::new(DataType::Bits, ByteOrder::Abcd).with_bits(0, 12));
+        assert_eq!(
+            bits.decode(&[0x12, 0x34, 0x56]).expect("bits").value,
+            DecodedValue::Bits(0x456)
+        );
+    }
+
+    /// QA 边界：单寄存器（2 字节）时 `CDAB` 无配对寄存器 → 退化原样；
+    /// `BADC` 是「寄存器内字节互换」本义，两字节仍互换（二者语义不同，勿混）。
+    #[test]
+    fn qa_single_register_cdab_degrades_but_badc_swaps() {
+        let bytes = [0x12u8, 0x34];
+        let cdab = dec(DataType::Uint16, ByteOrder::Cdab)
+            .decode(&bytes)
+            .expect("cdab");
+        assert_eq!(
+            cdab.value,
+            DecodedValue::Uint(0x1234),
+            "CDAB 单寄存器退化原样"
+        );
+        let badc = dec(DataType::Uint16, ByteOrder::Badc)
+            .decode(&bytes)
+            .expect("badc");
+        assert_eq!(
+            badc.value,
+            DecodedValue::Uint(0x3412),
+            "BADC 两字节仍做寄存器内互换"
+        );
+        // 3 字节奇数位访问遇 DCBA 逆序：末字节无配对也不越界。
+        let bits = dec_full(DecodeSpec::new(DataType::Bits, ByteOrder::Dcba).with_bits(0, 64));
+        assert_eq!(
+            bits.decode(&[1, 2, 3]).expect("bits").value,
+            DecodedValue::Bits(0x03_02_01)
+        );
+    }
+
+    /// QA 大数红线：`u64` 计数器全精度保留；超 `2^53 - 1` 必须编码为 JSON 字符串。
+    #[test]
+    fn qa_u64_precision_and_json_string_boundary() {
+        let out = dec(DataType::Uint64, ByteOrder::Abcd)
+            .decode(&u64::MAX.to_be_bytes())
+            .expect("u64");
+        assert_eq!(out.value, DecodedValue::Uint(u64::MAX), "原始值不得降精度");
+        assert_eq!(
+            out.value.json_number().as_deref(),
+            Some("\"18446744073709551615\"")
+        );
+        assert_eq!(
+            out.value.as_f64(),
+            u64::MAX as f64,
+            "as_f64 允许损失（已文档化）"
+        );
+
+        const SAFE: u64 = 9_007_199_254_740_991;
+        assert_eq!(
+            DecodedValue::Uint(SAFE).json_number().as_deref(),
+            Some("9007199254740991")
+        );
+        assert_eq!(
+            DecodedValue::Uint(SAFE + 1).json_number().as_deref(),
+            Some("\"9007199254740992\"")
+        );
+        assert_eq!(
+            DecodedValue::Int(-(SAFE as i64)).json_number().as_deref(),
+            Some("-9007199254740991")
+        );
+        assert_eq!(
+            DecodedValue::Int(-(SAFE as i64) - 1)
+                .json_number()
+                .as_deref(),
+            Some("\"-9007199254740992\"")
+        );
+        assert_eq!(
+            DecodedValue::Int(i64::MIN).json_number().as_deref(),
+            Some("\"-9223372036854775808\"")
+        );
+        assert_eq!(
+            DecodedValue::Bool(true).json_number().as_deref(),
+            Some("true")
+        );
+        assert_eq!(DecodedValue::Text("x".to_string()).json_number(), None);
+    }
+
+    /// QA 边界：负零（有限 → Good，符号可保留）、NaN / ±Inf（非有限 → Bad + JSON `null`）。
+    #[test]
+    fn qa_negative_zero_and_non_finite_floats() {
+        const NEG_ZERO_BITS: u64 = 0x8000_0000_0000_0000;
+        let plain = dec(DataType::Float64, ByteOrder::Abcd)
+            .decode(&NEG_ZERO_BITS.to_be_bytes())
+            .expect("f64");
+        assert_eq!(plain.value, DecodedValue::Float(-0.0));
+        // `-0.0 * 1.0 + 0.0` 在 IEEE754 下变回 `+0.0`（加法把符号吃掉）。
+        assert_eq!(plain.scaled, 0.0);
+        assert_eq!(plain.quality, Quality::Good, "负零是有限值");
+
+        // offset = -0.0 时符号得以保留（-0.0 + -0.0 = -0.0）。
+        let kept = dec_full(
+            DecodeSpec::new(DataType::Float64, ByteOrder::Abcd).with_scale_offset(1.0, -0.0),
+        )
+        .decode(&NEG_ZERO_BITS.to_be_bytes())
+        .expect("f64");
+        assert!(kept.scaled.is_sign_negative(), "scaled={}", kept.scaled);
+
+        for bits in [
+            0x7FF0_0000_0000_0000u64, // +Inf
+            0xFFF0_0000_0000_0000,    // -Inf
+            0x7FF8_0000_0000_0000,    // NaN
+        ] {
+            let out = dec(DataType::Float64, ByteOrder::Abcd)
+                .decode(&bits.to_be_bytes())
+                .expect("f64");
+            assert_eq!(out.quality, Quality::Bad, "bits {bits:#018X}");
+            assert!(!out.scaled.is_finite());
+            assert_eq!(
+                out.value.json_number().as_deref(),
+                Some("null"),
+                "非有限浮点必须编为 null（JSON 无 Inf/NaN 字面量）"
+            );
+        }
+    }
+
+    /// QA 边界：`scale = 0`（输出恒为 offset）与缩放溢出（→ Inf ⇒ Bad）。
+    #[test]
+    fn qa_scale_zero_and_overflow() {
+        let zero_scale = dec_full(
+            DecodeSpec::new(DataType::Uint16, ByteOrder::Abcd).with_scale_offset(0.0, 5.5),
+        );
+        let out = zero_scale.decode(&[0x03, 0xE8]).expect("decode");
+        assert_eq!(out.value, DecodedValue::Uint(1000));
+        assert_eq!(out.scaled, 5.5, "scale=0 ⇒ 工程量恒为 offset");
+        assert_eq!(out.quality, Quality::Good);
+
+        let huge = dec_full(
+            DecodeSpec::new(DataType::Uint16, ByteOrder::Abcd).with_scale_offset(f64::MAX, 0.0),
+        );
+        let out = huge.decode(&[0x00, 0x64]).expect("decode");
+        assert!(out.scaled.is_infinite(), "100 × f64::MAX 必须溢出");
+        assert_eq!(out.quality, Quality::Bad);
+        assert_eq!(
+            out.value.json_number().as_deref(),
+            Some("100"),
+            "原始值不被缩放污染"
+        );
+    }
+
+    /// QA 边界：`valid_range` 对文本点位（工程量为 NaN）的判定；`worst` 顺序无关。
+    #[test]
+    fn qa_valid_range_on_text_and_worst_is_order_independent() {
+        let mut spec = DecodeSpec::new(DataType::Text, ByteOrder::Abcd);
+        spec.string = StringSpec {
+            mode: StringMode::All,
+            trim_nul: false,
+            lossy: false,
+        };
+        spec.valid_range = Some((0.0, 100.0));
+        let out = dec_full(spec).decode(b"HI").expect("decode");
+        assert_eq!(out.value, DecodedValue::Text("HI".to_string()));
+        assert!(out.scaled.is_nan());
+        assert_eq!(
+            out.quality,
+            Quality::Good,
+            "非数值点位不做数值范围判定：文本工程量为 NaN，配了 valid_range 也不得恒报越界（修复验收报告 P2）"
+        );
+
+        let all = [
+            Quality::Good,
+            Quality::Uncertain,
+            Quality::OutOfRange,
+            Quality::CalcFailed,
+            Quality::Bad,
+            Quality::Timeout,
+            Quality::CommError,
+        ];
+        assert_eq!(Quality::worst_of(all), Quality::CommError);
+        assert_eq!(
+            Quality::worst_of(all.iter().rev().copied()),
+            Quality::CommError
+        );
+        for a in all {
+            for b in all {
+                assert_eq!(a.worst(b), b.worst(a), "{a:?}/{b:?} 不满足交换律");
+                assert_eq!(a.worst(b).severity(), a.severity().max(b.severity()));
+            }
+        }
+        assert_eq!(
+            Quality::worst_of(std::iter::empty::<Quality>()),
+            Quality::Good,
+            "空输入 = Good"
+        );
+    }
+
+    /// QA 反例：字符串非法 UTF-8——`lossy=false` 报错、`lossy=true` 以 U+FFFD 替换；
+    /// 定长 + 剥 NUL 组合。
+    #[test]
+    fn qa_invalid_utf8_strict_and_lossy() {
+        let truncated = [0xE4u8, 0xBD]; // 3 字节序列被截断
+        let mut strict = DecodeSpec::new(DataType::Text, ByteOrder::Abcd);
+        strict.string = StringSpec {
+            mode: StringMode::All,
+            trim_nul: false,
+            lossy: false,
+        };
+        let err = dec_full(strict)
+            .decode(&truncated)
+            .expect_err("strict must fail");
+        assert_eq!(err.error_code(), crate::error::ERR_PROTOCOL);
+
+        let mut lossy = DecodeSpec::new(DataType::Text, ByteOrder::Abcd);
+        lossy.string = StringSpec {
+            mode: StringMode::All,
+            trim_nul: false,
+            lossy: true,
+        };
+        let out = dec_full(lossy).decode(&truncated).expect("lossy");
+        assert_eq!(out.value, DecodedValue::Text("\u{FFFD}".to_string()));
+        assert_eq!(out.quality, Quality::Good, "文本不参与数值质量判定");
+
+        let mut fixed = DecodeSpec::new(DataType::Text, ByteOrder::Abcd);
+        fixed.string = StringSpec {
+            mode: StringMode::Fixed(8),
+            trim_nul: true,
+            lossy: false,
+        };
+        let out = dec_full(fixed).decode(&[b'A', b'B', 0, 0]).expect("fixed");
+        assert_eq!(out.value, DecodedValue::Text("AB".to_string()));
     }
 }

@@ -205,7 +205,12 @@ fn validate_node_address(p: &ReadPoint) -> DaemonResult<NodeId> {
             p.count
         )));
     }
-    Ok(NodeId::new(addr.db as u16, addr.start))
+    // `PointAddress.db` 为 `u32`，而 OPC UA 的命名空间索引是 `u16`。绝不可 `as u16`
+    // 静默截断（`65537 → 1` 会悄悄读写**另一个命名空间的同号节点**），必须显式拒绝。
+    let ns = u16::try_from(addr.db).map_err(|_| {
+        DaemonError::ProtocolError(format!("opc ua namespace index {} exceeds u16", addr.db))
+    })?;
+    Ok(NodeId::new(ns, addr.start))
 }
 
 impl OpcuaDriver {
@@ -1155,5 +1160,137 @@ mod tests {
             assert_eq!(samples[0].value, 42i32.to_le_bytes());
             driver.disconnect().await.expect("disconnect");
         });
+    }
+
+    // ================= QA 独立验收（task 10 边界 / 反例） =================
+
+    /// QA 边界：Variant ↔ 小端字节 的极值往返（含 `i64::MIN` / `u64::MAX` / 负零），
+    /// 未支持类型返回 `None` 而非 panic。
+    #[test]
+    fn qa_variant_byte_mapping_roundtrip_and_unsupported() {
+        let cases: Vec<(Variant, Vec<u8>)> = vec![
+            (Variant::Boolean(false), vec![0u8]),
+            (Variant::Boolean(true), vec![1u8]),
+            (Variant::SByte(i8::MIN), vec![0x80u8]),
+            (Variant::Byte(u8::MAX), vec![0xFFu8]),
+            (Variant::Int16(i16::MIN), i16::MIN.to_le_bytes().to_vec()),
+            (Variant::UInt16(u16::MAX), u16::MAX.to_le_bytes().to_vec()),
+            (Variant::Int32(i32::MIN), i32::MIN.to_le_bytes().to_vec()),
+            (Variant::UInt32(u32::MAX), u32::MAX.to_le_bytes().to_vec()),
+            (Variant::Int64(i64::MIN), i64::MIN.to_le_bytes().to_vec()),
+            (Variant::UInt64(u64::MAX), u64::MAX.to_le_bytes().to_vec()),
+            (Variant::Float(-0.0), (-0.0f32).to_le_bytes().to_vec()),
+            (Variant::Double(-0.0), (-0.0f64).to_le_bytes().to_vec()),
+        ];
+        for (variant, bytes) in cases {
+            assert_eq!(
+                variant_to_bytes(&variant),
+                Some(bytes.clone()),
+                "{variant:?}"
+            );
+            let ty = variant.scalar_type_id().expect("scalar type id");
+            assert_eq!(
+                bytes_to_variant(&bytes, ty),
+                Some(variant.clone()),
+                "{variant:?} 往返失败"
+            );
+        }
+        for unsupported in [Variant::Empty, Variant::StatusCode(StatusCode::Good)] {
+            assert!(
+                variant_to_bytes(&unsupported).is_none(),
+                "{unsupported:?} 应不支持字节映射"
+            );
+        }
+    }
+
+    /// QA 反例：`bytes_to_variant` 必须**严格等长**，不做截断 / 补零；布尔仅接受 0 / 1。
+    #[test]
+    fn qa_bytes_to_variant_is_strict() {
+        // 布尔：只接受 [0] / [1]。
+        assert_eq!(
+            bytes_to_variant(&[0], VariantScalarTypeId::Boolean),
+            Some(Variant::Boolean(false))
+        );
+        assert_eq!(
+            bytes_to_variant(&[1], VariantScalarTypeId::Boolean),
+            Some(Variant::Boolean(true))
+        );
+        assert!(bytes_to_variant(&[2], VariantScalarTypeId::Boolean).is_none());
+        assert!(bytes_to_variant(&[], VariantScalarTypeId::Boolean).is_none());
+        assert!(bytes_to_variant(&[0, 0], VariantScalarTypeId::Boolean).is_none());
+        // 定长类型：少一字节 / 多一字节都必须拒绝。
+        assert!(bytes_to_variant(&[0], VariantScalarTypeId::Int16).is_none());
+        assert!(bytes_to_variant(&[0, 0, 0], VariantScalarTypeId::Int16).is_none());
+        assert!(bytes_to_variant(&[0; 7], VariantScalarTypeId::Double).is_none());
+        assert!(bytes_to_variant(&[0; 9], VariantScalarTypeId::UInt64).is_none());
+        assert!(bytes_to_variant(&[], VariantScalarTypeId::Float).is_none());
+    }
+
+    /// QA 反例：`decode_read_values` 的数量不符 / 节点级坏状态码 / 无值都必须报 `ProtocolError`，
+    /// 不得静默降级为「好值」。
+    #[test]
+    fn qa_decode_read_values_guards() {
+        let points = vec![node_point(TEST_NS, DEMO_INT32_ID)];
+        // 条数不符。
+        let err = OpcuaDriver::decode_read_values(&points, Vec::new()).expect_err("count mismatch");
+        assert_eq!(err.error_code(), ERR_PROTOCOL);
+
+        let dv = |value: Option<Variant>, status: Option<StatusCode>| DataValue {
+            value,
+            status,
+            source_timestamp: None,
+            source_picoseconds: None,
+            server_timestamp: None,
+            server_picoseconds: None,
+        };
+
+        // 节点级坏状态码（即便带值）。
+        let err = OpcuaDriver::decode_read_values(
+            &points,
+            vec![dv(
+                Some(Variant::Int32(1)),
+                Some(StatusCode::BadNodeIdUnknown),
+            )],
+        )
+        .expect_err("bad status");
+        assert_eq!(err.error_code(), ERR_PROTOCOL);
+
+        // 无值。
+        let err = OpcuaDriver::decode_read_values(&points, vec![dv(None, Some(StatusCode::Good))])
+            .expect_err("no value");
+        assert_eq!(err.error_code(), ERR_PROTOCOL);
+
+        // 未支持类型（非标量）。
+        let err = OpcuaDriver::decode_read_values(&points, vec![dv(Some(Variant::Empty), None)])
+            .expect_err("unsupported type");
+        assert_eq!(err.error_code(), ERR_PROTOCOL);
+
+        // 正向：好状态 + 有值 → 小端字节。
+        let ok = OpcuaDriver::decode_read_values(
+            &points,
+            vec![dv(Some(Variant::Int32(258)), Some(StatusCode::Good))],
+        )
+        .expect("ok");
+        assert_eq!(ok[0].value, 258i32.to_le_bytes());
+    }
+
+    /// QA 回归（**RED**）：命名空间索引 `db` 为 `u32`，但 OPC UA 的 ns 是 `u16`。
+    /// 当前 `addr.db as u16` **静默截断**（65537 → 1），会把读 / 写悄悄指向**另一个节点**。
+    /// 工业场景下这是安全隐患，必须显式拒绝（`db > u16::MAX` ⇒ `ProtocolError`）。
+    #[test]
+    fn qa_namespace_index_beyond_u16_must_be_rejected() {
+        for db in [0x1_0000u32, 0x1_0001, u32::MAX] {
+            let mut p = node_point(TEST_NS, DEMO_INT32_ID);
+            p.address.db = db;
+            assert!(
+                validate_node_address(&p).is_err(),
+                "ns={db} 超出 u16 必须报错，不得静默截断到 {}",
+                db as u16
+            );
+        }
+        // u16::MAX 是合法上界。
+        let mut ok = node_point(TEST_NS, DEMO_INT32_ID);
+        ok.address.db = u32::from(u16::MAX);
+        assert!(validate_node_address(&ok).is_ok());
     }
 }

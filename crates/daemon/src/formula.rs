@@ -1952,7 +1952,12 @@ pub fn convert_output(value: f64, output_type: OutputType) -> Result<f64, CalcFa
         }
         OutputType::Int64 => {
             let rounded = value.round();
-            if rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+            // 浮点陷阱：`i64::MAX as f64` 会**向上取整**到 `2^63`，故
+            // `rounded > i64::MAX as f64` 对恰好等于 `2^63` 的值判为「未越界」而放行。
+            // 改用以 `2^63` 为界的**排他**上界；下界 `i64::MIN as f64`（= -2^63，精确可表示）
+            // 本身正确，保持 `<` 语义。
+            const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0; // 2^63
+            if rounded < i64::MIN as f64 || rounded >= I64_UPPER_EXCLUSIVE {
                 return Err(CalcFailure::OutputOutOfRange);
             }
             Ok(rounded)
@@ -2701,20 +2706,39 @@ pub fn dry_run_expr(
         .value
         .and_then(|v| convert_output(v, output_type).ok());
     let failed = outcome.failed || (outcome.value.is_some() && value.is_none());
+    // 失败原因：优先继承求值器给出的原因；仅「求值有值但输出越界被丢弃」时补
+    // `OutputOutOfRange`。（`failed == true` ⇒ 此处必为 `Some`。）
+    let reason = outcome
+        .reason
+        .or(failed.then_some(CalcFailure::OutputOutOfRange));
+    // 契约（见模块文档 / `CalcOutcome::quality`）：`failed == true` ⇒ 质量码取
+    // `Quality::worst(继承到的最差, Quality::CalcFailed)`，与 [`FormulaEngine::eval_cycle`]
+    // 口径一致；否则监控页草稿试算会把「算不出来」误报为 GOOD。
+    let quality = if failed {
+        Quality::worst(outcome.quality, Quality::CalcFailed)
+    } else {
+        outcome.quality
+    };
+    // 契约（见 [`DryRunOutput::error`]）：`ok == false` 时 `error` 必有值——编译期失败已由
+    // [`DryRunOutput::failure`] 填充；运行期失败（除零 / 缺输入等）在此按 `reason` 填充，
+    // 否则前端按文档读取 `error` 会渲染空白消息。
+    let error = if failed {
+        Some(reason.map_or_else(|| CalcFailure::MissingInput.to_string(), |r| r.to_string()))
+    } else {
+        None
+    };
     DryRunOutput {
         ok: !failed,
         outcome: CalcOutcome {
             value,
             failed,
-            reason: outcome
-                .reason
-                .or(failed.then_some(CalcFailure::OutputOutOfRange)),
-            quality: outcome.quality,
+            reason,
+            quality,
         },
         value,
         intermediates,
         order: program.deps().to_vec(),
-        error: None,
+        error,
     }
 }
 
@@ -3949,5 +3973,238 @@ mod tests {
         let beyond = engine.eval_cycle(&values(&[("X", 6.0)]), 3_000_000_000);
         assert!(get(&beyond, "R_Dead").emitted);
         assert_eq!(get(&beyond, "R_Dead").value, Some(12.0));
+    }
+
+    // ================= QA 独立验收（task 70 边界 / 反例） =================
+
+    /// 周期模式配置（强制每周期重算，隔离 OnChange 触发判定的干扰）。
+    fn cfg_periodic(point_id: &str, expr: &str) -> DerivedPointConfig {
+        let mut c = cfg(point_id, expr);
+        c.eval_mode = EvalMode::Periodic;
+        c
+    }
+
+    /// 空上下文试算辅助。
+    fn dry(expr: &str, output_type: OutputType) -> DryRunOutput {
+        dry_run_expr(
+            expr,
+            output_type,
+            &PointValues::new(),
+            &PointHistory::new(),
+            1.0,
+        )
+    }
+
+    /// QA 边界：空表达式 / 仅空白必须报错；表达式长度上限恰好 512 通过、513 拒绝。
+    #[test]
+    fn qa_blank_and_expr_length_boundary() {
+        for src in ["", "   ", "\t\n \r"] {
+            assert!(Program::compile(src).is_err(), "blank {src:?} 必须拒绝");
+        }
+        let exact = format!("[A]{}", " ".repeat(DEFAULT_MAX_EXPR_LEN - 3));
+        assert_eq!(exact.len(), DEFAULT_MAX_EXPR_LEN);
+        assert!(Program::compile(&exact).is_ok(), "512 字节必须通过");
+
+        let over = format!("[A]{} ", " ".repeat(DEFAULT_MAX_EXPR_LEN - 3));
+        assert_eq!(over.len(), DEFAULT_MAX_EXPR_LEN + 1);
+        let err = Program::compile(&over)
+            .expect_err("513 字节必须拒绝")
+            .to_string();
+        assert!(err.contains("超过上限"), "actual: {err}");
+    }
+
+    /// QA 边界：解析递归深度上限的**精确**边界（默认 32，`parse_root` 已占 1 层）。
+    #[test]
+    fn qa_parse_depth_boundary_is_exact() {
+        let nested = |n: usize| format!("{}[A]{}", "(".repeat(n), ")".repeat(n));
+        let mut ok_depth = 0usize;
+        for n in 1..=64 {
+            if Program::compile(&nested(n)).is_ok() {
+                ok_depth = n;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            ok_depth,
+            DEFAULT_MAX_PARSE_DEPTH - 1,
+            "恰好 {} 层括号应通过、下一层必须拒绝（`depth` 从 `parse_root` 起算）",
+            DEFAULT_MAX_PARSE_DEPTH - 1
+        );
+        let err = Program::compile(&nested(ok_depth + 1))
+            .expect_err("超深必须拒绝")
+            .to_string();
+        assert!(err.contains("嵌套过深"), "actual: {err}");
+    }
+
+    /// QA 反例：惰性 `if` 只求值被选中的分支——未选中分支的除零 / 缺失引用不得污染结果，
+    /// 而被选中分支的错误必须如实上报（不得被惰性吞掉）。
+    #[test]
+    fn qa_lazy_if_evaluates_selected_branch_only() {
+        for expr in ["if(1, 7, 1 / 0)", "if(0, 1 / 0, 7)", "if(0, [MISSING], 7)"] {
+            let out = dry(expr, OutputType::Float64);
+            assert!(
+                out.ok,
+                "{expr} 未选中分支不得报错：{:?}",
+                out.outcome.reason
+            );
+            assert_eq!(out.value, Some(7.0), "{expr}");
+        }
+        // 条件为真但分支为 0 → 仍走「真」分支。
+        assert_eq!(dry("if(2, 9, 7)", OutputType::Float64).value, Some(9.0));
+
+        let out = dry("if(1, 1 / 0, 7)", OutputType::Float64);
+        assert!(!out.ok, "被选中分支的除零必须上报");
+        assert_eq!(out.outcome.reason, Some(CalcFailure::DivideByZero));
+        assert!(out.outcome.failed);
+        assert_eq!(out.value, None);
+    }
+
+    /// QA 回归（**RED**）：`dry_run_expr` 的失败结果**未套用**模块文档约定的质量映射
+    /// `Quality::worst(继承到的最差, Quality::CalcFailed)`（`eval_cycle` 在
+    /// 第 3014 行做了，`dry_run_expr` 漏了）。
+    ///
+    /// 后果：同一条失败表达式在**试算（监控页草稿）**上报 `GOOD`，在**实际周期求值**上报
+    /// `CALC_FAILED` —— 预览与生产不一致，且违反「`failed == true` ⇒ `quality` 取
+    /// `CalcFailed`」的模块契约。
+    #[test]
+    fn qa_dry_run_failure_must_report_calc_failed_quality() {
+        let out = dry("1 / 0", OutputType::Float64);
+        assert!(!out.ok);
+        assert!(out.outcome.failed);
+        assert_eq!(
+            out.outcome.quality,
+            Quality::CalcFailed,
+            "失败结果的 quality 必须 >= CalcFailed（不得是 GOOD）"
+        );
+        // 对照：同样的失败在实际周期路径上确实是 CalcFailed。
+        let mut engine = FormulaEngine::new(vec![cfg_periodic("R_Div", "1 / 0")]).expect("ok");
+        let results = engine.eval_cycle(&PointValues::new(), 1_000_000_000);
+        assert_eq!(get(&results, "R_Div").quality, Quality::CalcFailed);
+    }
+
+    /// QA 边界：除零 / 取模零（含分子为 0 的 `0/0`、`0%0`）——`b == 0` 先行判定，不看分子。
+    #[test]
+    fn qa_divide_and_modulo_by_zero_including_zero_numerator() {
+        for expr in ["1 / 0", "0 / 0", "1 % 0", "0 % 0", "-5 / 0"] {
+            let out = dry(expr, OutputType::Float64);
+            assert!(!out.ok, "{expr} 必须失败");
+            assert_eq!(
+                out.outcome.reason,
+                Some(CalcFailure::DivideByZero),
+                "{expr}（0/0 也必须是 DivideByZero，而非 NonFinite）"
+            );
+        }
+        // 负零作除数同样判除零（`-0.0 == 0.0`）。
+        assert!(!dry("1 / -0.0", OutputType::Float64).ok);
+    }
+
+    /// QA 边界：`clamp` 逆序区间判失败（不 panic / 不静默交换）；`min` / `max` 单参数编译期拒绝。
+    #[test]
+    fn qa_clamp_inverted_bounds_and_min_max_arity() {
+        let bad = dry("clamp(5, 10, 1)", OutputType::Float64);
+        assert!(!bad.ok, "lo > hi 必须判失败");
+        assert_eq!(bad.outcome.reason, Some(CalcFailure::OutputOutOfRange));
+        assert_eq!(dry("clamp(5, 1, 10)", OutputType::Float64).value, Some(5.0));
+        // 边界相等合法（闭区间）。
+        assert_eq!(dry("clamp(5, 5, 5)", OutputType::Float64).value, Some(5.0));
+        // 单参数：arity (2..) 编译期拒绝。
+        for src in ["min(1)", "max(1)"] {
+            assert!(Program::compile(src).is_err(), "{src} 必须拒绝");
+        }
+        assert_eq!(dry("min(3, 1, 2)", OutputType::Float64).value, Some(1.0));
+        assert_eq!(dry("max(3, 1, 2)", OutputType::Float64).value, Some(3.0));
+        assert_eq!(dry("min(2, 2)", OutputType::Float64).value, Some(2.0));
+    }
+
+    /// QA 边界（**RED**）：`Int64` 输出上限判定漏了 `2^63` 本身。
+    ///
+    /// `i64::MAX as f64` 会**向上取整**到 `2^63`，因此 `rounded > i64::MAX as f64`
+    /// 对 `rounded == 2^63` 为假 → 一个无法表示为 `i64` 的值被放行。
+    /// 正确写法：`rounded >= 9_223_372_036_854_775_808.0`（或用 `i64::try_from` 兜底）。
+    #[test]
+    fn qa_int64_output_upper_boundary_is_exclusive() {
+        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+        // i64::MIN 恰好可表示 → 合法。
+        assert_eq!(
+            convert_output(-TWO_POW_63, OutputType::Int64),
+            Ok(-TWO_POW_63)
+        );
+        // 略小于 2^63 → 合法。
+        assert!(convert_output(9_223_372_036_854_774_000.0, OutputType::Int64).is_ok());
+        // 恰好 2^63 → 超出 i64::MAX，必须判 OutputOutOfRange。
+        assert_eq!(
+            convert_output(TWO_POW_63, OutputType::Int64),
+            Err(CalcFailure::OutputOutOfRange),
+            "2^63 不可表示为 i64，必须拒绝"
+        );
+        // 更远 → 已拒绝。
+        assert_eq!(
+            convert_output(1.0e19, OutputType::Int64),
+            Err(CalcFailure::OutputOutOfRange)
+        );
+    }
+
+    /// QA 边界：`prev()` 首周期无历史 → 失败；`hold(x, 0)` 窗口为 0 → **绝不回看历史**。
+    #[test]
+    fn qa_hold_zero_window_never_looks_back() {
+        let mut engine = FormulaEngine::new(vec![
+            cfg_periodic("R_H0", "hold([X], 0)"),
+            cfg_periodic("R_H3", "hold([X], 3)"),
+            cfg_periodic("R_Prev", "prev([X])"),
+        ])
+        .expect("ok");
+
+        // 周期 1：首周期无历史 → 三者皆 MissingInput。
+        let first = engine.eval_cycle(&PointValues::new(), 1_000_000_000);
+        for id in ["R_H0", "R_H3", "R_Prev"] {
+            assert_eq!(
+                get(&first, id).reason,
+                Some(CalcFailure::MissingInput),
+                "{id} 首周期必须失败"
+            );
+        }
+
+        // 周期 2：本周期有值 → hold 直通；prev 仍无上周期值。
+        let second = engine.eval_cycle(&values(&[("X", 3.0)]), 2_000_000_000);
+        assert_eq!(get(&second, "R_H0").value, Some(3.0));
+        assert_eq!(get(&second, "R_H3").value, Some(3.0));
+        assert_eq!(
+            get(&second, "R_Prev").reason,
+            Some(CalcFailure::MissingInput)
+        );
+
+        // 周期 3：prev 取到上周期 3.0。
+        let third = engine.eval_cycle(&values(&[("X", 3.0)]), 3_000_000_000);
+        assert_eq!(get(&third, "R_Prev").value, Some(3.0));
+
+        // 周期 4：本周期缺失——window=0 绝不回看（即便历史上确有 3.0），window=3 可回看。
+        let fourth = engine.eval_cycle(&PointValues::new(), 4_000_000_000);
+        assert_eq!(
+            get(&fourth, "R_H0").reason,
+            Some(CalcFailure::MissingInput),
+            "hold(x, 0) 禁止回看历史"
+        );
+        assert!(get(&fourth, "R_H0").failed);
+        assert_eq!(get(&fourth, "R_H3").value, Some(3.0), "hold(x, 3) 回看历史");
+    }
+
+    /// QA 反例（**已修复**）：`dry_run_expr` 文档称「`error` 在 `ok == false` 时有值」。
+    /// 修复前**运行期求值失败**（非编译失败）路径返回 `error = None`（原因只在
+    /// `outcome.reason`），前端按文档读取会渲染空消息；修复后运行期失败同样填充 `error`。
+    #[test]
+    fn qa_dry_run_runtime_failure_still_reports_reason() {
+        let out = dry("1 / 0", OutputType::Float64);
+        assert!(!out.ok);
+        assert_eq!(out.outcome.reason, Some(CalcFailure::DivideByZero));
+        assert_eq!(
+            out.error.as_deref(),
+            Some(CalcFailure::DivideByZero.as_str()),
+            "运行期失败也必须填充 error（修复验收报告 P2）"
+        );
+        // 编译期失败同样填 error。
+        let compile_fail = dry("min(1)", OutputType::Float64);
+        assert!(!compile_fail.ok);
+        assert!(compile_fail.error.is_some());
     }
 }
