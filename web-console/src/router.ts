@@ -11,10 +11,19 @@
  * 每条路由的 `meta` 携带 `title`（文档标题 + 顶栏面包屑）与 `group`（侧栏分组）。
  */
 import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-router';
+import { API_MODE, getStoredToken } from './api/client';
 
 /** 路由表（懒加载各页面组件）。 */
 const routes: readonly RouteRecordRaw[] = [
   { path: '/', redirect: '/overview' },
+
+  // ---------- 登录（仅 real 模式可达；mock 模式守卫不拦，手动访问也会被弹回总览） ----------
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/pages/LoginPage.vue'),
+    meta: { title: '登录', group: '' },
+  },
 
   // ---------- 分组「监控」 ----------
   {
@@ -135,6 +144,27 @@ const routes: readonly RouteRecordRaw[] = [
 export const router = createRouter({
   history: createWebHashHistory(),
   routes: [...routes],
+});
+
+/**
+ * 全局守卫（仅 real 模式启用登录拦截；mock 模式保持原型「免登录」行为）。
+ *
+ * · real 且无 token：访问任何页面 → `/login`（携带 redirect 便于登录后回跳）；
+ * · real 且已有 token：访问 `/login` → 直接回总览；
+ * · mock：一律放行。
+ */
+router.beforeEach((to) => {
+  if (API_MODE !== 'real') {
+    return true;
+  }
+  const authed = Boolean(getStoredToken());
+  if (!authed && to.name !== 'login') {
+    return { name: 'login', query: { redirect: to.fullPath } };
+  }
+  if (authed && to.name === 'login') {
+    return { name: 'overview' };
+  }
+  return true;
 });
 
 /** 同步文档标题，便于多标签场景辨识。 */

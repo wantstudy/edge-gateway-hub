@@ -101,7 +101,7 @@ import {
   EmptyState,
   type SelectOption,
 } from '@ui-kit';
-import { repo, type PointRecord } from '../mock/mock-data';
+import { repo, type PointRecord } from '@/api/repo';
 
 const router = useRouter();
 

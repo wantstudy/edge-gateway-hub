@@ -5,9 +5,11 @@
     硬性约定：
       1. 顶栏**常驻授权状态徽标**（降级时转琥珀并附「查看原因」）；
       2. 顶栏右侧：连接状态指示 + 当前用户 + 角色切换（演示 RoleGate）；
-      3. 路由高亮跟随当前页；侧栏可折叠（宽度切换，图标/文字同步）。
+      3. 路由高亮跟随当前页；侧栏可折叠（宽度切换，图标/文字同步）；
+      4. /login 路由（仅 real 模式可达）走独立全屏布局，不渲染本外壳。
   -->
-  <div class="wc-app" :class="{ 'is-collapsed': session.state.sidebarCollapsed }">
+  <RouterView v-if="isLoginRoute" />
+  <div v-else class="wc-app" :class="{ 'is-collapsed': session.state.sidebarCollapsed }">
     <!-- 顶栏 -->
     <header class="wc-topbar">
       <button
@@ -50,21 +52,33 @@
         <span>{{ connectionLabel }}</span>
       </span>
 
-      <!-- 角色切换（演示 RoleGate 可见性控制；不影响授权） -->
-      <span class="wc-topbar__mini">角色</span>
-      <select
-        class="wc-role-select"
-        :value="session.state.role"
-        aria-label="切换当前角色"
-        @change="onRoleChange"
-      >
-        <option v-for="role in ROLES" :key="role" :value="role">
-          {{ ROLE_META[role].fullLabel }}
-        </option>
-      </select>
+      <!-- real 模式：角色来自登录接口，展示后端角色原文 + 退出登录 -->
+      <template v-if="API_MODE === 'real'">
+        <span class="wc-topbar__mini">角色</span>
+        <span class="wc-role-badge" :title="`后端角色：${session.state.backendRole}`">
+          {{ session.state.backendRole || '—' }}
+        </span>
+        <button type="button" class="wc-icon-btn" title="退出登录" aria-label="退出登录" @click="onLogout">
+          ⏻
+        </button>
+      </template>
+      <!-- mock 模式：角色切换（演示 RoleGate 可见性控制；不影响授权） -->
+      <template v-else>
+        <span class="wc-topbar__mini">角色</span>
+        <select
+          class="wc-role-select"
+          :value="session.state.role"
+          aria-label="切换当前角色"
+          @change="onRoleChange"
+        >
+          <option v-for="role in ROLES" :key="role" :value="role">
+            {{ ROLE_META[role].fullLabel }}
+          </option>
+        </select>
+      </template>
 
       <span class="wc-avatar" :title="`当前账号：${session.state.account}`">{{ initial }}</span>
-      <span class="wc-user-name">{{ session.state.displayName }}</span>
+      <span class="wc-user-name">{{ session.state.displayName || session.state.backendRole || '未登录' }}</span>
     </header>
 
     <div class="wc-body">
@@ -122,12 +136,16 @@ import {
   licenseBadgeText,
   type Role,
 } from './store/session';
+import { API_MODE } from './api/client';
 
 const route = useRoute();
 const router = useRouter();
 
 /** 顶栏头像字符。 */
 const initial = accountInitial;
+
+/** 当前是否为登录页（登录页不渲染应用外壳）。 */
+const isLoginRoute = computed<boolean>(() => route.name === 'login');
 
 /** 顶栏网关名（本机标识）。 */
 const gatewayName = '线1-网关-01';
@@ -247,5 +265,13 @@ function onToggleSidebar(): void {
 function onRoleChange(event: Event): void {
   const role = (event.target as HTMLSelectElement).value as Role;
   session.setRole(role);
+}
+
+/**
+ * 退出登录（real 模式顶栏）：清空会话与本地 token，回到登录页。
+ */
+function onLogout(): void {
+  session.logout();
+  window.location.hash = '#/login';
 }
 </script>

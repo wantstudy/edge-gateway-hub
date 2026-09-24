@@ -140,7 +140,7 @@ import {
   type TableColumn,
   type SelectOption,
 } from '@ui-kit';
-import { repo, type AuditEntry } from '../mock/mock-data';
+import { repo, type AuditEntry } from '@/api/repo';
 import { session } from '../store/session';
 
 /** 每页条数。 */

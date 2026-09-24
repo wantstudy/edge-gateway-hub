@@ -188,7 +188,7 @@ import {
   type PointRecord,
   type PointDraft,
   type DeviceRecord,
-} from '../mock/mock-data';
+} from '@/api/repo';
 import { session } from '../store/session';
 
 const route = useRoute();

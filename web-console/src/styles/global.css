@@ -774,3 +774,17 @@ body {
   outline: 2px solid var(--brand);
   outline-offset: 1px;
 }
+
+/* ---------- real 模式顶栏后端角色徽标 ---------- */
+.wc-role-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--bg-app);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 20px;
+  white-space: nowrap;
+}

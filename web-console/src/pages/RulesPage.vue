@@ -215,7 +215,7 @@ import {
   type TableColumn,
   type DangerFact,
 } from '@ui-kit';
-import { repo, DEFAULT_ACTOR, type RuleRecord } from '../mock/mock-data';
+import { repo, DEFAULT_ACTOR, type RuleRecord } from '@/api/repo';
 import { session } from '../store/session';
 
 /** 每页条数。 */

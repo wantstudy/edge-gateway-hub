@@ -20,6 +20,13 @@
  */
 import { reactive, readonly, computed } from 'vue';
 import { licenseSnapshot, type MockLicense } from '../mock/mock-data';
+import {
+  API_MODE,
+  clearAuth,
+  getStoredBackendRole,
+  getStoredToken,
+  onUnauthorized,
+} from '../api/client';
 
 /** 网关控制台四角色。 */
 export const ROLES = ['admin', 'engineer', 'operator', 'viewer'] as const;
@@ -80,6 +87,8 @@ interface SessionState {
   displayName: string;
   /** 当前角色（顶栏可切换，用于演示 RoleGate 与权限矩阵真实生效） */
   role: Role;
+  /** 后端角色原文（real 模式登录后由 `/api/auth/login` 返回；mock 模式为空串） */
+  backendRole: string;
   /** 展示用授权快照（**非**授权判定，判定在 Rust 侧） */
   license: MockLicense;
   /** 顶栏连接状态指示 */
@@ -88,31 +97,61 @@ interface SessionState {
   sidebarCollapsed: boolean;
 }
 
-/** 可变状态对象（模块内可直接写，对外只读）。 */
+/** 可变状态对象（模块内可直接写，对外只读）。
+ *
+ * real 模式：登录态以 localStorage token 为准（未登录 → 登录页）；
+ * mock 模式：保持原型行为，默认已登录。
+ */
 const state: SessionState = reactive<SessionState>({
-  loggedIn: true,
-  account: 'field.zhang',
-  displayName: '张工',
-  role: 'admin',
+  loggedIn: API_MODE === 'real' ? Boolean(getStoredToken()) : true,
+  account: API_MODE === 'real' ? '' : 'field.zhang',
+  displayName: API_MODE === 'real' ? '' : '张工',
+  role: API_MODE === 'real' ? 'viewer' : 'admin',
+  backendRole: API_MODE === 'real' ? getStoredBackendRole() : '',
   license: licenseSnapshot,
   connection: 'connected',
   sidebarCollapsed: false,
 });
 
-/** 登录：记录账号并重置为 admin（便于演示全量页面）。 */
-function login(account: string): void {
+/**
+ * 后端角色 → 前端 Role 映射（仅控制 RoleGate **可见性**，非授权判定）。
+ *
+ * 假设（本地联调约定）：`ops` / `system` → admin（运维主账号，全页可验收）；
+ * `lic_ops` → operator；`risk` → viewer；未知 → viewer（最保守）。
+ */
+export function mapBackendRole(backendRole: string): Role {
+  switch (backendRole) {
+    case 'system':
+    case 'ops':
+      return 'admin';
+    case 'lic_ops':
+      return 'operator';
+    case 'risk':
+      return 'viewer';
+    default:
+      return 'viewer';
+  }
+}
+
+/** 登录：记录账号；可选覆盖角色与后端角色原文（real 模式由 LoginPage 传入）。 */
+function login(account: string, opts?: { role?: Role; backendRole?: string }): void {
   state.loggedIn = true;
   state.account = account || 'field.zhang';
   state.displayName = account || '张工';
-  state.role = 'admin';
+  state.role = opts?.role ?? 'admin';
+  if (opts?.backendRole !== undefined) {
+    state.backendRole = opts.backendRole;
+  }
 }
 
-/** 登出：清空会话。 */
+/** 登出：清空会话并清除本地 token（mock 模式无 token，调用无副作用）。 */
 function logout(): void {
   state.loggedIn = false;
   state.account = '';
   state.displayName = '';
   state.role = 'viewer';
+  state.backendRole = '';
+  clearAuth();
 }
 
 /**
@@ -139,6 +178,11 @@ function toggleSidebar(): void {
 function setLicense(next: MockLicense): void {
   state.license = next;
 }
+
+/** 401 统一处理：client 层清 token 后同步清空内存会话（下一跳由守卫接管）。 */
+onUnauthorized(() => {
+  state.loggedIn = false;
+});
 
 /** 会话 API（对组件暴露只读状态 + 动作）。 */
 export const session = {

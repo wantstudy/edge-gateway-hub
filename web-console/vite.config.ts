@@ -24,6 +24,19 @@ export default defineConfig({
   server: {
     port: 5274,
     open: false,
+    /**
+     * 本地联调代理（real 模式）：把 `/api` 转发到本机网关 daemon。
+     *
+     * · 仅 dev server 生效，构建产物不受影响；
+     * · `VITE_API_MODE` 未设或为 `mock` 时前端根本不发请求，此代理空闲无副作用；
+     * · 目标地址与 daemon 默认管理端口对齐（`http://127.0.0.1:8080`）。
+     */
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true,
+      },
+    },
   },
   build: {
     outDir: 'dist',

@@ -146,7 +146,7 @@ import {
   type TableColumn,
   type DangerFact,
 } from '@ui-kit';
-import { repo, PROTOCOL_OPTIONS, type DeviceRecord } from '../mock/mock-data';
+import { repo, PROTOCOL_OPTIONS, type DeviceRecord } from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();

@@ -339,7 +339,7 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '../mock/mock-data';
+import { repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();

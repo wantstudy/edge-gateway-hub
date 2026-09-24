@@ -276,7 +276,7 @@ import {
   repo,
   type DeviceRecord,
   type PointRecord,
-} from '../mock/mock-data';
+} from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();

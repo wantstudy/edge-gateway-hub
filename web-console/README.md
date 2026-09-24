@@ -225,3 +225,52 @@ web-console/
 - [x] 侧栏可折叠、按运维动线分 5 组、路由高亮跟随当前页
 - [x] 授权页占位**无**任何解绑 / 重置试用 / revoke 按钮
 - [x] 颜色全部经 CSS 变量取自 `ui-kit/tokens.css`，无硬编码色值
+
+---
+
+## 10. 本地联调（mock / real 双模式）
+
+管理台支持两种数据模式，由环境变量 `VITE_API_MODE` 切换（**默认 `mock`**，不发任何网络请求）：
+
+| 模式 | 数据来源 | 登录 | 适用场景 |
+|---|---|---|---|
+| `mock`（默认） | `src/mock/mock-data.ts`（契约与 fallback） | 免登录，默认已登录 | 纯前端演示、无后端环境 |
+| `real` | 真实后端接口（vite proxy → `http://127.0.0.1:8080`） | `POST /api/auth/login`，401 跳登录页 | 本地人工端到端测试 |
+
+### 10.1 启动步骤
+
+**mock 模式（默认）**：
+
+```bash
+cd web-console
+npm run dev          # http://localhost:5274
+```
+
+**real 模式**（先起网关 daemon，再起前端）：
+
+```bash
+# 1. 启动网关 daemon（管理 API 监听 127.0.0.1:8080）
+#    本地联调可用 dev 管理员口令：
+export IOT_DAQ_DEV_ADMIN_PASS='your-dev-pass'
+iot-daq-daemon   # 以仓库实际 daemon 启动命令为准
+
+# 2. 新终端：real 模式启动前端（Windows Git Bash）
+cd web-console
+export VITE_API_MODE=real
+npm run dev          # http://localhost:5274，未登录会被守卫引导到 /login
+```
+
+也可在 `web-console/.env.local` 写入 `VITE_API_MODE=real`（该文件不入库）。
+
+### 10.2 dev 账号
+
+- 用户名：`ops`（以 daemon 侧约定为准）
+- 密码：环境变量 `IOT_DAQ_DEV_ADMIN_PASS` 配置的 dev 管理员口令
+- 登录成功后 token 存 `localStorage`（键 `iot-daq.wc.token`），顶栏展示后端角色原文（`ops` / `lic_ops` / `risk` / `system`），可一键退出。
+
+### 10.3 模式行为说明（容差约定）
+
+- real 模式下启动 / 登录后并行预取 `/api/status · /api/devices · /api/points · /api/outlets · /api/events`；**任一接口失败或为空，对应页面自动回退 mock 数据**，页面不崩。
+- 大数字段（累计计数器 / 序列号等）一律按后端返回的**字符串**直通展示，前端不做 parseFloat。
+- 设备 / 点位 / 编码等**写操作**后端契约尚未覆盖，落在前端本地覆盖层（刷新即失效），仅用于走通页面流程；运维动作（`POST /api/ops/restart`、`POST /api/ops/collectors`、`GET /api/ops/logs`、`GET /api/health`）在 real 模式下走真实接口，403 时提示「权限不足」。
+- proxy 仅 dev server 生效（`vite.config.ts` → `http://127.0.0.1:8080`），构建产物不受影响。

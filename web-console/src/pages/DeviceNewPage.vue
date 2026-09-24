@@ -172,7 +172,7 @@ import {
   PROTOCOL_OPTIONS,
   type ProtocolType,
   type DeviceDraft,
-} from '../mock/mock-data';
+} from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();

@@ -194,7 +194,7 @@ import {
   type DangerFact,
 } from '@ui-kit';
 import { session } from '../store/session';
-import { repo } from '../mock/mock-data';
+import { repo } from '@/api/repo';
 
 // ---------------------------------------------------------------------------
 // 网关基础配置

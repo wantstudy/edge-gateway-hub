@@ -19,6 +19,8 @@ import './styles/global.css';
 
 import App from './App.vue';
 import { router } from './router';
+import { API_MODE, getStoredToken } from './api/client';
+import { preloadRealData } from './api/repo';
 
 const app = createApp(App);
 
@@ -26,4 +28,16 @@ app.use(ArcoVue);
 app.use(ArcoVueIcon);
 app.use(router);
 
-app.mount('#app');
+/**
+ * 启动引导：real 模式且已有 token（页面刷新场景）时，先预取真实数据再挂载，
+ * 保证首屏读到的是后端数据而非 mock 回退；任一接口失败由 repo 层回退 mock 兜底。
+ * mock 模式（默认）与未登录场景直接挂载，无任何网络请求。
+ */
+async function bootstrap(): Promise<void> {
+  if (API_MODE === 'real' && getStoredToken()) {
+    await preloadRealData();
+  }
+  app.mount('#app');
+}
+
+void bootstrap();

@@ -365,7 +365,7 @@ import {
   formatMachineCode,
   type DangerFact,
 } from '@ui-kit';
-import { repo, DEFAULT_ACTOR } from '../mock/mock-data';
+import { repo, DEFAULT_ACTOR } from '@/api/repo';
 import { session } from '../store/session';
 
 // ---------------------------------------------------------------------------

@@ -315,7 +315,7 @@ import {
   type AlarmState,
   type DeviceRecord,
   type ForwarderRecord,
-} from '../mock/mock-data';
+} from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();

@@ -348,7 +348,7 @@ import {
   type SelectOption,
   type RadioOption,
 } from '@ui-kit';
-import { repo, DEFAULT_ACTOR, type Encoding, type ForwarderRecord } from '../mock/mock-data';
+import { repo, DEFAULT_ACTOR, type Encoding, type ForwarderRecord } from '@/api/repo';
 import { session } from '../store/session';
 
 /** 每页条数（出口列表）。 */
