@@ -82,7 +82,9 @@ async fn main() -> ExitCode {
     // ② 共享状态 + 管理面：与 bootstrap 共用同一 DaemonShared（状态/热重载/事件）。
     let shared = DaemonShared::default();
     shared.set_config(Arc::new(ConfigShared::new(config.clone())));
-    let mgmt_state = MgmtState::new(shared.clone(), Arc::new(config));
+    // 写接口落盘路径绑定：与 IOT_DAQ_CONFIG / --config 指向同一文件（热重载同源）。
+    let mgmt_state =
+        MgmtState::new(shared.clone(), Arc::new(config)).with_config_path(args.config_path.clone());
 
     let listener = match tokio::net::TcpListener::bind(&args.bind_addr).await {
         Ok(listener) => listener,

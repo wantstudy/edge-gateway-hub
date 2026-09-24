@@ -161,6 +161,8 @@ mod tests {
             gateway: GatewaySection::default(),
             outlets: Vec::new(),
             points,
+            // 可选 [[devices]] 登记段：测试配置不含设备登记（设备由点位聚合）。
+            devices: Vec::new(),
             // task 57：可选 mgmt_auth 段缺省 None（测试配置不含登录凭证）。
             mgmt_auth: None,
         }

@@ -42,6 +42,7 @@ pub mod auth_login;
 pub mod rbac;
 
 pub mod remote_ops;
+pub mod writeapi;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
@@ -151,10 +152,9 @@ impl EventEnvelope {
 
 /// [`MgmtState`] 内部态。
 struct MgmtStateInner {
-    /// daemon 共享态（生命周期 / 心跳 / 配置 watch 源）。
+    /// daemon 共享态（生命周期 / 心跳 / 配置 watch 源；配置读侧经
+    /// `daemon.config_snapshot()` 取**热重载感知**的最新快照）。
     daemon: DaemonShared,
-    /// 启动时配置快照（V1 聚合口径：REST 返回启动快照，实时变化走事件通道）。
-    startup_config: Arc<GatewayConfig>,
     /// 管理事件广播（并发订阅者即时扇出）。
     events: broadcast::Sender<EventEnvelope>,
     /// 事件历史环（断线重连 / 轮询间隙的事件回放）。
@@ -168,6 +168,9 @@ struct MgmtStateInner {
     auth: rbac::RbacAuth,
     /// task 57：登录凭证 + token 签发器（生产路 / 开发路两路 fail-closed）。
     login: Arc<auth_login::MgmtAuth>,
+    /// 配置写路径（`writeapi` 落盘目标；与热重载监听同一文件。`None` = 未
+    /// 装配，写接口 fail-closed 拒绝）。经 `with_config_path` 装配。
+    config_path: Option<PathBuf>,
 }
 
 /// 管理 API 共享状态（axum `State`；`Clone` 廉价，内部 `Arc`）。
@@ -182,6 +185,8 @@ impl MgmtState {
     /// task 57：鉴权上下文在此一并装配（`auth_login::build` 读环境变量与
     /// 配置内的 `[mgmt_auth]` 可选段；测试可用 [`Self::with_auth`] 覆盖，
     /// 避免测试间环境变量竞争）。
+    /// `startup_config` 仅用于装配期鉴权凭证解析；REST 读侧统一走
+    /// `daemon.config_snapshot()`（热重载感知，见 [`Self::config`]）。
     pub fn new(daemon: DaemonShared, startup_config: Arc<GatewayConfig>) -> Self {
         let (auth, login) =
             auth_login::build(&startup_config, &|key| std::env::var(key).ok());
@@ -189,13 +194,13 @@ impl MgmtState {
         Self {
             inner: Arc::new(MgmtStateInner {
                 daemon,
-                startup_config,
                 events,
                 history: Mutex::new(VecDeque::with_capacity(EVENT_HISTORY_CAPACITY)),
                 next_seq: AtomicU64::new(0),
                 web_dist: None,
                 auth,
                 login: Arc::new(login),
+                config_path: None,
             }),
         }
     }
@@ -234,9 +239,30 @@ impl MgmtState {
         &self.inner.daemon
     }
 
-    /// 启动配置快照。
-    pub fn config(&self) -> &Arc<GatewayConfig> {
-        &self.inner.startup_config
+    /// 当前配置快照（**热重载感知**：读 daemon 共享句柄的最新快照——写接口
+    /// 落盘后经 `ConfigShared::replace` 即时可见；HTTP 响应形状不变）。
+    pub fn config(&self) -> Arc<GatewayConfig> {
+        self.inner.daemon.config_snapshot()
+    }
+
+    /// 配置文件路径（写接口落盘目标；`None` = 未装配，写接口 fail-closed）。
+    pub fn config_path(&self) -> Option<PathBuf> {
+        self.inner.config_path.clone()
+    }
+
+    /// 绑定配置文件路径（写接口落盘目标；须与热重载监听同一文件）。
+    ///
+    /// 必须在 clone / 共享之前调用（与 [`Self::with_web_dist`] 同约束）；
+    /// 实例已被共享时无法写入，记 warn 后忽略——写接口将 fail-closed 拒绝，
+    /// 绝不 panic。
+    pub fn with_config_path(mut self, path: impl Into<PathBuf>) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.config_path = Some(path.into()),
+            None => tracing::warn!(
+                "with_config_path must be called before cloning/sharing; write path not bound"
+            ),
+        }
+        self
     }
 
     /// 发布管理事件：分配序号 → 写历史环 → broadcast 扇出，返回事件序号。
@@ -376,8 +402,18 @@ pub fn router(state: MgmtState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
-        .route("/api/devices", get(devices))
-        .route("/api/points", get(points))
+        // 读接口形状不变；写接口（writeapi）自带 AuthedRole extractor（401）
+        // + ensure()（403）+ 审计，不经过 ops_guard（动作映射仅覆盖 /api/ops/*）。
+        .route("/api/devices", get(devices).post(writeapi::device_create))
+        .route(
+            "/api/devices/:id",
+            axum::routing::put(writeapi::device_update).delete(writeapi::device_delete),
+        )
+        .route("/api/points", get(points).post(writeapi::point_create))
+        .route(
+            "/api/points/:device_id/:point_id",
+            axum::routing::put(writeapi::point_update).delete(writeapi::point_delete),
+        )
         .route("/api/outlets", get(outlets))
         .route("/api/events", get(events))
         .route("/api/auth/login", axum::routing::post(auth_login::login))
@@ -479,8 +515,11 @@ async fn status(State(state): State<MgmtState>) -> Response {
 
 /// GET /api/devices → 设备摘要数组（id/name/protocol/enabled/poll_interval_ms 字符串）。
 ///
-/// 设备从点位平铺行去重推导（保首次出现顺序）；`poll_interval_ms` 取该设备最小
-/// 采集频率（与 bootstrap `build_groups` 的组周期推导口径一致）。
+/// 设备列表 = 点位平铺行去重推导（保首次出现顺序）∪ `[[devices]]` 登记段
+/// （仅无点位设备追加，保持登记顺序）；`poll_interval_ms` 取该设备最小采集
+/// 频率（与 bootstrap `build_groups` 口径一致，无点位设备为 `"0"`）；
+/// `name` / `enabled` 优先取登记段覆盖，`protocol` 优先按点位行推导。
+/// **响应形状不变**：旧配置（无登记段）输出与既有口径逐字节一致。
 async fn devices(State(state): State<MgmtState>) -> Json<Value> {
     let config = state.config();
     let mut order: Vec<String> = Vec::new();
@@ -497,15 +536,33 @@ async fn devices(State(state): State<MgmtState>) -> Json<Value> {
             }
         }
     }
+    // 登记段并入：仅追加点位聚合中不存在的设备（无点位设备的登记行）。
+    for device in &config.devices {
+        if !order.iter().any(|id| id == &device.device_id) {
+            order.push(device.device_id.clone());
+        }
+    }
     let rows: Vec<Value> = order
         .iter()
         .map(|device_id| {
-            let (protocol, freq_ms) = &agg[device_id];
+            let entry = config
+                .devices
+                .iter()
+                .find(|d| &d.device_id == device_id);
+            // 协议：点位行推导优先，回退登记段默认协议，再回退空串。
+            let protocol = agg.get(device_id).map(|(p, _)| p.clone()).or_else(|| {
+                entry.and_then(|d| d.protocol.clone())
+            });
+            let name = entry
+                .and_then(|d| d.name.clone())
+                .unwrap_or_else(|| device_id.clone());
+            let enabled = entry.map(|d| d.enabled).unwrap_or(true);
+            let freq_ms = agg.get(device_id).map(|(_, f)| *f).unwrap_or(0);
             json!({
                 "id": device_id,
-                "name": device_id,
+                "name": name,
                 "protocol": protocol,
-                "enabled": true,
+                "enabled": enabled,
                 "poll_interval_ms": freq_ms.to_string(),
             })
         })

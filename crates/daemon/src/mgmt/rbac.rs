@@ -57,6 +57,7 @@ impl Role {
 
     /// 解析角色字面量（大小写敏感、**不接受别名**：`admin`/`viewer` 等
     /// 历史命名一律 `None`，由上层转 [`JwtError::UnknownRole`] 便于审计区分）。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(raw: &str) -> Option<Self> {
         match raw {
             "ops" => Some(Role::Ops),
@@ -120,6 +121,13 @@ pub enum Permission {
     OpsCollectors,
     /// 运维日志查询（仅 system）。
     OpsLogsRead,
+    // —— mgmt 面新增（设备/点位配置写接口；⚠️ 与前端同步：命名已按点分小写
+    //    预留，前端适配时须在 `ui-kit/src/rbac.ts` 的 `Action` / `ACTION_MATRIX`
+    //    补充 `device.write` / `point.write`——配置写为高危动作，仅 system 可授）——
+    /// 设备配置写（新增 / 启停改名 / 删除，仅 system）。
+    DeviceWrite,
+    /// 点位配置写（新增 / 修改 / 删除，仅 system）。
+    PointWrite,
 }
 
 impl Permission {
@@ -148,6 +156,8 @@ impl Permission {
             Permission::OpsRestart => "ops.restart",
             Permission::OpsCollectors => "ops.collectors",
             Permission::OpsLogsRead => "ops.logs_read",
+            Permission::DeviceWrite => "device.write",
+            Permission::PointWrite => "point.write",
         }
     }
 }
@@ -204,6 +214,9 @@ const PERMS_SYSTEM: &[Permission] = &[
     Permission::OpsRestart,
     Permission::OpsCollectors,
     Permission::OpsLogsRead,
+    // mgmt 面配置写权限（设备/点位 CRUD；仅 system 档可授，与前端同步见 Permission 注释）。
+    Permission::DeviceWrite,
+    Permission::PointWrite,
 ];
 
 /// 角色 → 可授权限集合（**映射关系集中于此一个函数**；改动须与
@@ -506,7 +519,9 @@ mod tests {
     }
 
     /// QA: 四角色权限矩阵与 rbac.ts `ACTION_MATRIX` 逐项对齐
-    /// （顺序镜像前端数组；system 末尾追加 mgmt 面 ops.* 三项）。
+    /// （顺序镜像前端数组；system 末尾追加 mgmt 面权限：ops.* 三项 +
+    /// 配置写 device.write / point.write 两项——均属 mgmt 面新增，
+    /// 前端适配时须同步进 Action / ACTION_MATRIX，见 Permission 注释）。
     #[test]
     fn permission_matrix_matches_frontend_action_matrix() {
         let expected_ops: &[Permission] = &[
@@ -551,6 +566,8 @@ mod tests {
             Permission::OpsRestart,
             Permission::OpsCollectors,
             Permission::OpsLogsRead,
+            Permission::DeviceWrite,
+            Permission::PointWrite,
         ];
 
         assert_eq!(permissions_of(Role::Ops), expected_ops);
@@ -564,6 +581,16 @@ mod tests {
         assert!(!authorize(Role::Risk, Permission::CodeIssue));
         assert!(!authorize(Role::Ops, Permission::KeyRotate));
         assert!(authorize(Role::System, Permission::KeyRotate));
+
+        // 配置写权限仅 system 可授（设备/点位写 = 高危配置动作，见 Permission 注释）。
+        assert!(authorize(Role::System, Permission::DeviceWrite));
+        assert!(authorize(Role::System, Permission::PointWrite));
+        assert!(!authorize(Role::Ops, Permission::DeviceWrite));
+        assert!(!authorize(Role::LicOps, Permission::DeviceWrite));
+        assert!(!authorize(Role::Risk, Permission::DeviceWrite));
+        assert!(!authorize(Role::Ops, Permission::PointWrite));
+        assert!(!authorize(Role::LicOps, Permission::PointWrite));
+        assert!(!authorize(Role::Risk, Permission::PointWrite));
     }
 
     /// QA: remote_ops 动作字面量 → mgmt 面权限映射稳定（task 57 全量接线依据）；

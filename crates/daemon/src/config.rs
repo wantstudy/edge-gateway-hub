@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 // `watch` 方法来自 Watcher trait，必须在作用域内。
 use notify::Watcher as _;
 
@@ -52,7 +52,7 @@ fn default_heartbeat_secs() -> u64 {
 }
 
 /// 北向出口编码（每路出口独立可选；计划决议：protobuf 默认 / json 可选）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutletEncoding {
     /// Protobuf 编码（默认）。
@@ -63,7 +63,7 @@ pub enum OutletEncoding {
 }
 
 /// 授权配置雏形（task 22-24 填充语义）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LicensingSection {
     /// 云授权服务地址；None = 纯本地模式（C 档雏形）。
@@ -82,7 +82,7 @@ impl Default for LicensingSection {
 }
 
 /// 缓存配置雏形（task 17-18 填充 SQLite 细节）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CacheSection {
     /// 缓存库文件路径（相对 data_dir）。
@@ -104,7 +104,7 @@ impl Default for CacheSection {
 }
 
 /// 安全配置雏形（task 25/31/34 填充 SQLCipher / TLS 细节）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SecuritySection {
     /// 北向/界面 TLS 证书路径。
@@ -126,7 +126,7 @@ impl Default for SecuritySection {
 }
 
 /// 管理面登录账号（task 57 全量接线：生产路凭证来源）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MgmtAuthUser {
     /// 用户名（登录主体；登录时精确匹配）。
     pub name: String,
@@ -140,7 +140,7 @@ pub struct MgmtAuthUser {
 
 /// 管理面登录凭证段（**可选**；缺省时生产路无凭证，登录仅开发路可用，
 /// 详见 `mgmt::auth_login` 的两路 fail-closed 说明）。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MgmtAuthSection {
     /// 登录账号列表（空列表 = 无任何登录凭证 → 登录端点全拒）。
     #[serde(default)]
@@ -148,7 +148,7 @@ pub struct MgmtAuthSection {
 }
 
 /// `[gateway]` 命名空间。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GatewaySection {
     /// 网关标识（平台侧登记）。
@@ -176,7 +176,7 @@ impl Default for GatewaySection {
 }
 
 /// `[[outlets]]` 北向出口（每路独立：broker / topic / qos / tls / 编码）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutletConfig {
     /// 出口名（唯一键，日志与诊断用）。
     pub name: String,
@@ -197,7 +197,7 @@ pub struct OutletConfig {
 }
 
 /// `[[points]]` 点位平铺行（设备级字段随行冗余，便于批量导入导出）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PointConfig {
     /// 南向设备标识。
     pub device_id: String,
@@ -212,8 +212,33 @@ pub struct PointConfig {
     pub frequency_ms: u64,
 }
 
+/// 设备登记行（可选 `[[devices]]` 段；管理面写接口的设备事实源）。
+///
+/// 设计取舍：设备列表 = 本段 ∪ `points.device_id` 去重聚合。**点位行仍是采集
+/// 唯一事实源**——设备的协议 / 频率始终优先按点位行推导；本段只承载「无点位
+/// 设备的登记」与「显示名 / 启停覆盖」，旧配置无此段时 serde default 为空列表，
+/// 完全向后兼容。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeviceConfig {
+    /// 设备标识（唯一键；与点位行的 `device_id` 同一命名空间）。
+    pub device_id: String,
+    /// 显示名（`None` = 展示层回退 `device_id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 启停（缺省 `true`）。
+    #[serde(default = "default_device_enabled")]
+    pub enabled: bool,
+    /// 设备默认协议（可选；仅当该设备无点位行时在设备摘要中展示）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+fn default_device_enabled() -> bool {
+    true
+}
+
 /// 网关强类型配置根。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct GatewayConfig {
     /// `[gateway]` 命名空间。
@@ -222,9 +247,14 @@ pub struct GatewayConfig {
     pub outlets: Vec<OutletConfig>,
     /// `[[points]]` 点位列表。
     pub points: Vec<PointConfig>,
+    /// `[[devices]]` 设备登记段（**可选**，向后兼容：缺省空列表；见
+    /// [`DeviceConfig`] 的取舍说明。序列化时空列表省略，避免旧版本 daemon
+    /// 拒读新字段）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceConfig>,
     /// `[mgmt_auth]` 管理面登录凭证段（**可选**；缺省 = 生产路未配置凭证，
     /// 登录走 `mgmt::auth_login` 的开发路 / fail-closed 逻辑，既有字段语义不变）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mgmt_auth: Option<MgmtAuthSection>,
 }
 
@@ -249,6 +279,67 @@ impl GatewayConfig {
     pub fn parse(raw: &str) -> DaemonResult<Self> {
         Ok(toml::from_str(raw)?)
     }
+
+    /// 保存配置到 TOML 文件（管理面写路径）：
+    /// toml 序列化 → `backup_before_rewrite` 写前原子备份 → 临时文件 + fsync +
+    /// 同目录 rename 原子落盘。任一步失败即中止，原文件保持写前状态（或可从
+    /// `.bak-<unix秒>` 备份恢复）。
+    ///
+    /// # Errors
+    /// - 序列化失败 → [`DaemonError::ConfigError`]；
+    /// - 备份 / 写盘失败 → [`DaemonError::StorageError`]（临时半成品一律清理）。
+    pub fn save(&self, path: impl AsRef<Path>) -> DaemonResult<()> {
+        let path = path.as_ref();
+        let raw = toml::to_string_pretty(self)
+            .map_err(|e| DaemonError::ConfigError(format!("serialize config: {e}")))?;
+        let backup = crate::migrations::backup_before_rewrite(path)?;
+        tracing::info!(
+            target: "daemon::config",
+            path = %path.display(),
+            backup = %backup.display(),
+            "config: backup created before rewrite"
+        );
+        atomic_write(path, raw.as_bytes())?;
+        Ok(())
+    }
+}
+
+/// 原子写文件：同目录临时文件 + fsync + rename（与 `backup_before_rewrite`
+/// 同一原子性口径；失败清理半成品临时文件，绝不 panic）。
+fn atomic_write(path: &Path, data: &[u8]) -> DaemonResult<()> {
+    use std::io::Write as IoWrite;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config")
+        .to_string();
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DaemonError::StorageError(format!(
+            "atomic write {}: {e}",
+            tmp.display()
+        )));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DaemonError::StorageError(format!(
+            "atomic write rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// 共享配置快照：读侧拿 `Arc<GatewayConfig>` 快照 + 版本号探测变更。
@@ -288,6 +379,13 @@ impl ConfigShared {
         *guard = Arc::new(config);
         drop(guard);
         self.version.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// 原子替换快照并递增版本（管理面写路径专用）：`GatewayConfig::save`
+    /// 落盘成功后调用，读侧**即时**可见新配置，无需等待 notify 防抖窗口。
+    /// 随后 notify watch 对磁盘的重读为同内容幂等重放（版本再 +1，无害）。
+    pub fn replace(&self, config: GatewayConfig) -> u64 {
+        self.store(config)
     }
 }
 
@@ -610,5 +708,83 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             "previous config must survive"
         );
         drop(reloader);
+    }
+
+    /// QA: 管理面写路径 `save()`——落盘内容可往返解析、写前备份文件产生且
+    /// 内容为写前快照、临时半成品不残留。
+    #[test]
+    fn save_roundtrips_and_creates_backup_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXAMPLE_TOML).expect("seed");
+        let original_raw = EXAMPLE_TOML.to_string();
+
+        let mut config = GatewayConfig::load(&path).expect("load");
+        // 模拟管理面写操作：追加设备登记。
+        config.devices.push(DeviceConfig {
+            device_id: "dev-02".to_string(),
+            name: Some("二号设备".to_string()),
+            enabled: false,
+            protocol: Some("s7".to_string()),
+        });
+        config.save(&path).expect("save");
+
+        // 落盘内容可重新解析且语义一致。
+        let reloaded = GatewayConfig::load(&path).expect("reload");
+        assert_eq!(reloaded.devices.len(), 1);
+        assert_eq!(reloaded.devices[0].device_id, "dev-02");
+        assert!(!reloaded.devices[0].enabled);
+        assert_eq!(reloaded.devices[0].protocol.as_deref(), Some("s7"));
+        assert_eq!(reloaded.points[0].frequency_ms, 100);
+        assert_eq!(reloaded.gateway.gateway_id, "gw-alpha");
+
+        // 写前备份存在且逐字节为写前快照。
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("config.toml.bak-"))
+            .collect();
+        assert!(!backups.is_empty(), "backup file must be created");
+        let backup_raw = std::fs::read_to_string(backups[0].path()).expect("read backup");
+        assert_eq!(
+            backup_raw, original_raw,
+            "backup must be the pre-write snapshot"
+        );
+
+        // 无 .tmp 半成品残留。
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no tmp leftovers: {leftovers:?}");
+    }
+
+    /// QA: `[[devices]]` 可选段向后兼容——旧配置（无 devices 段）解析为空列表；
+    /// 空列表序列化时省略该键（旧版本 daemon 仍可读新写出的文件）。
+    #[test]
+    fn devices_section_is_backward_compatible() {
+        // 旧配置无 devices 段 → serde default 空列表。
+        let config = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy config");
+        assert!(
+            config.devices.is_empty(),
+            "legacy config without [[devices]] must default to empty"
+        );
+
+        // 空列表序列化时省略 devices 键。
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !raw.contains("devices"),
+            "empty devices must be skipped when serializing: {raw}"
+        );
+
+        // 带 devices 段的配置序列化 → `[[devices]]` 数组表。
+        let with_devices = GatewayConfig::parse("[[devices]]\ndevice_id = \"dev-x\"\nenabled = true\n")
+            .expect("parse devices");
+        let raw = toml::to_string_pretty(&with_devices).expect("serialize");
+        assert!(raw.contains("[[devices]]"), "devices section emitted: {raw}");
+        assert!(raw.contains("device_id = \"dev-x\""));
+        // mgmt_auth None 不产生空表垃圾。
+        assert!(!raw.contains("mgmt_auth"));
     }
 }

@@ -75,6 +75,19 @@ pub enum OpsAction {
     CollectorsResume,
     /// 运维日志查询。
     LogsRead,
+    // —— 设备/点位配置写（mgmt writeapi；写动作含被拒均入审计环）——
+    /// 设备登记（`POST /api/devices`）。
+    DeviceCreate,
+    /// 设备改名/启停（`PUT /api/devices/{id}`）。
+    DeviceUpdate,
+    /// 设备删除（`DELETE /api/devices/{id}`）。
+    DeviceDelete,
+    /// 点位新增（`POST /api/points`）。
+    PointCreate,
+    /// 点位修改（`PUT /api/points/{device_id}/{point_id}`）。
+    PointUpdate,
+    /// 点位删除（`DELETE /api/points/{device_id}/{point_id}`）。
+    PointDelete,
 }
 
 impl OpsAction {
@@ -85,6 +98,12 @@ impl OpsAction {
             OpsAction::CollectorsPause => "collectors_pause",
             OpsAction::CollectorsResume => "collectors_resume",
             OpsAction::LogsRead => "logs_read",
+            OpsAction::DeviceCreate => "device_create",
+            OpsAction::DeviceUpdate => "device_update",
+            OpsAction::DeviceDelete => "device_delete",
+            OpsAction::PointCreate => "point_create",
+            OpsAction::PointUpdate => "point_update",
+            OpsAction::PointDelete => "point_delete",
         }
     }
 }
@@ -704,9 +723,9 @@ pub async fn logs(
     let rows: Vec<Value> = runtime
         .log_snapshot()
         .iter()
-        .filter(|entry| level.map_or(true, |name| entry.event.type_name() == name))
-        .filter(|entry| since.map_or(true, |s| entry.ts_ms >= s))
-        .filter(|entry| until.map_or(true, |u| entry.ts_ms <= u))
+        .filter(|entry| level.is_none_or(|name| entry.event.type_name() == name))
+        .filter(|entry| since.is_none_or(|s| entry.ts_ms >= s))
+        .filter(|entry| until.is_none_or(|u| entry.ts_ms <= u))
         .map(log_entry_to_json)
         .collect();
 
