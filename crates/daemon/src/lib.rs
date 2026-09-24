@@ -16,6 +16,7 @@
 //! 规划模块（后续任务逐步填充）：
 //! - `north`    北向 MQTT 转发（Wave 3 task 19+）
 
+pub mod audit;
 pub mod auth;
 pub mod backpressure;
 pub mod bootstrap;
@@ -25,6 +26,7 @@ pub mod driver;
 pub mod error;
 pub mod formula;
 pub mod hardening;
+pub mod license;
 pub mod logging;
 pub mod mgmt;
 pub mod migrations;

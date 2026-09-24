@@ -9,8 +9,14 @@
 //!   fail-safe 受限模式继续，debug 构建跳过）；OTA 启动判定钩子（task 35
 //!   `boot_commit_or_rollback`，回滚显式 [WARN]）。SQLite 分库（telemetry/queue）
 //!   的迁移框架接线在各库模块内完成（task 55 `run_migrations`）。
-//! - **不做**：真实北向连接（经 `north_starter` / `north_stopper` 钩子解耦，task 19+ 集成）；
-//!   OfflineQueue 实例装配（task 17/18 集成后把 flush 钩子替换为真实调用）。
+//!   **北向运行期接线（task 19 + task 54 最后一跳）**：注入 [`NorthRuntimeConfig`]
+//!   后，Running 前按 `[[outlets]]` 构造 [`crate::north::runtime::NorthRuntime`]
+//!   （每个出口一个 `MqttClient` + `NorthOutlet`：有界发送队列 / PUBACK 门控确认 /
+//!   补发幂等 / 审计取走上报）并起驱动任务；运行期句柄挂在 [`DaemonShared`]
+//!   （[`DaemonShared::north_runtime`]）供采集侧投递与 mgmt 观测；停机步骤 3 中止
+//!   全部驱动任务。
+//! - **不做**：MQTT 协议本身与出口选路（= `north` 域）；`OfflineQueue` 实例的
+//!   **创建**由装配方完成（见 [`NorthRuntimeConfig::queue`]，bootstrap 只消费）。
 //!
 //! ## 实现红线
 //! - 仅用 workspace 已锁定依赖；错误收敛为 [`DaemonError`]。
@@ -25,10 +31,13 @@
 //! 2. 看门狗重启 = **单次**调用 `watchdog_restart` 钩子（默认 no-op warn）：
 //!    V1 无法重建已被消费的 `RunningScheduler`，仅记录 + 钩子回调；
 //!    组件级真正的重启留待装配闭环任务。
-//! 3. 离线队列 flush 为钩子（默认 no-op + TODO）：bootstrap 尚不持有 `OfflineQueue`
-//!    实例（其构造需要 db 路径与 gateway_id 装配决策），集成任务接入后替换。
+//! 3. 离线队列 flush 为钩子（默认 no-op + TODO）：bootstrap 只**消费**装配方注入的
+//!    `OfflineQueue`，不负责其创建（构造需要 db 路径与 gateway_id 装配决策）。
 //! 4. `run()` 支持外部注入 [`DaemonShared`]（[`BootstrapBuilder::with_shared`]）：
 //!    管理 API（mgmt）与北向都需要在运行期持有同一句柄，故不能只在 run 结束时返回。
+//! 5. 北向出口的 **TLS/mTLS 在 V1 不可接线**（`[[outlets]]` 无证书字段且不得新增
+//!    配置段）：此类出口被显式拒绝并计入
+//!    [`crate::north::runtime::NorthRuntimeStats::skipped`]，**不静默退化为明文**。
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -45,6 +54,8 @@ use tracing::{error, info, warn};
 use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig};
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
+use crate::license::{LicenseRuntime, LicenseRuntimeConfig};
+use crate::north::runtime::{NorthRuntime, NorthRuntimeConfig};
 use crate::ota::OtaBootDecision;
 use crate::scheduler::{GroupConfig, GroupScheduler, PollHandler, RunningScheduler};
 
@@ -104,6 +115,16 @@ struct DaemonSharedInner {
     shutdown_tx: watch::Sender<bool>,
     /// 优雅停机是否超宽限期被中止（诊断 / 测试观测）。
     shutdown_timed_out: AtomicBool,
+    /// 北向运行期句柄（task 19 + task 54 最后一跳；`None` = 尚未启动 / 未接线）。
+    ///
+    /// 挂在此处而非 `run` 返回值：采集侧（pipeline / scheduler）与 mgmt 探测都
+    /// 需要在运行期通过 [`DaemonShared::north_runtime`] 拿到同一句柄。
+    north: RwLock<Option<Arc<NorthRuntime>>>,
+    /// 授权运行期句柄（task 22/23/24 运行期接线；`None` = 未接线 / 尚未启动）。
+    ///
+    /// 采集侧 / mgmt / 测试据此在运行期读取授权状态（[`LicenseRuntime::state`]）与
+    /// 北向转发判据（[`LicenseRuntime::north_forward_allowed`]）。
+    license: RwLock<Option<Arc<LicenseRuntime>>>,
 }
 
 /// daemon 全局共享状态：生命周期 / 心跳 / 配置快照（task 51）。
@@ -129,6 +150,8 @@ impl DaemonShared {
                 reload_tx,
                 shutdown_tx,
                 shutdown_timed_out: AtomicBool::new(false),
+                north: RwLock::new(None),
+                license: RwLock::new(None),
             }),
         }
     }
@@ -233,6 +256,54 @@ impl DaemonShared {
     pub fn shutdown_timed_out(&self) -> bool {
         self.inner.shutdown_timed_out.load(Ordering::Relaxed)
     }
+
+    /// 挂载北向运行期句柄（bootstrap 在 Running 前调用一次）。
+    ///
+    /// 重复调用只替换句柄（旧句柄的驱动任务由调用方负责中止）。
+    pub fn set_north_runtime(&self, runtime: Arc<NorthRuntime>) {
+        let mut guard = self
+            .inner
+            .north
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(runtime);
+    }
+
+    /// 北向运行期句柄（`None` = 未接线 / 尚未启动）。
+    ///
+    /// 采集侧据此投递批次（[`NorthRuntime::submit`]，同步不阻塞）；mgmt / 测试
+    /// 据此观测出口与驱动统计（[`NorthRuntime::stats`]）。
+    pub fn north_runtime(&self) -> Option<Arc<NorthRuntime>> {
+        self.inner
+            .north
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 挂载授权运行期句柄（bootstrap 在 Running 前调用一次）。
+    ///
+    /// 照 [`DaemonShared::set_north_runtime`] 的「注入后只读共享」范式：
+    /// 重复调用只替换句柄；未注入时保持 `None`，不 panic。
+    pub fn set_license_runtime(&self, runtime: Arc<LicenseRuntime>) {
+        let mut guard = self
+            .inner
+            .license
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(runtime);
+    }
+
+    /// 授权运行期句柄（`None` = 未接线 / 尚未启动）。
+    ///
+    /// 采集侧 / mgmt / 测试据此读取授权状态与北向转发判据。
+    pub fn license_runtime(&self) -> Option<Arc<LicenseRuntime>> {
+        self.inner
+            .license
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl Default for DaemonShared {
@@ -249,6 +320,14 @@ impl std::fmt::Debug for DaemonShared {
             .field("last_heartbeat_ns", &self.last_heartbeat_ns())
             .field("config_version", &self.config_version())
             .field("shutdown_timed_out", &self.shutdown_timed_out())
+            .field(
+                "north_outlets",
+                &self.north_runtime().map_or(0, |rt| rt.outlet_count()),
+            )
+            .field(
+                "license_state",
+                &self.license_runtime().map(|rt| rt.state().name()),
+            )
             .finish()
     }
 }
@@ -298,6 +377,10 @@ pub struct BootstrapBuilder {
     watchdog_restart: Option<StopHook>,
     /// OTA 启动判定钩子（task 35 接线；`None` = no-op warn）。
     ota_boot_check: Option<OtaBootCheckHook>,
+    /// 北向运行期装配输入（task 19 + task 54 最后一跳；`None` = 未接线，仅 warn）。
+    north: Option<NorthRuntimeConfig>,
+    /// 授权运行期装配输入（task 22/23/24；`None` = 未接线，跳过授权编排）。
+    license: Option<LicenseRuntimeConfig>,
 }
 
 impl BootstrapBuilder {
@@ -316,6 +399,8 @@ impl BootstrapBuilder {
             offline_flusher: None,
             watchdog_restart: None,
             ota_boot_check: None,
+            north: None,
+            license: None,
         }
     }
 
@@ -368,6 +453,32 @@ impl BootstrapBuilder {
         self
     }
 
+    /// 注入北向运行期装配输入（task 19 + task 54 的**最后一跳**）。
+    ///
+    /// Running 前 bootstrap 会按配置里的 `[[outlets]]` 为每个出口构造
+    /// `MqttClient` + `NorthOutlet`（有界发送队列 / PUBACK 门控确认 / 补发幂等 /
+    /// 审计取走上报）并启动驱动任务；句柄挂到 [`DaemonShared::north_runtime`]，
+    /// 停机步骤 3 中止全部驱动任务。
+    ///
+    /// 未注入时北向**不启动**：配置里声明了 `[[outlets]]` 则记 `error!`
+    /// （绝不静默放过），否则记 `info!`。
+    pub fn with_north_runtime(mut self, cfg: NorthRuntimeConfig) -> Self {
+        self.north = Some(cfg);
+        self
+    }
+
+    /// 注入授权运行期装配输入（task 22/23/24 运行期接线）。
+    ///
+    /// Running 前 bootstrap 会构造 [`LicenseRuntime`]、启动其 `step` 循环并把句柄挂到
+    /// [`DaemonShared::license_runtime`]；停机步骤通知该循环优雅退出。
+    ///
+    /// 未注入时授权编排**不启动**：`DaemonShared::license_runtime()` 保持 `None`，
+    /// 其余装配行为与现状完全一致（纯 UI / 库测试场景不受影响）。
+    pub fn with_license_runtime(mut self, cfg: LicenseRuntimeConfig) -> Self {
+        self.license = Some(cfg);
+        self
+    }
+
     /// 注入离线队列 flush 钩子（缺省 no-op + TODO，见模块注释限制 3）。
     pub fn with_offline_flusher(mut self, hook: StopHook) -> Self {
         self.offline_flusher = Some(hook);
@@ -397,7 +508,7 @@ impl BootstrapBuilder {
     ///
     /// # Errors
     /// 配置初始加载 / watcher 初始化失败 → [`DaemonError`]（此时未产生任何后台任务）。
-    pub async fn run(self) -> DaemonResult<DaemonShared> {
+    pub async fn run(mut self) -> DaemonResult<DaemonShared> {
         // ① 初始化共享状态。
         let shared = self.shared.clone().unwrap_or_default();
         shared.set_state(LifecycleState::Starting);
@@ -465,12 +576,76 @@ impl BootstrapBuilder {
             }
         };
 
-        // ④ 北向启动钩子。
+        // ④ 北向启动（task 19 + task 54 的**最后一跳**）：把 `MqttClient` +
+        //    `NorthOutlet` 真正接到运行期，替换原先的 no-op 占位。
+        //
+        // 注入 `NorthRuntimeConfig` 后，按配置 `[[outlets]]` 为每个出口构造
+        // `MqttClient` + `NorthOutlet`（有界发送队列 / PUBACK 门控确认 / 补发幂等 /
+        // 审计取走上报）并起驱动任务；句柄挂到 [`DaemonShared::north_runtime`]，
+        // 供采集侧在运行期投递（`NorthRuntime::submit`）、mgmt 观测；停机步骤 3
+        // 中止全部驱动任务。**未注入**时按是否声明 `[[outlets]]` 记 error/info
+        // （绝不静默放过已声明的出口）。
+        match self.north.take() {
+            Some(cfg) => {
+                let snapshot = config_shared.snapshot();
+                let runtime = Arc::new(NorthRuntime::start(
+                    snapshot.gateway.gateway_id.as_str(),
+                    &snapshot.outlets,
+                    cfg,
+                    shared.subscribe_shutdown(),
+                ));
+                let stats = runtime.stats();
+                if stats.skipped > 0 {
+                    error!(
+                        started = stats.outlets,
+                        skipped = stats.skipped,
+                        "bootstrap: [ERROR] some north outlets were rejected at startup \
+                         (invalid broker / unsupported TLS); northbound is degraded there"
+                    );
+                }
+                info!(
+                    outlets = stats.outlets,
+                    names = ?runtime.outlet_names(),
+                    "bootstrap: north runtime started"
+                );
+                shared.set_north_runtime(runtime);
+            }
+            None => {
+                let outlets = config_shared.snapshot().outlets.len();
+                if outlets == 0 {
+                    info!("bootstrap: north runtime not injected; no [[outlets]] declared");
+                } else {
+                    error!(
+                        outlets,
+                        "bootstrap: [ERROR] [[outlets]] declared but north runtime not injected; \
+                         northbound will NOT send (call BootstrapBuilder::with_north_runtime)"
+                    );
+                }
+            }
+        }
+        // 可选北向启动扩展钩子（运行期就绪后调用一次；缺省 no-op warn，向后兼容）。
         match &self.north_starter {
             Some(hook) => hook(shared.clone()).await,
-            None => warn!(
-                "bootstrap: north_starter not configured; northbound not started (no-op hook)"
-            ),
+            None => {
+                warn!("bootstrap: north_starter hook not configured (optional extension point)")
+            }
+        }
+
+        // ④-b 授权运行期接线（task 22/23/24）：注入 `LicenseRuntimeConfig` 后构造
+        //     [`LicenseRuntime`]、启动其 `step` 循环并把句柄挂到
+        //     [`DaemonShared::license_runtime`]；停机步骤通知该循环退出。
+        //     **未注入**时跳过（库 / 纯 UI 场景行为不变，`license_runtime()` 保持 `None`）。
+        match self.license.take() {
+            Some(cfg) => {
+                let runtime = Arc::new(LicenseRuntime::new(cfg));
+                // 驱动任务自行在后台跑；句柄经 DaemonShared 共享给采集侧 / mgmt。
+                let _driver = runtime.clone().spawn();
+                shared.set_license_runtime(runtime);
+                info!("bootstrap: license runtime started");
+            }
+            None => {
+                info!("bootstrap: license runtime not injected (no licensing orchestration)");
+            }
         }
 
         shared.set_state(LifecycleState::Running);
@@ -687,7 +862,7 @@ async fn graceful_shutdown(
 ) {
     shared.set_state(LifecycleState::Stopping);
     info!("bootstrap: graceful shutdown started");
-    let steps = shutdown_sequence(builder, scheduler);
+    let steps = shutdown_sequence(shared, builder, scheduler);
     match tokio::time::timeout(builder.shutdown_grace, steps).await {
         Ok(()) => {
             shared.set_state(LifecycleState::Stopped);
@@ -706,7 +881,11 @@ async fn graceful_shutdown(
 /// 停机三步骤：调度器 → 离线队列 flush → 北向停止。
 ///
 /// 每步之间 `yield_now`：给 watch 订阅方（mgmt SSE / 测试断言）一个确定的观察点。
-async fn shutdown_sequence(builder: &BootstrapBuilder, scheduler: Option<RunningScheduler>) {
+async fn shutdown_sequence(
+    shared: &DaemonShared,
+    builder: &BootstrapBuilder,
+    scheduler: Option<RunningScheduler>,
+) {
     // ① 调度器停：中止并等待全部组任务退出。
     if let Some(scheduler) = scheduler {
         scheduler.shutdown().await;
@@ -728,12 +907,29 @@ async fn shutdown_sequence(builder: &BootstrapBuilder, scheduler: Option<Running
     info!("bootstrap: shutdown step 2/3 offline queue flushed");
     tokio::task::yield_now().await;
 
-    // ③ 北向停止钩子。
+    // ③ 北向停止：先中止全部驱动任务（幂等、不阻塞宽限期），再调可选停止钩子。
+    if let Some(runtime) = shared.north_runtime() {
+        runtime.shutdown();
+        info!(
+            outlets = runtime.outlet_count(),
+            "bootstrap: north runtime driver tasks aborted"
+        );
+    }
     match &builder.north_stopper {
         Some(hook) => hook().await,
         None => warn!("bootstrap: north_stopper not configured (no-op hook)"),
     }
     info!("bootstrap: shutdown step 3/3 northbound stopped");
+    tokio::task::yield_now().await;
+
+    // ④ 授权运行期停机：通知其 `step` 循环优雅退出（幂等、不阻塞宽限期）。
+    if let Some(runtime) = shared.license_runtime() {
+        runtime.shutdown();
+        info!(
+            state = runtime.state().name(),
+            "bootstrap: license runtime shutdown signalled"
+        );
+    }
     tokio::task::yield_now().await;
 }
 
@@ -867,6 +1063,10 @@ fn build_groups(config: &GatewayConfig) -> Vec<GroupConfig> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    use crate::auth::client::{LicensingClient, LicensingClientConfig};
+    use crate::auth::machine_id::{FingerprintKey, MachineIdentity, StaticAnchor};
+    use crate::auth::signing::{AuthSigner, LicenseGate, StaticKeyProvider};
 
     /// 最小可加载配置（ConfigHotReloader 要求真实文件）。
     const TEST_TOML: &str = r#"
@@ -1358,5 +1558,242 @@ frequency_ms = 3000
         .await;
         shared.request_shutdown();
         handle.await.expect("run task joins").expect("run ok");
+    }
+
+    // ---- 集成波次接线：北向运行期（task 19 + task 54 最后一跳） ----
+
+    /// 记录型审计出口：累计收到的事件条数（接线证明用）。
+    #[derive(Default)]
+    struct CountingAuditSink {
+        emitted: Mutex<usize>,
+    }
+
+    impl crate::north::mqtt::AuditSink for CountingAuditSink {
+        fn emit(&self, events: Vec<crate::backpressure::BackpressureAudit>) {
+            if let Ok(mut guard) = self.emitted.lock() {
+                *guard = guard.saturating_add(events.len());
+            }
+        }
+    }
+
+    /// 在临时目录打开一个真实 [`OfflineQueue`]（落盘降级 + 补发源）。
+    fn temp_queue(dir: &tempfile::TempDir) -> Arc<crate::offline_queue::OfflineQueue> {
+        let cfg = crate::offline_queue::QueueConfig::new(dir.path().join("queue.db"), "gw-test")
+            .expect("queue cfg");
+        Arc::new(
+            crate::offline_queue::OfflineQueue::open(
+                cfg,
+                Arc::new(crate::offline_queue::SystemClock),
+            )
+            .expect("open queue"),
+        )
+    }
+
+    /// 接线证明（**摘掉接线即失败**）：注入 `NorthRuntimeConfig` 后，
+    /// 出口注册表挂到 `DaemonShared::north_runtime`、驱动任务真的在跑
+    /// （`poll_cycles` 增长）、停机时驱动任务被全部中止。
+    #[tokio::test(start_paused = true)]
+    async fn north_runtime_wires_outlets_and_driver_task_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = temp_queue(&dir);
+        let shared = DaemonShared::new();
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers()
+            .with_north_runtime(NorthRuntimeConfig::new(
+                Arc::clone(&queue),
+                Arc::new(crate::offline_queue::SystemClock),
+                Arc::new(CountingAuditSink::default()),
+            ));
+
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
+
+        // 接线点：句柄可经 DaemonShared 拿到（采集侧运行期投递入口）。
+        let runtime = shared
+            .north_runtime()
+            .expect("north runtime must be wired into DaemonShared");
+        assert_eq!(runtime.outlet_count(), 1, "one outlet from [[outlets]]");
+        assert_eq!(runtime.outlet_names(), vec!["north-1"]);
+        assert!(
+            runtime.outlet("north-1").is_some(),
+            "outlet reachable by name"
+        );
+        assert!(
+            matches!(
+                runtime.submit("north-1", 1, vec![1, 2, 3]),
+                Ok(crate::backpressure::PushOutcome::Admitted)
+            ),
+            "fresh send queue must admit the batch (non-blocking ingest is wired)"
+        );
+
+        // 驱动任务真的在跑：推进虚拟时间越过一个 tick（首拍已消费）。
+        let mut cycles = runtime.stats().poll_cycles;
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+            let now = runtime.stats().poll_cycles;
+            if now > cycles {
+                cycles = now;
+                break;
+            }
+        }
+        assert!(
+            cycles > 0,
+            "driver task must execute poll cycles (wiring removed → stays 0)"
+        );
+
+        shared.request_shutdown();
+        handle.await.expect("run task joins").expect("run ok");
+        assert_eq!(
+            runtime.running_tasks(),
+            0,
+            "shutdown step 3 must abort all north driver tasks"
+        );
+    }
+
+    /// 反向接线证明：未注入 `NorthRuntimeConfig` → `DaemonShared` 无北向句柄
+    /// （与上一个测试互为对照，共同锁定「接线存在」这一事实）。
+    #[tokio::test(start_paused = true)]
+    async fn north_runtime_absent_without_injection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = DaemonShared::new();
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers();
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
+        assert!(
+            shared.north_runtime().is_none(),
+            "no injection → no runtime (wiring is what creates it)"
+        );
+        shared.request_shutdown();
+        handle.await.expect("run task joins").expect("run ok");
+    }
+
+    // ---- 集成波次接线：授权运行期（task 22/23/24） ----
+
+    /// 恒开放行的测试闸门（`AuthSigner` 需要；本测试不签名）。
+    struct BootstrapAlwaysLicensed;
+    impl LicenseGate for BootstrapAlwaysLicensed {
+        fn can_sign(&self) -> bool {
+            true
+        }
+    }
+
+    /// 构造测试用机器码指纹（64 hex）。
+    fn bootstrap_test_mid() -> String {
+        let identity = MachineIdentity::new(
+            vec![Box::new(StaticAnchor::new(
+                "boot-anchor",
+                Some("gw-license-001"),
+            ))],
+            1,
+            FingerprintKey::from_bytes(b"TEST_ONLY_bootstrap_fp_key".to_vec())
+                .expect("non-empty fp key"),
+        );
+        identity
+            .get_machine_fingerprint()
+            .expect("quorum ok: 1 usable anchor")
+    }
+
+    /// 构造一个未接线 transport 的授权客户端（纯本地 C 档）。
+    fn bootstrap_test_license_client() -> Arc<LicensingClient> {
+        let mid = bootstrap_test_mid();
+        let signer = Arc::new(
+            AuthSigner::new(
+                Arc::new(StaticKeyProvider::new([0x1au8; 32])),
+                Arc::new(BootstrapAlwaysLicensed),
+                mid.clone(),
+            )
+            .expect("mid is 64-hex"),
+        );
+        let cfg = LicensingClientConfig::new("https://licensing.test/v1", 24, 10, 30)
+            .expect("non-empty url");
+        Arc::new(LicensingClient::new(cfg, signer, mid))
+    }
+
+    /// 接线证明：注入 `LicenseRuntimeConfig` 后句柄挂到 `DaemonShared::license_runtime`，
+    /// 启动即步进（纯本地 → `Trial`），且停机时循环被通知退出（run 正常返回）。
+    #[tokio::test(start_paused = true)]
+    async fn license_runtime_wires_and_shuts_down() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = DaemonShared::new();
+        let rt_cfg =
+            LicenseRuntimeConfig::new(bootstrap_test_license_client(), dir.path().join("data"));
+
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers()
+            .with_license_runtime(rt_cfg);
+
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
+
+        let runtime = shared
+            .license_runtime()
+            .expect("license runtime must be wired into DaemonShared");
+
+        // 驱动循环启动即步进一次（首拍立即触发）；让独立任务推进。
+        for _ in 0..50 {
+            if runtime.is_initialized() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert!(
+            runtime.is_initialized(),
+            "startup phase must have run at least once"
+        );
+        assert_eq!(runtime.state().name(), "Trial", "pure-local start ⇒ Trial");
+        assert!(
+            runtime.north_forward_allowed(),
+            "Trial must allow northbound forward"
+        );
+
+        shared.request_shutdown();
+        let result = handle.await.expect("run task joins").expect("run ok");
+        assert_eq!(
+            result.state(),
+            LifecycleState::Stopped,
+            "license runtime shutdown must not block graceful stop"
+        );
+    }
+
+    /// 反向接线证明：未注入 `LicenseRuntimeConfig` → `DaemonShared::license_runtime()`
+    /// 为 `None`，其余装配行为不变（与 north 的缺省范式一致）。
+    #[tokio::test(start_paused = true)]
+    async fn license_runtime_absent_without_injection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = DaemonShared::new();
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers();
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
+        assert!(
+            shared.license_runtime().is_none(),
+            "no injection → no license runtime"
+        );
+        shared.request_shutdown();
+        let result = handle.await.expect("run task joins").expect("run ok");
+        assert_eq!(result.state(), LifecycleState::Stopped);
     }
 }
