@@ -7,6 +7,8 @@
 # ---- 密钥与敏感文件：严禁入库（红线） ----
 .env
 .env.*
+# 例外：示例 / 模板 env 文件不含真实密钥，且是 deploy/README 引用的输入契约，必须入库。
+!**/.env.example
 *.pem
 *.key
 *.p12
@@ -29,3 +31,5 @@ Thumbs.db
 AGENTS.md
 CLAUDE.md
 docs/
+# 工作区记忆与 agent 内部状态（与 .omo/ 同类：本地会话状态，非交付物；含内部审查笔记）
+.workbuddy/
