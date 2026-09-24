@@ -24,6 +24,33 @@
 //!   配置版本 watch；心跳注释行由 `KeepAlive`（15s）承担；
 //! - 断线重连：客户端带回上次最大 `seq` 重新 GET 即可，历史环（容量 256）保证不丢。
 
+// task 57 切片 2：管理面 JWT 鉴权 + RBAC 原语（服务端判定，红线：授权判定只在
+// Rust 侧，WebView/JS 只做展示）。两模块为**原语层**，本轮不改任何既有路由行为；
+// 全量接线（16 页 web-console 契约不动）由后续任务执行。接线示例（届时替换
+// remote_ops 的 DenyAllOpsAuthorizer 注入即可，端点零改动）：
+//
+// ```ignore
+// use crate::mgmt::auth_jwt::{sign, Claims, IssuerKey};
+// use crate::mgmt::rbac::{permission_for_ops_action, AuthedRole, Permission, RbacAuth};
+//
+// // ① axum State 装配（示例：扩展 state 结构或用 FromRef 分发）：
+// let auth = RbacAuth::new(IssuerKey(key_bytes_32));      // 密钥来源由接线任务定
+//
+// // ② 保护某个 handler（extractor 形式，401/403 自动区分）：
+// async fn admin_only(authed: AuthedRole) -> Response {
+//     authed.ensure(Permission::KeyRotate)?;              // 权限不足 → 403
+//     /* ... */
+// }
+//
+// // ③ /api/ops/* 的 authorizer 切换（对齐 remote_ops::install 接线点）：
+// //    authorize(actor, action) 内部改为：
+// //      rbac::permission_for_ops_action(action)
+// //        .map(|perm| rbac::authorize(jwt_role, perm))
+// //        .unwrap_or(false)                                // 未知动作 fail-closed
+// ```
+pub mod auth_jwt;
+pub mod rbac;
+
 pub mod remote_ops;
 
 use std::collections::{HashMap, HashSet, VecDeque};
