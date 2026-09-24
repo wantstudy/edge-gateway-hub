@@ -5,6 +5,10 @@
 //!   [`BootstrapBuilder`] 链式装配（配置热重载 → 调度器 → 北向启动钩子 → Running）；
 //!   优雅停机（调度器停 → 离线队列 flush → 北向停 → Stopped，总宽限期 30s）；
 //!   看门狗（基于 `last_heartbeat` 陈旧度判定 + 单次重启钩子）。
+//!   **集成波次接线**：启动早期完整性自检（task 50 `verify_self_integrity`，
+//!   fail-safe 受限模式继续，debug 构建跳过）；OTA 启动判定钩子（task 35
+//!   `boot_commit_or_rollback`，回滚显式 [WARN]）。SQLite 分库（telemetry/queue）
+//!   的迁移框架接线在各库模块内完成（task 55 `run_migrations`）。
 //! - **不做**：真实北向连接（经 `north_starter` / `north_stopper` 钩子解耦，task 19+ 集成）；
 //!   OfflineQueue 实例装配（task 17/18 集成后把 flush 钩子替换为真实调用）。
 //!
@@ -27,7 +31,7 @@
 //!    管理 API（mgmt）与北向都需要在运行期持有同一句柄，故不能只在 run 结束时返回。
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -40,6 +44,8 @@ use tracing::{error, info, warn};
 
 use crate::config::{ConfigShared, ConfigHotReloader, GatewayConfig};
 use crate::error::DaemonResult;
+use crate::hardening::RestrictedMode;
+use crate::ota::OtaBootDecision;
 use crate::scheduler::{GroupConfig, GroupScheduler, PollHandler, RunningScheduler};
 
 // ---- 默认常量 ----
@@ -257,6 +263,12 @@ pub type HookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub type NorthStarterHook = Arc<dyn Fn(DaemonShared) -> HookFuture + Send + Sync>;
 /// 停机步骤钩子（北向停止 / 离线 flush / 看门狗重启共用签名）。
 pub type StopHook = Arc<dyn Fn() -> HookFuture + Send + Sync>;
+/// OTA 启动判定钩子的 boxed future（输出 [`OtaBootDecision`]）。
+pub type OtaBootFuture = Pin<Box<dyn Future<Output = DaemonResult<OtaBootDecision>> + Send>>;
+/// OTA 启动判定钩子（task 35 接线）：bootstrap 启动早期调用一次，由装配方
+/// 在闭包内构造真实 `OtaManager`（store + 公钥注入）并调用
+/// `boot_commit_or_rollback(healthy)`；bootstrap 只负责结果审计/日志与回滚告警。
+pub type OtaBootCheckHook = Arc<dyn Fn() -> OtaBootFuture + Send + Sync>;
 
 // ---- 装配器 ----
 
@@ -286,6 +298,8 @@ pub struct BootstrapBuilder {
     offline_flusher: Option<StopHook>,
     /// 看门狗重启钩子（单次）。
     watchdog_restart: Option<StopHook>,
+    /// OTA 启动判定钩子（task 35 接线；`None` = no-op warn）。
+    ota_boot_check: Option<OtaBootCheckHook>,
 }
 
 impl BootstrapBuilder {
@@ -303,6 +317,7 @@ impl BootstrapBuilder {
             north_stopper: None,
             offline_flusher: None,
             watchdog_restart: None,
+            ota_boot_check: None,
         }
     }
 
@@ -367,6 +382,16 @@ impl BootstrapBuilder {
         self
     }
 
+    /// 注入 OTA 启动判定钩子（task 35 接线；缺省 no-op warn）。
+    ///
+    /// 钩子在 bootstrap 启动早期（配置加载前）被调用一次；装配方在闭包内
+    /// 构造真实 `OtaManager` 并调用 `boot_commit_or_rollback(healthy)`，
+    /// 判定结果由 bootstrap 写审计/日志：`RolledBackTo` 触发显式 `[WARN]`。
+    pub fn with_ota_boot_check(mut self, hook: OtaBootCheckHook) -> Self {
+        self.ota_boot_check = Some(hook);
+        self
+    }
+
     /// 装配并运行 daemon 直至优雅停机完成，返回共享状态句柄。
     ///
     /// 装配顺序：共享状态 → 配置热重载 → 调度器 → 北向钩子 → Running；
@@ -379,6 +404,21 @@ impl BootstrapBuilder {
         let shared = self.shared.clone().unwrap_or_default();
         shared.set_state(LifecycleState::Starting);
         info!("bootstrap: daemon starting");
+
+        // ①-a 完整性自检（task 50 接线）：早期执行、fail-safe 不 panic、
+        // 不中断启动；进入 RestrictedMode 仅打 [WARN] 并继续（敏感能力的
+        // 降级处置由 mgmt / 北向按受限标记执行）。
+        if let Some(restricted) = startup_integrity_check() {
+            warn!(
+                reason = ?restricted.reason(),
+                "bootstrap: [WARN] RestrictedMode: integrity self-check did not pass; \
+                 continuing in restricted mode (fail-safe)"
+            );
+        }
+
+        // ①-b OTA 启动判定（task 35 接线）：commit / 回滚结果写审计日志；
+        // 回滚发生时显式 [WARN] 并记录原因（宽限期内未确认启动健康）。
+        run_ota_boot_check(&self.ota_boot_check).await;
 
         // ② 配置热重载：初始加载失败直接返回错误（绝不静默空配置）。
         let (reloader, config_shared) = ConfigHotReloader::spawn(&self.config_path)?;
@@ -488,6 +528,111 @@ impl PollHandler for DynPollHandler {
 impl std::fmt::Debug for DynPollHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynPollHandler").finish_non_exhaustive()
+    }
+}
+
+/// OTA 启动判定（task 35 接线）：调用注入的判定钩子并按结果写审计/日志。
+///
+/// - `NoPending` / `Committed` → `info!`；
+/// - `RolledBackTo` → **显式 `[WARN]`**（原因：新版本宽限期内未确认启动健康，
+///   pending 已清除、旧版本保留）；
+/// - 钩子返回 Err → `error!` 后继续启动（OTA 判定不可用不应阻断数据面；
+///   失败不静默）；
+/// - 未注入钩子 → `warn!`（no-op，与其它钩子的缺省语义一致）。
+async fn run_ota_boot_check(hook: &Option<OtaBootCheckHook>) {
+    match hook {
+        Some(hook) => match hook().await {
+            Ok(OtaBootDecision::NoPending) => {
+                info!("bootstrap: ota boot check: no pending firmware (no-op)");
+            }
+            Ok(OtaBootDecision::Committed { version }) => {
+                info!(version, "bootstrap: ota boot commit: pending firmware promoted");
+            }
+            Ok(OtaBootDecision::RolledBackTo { version }) => {
+                warn!(
+                    version,
+                    "bootstrap: [WARN] ota boot ROLLBACK: pending firmware was not \
+                     confirmed healthy within the grace period; pending slot cleared, \
+                     previous version retained"
+                );
+            }
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "bootstrap: ota boot check failed; continuing without boot decision"
+                );
+            }
+        },
+        None => warn!("bootstrap: ota boot check not configured (no-op hook)"),
+    }
+}
+
+/// 完整性 manifest 文件名约定：`<exe 全名>.integrity-manifest`，内容为
+/// 64 字符小写 hex 的 exe SHA-256（task 58 打包期注入点；缺失即受限）。
+const INTEGRITY_MANIFEST_SUFFIX: &str = ".integrity-manifest";
+
+/// 从 manifest 文件读取 expected 哈希（64 hex → 32 字节）。
+///
+/// 文件缺失 / 非 64 hex / 读取失败 → `None`（调用方按 `Unavailable` 处理，
+/// fail-safe 进入受限模式，绝不 panic）。
+#[cfg_attr(debug_assertions, allow(dead_code))] // debug 构建下仅测试使用
+fn read_expected_exe_hash(manifest: &Path) -> Option<[u8; 32]> {
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let trimmed = text.trim();
+    if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut expected = [0u8; 32];
+    // 长度与字符集已校验，逐字节配对解码不会越界（防御式写法，零 panic）。
+    for i in 0..32 {
+        let hi = (i * 2) as usize;
+        let lo = hi + 1;
+        let hi_val = (trimmed.as_bytes()[hi] as char).to_digit(16)?;
+        let lo_val = (trimmed.as_bytes()[lo] as char).to_digit(16)?;
+        expected[i] = ((hi_val << 4) | lo_val) as u8;
+    }
+    Some(expected)
+}
+
+/// 启动期完整性自检（task 50 接线）。
+///
+/// ## debug 构建跳过（有意为之，勿“补全”）
+/// debug / 测试构建的 exe 每次重编译哈希都不同，且测试进程的 expected 哈希
+/// 无法在构建期注入 —— 此时强制执行自检必然全员 `Unavailable`（假受限）。
+/// 故 debug 构建下**直接跳过**并返回 `None`；release 构建下从 exe 同目录的
+/// manifest 读取 expected 哈希（task 58 打包期注入），manifest 缺失即
+/// `Unavailable` → 受限模式（fail-safe：拿不到完整性证据按可疑处理）。
+fn startup_integrity_check() -> Option<RestrictedMode> {
+    #[cfg(debug_assertions)]
+    {
+        // debug 构建：跳过（理由见函数文档）。
+        None
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let verdict = match std::env::current_exe() {
+            Ok(exe) => {
+                let manifest = exe.with_file_name(format!(
+                    "{}{INTEGRITY_MANIFEST_SUFFIX}",
+                    exe.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                ));
+                match read_expected_exe_hash(&manifest) {
+                    Some(expected) => crate::hardening::verify_self_integrity(&expected),
+                    None => crate::hardening::IntegrityVerdict::Unavailable {
+                        reason: format!(
+                            "integrity manifest missing or invalid: {}",
+                            manifest.display()
+                        ),
+                    },
+                }
+            }
+            Err(e) => crate::hardening::IntegrityVerdict::Unavailable {
+                reason: format!("current_exe: {e}"),
+            },
+        };
+        RestrictedMode::from_integrity(&verdict)
     }
 }
 
@@ -1030,5 +1175,150 @@ frequency_ms = 3000
         assert_eq!(names, vec!["dev-b", "dev-a"], "first-seen order");
         assert_eq!(groups[0].interval, Duration::from_millis(2000));
         assert_eq!(groups[0].point_ids, vec!["b1".to_string()], "deduped");
+    }
+
+    // ---- 集成波次接线：完整性自检（task 50） ----
+
+    /// QA 接线：debug 构建下完整性自检跳过（恒 `None`，不产生假受限）。
+    /// release 路径（manifest 缺失 → Unavailable → 受限）无法在本测试进程
+    /// 真实触发（release 测试 exe 无 manifest），由 `expected_exe_hash_manifest` 覆盖解析层。
+    #[cfg(debug_assertions)]
+    #[test]
+    fn startup_integrity_check_is_skipped_in_debug_builds() {
+        assert!(
+            startup_integrity_check().is_none(),
+            "debug 构建必须跳过完整性自检"
+        );
+    }
+
+    /// QA 接线：expected 哈希 manifest 解析 —— 64 hex 放行、垃圾 / 缺失拒绝
+    /// （`None` → release 路径按 Unavailable 进入受限模式，fail-safe）。
+    #[test]
+    fn expected_exe_hash_manifest_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let good = dir.path().join("good.integrity-manifest");
+        std::fs::write(&good, format!("{}{}", "a".repeat(64), "\n")).expect("write good");
+        assert!(
+            read_expected_exe_hash(&good).is_some(),
+            "64 hex（含尾随空白）必须可解析"
+        );
+
+        let garbage = dir.path().join("garbage.integrity-manifest");
+        std::fs::write(&garbage, "zz-not-hex").expect("write garbage");
+        assert!(read_expected_exe_hash(&garbage).is_none(), "非 hex 必须拒绝");
+
+        let short = dir.path().join("short.integrity-manifest");
+        std::fs::write(&short, "aabb").expect("write short");
+        assert!(read_expected_exe_hash(&short).is_none(), "长度不足必须拒绝");
+
+        assert!(
+            read_expected_exe_hash(&dir.path().join("missing.integrity-manifest")).is_none(),
+            "manifest 缺失必须返回 None"
+        );
+    }
+
+    // ---- 集成波次接线：OTA 启动判定（task 35） ----
+
+    /// QA 接线 Happy：注入「真实 `OtaManager` + 空内存 store」的判定钩子，
+    /// 无 pending 槽位 → `NoPending` 零写操作（no-op），bootstrap 照常 Running，
+    /// 钩子恰被调用一次。
+    #[tokio::test(start_paused = true)]
+    async fn ota_boot_check_no_pending_is_noop_and_reaches_running() {
+        use crate::ota::{InMemoryOtaStore, OtaManager};
+        use ed25519_dalek::SigningKey;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = Arc::new(tokio::sync::Mutex::new(OtaManager::new(
+            Arc::new(InMemoryOtaStore::default()),
+            SigningKey::from_bytes(&[0x1au8; 32]).verifying_key(),
+            1,
+        )));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let hook: OtaBootCheckHook = {
+            let manager = Arc::clone(&manager);
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let manager = Arc::clone(&manager);
+                Box::pin(async move {
+                    let decision = manager.lock().await.boot_commit_or_rollback(false).await?;
+                    assert_eq!(
+                        decision,
+                        OtaBootDecision::NoPending,
+                        "无 meta 无 pending 必须 NoPending"
+                    );
+                    Ok(decision)
+                }) as OtaBootFuture
+            })
+        };
+
+        let shared = DaemonShared::new();
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers()
+            .with_ota_boot_check(hook);
+
+        let handle =
+            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        shared.request_shutdown();
+        handle.await.expect("run task joins").expect("run ok");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "启动判定钩子必须恰被调用一次"
+        );
+    }
+
+    /// QA 接线：判定结果为回滚（`RolledBackTo`）→ bootstrap 打显式 [WARN]
+    /// （此处以标记观测「结果被消费」），**不阻断启动**（照常 Running）。
+    #[tokio::test(start_paused = true)]
+    async fn ota_boot_check_rollback_warns_but_boots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let hook: OtaBootCheckHook = {
+            let log = Arc::clone(&log);
+            Arc::new(move || {
+                if let Ok(mut guard) = log.lock() {
+                    guard.push("rollback-decision".to_string());
+                }
+                Box::pin(async {
+                    Ok(OtaBootDecision::RolledBackTo { version: 1 }) as DaemonResult<_>
+                }) as OtaBootFuture
+            })
+        };
+
+        let shared = DaemonShared::new();
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers()
+            .with_ota_boot_check(hook);
+
+        let handle =
+            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        assert_eq!(
+            log.lock().expect("log lock").as_slice(),
+            ["rollback-decision"],
+            "回滚判定必须在 Running 前被消费一次"
+        );
+        shared.request_shutdown();
+        let result = handle.await.expect("run task joins").expect("run ok");
+        assert_eq!(result.state(), LifecycleState::Stopped, "回滚不阻断优雅停机");
+    }
+
+    /// QA 接线：未注入 OTA 判定钩子 → no-op warn，启动流程不受影响。
+    #[tokio::test(start_paused = true)]
+    async fn ota_boot_check_defaults_to_noop_without_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = DaemonShared::new();
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers();
+        let handle =
+            wait_for_state(tokio::spawn(builder.run()), &shared, LifecycleState::Running).await;
+        shared.request_shutdown();
+        handle.await.expect("run task joins").expect("run ok");
     }
 }

@@ -270,6 +270,84 @@ impl KeyProvider for StaticKeyProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 49 → task 21 适配层（集成波次）：KeyHandle ↔ 旧 KeyProvider
+// ---------------------------------------------------------------------------
+
+/// 把 `keyprovider::KeyHandle`（task 49 托管句柄）包装为本模块旧
+/// [`KeyProvider`] trait 的实现 —— **最小适配层，语义冲突显式化，交主理人裁决**。
+///
+/// ## ⚠️ 语义冲突点（勿「顺手」绕过）
+/// 旧 [`KeyProvider`] 契约要求 `signing_key()` 返回裸 [`SigningKey`]——
+/// 等价于把私钥种子字节交出（`SigningKey` 可随时 `to_bytes()` 导出）；
+/// 而 `keyprovider::KeyHandle` 的红线是**不提供任何字节导出 API**
+/// （无 `to_bytes` / `as_bytes`，编译期保证，见其模块文档「私钥红线」）。
+/// 二者**本质冲突**：在不破坏「无字节导出」红线的前提下，本适配层
+/// **不可能**满足旧契约。故 `signing_key()` 走显式 `unimplemented` 错误
+/// （fail-closed：返回 `SecurityError`，绝不 panic、绝不用 `todo!()`），
+/// 错误文本写明冲突点。
+///
+/// ## 后续决策项（裁决前托管场景不可经本适配层签名）
+/// - **(a) 推荐**：把 [`AuthSigner`] 的取钥路径迁移为「句柄式签名」
+///   （`handle.sign(msg) -> Signature`，即本适配层的 [`Self::sign_message`]），
+///   随后删除旧 trait 的裸密钥出口；
+/// - (b) 放宽 `KeyHandle` 红线（破坏 task 49 防克隆 / 防导出防线，**不建议**）；
+/// - (c) 维持双轨：静态注入场景继续用 [`StaticKeyProvider`]，托管场景等 (a)。
+pub struct KeyHandleKeyProviderAdapter {
+    /// 托管句柄（只能经 `keyprovider::KeyProvider::load_or_create` 取得，
+    /// 本模块无法凭空构造——`from_seed` 为 keyprovider 模块私有）。
+    handle: crate::auth::keyprovider::KeyHandle,
+}
+
+impl KeyHandleKeyProviderAdapter {
+    /// 包装既有托管句柄。
+    #[must_use]
+    pub fn new(handle: crate::auth::keyprovider::KeyHandle) -> Self {
+        Self { handle }
+    }
+
+    /// 句柄式签名（**不导出种子**；决策项 (a) 落地后 `AuthSigner` 的目标形态）。
+    ///
+    /// # Errors
+    /// 句柄未初始化（构造路径保证不会发生）→ `SecurityError`。
+    pub fn sign_message(&self, msg: &[u8]) -> DaemonResult<Signature> {
+        self.handle.sign(msg).map_err(DaemonError::from)
+    }
+
+    /// 对应公钥（公钥可自由导出，在 keyprovider 红线之外）。
+    ///
+    /// # Errors
+    /// 句柄未初始化 → `SecurityError`。
+    pub fn public_key(&self) -> DaemonResult<VerifyingKey> {
+        self.handle.public_key().map_err(DaemonError::from)
+    }
+}
+
+impl fmt::Debug for KeyHandleKeyProviderAdapter {
+    /// 手写 Debug：句柄脱敏（与 `KeyHandle` 的红线一致，永不泄密钥材料）。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("KeyHandleKeyProviderAdapter { handle: <redacted> }")
+    }
+}
+
+impl KeyProvider for KeyHandleKeyProviderAdapter {
+    /// 旧契约要求裸 `SigningKey`（种子导出）——与 `KeyHandle` 的「无字节导出」
+    /// 红线本质冲突，**显式 unimplemented 错误**（非 panic、非 `todo!()`）。
+    ///
+    /// # Errors
+    /// 恒返回 `SecurityError`，消息含冲突说明与决策项指引。
+    fn signing_key(&self) -> DaemonResult<SigningKey> {
+        Err(DaemonError::SecurityError(
+            "unimplemented bridging: legacy KeyProvider::signing_key demands a bare \
+             SigningKey (equivalent to exporting the seed bytes), which \
+             keyprovider::KeyHandle forbids by design (no byte-export API, \
+             anti-clone red line). Decision pending: migrate AuthSigner to \
+             handle-based signing (adapter::sign_message) — see adapter docs"
+                .to_string(),
+        ))
+    }
+}
+
 /// AuthBlock 签名器：密钥托管 + 授权闸门 + 机器码指纹三件套。
 pub struct AuthSigner {
     keys: Arc<dyn KeyProvider>,
@@ -751,6 +829,69 @@ mod tests {
         let mut guarded = batch.clone();
         assert!(signer.attach(&mut guarded, TEST_TS_NS).is_err());
         assert!(guarded.auth.is_none(), "no auth block may be attached");
+    }
+
+    // ---- KeyHandle 适配层（集成波次接线，task 49 → 21） ----
+
+    /// QA 接线：适配层 `signing_key()` 必须返回**显式 unimplemented 错误**
+    /// （SecurityError，非 panic、非 todo!()），消息写明「种子导出 vs 无字节
+    /// 导出红线」的冲突点。
+    #[test]
+    fn key_handle_adapter_signing_key_is_explicit_unimplemented_error() {
+        use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let handle = FileKeyProvider::new(dir.path().join("gw.key"), &"a1".repeat(32))
+            .expect("valid test fingerprint")
+            .load_or_create()
+            .expect("handle");
+        let adapter = KeyHandleKeyProviderAdapter::new(handle);
+
+        let err = adapter
+            .signing_key()
+            .expect_err("seed export must be refused by design");
+        assert!(
+            matches!(err, DaemonError::SecurityError(_)),
+            "expected SecurityError, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("unimplemented"), "须显式声明未接线: {msg}");
+        assert!(msg.contains("KeyHandle"), "须指明冲突对象: {msg}");
+        assert!(
+            msg.contains("forbids"),
+            "须写明红线冲突（无字节导出）: {msg}"
+        );
+    }
+
+    /// QA 接线：适配层的句柄式签名路径可用 —— `sign_message` 产出可被
+    /// `public_key` 验证的签名（不导出种子的前提下完成签名）；Debug 脱敏。
+    #[test]
+    fn key_handle_adapter_sign_message_round_trips_and_redacts_debug() {
+        use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let handle = FileKeyProvider::new(dir.path().join("gw.key"), &"b2".repeat(32))
+            .expect("valid test fingerprint")
+            .load_or_create()
+            .expect("handle");
+        let adapter = KeyHandleKeyProviderAdapter::new(handle);
+
+        let msg = b"iotdaq adapter sign probe";
+        let sig = adapter.sign_message(msg).expect("handle-based sign");
+        let pk = adapter.public_key().expect("public key export");
+        pk.verify(msg, &sig)
+            .expect("signature must verify under handle public key");
+
+        // 篡改消息 → 验签失败（签名语义正确）。
+        assert!(pk.verify(b"iotdaq adapter sign profX", &sig).is_err());
+
+        // Debug 输出脱敏（适配层与底层 KeyHandle 双层）。
+        let rendered = format!("{adapter:?}");
+        assert!(
+            !rendered.contains("b2b2"),
+            "no key material in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     /// mid 变化（另一把 FingerprintKey 派生）→ 用原 mid 的公钥验签失败。

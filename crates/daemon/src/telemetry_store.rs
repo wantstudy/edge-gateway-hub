@@ -668,6 +668,13 @@ impl DbWriter {
                 "failed to enable WAL journal mode (got `{mode}`)"
             )));
         }
+        // 迁移框架接线（task 55 → task 18 集成波次）：连接建立即执行内置迁移
+        // （`schema_migrations` 账本 + `user_version` 版本登记，幂等）。
+        // 分库红线不变：telemetry.db 仍走本模块**独立写连接**，不与 queue.db 共库；
+        // 迁移失败（含「旧程序开新库」forward-only 拒绝）→ 错误上抛 → `open` 失败
+        // → 启动失败，**绝不静默跳过**。
+        crate::migrations::run_migrations(&conn)
+            .map_err(|e| storage_err(format!("telemetry db migration failed: {e}")))?;
         Ok(conn)
     }
 
@@ -1983,6 +1990,53 @@ mod tests {
         assert_eq!(err.error_code(), ERR_STORAGE);
         assert!(matches!(err, DaemonError::StorageError(_)), "err: {err}");
         store.close().expect("close");
+    }
+
+    // ---- 迁移框架接线（task 55 集成波次） ----
+
+    /// QA 接线：`open` 成功的库必须已走迁移框架 —— `user_version = 1`、
+    /// `schema_migrations` 账本恰 1 行（内置 v1）。分库红线：本库文件仍是
+    /// 独立的 telemetry.db，未共享任何连接。
+    #[test]
+    fn open_runs_builtin_migration_and_ledger() {
+        let dir = tempdir();
+        let clock = ManualClock::new(T0_NS);
+        let store = open(dir.path(), "gw-mig", MACHINE_A, &clock);
+        store.close().expect("close");
+
+        // 用只读连接直查迁移账本（绕过本模块，验证落盘状态）。
+        let ro = Connection::open_with_flags(
+            dir.path().join(TELEMETRY_DB_FILE_NAME),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open read-only");
+        let version: i64 = ro
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(version, 1, "内置 v1 迁移必须已应用");
+        let ledger_rows: i64 = ro
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .expect("ledger count");
+        assert_eq!(ledger_rows, 1, "账本恰 1 行（v1）");
+    }
+
+    /// QA 接线 Error：库文件损坏（非 SQLite 格式）→ 连接初始化 / 迁移失败 →
+    /// `open` 失败（启动失败、可解释错误，绝不静默跳过）。
+    #[test]
+    fn open_fails_when_migration_fails_on_corrupt_db() {
+        let dir = tempdir();
+        let db_path = dir.path().join(TELEMETRY_DB_FILE_NAME);
+        std::fs::write(&db_path, b"this is definitely not a sqlite database").expect("seed garbage");
+
+        let clock = ManualClock::new(T0_NS);
+        let err = TelemetryStore::open(cfg(dir.path(), "gw-corrupt", MACHINE_A), Arc::new(clock))
+            .expect_err("corrupt db must fail during open init");
+        assert_eq!(err.error_code(), ERR_STORAGE);
+        // 失败发生在写线程初始化路径（WAL PRAGMA 或迁移框架），错误已收敛并上抛。
+        assert!(
+            err.to_string().contains("sqlite:"),
+            "错误须来自 SQLite 初始化链路: {err}"
+        );
     }
 
     /// 任务 C：`Debug for TelemetryStoreConfig` 只显示文件名、不显示目录；密钥脱敏。
