@@ -82,9 +82,19 @@ multiple-versions = "warn"
 #   本任务纪律禁改 Cargo.toml，故先取 warn；补上 publish = false 后应立即改回 deny。
 wildcards = "warn"
 # 禁止 workspace 内重复版本声明导致的歧义。
+# 依赖红线封禁（**已启用**）：纯 Rust 依赖栈，禁止引入需系统 C 库 / cmake / NASM 的非
+# vendored 依赖。以下 crate 一律封禁，误引入即让 CI 变红并回溯删除：
+#   - aws-lc-rs / aws-lc-sys：rustls 的 crypto provider，cmake + C 工具链（x86_64 Windows 常需 NASM）。
+#     项目口径：rustls provider 统一 `ring`（见 crates/daemon/Cargo.toml 的 rustls/tokio-rustls 特性）。
+#   - openssl-sys：需系统 OpenSSL 开发库（或 vendored，均属非纯 Rust C 构建）。
+#   - native-tls：依赖平台原生 TLS 栈（Windows SChannel / macOS Security.framework）。
+#   - paho-mqtt：需系统 Paho C 库。
 deny = [
-    # 按 crate 名封禁的高危依赖（当前为空；如未来误引入 openssl-sys / 需 cmake 的
-    # 非 vendored 依赖，在此登记封禁并回溯删除）。
+    "aws-lc-rs",
+    "aws-lc-sys",
+    "openssl-sys",
+    "native-tls",
+    "paho-mqtt",
 ]
 # 允许多版本共存的已审查豁免（当前为空；新增必须注明「哪个 crate 的哪两条路径」）。
 skip = []
