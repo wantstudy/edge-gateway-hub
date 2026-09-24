@@ -35,6 +35,7 @@ export const STATUS_MAP: Readonly<Record<string, StatusView>> = Object.freeze({
   // ---- 设备连接 / 租约状态 ----
   online: { label: '在线', tone: 'ok' },
   offline: { label: '离线', tone: 'danger' },
+  error: { label: '故障', tone: 'danger' },
   reconnecting: { label: '重连中', tone: 'warn' },
   collect_failed: { label: '采集失败', tone: 'danger' },
   active: { label: '已授权', tone: 'ok' },
