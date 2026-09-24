@@ -9,5 +9,6 @@ pub mod client;
 pub mod clock;
 pub mod limits;
 pub mod machine_id;
+pub mod receipt_reporter;
 pub mod signing;
 pub mod trial;
