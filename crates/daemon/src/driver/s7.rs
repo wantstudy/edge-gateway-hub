@@ -11,9 +11,9 @@
 //!   读确认解析 [`parse_read_ack`]（ReturnCode 错误映射）。
 //! - 大端读辅助 [`read_u16_be`] / [`read_u32_be`]。
 //!
-//! ## 阶段 B（本模块不做）
-//! TcpListener mock、TcpStream 连接管理、重连与异步会话编排——阶段 B 仅消费
-//! 本模块 pub API 组帧/解帧，不加协议逻辑。
+//! ## 阶段 B2（会话层，本文件 `S7Session`）
+//! TcpStream 连接管理（三步握手）、读/写路径、同 DB 相邻地址合并读、
+//! 按协商 PDU 拆分多请求、对端关闭自动重连一次；测试内含 TcpListener mock。
 //!
 //! ## 与任务签名的小偏差（为满足「零 panic + 协议错误一律 Result」红线）
 //! - `build_tpkt` / `build_read_var` / `build_write_var` 返回 `Result<Vec<u8>, S7Error>`：
@@ -27,8 +27,8 @@
 //! - 传输尺寸（transport size）：Bit=0x01（长度单位=位），Byte/Word/DWord=0x04
 //!   （长度单位=字节）。`S7ReadItem::count` 与 [`build_write_var`] 的 `data`
 //!   均按该单位解释（Bit 区为位数，其余为字节数）。
-//! - Item 数据区对齐 / 写确认（Write ACK）解析、Password/DateTime 等扩展功能
-//!   未覆盖（见交付报告「未覆盖清单」），由阶段 B 按需扩展。
+//! - Item 数据区对齐、Password/DateTime 等扩展功能未覆盖（见交付报告
+//!   「未覆盖清单」）。
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -656,6 +656,28 @@ pub fn parse_read_ack(buf: &[u8]) -> Result<Vec<Vec<u8>>, S7Error> {
     Ok(out)
 }
 
+/// 写确认（ACK_DATA，功能码 0x05）解析：校验 Item 返回码。
+///
+/// 写 ACK 的数据区每 Item 仅 1 字节返回码；非 0xFF（OK）→ 经
+/// [`return_code_error`] 映射为 [`S7Error::ReturnCode`]（0x05=地址越界等）。
+///
+/// # Errors
+/// 帧结构不符 / ReturnCode 非 OK / 缺 Item 返回码 → [`S7Error`]。
+pub fn parse_write_ack(buf: &[u8]) -> Result<(), S7Error> {
+    check_ack_header(buf, 2, 0x05, "write ack")?;
+    let param_len = u16_at(buf, 6)? as usize;
+    let data_start = 12usize.saturating_add(param_len);
+    let rc = *buf.get(data_start).ok_or_else(|| {
+        S7Error::BadFrame(format!(
+            "write ack truncated: missing item return code at offset {data_start}"
+        ))
+    })?;
+    if rc != 0xFF {
+        return Err(return_code_error(rc));
+    }
+    Ok(())
+}
+
 // ---- 会话层（阶段 B 切片一：握手 + 读路径）----
 
 /// connect / 读写默认超时（秒）。握手与数据阶段统一使用。
@@ -664,20 +686,31 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(2);
 /// connect 时请求的 PDU 长度（常见 S7-300/400 值；实际以 PLC ACK 协商结果为准）。
 pub const S7_REQUESTED_PDU: u16 = 480;
 
+/// 组一个 Read Var 请求帧的固定开销（字节）：TPKT 头 4 + COTP DT 头 3 +
+/// S7 头 10 + 参数头（功能码 + Item 数）2。协商 PDU 扣除该值后为 Item 预算。
+const READ_FRAME_OVERHEAD: usize = 4 + 3 + 10 + 2;
+
+/// 单个 Any 指针 Item 的编码长度（0x12 0x0A + 10 字节体）。
+const ITEM_ENCODED_LEN: usize = 12;
+
 /// io::Error → [`S7Error::NetworkError`] 统一映射。
 fn io_err(ctx: &str, e: std::io::Error) -> S7Error {
     S7Error::NetworkError(format!("{ctx}: {e}"))
 }
 
-/// S7 会话：已握手的 TCP 连接 + 协商 PDU 长度 + 自增 PDU 引用。
+/// S7 会话：已握手的 TCP 连接 + 协商 PDU 长度 + 自增 PDU 引用 + 重连端点信息。
 ///
-/// 生命周期内假设独占连接（&mut self 保证）；不自动重连——断链一律返回
-/// [`S7Error::NetworkError`]，由上层 Driver 决定重建（阶段 B2 范围）。
+/// 生命周期内假设独占连接（&mut self 保证）；读/写遇对端关闭类网络错误时
+/// 自动重连一次并重试（[`S7Session::is_connection_lost`]），二次失败上抛。
 #[derive(Debug)]
 pub struct S7Session {
     stream: TcpStream,
     negotiated_pdu: u16,
     next_pdu_ref: u16,
+    /// 重连端点：connect 地址（重连时原样复用）。
+    addr: String,
+    /// 重连端点：远程 TSAP（重连时原样复用）。
+    tsap: [u8; 2],
 }
 
 impl S7Session {
@@ -693,7 +726,10 @@ impl S7Session {
     pub fn connect(addr: &str, tsap: [u8; 2]) -> Result<Self, S7Error> {
         let stream =
             TcpStream::connect(addr).map_err(|e| io_err(&format!("tcp connect {addr}"), e))?;
-        Self::handshake(stream, tsap)
+        let mut session = Self::handshake(stream, tsap)?;
+        session.addr = addr.to_string();
+        session.tsap = tsap;
+        Ok(session)
     }
 
     /// 握手核心（`stream` 已连接）：设超时 → CR/CC → Setup/ACK。
@@ -723,6 +759,8 @@ impl S7Session {
             stream,
             negotiated_pdu,
             next_pdu_ref: 0x0001,
+            addr: String::new(),
+            tsap,
         })
     }
 
@@ -731,35 +769,129 @@ impl S7Session {
         self.negotiated_pdu
     }
 
-    /// 读一批点位（一次 Read Var 多 Item 请求；PDU 拆分 / 重连为阶段 B2 范围）。
+    /// 读一批点位：同区同 DB 相邻地址合并为单 Item，按协商 PDU 拆分多请求，
+    /// 结果按原地址顺序逐点返回（每点字节宽度由其尺寸决定）。
     ///
-    /// 每个地址的读取量由尺寸决定：Bit=1 位、Byte=1、Word=2、DWord=4 字节。
     /// 任一 Item ReturnCode 非 OK → 整体 `Err`（与 Driver 契约一致）。
+    /// 遇对端关闭类网络错误自动重连一次并整体重试，二次失败上抛。
     ///
     /// # Errors
     /// 网络 / 帧结构 / ReturnCode 错误 → [`S7Error`]；空切片直接返回空。
     pub fn read_points(&mut self, addrs: &[S7Address]) -> Result<Vec<Vec<u8>>, S7Error> {
+        match self.read_points_once(addrs) {
+            Err(e) if Self::is_connection_lost(&e) => {
+                self.reconnect()?;
+                self.read_points_once(addrs)
+            }
+            other => other,
+        }
+    }
+
+    /// 单次读尝试（无重连）：合并 → 按协商 PDU 分块 → 逐请求执行并汇总切分。
+    fn read_points_once(&mut self, addrs: &[S7Address]) -> Result<Vec<Vec<u8>>, S7Error> {
         if addrs.is_empty() {
             return Ok(Vec::new());
         }
-        let items: Vec<S7ReadItem> = addrs
-            .iter()
-            .map(|a| S7ReadItem {
-                address: a.clone(),
-                count: a.size.width(),
-            })
-            .collect();
+        let groups = merge_adjacent_groups(addrs);
+        let max_items = self.max_items_per_request();
+        let mut results: Vec<Vec<u8>> = Vec::with_capacity(addrs.len());
+        for chunk in groups.chunks(max_items) {
+            let items: Vec<S7ReadItem> = chunk.iter().map(|(item, _)| item.clone()).collect();
+            let pdu_ref = self.next_pdu_ref;
+            self.next_pdu_ref = self.next_pdu_ref.wrapping_add(1);
+
+            let mut cotp_s7 = build_cotp_dt_data().to_vec();
+            cotp_s7.extend_from_slice(&build_read_var(pdu_ref, &items)?);
+            let frame = build_tpkt(&cotp_s7)?;
+            self.stream
+                .write_all(&frame)
+                .map_err(|e| io_err("send read var", e))?;
+            let resp_frame = recv_frame(&mut self.stream)?;
+            let payloads = parse_read_ack(parse_tpkt(&resp_frame)?)?;
+            if payloads.len() != items.len() {
+                return Err(S7Error::BadFrame(format!(
+                    "read ack item count {} != request item count {}",
+                    payloads.len(),
+                    items.len()
+                )));
+            }
+            // 合并 Item 的连续载荷按原地址宽度切分回逐点结果。
+            for ((_, widths), payload) in chunk.iter().zip(payloads) {
+                let mut cursor = 0usize;
+                for &w in widths {
+                    let end = cursor + usize::from(w);
+                    if end > payload.len() {
+                        return Err(S7Error::BadFrame(format!(
+                            "read ack item payload {} bytes < {end} bytes for merged addresses",
+                            payload.len()
+                        )));
+                    }
+                    results.push(payload[cursor..end].to_vec());
+                    cursor = end;
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// 单个 Read Var 请求可承载的最大 Item 数：协商 PDU 扣除帧固定开销
+    /// （[`READ_FRAME_OVERHEAD`]）后按每 Item 12 字节取整；至少 1（防御
+    /// 异常小的协商值，避免空请求）。
+    fn max_items_per_request(&self) -> usize {
+        let budget = (self.negotiated_pdu as usize).saturating_sub(READ_FRAME_OVERHEAD);
+        (budget / ITEM_ENCODED_LEN).max(1)
+    }
+
+    /// 写单个点位（一次 Write Var 请求）。
+    ///
+    /// `data` 编码语义与 [`build_write_var`] 一致（Bit 区 0x00/0x01，其余大端）。
+    /// 遇对端关闭类网络错误自动重连一次并重试，二次失败上抛。
+    ///
+    /// # Errors
+    /// 网络 / 帧结构 / ReturnCode（PLC 拒绝写入）→ [`S7Error`]。
+    pub fn write_point(&mut self, addr: &S7Address, data: &[u8]) -> Result<(), S7Error> {
+        match self.write_point_once(addr, data) {
+            Err(e) if Self::is_connection_lost(&e) => {
+                self.reconnect()?;
+                self.write_point_once(addr, data)
+            }
+            other => other,
+        }
+    }
+
+    /// 单次写尝试（无重连）。
+    fn write_point_once(&mut self, addr: &S7Address, data: &[u8]) -> Result<(), S7Error> {
         let pdu_ref = self.next_pdu_ref;
         self.next_pdu_ref = self.next_pdu_ref.wrapping_add(1);
-
         let mut cotp_s7 = build_cotp_dt_data().to_vec();
-        cotp_s7.extend_from_slice(&build_read_var(pdu_ref, &items)?);
+        cotp_s7.extend_from_slice(&build_write_var(pdu_ref, addr, data)?);
         let frame = build_tpkt(&cotp_s7)?;
         self.stream
             .write_all(&frame)
-            .map_err(|e| io_err("send read var", e))?;
+            .map_err(|e| io_err("send write var", e))?;
         let resp_frame = recv_frame(&mut self.stream)?;
-        parse_read_ack(parse_tpkt(&resp_frame)?)
+        parse_write_ack(parse_tpkt(&resp_frame)?)
+    }
+
+    /// 对端关闭类错误判定：读到 EOF/连接重置（"peer closed"）、写失败
+    /// （"send …" 上下文）。读超时不算——可能是 PLC 忙，重连反而放大故障。
+    fn is_connection_lost(err: &S7Error) -> bool {
+        match err {
+            S7Error::NetworkError(msg) => msg.contains("peer closed") || msg.starts_with("send "),
+            _ => false,
+        }
+    }
+
+    /// 重连一次：按 connect 时的地址与 TSAP 重建会话（完整三步握手），
+    /// 成功则整体替换自身（旧连接随之关闭，协商 PDU 以新握手为准）。
+    ///
+    /// # Errors
+    /// 重连或握手失败 → [`S7Error`]。
+    fn reconnect(&mut self) -> Result<(), S7Error> {
+        let addr = self.addr.clone();
+        let session = Self::connect(&addr, self.tsap)?;
+        *self = session;
+        Ok(())
     }
 
     /// 关闭连接（幂等；错误忽略——关闭失败无恢复路径）。
@@ -772,15 +904,59 @@ impl S7Session {
 fn read_exact_s7(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), S7Error> {
     let mut filled = 0;
     while filled < buf.len() {
-        let n = stream
-            .read(&mut buf[filled..])
-            .map_err(|e| io_err("recv", e))?;
+        let n = stream.read(&mut buf[filled..]).map_err(|e| {
+            // 连接重置/中止/异常关闭归一为「peer closed」，供会话层判定重连。
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            ) {
+                S7Error::NetworkError(format!("peer closed connection: {e}"))
+            } else {
+                io_err("recv", e)
+            }
+        })?;
         if n == 0 {
             return Err(S7Error::NetworkError("peer closed connection".to_string()));
         }
         filled += n;
     }
     Ok(())
+}
+
+/// 同区同 DB、字节区间相邻衔接的非位地址合并（按输入顺序连续段）。
+///
+/// 返回合并后的读 Item 及段内各原始地址的字节宽度（用于应答切分）。
+/// 不合拢的情形：位地址、跨区/跨 DB、字节区间有间隙、合并会使 `count`
+/// 超 u16 上限（此时断开新段，保证编码无溢出）。
+fn merge_adjacent_groups(addrs: &[S7Address]) -> Vec<(S7ReadItem, Vec<u16>)> {
+    let mut groups: Vec<(S7ReadItem, Vec<u16>)> = Vec::new();
+    for a in addrs {
+        let width = a.size.width();
+        let can_merge = match groups.last() {
+            Some((item, widths)) => {
+                item.address.size != S7Size::Bit
+                    && a.size != S7Size::Bit
+                    && item.address.area == a.area
+                    && item.address.db == a.db
+                    && item.address.byte_offset
+                        + widths.iter().map(|&w| u32::from(w)).sum::<u32>()
+                        == a.byte_offset
+                    && u32::from(item.count) + u32::from(width) <= u32::from(u16::MAX)
+            }
+            None => false,
+        };
+        if can_merge {
+            if let Some((item, widths)) = groups.last_mut() {
+                item.count += width;
+                widths.push(width);
+                continue;
+            }
+        }
+        groups.push((S7ReadItem { address: a.clone(), count: width }, vec![width]));
+    }
+    groups
 }
 
 /// 接收一帧 TPKT（读 4 字节头取总长 → 再读余体），返回完整 TPKT 帧。
@@ -1069,6 +1245,27 @@ mod tests {
         );
     }
 
+    /// QA: Write ACK 解析——OK（0xFF）/ ReturnCode 0x0A / 缺返回码截断。
+    #[test]
+    fn parse_write_ack_ok_and_return_code_error() {
+        // golden：头 10B + 错误类/码 00 00 + 参数（05 01）+ 数据区（FF）。
+        let ok = hex("32 03 00 00 00 00 00 02 00 01 00 00 05 01 FF");
+        assert_eq!(parse_write_ack(&ok), Ok(()));
+        // 返回码 0x0A（对象不存在）→ ReturnCode 错误。
+        let bad = hex("32 03 00 00 00 00 00 02 00 01 00 00 05 01 0A");
+        match parse_write_ack(&bad) {
+            Err(S7Error::ReturnCode { code: 0x0A, detail }) => {
+                assert!(detail.contains("does not exist"), "detail: {detail}");
+            }
+            other => panic!("expected ReturnCode, got {other:?}"),
+        }
+        // 截断：数据区缺 Item 返回码。
+        assert!(matches!(
+            parse_write_ack(&ok[..ok.len() - 1]),
+            Err(S7Error::BadFrame(_))
+        ));
+    }
+
     /// QA Error: ReturnCode 0x05（地址越界）/ 0x0A（对象不存在）→ ReturnCode 错误。
     #[test]
     fn parse_read_ack_return_code_errors() {
@@ -1095,7 +1292,83 @@ mod session_tests {
     use super::*;
 
     use std::net::{SocketAddr, TcpListener};
+    use std::sync::{Arc, Mutex};
     use std::thread;
+
+    /// mock 脚本类型：每连接一组应答（组内多帧拼接为一次 write，构造粘包）。
+    type MockScript = Vec<Vec<Vec<u8>>>;
+
+    /// 多连接记录型 mock：每个 accept 消耗一份脚本；`hold=false` 时脚本用尽
+    /// 后**主动关闭该连接**（供重连用例模拟对端关闭），`hold=true` 时保持
+    /// 连接直至客户端关闭（粘包等旧用例语义）。全部脚本用尽且未 hold 时关闭
+    /// 监听退出（后续 connect 将被拒绝，供二次失败用例）。收到的每个完整
+    /// TPKT 请求帧按序记录入共享 `received`。
+    fn spawn_mock_multi_holding(
+        scripts: Vec<MockScript>,
+        hold: bool,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
+        let addr = listener.local_addr().expect("mock addr");
+        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let rec = Arc::clone(&received);
+        thread::spawn(move || {
+            for script in scripts {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+                for group in script {
+                    // 读取一帧请求（4 字节头 + 余体），记录后按序应答。
+                    let mut head = [0u8; 4];
+                    if read_exact_s7(&mut sock, &mut head).is_err() {
+                        return;
+                    }
+                    let total = u16::from_be_bytes([head[2], head[3]]) as usize;
+                    if total < 4 {
+                        return;
+                    }
+                    let mut body = vec![0u8; total - 4];
+                    if read_exact_s7(&mut sock, &mut body).is_err() {
+                        return;
+                    }
+                    let mut frame = head.to_vec();
+                    frame.extend_from_slice(&body);
+                    rec.lock().expect("mock record lock").push(frame);
+                    // 组内多帧拼一次 write（粘包）；空组 = 只收不发。
+                    let mut glued: Vec<u8> = Vec::new();
+                    for resp in group {
+                        glued.extend_from_slice(&resp);
+                    }
+                    if !glued.is_empty() && sock.write_all(&glued).is_err() {
+                        return;
+                    }
+                }
+                if hold {
+                    // 保持连接直至客户端关闭（避免测试期间 RST 干扰读超时）。
+                    let mut drain = [0u8; 64];
+                    loop {
+                        match sock.read(&mut drain) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
+                // 非 hold：该连接脚本用尽即主动关闭（模拟对端关闭）。
+                drop(sock);
+            }
+        });
+        (addr, received)
+    }
+
+    /// 多连接 mock（默认用完即关）：供写断言 / 重连 / 拆分用例。
+    fn spawn_mock_multi(scripts: Vec<MockScript>) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+        spawn_mock_multi_holding(scripts, false)
+    }
+
+    /// 单连接 mock（旧用例兼容封装，保持连接语义）：返回监听地址。
+    fn spawn_mock(script: MockScript) -> SocketAddr {
+        spawn_mock_multi_holding(vec![script], true).0
+    }
 
     /// 测试用 Setup ACK（协商 PDU = 480 = 0x01E0，错误类/码为 0）。
     fn setup_ack_frame() -> Vec<u8> {
@@ -1107,66 +1380,30 @@ mod session_tests {
         hex("06 D0 00 01 00 00 00")
     }
 
-    /// 单 Item 读 ACK：`data` 为 Item 数据本体（FF 04/01 长度 + 数据）。
+    /// 多 Item 读 ACK：每项 `(transport, units, data)` 按序拼接数据区。
     ///
     /// `transport`：0x04=字节（units=字节数）、0x01=位（units=位数）。
-    fn read_ack_frame(transport: u8, units: u16, data: &[u8]) -> Vec<u8> {
+    fn read_ack_frame_items(items: &[(u8, u16, Vec<u8>)]) -> Vec<u8> {
         let mut ack = hex("32 03 00 00 00 00 00 02 00 00 00 00 04 01");
-        // 数据区长度字段（偏移 8..10）= 每项头 4 字节 + 数据本体。
-        let data_len = (4 + data.len()) as u16;
+        ack[13] = items.len() as u8; // 参数区 Item 数
+        let data_len: u16 = items.iter().map(|(_, _, d)| (4 + d.len()) as u16).sum();
         ack[8..10].copy_from_slice(&data_len.to_be_bytes());
-        ack.extend_from_slice(&[0xFF, transport]);
-        ack.extend_from_slice(&units.to_be_bytes());
-        ack.extend_from_slice(data);
+        for (transport, units, data) in items {
+            ack.extend_from_slice(&[0xFF, *transport]);
+            ack.extend_from_slice(&units.to_be_bytes());
+            ack.extend_from_slice(data);
+        }
         ack
     }
 
-    /// 启动 mock S7 服务器：逐帧读取客户端请求，按 `script` 顺序回放应答。
-    ///
-    /// `script` 每项为一组应答帧：组内多帧**拼接为一次 write** 发出（构造粘包）。
-    /// 空组 = 只收不发（持有连接，用于超时场景）。返回监听地址。
-    fn spawn_mock(script: Vec<Vec<Vec<u8>>>) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
-        let addr = listener.local_addr().expect("mock addr");
-        thread::spawn(move || {
-            let Ok((mut sock, _)) = listener.accept() else {
-                return;
-            };
-            let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
-            for group in script {
-                // 读取一帧请求（4 字节头 + 余体），忽略内容（按序应答即可）。
-                let mut head = [0u8; 4];
-                if read_exact_s7(&mut sock, &mut head).is_err() {
-                    return;
-                }
-                let total = u16::from_be_bytes([head[2], head[3]]) as usize;
-                if total < 4 {
-                    return;
-                }
-                let mut body = vec![0u8; total - 4];
-                if read_exact_s7(&mut sock, &mut body).is_err() {
-                    return;
-                }
-                // 组内多帧拼一次 write（粘包）；帧间也拼接（握手两帧同发亦可分帧）。
-                let mut glued: Vec<u8> = Vec::new();
-                for frame in group {
-                    glued.extend_from_slice(&frame);
-                }
-                if !glued.is_empty() && sock.write_all(&glued).is_err() {
-                    return;
-                }
-            }
-            // 应答完毕后保持连接直至客户端关闭（避免测试期间 RST 干扰读超时）。
-            thread::sleep(Duration::from_millis(100));
-            let mut drain = [0u8; 64];
-            loop {
-                match sock.read(&mut drain) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        });
-        addr
+    /// 单 Item 读 ACK（旧用例兼容封装）：`data` 为 Item 数据本体。
+    fn read_ack_frame(transport: u8, units: u16, data: &[u8]) -> Vec<u8> {
+        read_ack_frame_items(&[(transport, units, data.to_vec())])
+    }
+
+    /// 写 ACK（单 Item 返回码 OK）。
+    fn write_ack_frame() -> Vec<u8> {
+        hex("32 03 00 00 00 00 00 02 00 01 00 00 05 01 FF")
     }
 
     /// hex 字符串 → 字节向量（与纯函数层测试同构的本地辅助）。
@@ -1236,10 +1473,10 @@ mod session_tests {
         s.shutdown();
     }
 
-    /// QA Error: 握手无应答（2s 读超时）→ NetworkError。
+    /// QA Error: 握手无应答（mock 只收 CR 不回包随即关闭）→ NetworkError。
     #[test]
-    fn mock_connect_timeout_is_network_error() {
-        // 空脚本：mock 只收 CR 不回包并持有连接。
+    fn mock_connect_no_reply_is_network_error() {
+        // 空脚本：mock 只收 CR 不回包（EOF / 对端关闭）。
         let addr = spawn_mock(vec![vec![]]);
         let err = S7Session::connect(&addr.to_string(), derive_tsap(0, 0))
             .expect_err("must time out");
@@ -1255,6 +1492,158 @@ mod session_tests {
         drop(listener);
         let err = S7Session::connect(&addr.to_string(), derive_tsap(0, 0))
             .expect_err("must be refused");
+        assert!(matches!(err, S7Error::NetworkError(_)), "got {err:?}");
+    }
+
+    // ---- B2：写路径 ----
+
+    /// QA Happy: 写 DB1.DBW0 ← 0x1234（大端）；mock 校验收到的 Write Var 数据字段。
+    #[test]
+    fn mock_write_point_dbw0_0x1234() {
+        let mut script = handshake_script();
+        script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
+        let (addr, received) = spawn_mock_multi(vec![script]);
+        let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
+        let a = parse_s7_address("DB1.DBW0").expect("addr");
+        s.write_point(&a, &[0x12, 0x34]).expect("write");
+        s.shutdown();
+
+        let rec = received.lock().expect("lock");
+        assert_eq!(rec.len(), 3, "CR + Setup + Write Var");
+        let payload = parse_tpkt(&rec[2]).expect("tpkt");
+        assert_eq!(payload[13], 0x05, "function = Write Var");
+        // COTP DT(3) + S7 头(10) + 功能码/项数(2) + Item(12) + 数据头(4) = 31。
+        assert_eq!(&payload[31..33], &[0x12, 0x34], "write data big-endian");
+    }
+
+    /// QA Error: 写 ACK 返回码 0x05（地址越界）→ ReturnCode，且不触发重连重试。
+    #[test]
+    fn mock_write_point_return_code_error_no_retry() {
+        let mut ack = write_ack_frame();
+        let last = ack.len() - 1;
+        ack[last] = 0x05;
+        let mut script = handshake_script();
+        script.push(vec![build_tpkt(&ack).expect("tpkt")]);
+        let (addr, received) = spawn_mock_multi(vec![script]);
+        let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
+        let a = parse_s7_address("DB1.DBW0").expect("addr");
+        let err = s.write_point(&a, &[0x12, 0x34]).expect_err("must fail");
+        assert!(
+            matches!(err, S7Error::ReturnCode { code: 0x05, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(received.lock().expect("lock").len(), 3, "no reconnect retry");
+        s.shutdown();
+    }
+
+    // ---- B2：同 DB 相邻地址合并读 ----
+
+    /// QA Happy: 同 DB 相邻两 Word 合并为单 Item（count=4），结果按原地址切分。
+    #[test]
+    fn mock_read_merges_adjacent_words_into_single_item() {
+        let mut script = handshake_script();
+        script.push(vec![build_tpkt(&read_ack_frame(0x04, 4, &[0x12, 0x34, 0x56, 0x78]))
+            .expect("tpkt")]);
+        let (addr, received) = spawn_mock_multi(vec![script]);
+        let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
+        let w0 = parse_s7_address("DB1.DBW0").expect("addr");
+        let w2 = parse_s7_address("DB1.DBW2").expect("addr");
+        let vals = s.read_points(&[w0, w2]).expect("read");
+        s.shutdown();
+
+        assert_eq!(vals, vec![hex("12 34"), hex("56 78")], "split back per address");
+        let rec = received.lock().expect("lock");
+        let payload = parse_tpkt(&rec[2]).expect("tpkt");
+        assert_eq!(payload[14], 1, "merged into a single item");
+        // Item 长度字段位于 payload[19..21]（Item 头 4 字节之后）。
+        assert_eq!(&payload[19..21], &4u16.to_be_bytes(), "merged count = 4 bytes");
+    }
+
+    /// QA: 合并边界——有间隙不合拢、位地址不合拢、跨 DB 不合拢；异宽可链式合并。
+    #[test]
+    fn merge_adjacent_groups_boundaries() {
+        let g = |addrs: &[&str]| -> Vec<(S7ReadItem, Vec<u16>)> {
+            let parsed: Vec<S7Address> = addrs
+                .iter()
+                .map(|a| parse_s7_address(a).expect("addr"))
+                .collect();
+            merge_adjacent_groups(&parsed)
+        };
+        // 间隙 2 字节：不合拢。
+        assert_eq!(g(&["DB1.DBW0", "DB1.DBW4"]).len(), 2);
+        // 位地址永不合并。
+        assert_eq!(g(&["DB1.DBX0.0", "DB1.DBX1.0"]).len(), 2);
+        // 跨 DB 不合拢。
+        assert_eq!(g(&["DB1.DBW0", "DB2.DBW2"]).len(), 2);
+        // Word+DWord+Byte 链式合并为单 Item（count=7，宽度 2/4/1）。
+        let merged = g(&["DB1.DBW0", "DB1.DBD2", "DB1.DBB6"]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0.count, 7);
+        assert_eq!(merged[0].1, vec![2, 4, 1]);
+    }
+
+    // ---- B2：PDU 拆分 ----
+
+    /// QA Happy: 40 个不连续 Word 超协商 PDU（480 → 每请求 38 Item）拆为 2 个 Read Var。
+    #[test]
+    fn mock_read_pdu_split_into_multiple_requests() {
+        // 步进 4 字节（字宽 2 + 间隙 2），相邻地址不合并 → 40 个独立 Item。
+        let addrs: Vec<S7Address> = (0..40usize)
+            .map(|i| parse_s7_address(&format!("DB1.DBW{}", i * 4)).expect("addr"))
+            .collect();
+        let mut script = handshake_script();
+        // 请求 1 应答 38 项（值 100+j），请求 2 应答 2 项（值 200+j）。
+        for (base, count) in [(100u16, 38usize), (200u16, 2usize)] {
+            let items: Vec<(u8, u16, Vec<u8>)> = (0..count)
+                .map(|j| (0x04u8, 2u16, (base + j as u16).to_be_bytes().to_vec()))
+                .collect();
+            script.push(vec![build_tpkt(&read_ack_frame_items(&items)).expect("tpkt")]);
+        }
+        let (addr, received) = spawn_mock_multi(vec![script]);
+        let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
+        let vals = s.read_points(&addrs).expect("read");
+        s.shutdown();
+
+        let rec = received.lock().expect("lock");
+        assert_eq!(rec.len(), 4, "CR + Setup + Read#1 + Read#2");
+        let p1 = parse_tpkt(&rec[2]).expect("tpkt");
+        let p2 = parse_tpkt(&rec[3]).expect("tpkt");
+        assert_eq!(p1[13], 0x04, "function = Read Var");
+        assert_eq!(p1[14], 38, "first request carries 38 items");
+        assert_eq!(p2[14], 2, "second request carries the rest");
+        // 结果顺序与取值逐一正确（按请求内序号还原）。
+        assert_eq!(vals.len(), 40);
+        for (i, v) in vals.iter().enumerate() {
+            let expect = if i < 38 { 100 + i as u16 } else { 200 + (i - 38) as u16 };
+            assert_eq!(read_u16_be(v).expect("u16"), expect, "index {i}");
+        }
+    }
+
+    // ---- B2：断线重连 ----
+
+    /// QA Happy: 首连接握手后被对端关闭 → 自动重连到同一端点的新连接完成读。
+    #[test]
+    fn mock_reconnect_after_peer_close_succeeds() {
+        let mut script2 = handshake_script();
+        script2.push(vec![build_tpkt(&read_ack_frame(0x04, 2, &[0x12, 0x34])).expect("tpkt")]);
+        // 连接 1：仅握手（随后被 mock 关闭）；连接 2：握手 + 正常应答。
+        let (addr, _rec) = spawn_mock_multi(vec![handshake_script(), script2]);
+        let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
+        let a = parse_s7_address("DB1.DBW0").expect("addr");
+        let vals = s.read_points(&[a]).expect("read after auto-reconnect");
+        s.shutdown();
+        assert_eq!(vals, vec![hex("12 34")]);
+    }
+
+    /// QA Error: 对端关闭后重连仍失败（监听已关闭）→ 二次失败上抛 NetworkError。
+    #[test]
+    fn mock_reconnect_second_failure_propagates() {
+        let (addr, _rec) = spawn_mock_multi(vec![handshake_script()]);
+        let mut s = S7Session::connect(&addr.to_string(), derive_tsap(0, 0)).expect("connect");
+        // 让 mock 线程处理完连接 1 并释放监听端口（脚本耗尽后 mock 关闭退出）。
+        thread::sleep(Duration::from_millis(300));
+        let a = parse_s7_address("DB1.DBW0").expect("addr");
+        let err = s.read_points(&[a]).expect_err("second failure must propagate");
         assert!(matches!(err, S7Error::NetworkError(_)), "got {err:?}");
     }
 }
