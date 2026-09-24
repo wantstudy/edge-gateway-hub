@@ -6,5 +6,8 @@
 //! 后续任务填充：授权状态机与本地租约校验（Wave 6）。
 
 pub mod client;
+pub mod clock;
+pub mod limits;
 pub mod machine_id;
 pub mod signing;
+pub mod trial;
