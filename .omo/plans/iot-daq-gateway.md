@@ -3140,3 +3140,50 @@ lease_id / payload_digest / sig）走同一个 `missing()` 辅助，空白一律
 `engineer-webcore` 已交付工程骨架（package.json / vite.config / tsconfig / router /
 App.vue / store / mock + 17 个页面占位）；`engineer-webmon` 已启动实现监控组 3 页。
 页面基线 = `docs/design/prototype/gateway-v2a-glacier.html:1384-2136`（内联原型，二选一不可行）。
+
+---
+
+## 交付进度快照（自动维护，非任务清单主体）
+
+> 由主理人在每轮交付后追加，记录「已实现 / 按计划延期 / 口径澄清」，便于跨会话对齐。
+> 最近更新：**2026-09-24**。
+
+### 已实现（生产级）
+
+- **web-console（网关侧控制台）16 页 100% 实现**：
+  - 本轮补齐 5 页——`启动与自启`（Docker/systemd 形态自动识别 + 自启开关，仅管理员可改）、
+    `设备接入`（KPI / 筛选 / 分页 / 删除二次确认 DangerConfirmModal 四要素）、
+    `新增设备`（四步向导 + 逐步实时门控）、`点位与映射`（CSV 导入「行号 + 原因 + 允许值」校验 + 模板导出）、
+    `实时点位值`（1s 节流 + 暂停冻结）；
+  - 另 11 页（总览 / 实时监控 / 告警 / 北向转发 / 转发规则 / 日志审计 / 诊断 / 备份 / 系统更新 / 授权激活 / 账号角色 / 系统设置）前序已实现；
+  - mock repo 扩展写入层（createDevice / deleteDevice / createPoint / deletePoint / replacePointsOfDevice）+ 审计落点；
+    `ui-kit/status-map.ts` 补 `error` 枚举（设备状态机复用）；
+  - **验证**：`vue-tsc --noEmit` 与 `vite build` 均 EXIT=0；headless Chromium CDP 真机验证 **23/23 通过**（渲染 + 逐步门控 + 自启开关交互 + 无控制台报错 / 无横向溢出）。
+- **deploy/（Linux Docker 主推交付）**：Dockerfile（digest pin / 非 root / 无敏感物入镜像）、
+  docker-compose.yml（宿主指纹 `:ro` 挂载 / `read_only` + 单一 rw 持久卷 / `cap_drop: ALL` / 禁 `--privileged` / 禁 docker.sock）、
+  entrypoint.sh、install.sh / uninstall.sh、build-offline-bundle.sh（离线 tar + SHA256SUMS）、
+  sign-and-verify.sh（cosign verify + 离线包哈希校验）、detect-serial.sh、README.md；
+  设计文档 `docs/design/container-{deploy,machine-binding,persistence-layout,supply-chain}.md` 齐备。
+- **admin-console（厂商后台）12 页**（前序 task 47，真构建通过）。
+- **ui-kit（两端共用）**：设计 token + 共享业务组件 + RBAC（admin 侧）+ 状态映射。
+- **Rust 核心**：daemon / licensing-server / protocol-proto（397 passed）。
+
+### 按计划延期（非缺陷）
+
+- `tauri-shell/`、`headless/`：仅 README 占位。计划明确「本阶段不创建 Cargo 工程，避免空壳干扰 workspace」
+  （Wave 4 task 32/33/38/60 容器化交付资产在 deploy/）。属计划内有意延期，非遗漏。
+
+### 口径澄清（设计 → 实现 偏差与定调）
+
+1. **rusqlite 合规**：「纯 Rust 依赖栈」红线禁的是需系统 C 库 / cmake / NASM 的裸链接依赖
+   （`openssl-sys` 非 vendored、`native-tls`、`paho-mqtt`、`aws-lc-rs` 等）；
+   `rusqlite` 的 `bundled` 特性（内嵌 SQLite C 源，vendored）已实测 mingw 构建 EXIT=0，属合规 SQLite 接入。
+   已在根 README 与 `F:\xy\.workbuddy\memory/MEMORY.md` 定调。
+2. **通配规则多命中 = 多出口分发（设计意图，非 bug）**：转发规则引擎按「转发什么、去哪」匹配，
+   一条数据可同时满足多条规则 → 分发到多个北向出口。QA 曾建议「多命中改单命中」被主理人否决——
+   属设计意图；既有测试固化此语义，改断言会红。
+3. **两处 licensing 契约角色偏差（均为「细化」非「变更」）**：
+   - admin-console RBAC 四角色 = `system` 吸收原三角色 + 新增；`admin→system`、`viewer→risk` 映射集中在
+     `ui-kit/src/rbac.ts` 一处（doc 里三角色已被取代）。
+   - web-console 角色 = `admin / engineer / operator / viewer`（见 `web-console/src/store/session.ts`），
+     较设计文档 §2 三角色细分出 `engineer`；客户端无路由级 RBAC 守卫（授权判定在 Rust 侧，前端 RoleGate 仅控可见性）。

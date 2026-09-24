@@ -1,0 +1,52 @@
+# iot-daq 网关默认配置模板（占位值，现场由持久卷 config/ 覆盖）
+# 权威设计：docs/design/container-deploy.md
+# ⚠️ 本文件随镜像层分发 → 属公开内容 → 严禁写任何真实凭据 / 密钥 / 激活码。
+
+[gateway]
+# 管理面监听（host 网络下即宿主端口）
+http_bind = "0.0.0.0"
+http_port = 8080
+# Web 控制台静态资源目录（镜像内路径）
+web_console_dir = "/srv/web-console"
+
+[storage]
+# 全部状态落宿主持久卷（陷阱 2 红线）
+data_dir = "/var/lib/iot-daq"
+queue_db = "/var/lib/iot-daq/queue.db"
+telemetry_db = "/var/lib/iot-daq/telemetry.db"
+config_dir = "/var/lib/iot-daq/config"
+logs_dir = "/var/lib/iot-daq/logs"
+
+[fingerprint]
+# 宿主锚点（容器内只读挂载到此路径，陷阱 1 红线）
+host_machine_id = "/host/etc/machine-id"
+host_dmi_dir = "/host/sys/class/dmi/id"
+# 宿主 MAC 指纹文件（安装脚本生成，只读挂载）
+host_fingerprint_file = "/var/lib/iot-daq/host-fingerprint.json"
+# 宿主 MAC 经环境变量注入（daemon EnvAnchor 读取）
+host_mac_env = "IOT_DAQ_HOST_MAC"
+# 指纹 HMAC 盐：从文件读取，禁止内联
+fingerprint_key_file = "/run/secrets/iot-daq-fingerprint-key"
+# N-of-M 配额（与 task 41 口径一致：命中 ≥4/5 判同机）
+anchor_quorum_min = 3
+
+[license]
+server_url = ""          # 离线现场留空
+heartbeat_secs = 300
+grace_secs = 86400
+license_dir = "/var/lib/iot-daq/license"
+trial_dir = "/var/lib/iot-daq/trial"
+
+[logging]
+level = "info"
+json = false
+# 审计 / 授权判定记录落持久卷，不走 stdout（container-deploy.md §2.4）
+audit_dir = "/var/lib/iot-daq/logs"
+
+[integrity]
+# 运行时自检失败行为：restricted（停北向）| refuse（拒绝启动）
+tamper_policy = "restricted"
+
+[serial]
+# 串口在 compose 中以 devices 声明；此处仅列逻辑名，实际节点由 env 注入
+group = "dialout"
