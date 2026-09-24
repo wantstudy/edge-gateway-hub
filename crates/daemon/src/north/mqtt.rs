@@ -53,9 +53,10 @@ use std::time::Duration;
 
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS,
-    Transport,
+    TlsConfiguration, Transport,
 };
-use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{crypto::CryptoProvider, ClientConfig, RootCertStore};
 
 use crate::backpressure::{
     AckOutcome, AuditLog, BackpressureAudit, DedupOutcome, IdempotencyLedger, LedgerStats,
@@ -178,11 +179,13 @@ pub fn qos_to_u8(qos: QoS) -> u8 {
 
 /// TLS 配置（PEM **路径**，内容在构建 [`Transport`] 时读取，不入库、不硬编码）。
 ///
-/// - `ca_cert_path`：服务端 CA（必填，用于校验 broker 证书）；
+/// - `ca_cert_path`：服务端 CA；**可选**——`None` = 用**操作系统根证书库**校验
+///   broker 证书（2026-09-25 用户决策：证书配置可选，没有证书文件也可用）。
+///   无论哪种来源都**强制**服务端证书校验，**无「跳过校验」路径**；
 /// - `client_cert_path` + `client_key_path`：成对出现即启用 mTLS。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsConfig {
-    /// CA 证书 PEM 路径（必填）。
+    /// CA 证书 PEM 路径（可选；`None` = 操作系统根证书库）。
     pub ca_cert_path: Option<PathBuf>,
     /// 客户端证书 PEM 路径（mTLS；与 `client_key_path` 成对）。
     pub client_cert_path: Option<PathBuf>,
@@ -193,7 +196,7 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
-    /// 仅服务端校验（无 mTLS）。
+    /// 仅服务端校验（无 mTLS），信任锚 = 指定 CA 文件。
     pub fn ca_only(ca_cert_path: impl Into<PathBuf>) -> Self {
         Self {
             ca_cert_path: Some(ca_cert_path.into()),
@@ -203,7 +206,17 @@ impl TlsConfig {
         }
     }
 
-    /// mTLS（服务端校验 + 客户端证书）。
+    /// 仅服务端校验（无 mTLS），信任锚 = **操作系统根证书库**（无自定义 CA 文件）。
+    pub fn system_roots() -> Self {
+        Self {
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            alpn: Vec::new(),
+        }
+    }
+
+    /// mTLS（服务端校验 + 客户端证书），信任锚 = 指定 CA 文件。
     pub fn mtls(
         ca_cert_path: impl Into<PathBuf>,
         client_cert_path: impl Into<PathBuf>,
@@ -217,16 +230,26 @@ impl TlsConfig {
         }
     }
 
-    /// 配置自检：CA 必填、mTLS 证书与私钥必须成对。
+    /// mTLS（服务端校验 + 客户端证书），信任锚 = **操作系统根证书库**。
+    pub fn mtls_system_roots(
+        client_cert_path: impl Into<PathBuf>,
+        client_key_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            ca_cert_path: None,
+            client_cert_path: Some(client_cert_path.into()),
+            client_key_path: Some(client_key_path.into()),
+            alpn: Vec::new(),
+        }
+    }
+
+    /// 配置自检：mTLS 证书与私钥必须成对。
+    ///
+    /// `ca_cert_path` **可选**（`None` = 操作系统根证书库，见 [`TlsConfig::system_roots`]）。
     ///
     /// # Errors
     /// 非法组合返回 [`DaemonError::ConfigError`]（2000）。
     pub fn validate(&self) -> DaemonResult<()> {
-        if self.ca_cert_path.is_none() {
-            return Err(DaemonError::ConfigError(
-                "outlet tls: ca_cert_path is required when tls is enabled".to_string(),
-            ));
-        }
         match (&self.client_cert_path, &self.client_key_path) {
             (Some(_), None) => Err(DaemonError::ConfigError(
                 "outlet tls: client_key_path is required when client_cert_path is set".to_string(),
@@ -238,42 +261,84 @@ impl TlsConfig {
         }
     }
 
-    /// 读取 PEM 并构造 rumqttc [`Transport`]（rustls）。
+    /// 构造 rumqttc [`Transport`]（rustls，注入急切构建的 [`ClientConfig`]）。
     ///
-    /// 只做**配置→传输**的映射（PEM 内容在此读入内存），真正的 rustls 握手配置由
-    /// rumqttc 在建连阶段惰性构建；本方法会先确保进程级 `CryptoProvider` 就位
+    /// 信任锚来源：`ca_cert_path` 提供则读该 PEM（可含证书链）；缺省则加载
+    /// **操作系统根证书库**（`rustls-native-certs`）。两者皆**强制**服务端证书
+    /// 校验——信任锚解析不到任何证书即 [`DaemonError::SecurityError`]，
+    /// **无「跳过校验」路径**。本方法会先确保进程级 `CryptoProvider` 就位
     /// （见 [`ensure_rustls_provider`]），因此**宿主二进制无需额外调用
     /// `install_default()`**。
     ///
+    /// 相比「把 PEM 字节交给 rumqttc 建连时惰性解析」的旧实现，这里**急切**构建
+    /// `ClientConfig`：证书/私钥非法在出口启动时即暴露（fail-fast），不留到首次握手。
+    ///
     /// # Errors
-    /// 文件读取/内容非法 → [`DaemonError::SecurityError`]（7000）；
+    /// 文件读取/内容非法或信任锚为空 → [`DaemonError::SecurityError`]（7000）；
     /// 配置非法 → [`DaemonError::ConfigError`]（2000）。
     pub fn to_transport(&self) -> DaemonResult<Transport> {
         self.validate()?;
         ensure_rustls_provider()?;
 
-        let ca = read_pem(
-            self.ca_cert_path
-                .as_ref()
-                .ok_or_else(|| DaemonError::ConfigError("outlet tls: missing ca".to_string()))?,
-            "ca_cert_path",
-        )?;
-
-        let client_auth = match (&self.client_cert_path, &self.client_key_path) {
-            (Some(cert), Some(key)) => Some((
-                read_pem(cert, "client_cert_path")?,
-                read_pem(key, "client_key_path")?,
-            )),
-            _ => None,
+        let roots = self.build_root_store()?;
+        let builder = ClientConfig::builder().with_root_certificates(roots);
+        let mut config = match (&self.client_cert_path, &self.client_key_path) {
+            (Some(cert), Some(key)) => {
+                let (chain, key) = load_client_identity(cert, key)?;
+                builder.with_client_auth_cert(chain, key).map_err(|e| {
+                    DaemonError::SecurityError(format!(
+                        "outlet tls: invalid client identity (cert/key mismatch?): {e}"
+                    ))
+                })?
+            }
+            _ => builder.with_no_client_auth(),
         };
+        config.alpn_protocols.clone_from(&self.alpn);
 
-        let alpn = if self.alpn.is_empty() {
-            None
-        } else {
-            Some(self.alpn.clone())
-        };
+        Ok(Transport::Tls(TlsConfiguration::Rustls(Arc::new(config))))
+    }
 
-        Ok(Transport::tls(ca, client_auth, alpn))
+    /// 构建服务端信任锚：`ca_cert_path` 有值用该文件，缺省用**操作系统根证书库**。
+    ///
+    /// fail-closed：两条路径都解析不到任何证书 → [`DaemonError::SecurityError`]。
+    fn build_root_store(&self) -> DaemonResult<RootCertStore> {
+        let mut roots = RootCertStore::empty();
+        match self.ca_cert_path.as_deref() {
+            Some(path) => {
+                let pem = read_pem(path, "ca_cert_path")?;
+                if load_certs_into(&mut roots, &pem, "ca_cert_path")? == 0 {
+                    return Err(DaemonError::SecurityError(format!(
+                        "outlet tls: `ca_cert_path` `{}` contains no certificate",
+                        path.display()
+                    )));
+                }
+            }
+            None => {
+                let loaded = rustls_native_certs::load_native_certs();
+                if !loaded.errors.is_empty() {
+                    return Err(DaemonError::SecurityError(format!(
+                        "outlet tls: failed to load OS root certificate store: {:?}",
+                        loaded.errors
+                    )));
+                }
+                for cert in loaded.certs {
+                    roots.add(cert).map_err(|e| {
+                        DaemonError::SecurityError(format!(
+                            "outlet tls: OS root store contains an unparsable certificate: {e}"
+                        ))
+                    })?;
+                }
+                if roots.is_empty() {
+                    return Err(DaemonError::SecurityError(
+                        "outlet tls: OS root certificate store is empty; provide \
+                         `ca_cert_path` explicitly to verify the broker certificate \
+                         (skipping certificate verification is not supported)"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(roots)
     }
 }
 
@@ -292,6 +357,56 @@ fn read_pem(path: &Path, field: &str) -> DaemonResult<Vec<u8>> {
         )));
     }
     Ok(bytes)
+}
+
+/// 将 PEM 字节中的全部证书解析进 [`RootCertStore`]，返回解析数量。
+fn load_certs_into(store: &mut RootCertStore, pem: &[u8], field: &str) -> DaemonResult<usize> {
+    let mut count = 0usize;
+    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(pem)) {
+        let cert = cert
+            .map_err(|e| DaemonError::SecurityError(format!("outlet tls: parse {field}: {e}")))?
+            .into_owned();
+        store.add(cert).map_err(|e| {
+            DaemonError::SecurityError(format!(
+                "outlet tls: unparsable certificate in {field}: {e}"
+            ))
+        })?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// 读取并解析 mTLS 客户端身份：证书链（全部证书）+ 私钥（取第一个可用项）。
+fn load_client_identity(
+    cert_path: &Path,
+    key_path: &Path,
+) -> DaemonResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_pem = read_pem(cert_path, "client_cert_path")?;
+    let mut chain = Vec::new();
+    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem.as_slice())) {
+        let cert = cert
+            .map_err(|e| {
+                DaemonError::SecurityError(format!("outlet tls: parse client_cert_path: {e}"))
+            })?
+            .into_owned();
+        chain.push(cert);
+    }
+    if chain.is_empty() {
+        return Err(DaemonError::SecurityError(
+            "outlet tls: `client_cert_path` contains no certificate".to_string(),
+        ));
+    }
+
+    let key_pem = read_pem(key_path, "client_key_path")?;
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem.as_slice()))
+        .map_err(|e| DaemonError::SecurityError(format!("outlet tls: parse client_key_path: {e}")))?
+        .ok_or_else(|| {
+            DaemonError::SecurityError(
+                "outlet tls: `client_key_path` contains no private key".to_string(),
+            )
+        })?
+        .clone_key();
+    Ok((chain, key))
 }
 
 /// 确保 rustls 有进程级 `CryptoProvider`（mqtts 握手的前提）。
@@ -2261,14 +2376,14 @@ mod tests {
         assert_eq!(err.error_code(), ERR_CONFIG);
     }
 
-    /// QA: TLS 缺 CA / mTLS 只有半套 → ConfigError（证书域自检在构建期完成）。
+    /// QA: TLS 无自定义 CA = 操作系统根证书库（**合法**，2026-09-25 用户决策：
+    /// 证书配置可选）；mTLS 只有半套 → ConfigError（证书域自检在构建期完成）。
     #[test]
-    fn incomplete_tls_config_is_rejected() {
-        let no_ca = TlsConfig::default();
-        assert_eq!(
-            no_ca.validate().expect_err("missing ca").error_code(),
-            ERR_CONFIG
-        );
+    fn tls_without_ca_is_valid_but_half_mtls_is_rejected() {
+        let system_roots = TlsConfig::default();
+        system_roots
+            .validate()
+            .expect("no custom CA = OS root store (valid config)");
 
         let half_mtls = TlsConfig {
             ca_cert_path: Some(PathBuf::from("ca.pem")),
@@ -2737,14 +2852,15 @@ mod tests {
 
     // ---- TLS 配置映射 ----
 
-    /// QA: TLS 证书路径 → rumqttc `Transport::Tls`；缺失文件 → SecurityError（7000）。
+    /// QA: TLS 证书路径 → rumqttc `Transport::Tls`（急切构建 `ClientConfig`，
+    /// 用真实测试 CA 夹具）；缺失文件 → SecurityError（7000）。
     #[test]
     fn tls_config_maps_to_rustls_transport() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ca = dir.path().join("ca.pem");
-        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\ntest-only\n").expect("write ca");
+        // 真实证书（自签名 ECDSA 测试夹具）：急切路径要求能解析进 RootCertStore。
+        let real_ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls/ca.crt");
 
-        let config = TlsConfig::ca_only(&ca);
+        let config = TlsConfig::ca_only(&real_ca);
         // `Transport` 未实现 Debug，故用 match 断言变体（避免 Debug 格式化）。
         match config.to_transport() {
             Ok(Transport::Tls(_)) => {}
@@ -2770,6 +2886,40 @@ mod tests {
         assert_eq!(err.error_code(), ERR_SECURITY);
     }
 
+    /// QA: `ca_cert_path` 缺省 → 操作系统根证书库（用 `SSL_CERT_FILE` 指向测试 CA /
+    /// 不存在的路径做**封闭**验证：非空信任锚成功、空信任锚 fail-closed SecurityError）。
+    /// 正反两例放同一测试内**串行**执行，避免并行测试竞改进程级环境变量。
+    #[test]
+    fn system_root_store_fallback_is_hermetic() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls/ca.crt");
+        assert!(
+            fixture.is_file(),
+            "test CA fixture missing: {}",
+            fixture.display()
+        );
+
+        // 正例：SSL_CERT_FILE 指向测试 CA → 系统库非空 → Tls 传输构建成功。
+        std::env::set_var("SSL_CERT_FILE", &fixture);
+        let ok = TlsConfig::default().to_transport();
+        std::env::remove_var("SSL_CERT_FILE");
+        // `Transport` 未实现 Debug，用 match 断言变体。
+        match ok {
+            Ok(Transport::Tls(_)) => {}
+            Ok(_) => panic!("启用 TLS 时应映射到 Transport::Tls（实际为明文变体）"),
+            Err(e) => panic!("OS root store 传输构建失败: {e}"),
+        }
+
+        // 反例：信任锚为空 → fail-closed（绝不静默跳过校验）。
+        std::env::set_var("SSL_CERT_FILE", "/nonexistent/iotdaq-test-no-such-ca.pem");
+        // `Transport` 未实现 Debug，不能用 expect_err（要求 Ok 变体可 Debug）。
+        let err = match TlsConfig::default().to_transport() {
+            Ok(_) => panic!("empty trust anchor must fail"),
+            Err(e) => e,
+        };
+        std::env::remove_var("SSL_CERT_FILE");
+        assert_eq!(err.error_code(), ERR_SECURITY);
+    }
+
     /// QA（守护性回归）：rustls 必须有可用的进程级 crypto provider，否则 mqtts 握手必然失败。
     ///
     /// **若此测试失败，说明 rustls 的 `ring`（或 `aws-lc-rs`）provider 特性被移除**——
@@ -2781,10 +2931,8 @@ mod tests {
     #[test]
     fn tls_crypto_provider_is_installed() {
         // 走一次真实构建路径（`to_transport` 内部会确保 provider 就位）。
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ca = dir.path().join("ca.pem");
-        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\ntest-only\n").expect("write ca");
-        match TlsConfig::ca_only(&ca).to_transport() {
+        let real_ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls/ca.crt");
+        match TlsConfig::ca_only(&real_ca).to_transport() {
             Ok(Transport::Tls(_)) => {}
             Ok(_) => panic!("启用 TLS 时应映射到 Transport::Tls（实际为明文变体）"),
             Err(e) => panic!("TLS 传输构建失败: {e}"),

@@ -105,15 +105,17 @@ fn parse_port(text: &str) -> DaemonResult<u16> {
 /// 接受 `mqtt://host:port` / `mqtts://host:port` / `host:port` / `host`；
 /// 缺省端口 `mqtt` → 1883、`mqtts` → 8883。
 ///
-/// ## TLS / mTLS（task 25）
-/// 出口启用 TLS 时**必须**提供可校验的信任锚（`ca_cert_path`），并可选提供
-/// 成对的客户端证书（`client_cert_path` + `client_key_path`）以启用 mTLS。
+/// ## TLS / mTLS（task 25；2026-09-25 用户决策：**证书配置可选**）
+/// 出口启用 TLS 时必须存在**可校验的信任锚**：`ca_cert_path` 提供则用该 CA 文件，
+/// **缺省用操作系统根证书库**（`rustls-native-certs`）；并可选提供成对的客户端证书
+/// （`client_cert_path` + `client_key_path`）以启用 mTLS。
 /// 全部规则 **fail-closed**：任一违规返回 [`DaemonError::ConfigError`]（含出口名），
 /// **绝不**静默降级为明文、**绝不**跳过证书校验。
 ///
 /// 规则清单：
 /// 1. `tls = true` 但 scheme 为 `mqtt://`（或省略 scheme）→ 报错（不猜意图）。
-/// 2. TLS 出口（`mqtts://` 或 `tls = true`）缺 `ca_cert_path` → 报错。
+/// 2. TLS 出口的信任锚：`ca_cert_path` **可选**——缺省 = 操作系统根证书库
+///    （系统库为空时在 `TlsConfig::to_transport` 处 fail-closed，运行期不留死角）。
 /// 3. `client_cert_path` / `client_key_path` 出现任一个时**必须成对**，否则报错。
 /// 4. 上述 PEM 路径在**构建出口时**即校验存在（路径写错不留到运行期）。
 /// 5. TLS 字段（`ca_cert_path` / `client_cert_path` / `client_key_path` /
@@ -202,18 +204,15 @@ pub fn endpoint_from_outlet(outlet: &OutletConfig) -> DaemonResult<EndpointConfi
 /// 只读 IO（PEM 路径存在性检查），无隐藏可变状态；不读取/解析 PEM 内容——
 /// 内容合法性由 [`TlsConfig::to_transport`] / [`EndpointConfig::validate`] 负责。
 fn build_tls_config(outlet: &OutletConfig, broker_host: &str) -> DaemonResult<TlsConfig> {
-    // 规则 2：CA 必填。
-    let ca = match outlet.ca_cert_path.as_deref().map(str::trim) {
-        Some(path) if !path.is_empty() => path.to_string(),
-        _ => {
-            return Err(config_err(format!(
-                "outlet `{}`: TLS is enabled but `ca_cert_path` is missing; a verifiable \
-                 TLS session requires the broker CA certificate (skipping certificate \
-                 verification is not supported)",
-                outlet.name
-            )))
-        }
-    };
+    // 规则 2：信任锚可选 —— `ca_cert_path` 缺省 = 操作系统根证书库
+    // （2026-09-25 用户决策：证书配置可选、无证书也可用）。
+    // 无论哪种来源都强制服务端证书校验，绝无「跳过校验」路径；
+    // 系统库为空时在 `TlsConfig::to_transport` 处 fail-closed。
+    let ca = outlet
+        .ca_cert_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let cert = non_empty(outlet.client_cert_path.as_deref());
     let key = non_empty(outlet.client_key_path.as_deref());
@@ -238,7 +237,9 @@ fn build_tls_config(outlet: &OutletConfig, broker_host: &str) -> DaemonResult<Tl
     }
 
     // 规则 4：路径存在性（构建期 fail-closed）。
-    ensure_cert_file_exists(outlet, "ca_cert_path", &ca)?;
+    if let Some(path) = &ca {
+        ensure_cert_file_exists(outlet, "ca_cert_path", path)?;
+    }
     if let Some(path) = &cert {
         ensure_cert_file_exists(outlet, "client_cert_path", path)?;
     }
@@ -259,8 +260,14 @@ fn build_tls_config(outlet: &OutletConfig, broker_host: &str) -> DaemonResult<Tl
     }
 
     let mut tls = match (&cert, &key) {
-        (Some(cert), Some(key)) => TlsConfig::mtls(ca, cert.clone(), key.clone()),
-        _ => TlsConfig::ca_only(ca),
+        (Some(cert), Some(key)) => match &ca {
+            Some(ca) => TlsConfig::mtls(ca, cert.clone(), key.clone()),
+            None => TlsConfig::mtls_system_roots(cert.clone(), key.clone()),
+        },
+        _ => match &ca {
+            Some(ca) => TlsConfig::ca_only(ca),
+            None => TlsConfig::system_roots(),
+        },
     };
     tls.alpn = outlet
         .alpn
@@ -725,14 +732,18 @@ mod tests {
         assert!(msg.contains("mqtts://"), "msg={msg}");
     }
 
-    /// 规则 2：`mqtts://` 缺 `ca_cert_path` → 报错（含出口名与字段名）。
+    /// 规则 2：`mqtts://` 缺 `ca_cert_path` → 信任锚回退**操作系统根证书库**
+    /// （不再报错；2026-09-25 用户决策「证书配置可选」），TLS 仍挂载。
     #[test]
-    fn tls_mqtts_without_ca_is_rejected() {
+    fn tls_mqtts_without_ca_falls_back_to_system_roots() {
         let outlet = base_outlet("north-ca", "mqtts://broker.local:8883");
-        let err = endpoint_from_outlet(&outlet).expect_err("must reject");
-        let msg = err.to_string();
-        assert!(msg.contains("north-ca"), "msg={msg}");
-        assert!(msg.contains("ca_cert_path"), "msg={msg}");
+        let endpoint = endpoint_from_outlet(&outlet).expect("system-roots outlet");
+        let tls = endpoint.tls.clone().expect("tls must be attached");
+        assert!(tls.ca_cert_path.is_none(), "no custom CA expected");
+        assert!(
+            tls.client_cert_path.is_none() && tls.client_key_path.is_none(),
+            "no client identity expected"
+        );
     }
 
     /// 规则 3：`client_cert_path` 有、`client_key_path` 无 → 报错。

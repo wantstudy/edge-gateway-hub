@@ -195,9 +195,10 @@ pub struct OutletConfig {
     /// [`crate::north::runtime::endpoint_from_outlet`] 处报错，**绝不猜测意图**。
     #[serde(default)]
     pub tls: bool,
-    /// 服务端 CA 证书 PEM 路径（task 25；启用 TLS 时**必填**，用于校验 broker 证书）。
+    /// 服务端 CA 证书 PEM 路径（task 25；TLS 出口**可选**——缺省用**操作系统根证书库**
+    /// 校验 broker 证书；2026-09-25 用户决策「证书配置可选」。仍无跳过校验路径）。
     ///
-    /// `None` = 明文出口（不启用 TLS 时忽略）。
+    /// `None` = 用操作系统根证书库（TLS 未启用时忽略）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_path: Option<String>,
     /// 客户端证书 PEM 路径（task 25；mTLS，与 `client_key_path` **成对**）。

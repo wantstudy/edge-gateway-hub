@@ -52,6 +52,12 @@ rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustl
 # 显式启用 `ring`（纯 Rust 侧可构建；**不要选 aws-lc-rs**：cmake/NASM C 构建，违反纯 Rust 栈红线）。
 # 特性在同一 rustls 0.23.x 上做版本统一，无需改动 rumqttc/tokio-rustls 自身配置。
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# task 25 证书可选（2026-09-25 用户决策）：`ca_cert_path` 缺省时用**操作系统根证书库**
+# 校验 broker 证书（rustls-native-certs，纯 Rust，依赖仅 rustls-pki-types）；
+# `rustls-pemfile` 解析 PEM 证书链/私钥（急切构建 ClientConfig，出口启动即暴露坏证书）。
+# 两者皆为 rustls 系纯 Rust，符合依赖红线；仍无任何「跳过证书校验」路径。
+rustls-native-certs = "0.8.4"
+rustls-pemfile = "2.2.0"
 ed25519-dalek = "3.0.0"
 serde_json = "1.0.151"
 base64 = "0.23.1"
@@ -89,13 +95,13 @@ licensing-server = { path = "../licensing-server" }
 tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "sync"] }
 
 # task 25 TLS/mTLS：**真实握手**集成测试的客户端侧传输（`tokio-rustls` 0.26.5 已由
-# rumqttc 引入 Cargo.lock，登记为 dev-dep 不新增下载）；`rustls-pemfile` 读测试 PEM。
+# rumqttc 引入 Cargo.lock，登记为 dev-dep 不新增下载）。
 # 纯 Rust 栈合规（rustls 系，crypto provider 统一 `ring`）。
 # **必须关闭 default 特性**：tokio-rustls 的 default = ["logging","tls12","aws_lc_rs"]，
 # 开着会把 aws-lc-rs 重新拉回 dev/test 依赖图（红线违规；CI `cargo deny check` 仍会红）。
 # 显式声明测试真正需要的三个特性（ring provider + tls12 + logging），等价于去掉 default 的 aws_lc_rs。
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pemfile = "2.2.0"
+# （`rustls-pemfile` 已升级为正式依赖，见 [dependencies]。）
 # task 25 真实握手测试需要构造 `ServerName` / 证书解析（1.15.1 已在 Cargo.lock）。
 rustls-pki-types = "1.15.1"
 

@@ -573,6 +573,7 @@ dependencies = [
  "rumqttc",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",
