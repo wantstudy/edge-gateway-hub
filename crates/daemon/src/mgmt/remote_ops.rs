@@ -5,8 +5,11 @@
 //!   鉴权 trait + 注入点（默认 **拒绝一切**，fail-closed）、[`OpsAuditEvent`]
 //!   审计环（每个动作必记，含被拒动作）、mgmt 事件历史环的带时间戳捕获
 //!   （`/api/ops/logs` 数据源）。
-//! - **不做**：统一鉴权中间件（task 57）——本模块的 `install()` 即中间件落地后的
-//!   **接线点**：届时把默认 `DenyAllOpsAuthorizer` 替换为真实策略即可，端点零改动；
+//! - **不做**：~~统一鉴权中间件（task 57）~~ → task 57 全量接线已完成：`/api/ops/*`
+//!   由 `mod.rs::ops_guard` 中间件守卫（JWT 401 + RBAC 403），三个 handler 内
+//!   保留 `ensure_action` 二次校验（防御纵深）；`install()` 仍是运维运行时
+//!   （审计环 / 事件捕获）的装配点，`OpsAuthorizer` 降级为「无可信角色源」的
+//!   fail-closed 兜底（见 `DenyAllOpsAuthorizer` 注释）；
 //!   文件系统日志聚合（task 18/57 范畴，见 `logs` 注释）；运行期采集器启停能力
 //!   （task 37 调度器拓扑，见 `collectors` 诚实降级说明）。
 //!
@@ -41,6 +44,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{MgmtEvent, MgmtState};
+use super::rbac::{permission_for_ops_action, AuthRejection, AuthedRole};
 
 /// 审计环容量（超出按环形淘汰最旧）。
 pub const AUDIT_RING_CAPACITY: usize = 1024;
@@ -97,6 +101,12 @@ pub trait OpsAuthorizer: Send + Sync + 'static {
 }
 
 /// 默认鉴权策略：拒绝一切（fail-closed）。
+///
+/// task 57 全量接线后语义：三个 handler 的授权判定已切换为「可信 JWT role →
+/// `permission_for_ops_action` → `ensure`」链（守卫中间件见 `mod.rs::ops_guard`），
+/// 本策略**不再参与该链**，保留为「无可信角色源」路径的 fail-closed 兜底
+///（未装配 runtime 的实例自动落 [`runtime_for`] 默认值；未来任何绕过
+/// extractor 的新代码路径默认全拒）。
 pub struct DenyAllOpsAuthorizer;
 
 impl OpsAuthorizer for DenyAllOpsAuthorizer {
@@ -373,6 +383,19 @@ fn forbidden(message: &str) -> Response {
 
 // ---- 请求体 ----
 
+/// task 57：可信角色 → RBAC 判定（授权判定唯一入口 = 权限矩阵，fail-closed：
+/// 映射外动作一律拒绝）。守卫中间件（`mod.rs::ops_guard`）已做过同等判定，
+/// handler 内保留二次校验为**防御纵深**。
+fn ensure_action(authed: &AuthedRole, action: OpsAction) -> Result<(), AuthRejection> {
+    match permission_for_ops_action(action.as_str()) {
+        Some(permission) => authed.ensure(permission),
+        None => Err(AuthRejection::Forbidden(format!(
+            "unknown ops action {:?}",
+            action.as_str()
+        ))),
+    }
+}
+
 /// POST /api/ops/restart 请求体（字段缺失按空串校验，避免 serde 硬失败路径分叉）。
 #[derive(Debug, Default, Deserialize)]
 struct RestartBody {
@@ -397,14 +420,19 @@ struct CollectorsBody {
 
 /// POST /api/ops/restart → 请求优雅停机（**不直接杀进程**）。
 ///
-/// 管线：解析 → actor 校验 → 鉴权 → 二次确认（`confirm` 必须回显当前
-/// `gateway_id`，缺失/不匹配 → 400 + 审计）→ [`DaemonShared::request_shutdown`]。
-/// 通过 → 200 `{accepted, mode: "graceful", note}`；note 说明停机由
-/// Supervisor / 服务管理器拉起（Windows 服务 / systemd 形态）。
+/// 管线：解析 → actor 校验 → 鉴权（task 57：可信 JWT role 经
+/// [`ensure_action`] 判定；守卫中间件已先行 401/403，此处为二次校验）→
+/// 二次确认（`confirm` 必须回显当前 `gateway_id`，缺失/不匹配 → 400 + 审计）→
+/// [`DaemonShared::request_shutdown`]。通过 → 200 `{accepted, mode: "graceful", note}`；
+/// note 说明停机由 Supervisor / 服务管理器拉起（Windows 服务 / systemd 形态）。
 ///
 /// **诚实限制**：本端点只保证「优雅停机请求已受理」；重启是否成功取决于
 /// 外部 Supervisor 的拉起策略（与看门狗/task 51 的单次重启钩子同一契约）。
-pub async fn restart(State(state): State<MgmtState>, body: Bytes) -> Response {
+pub async fn restart(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
     let runtime = runtime_for(&state);
 
     let req: RestartBody = match serde_json::from_slice(&body) {
@@ -435,13 +463,13 @@ pub async fn restart(State(state): State<MgmtState>, body: Bytes) -> Response {
         return bad_request("bad_request", "actor is required");
     }
 
-    if !runtime.authorize(&req.actor, OpsAction::Restart.as_str()) {
+    if let Err(rejection) = ensure_action(&authed, OpsAction::Restart) {
         runtime.record_audit(
             &req.actor,
             OpsAction::Restart,
             false,
             OUTCOME_DENIED,
-            "authorizer denied restart",
+            &rejection.to_string(),
         );
         return forbidden("restart denied by authorizer");
     }
@@ -502,7 +530,11 @@ pub async fn restart(State(state): State<MgmtState>, body: Bytes) -> Response {
 /// 采集开关（启停需调度器拓扑开关，task 37），故授权通过后返回
 /// 501 `{error: "not_implemented", planned, reason}` + 审计（not_implemented）。
 /// 「管线先于能力」：能力落地时仅替换 501 分支，安全管线零改动。
-pub async fn collectors(State(state): State<MgmtState>, body: Bytes) -> Response {
+pub async fn collectors(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
     let runtime = runtime_for(&state);
 
     let req: CollectorsBody = match serde_json::from_slice(&body) {
@@ -548,13 +580,13 @@ pub async fn collectors(State(state): State<MgmtState>, body: Bytes) -> Response
         }
     };
 
-    if !runtime.authorize(&req.actor, action.as_str()) {
+    if let Err(rejection) = ensure_action(&authed, action) {
         runtime.record_audit(
             &req.actor,
             action,
             false,
             OUTCOME_DENIED,
-            "authorizer denied collectors action",
+            &rejection.to_string(),
         );
         return forbidden("collectors action denied by authorizer");
     }
@@ -593,6 +625,7 @@ pub async fn collectors(State(state): State<MgmtState>, body: Bytes) -> Response
 /// 查询本身也是运维动作：actor 必填、鉴权、审计（logs_read）。
 pub async fn logs(
     State(state): State<MgmtState>,
+    authed: AuthedRole,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let runtime = runtime_for(&state);
@@ -609,13 +642,13 @@ pub async fn logs(
         return bad_request("bad_request", "actor query parameter is required");
     }
 
-    if !runtime.authorize(actor, OpsAction::LogsRead.as_str()) {
+    if let Err(rejection) = ensure_action(&authed, OpsAction::LogsRead) {
         runtime.record_audit(
             actor,
             OpsAction::LogsRead,
             false,
             OUTCOME_DENIED,
-            "authorizer denied logs_read",
+            &rejection.to_string(),
         );
         return forbidden("logs_read denied by authorizer");
     }
@@ -725,6 +758,8 @@ mod tests {
     use super::*;
     use crate::bootstrap::{DaemonShared, LifecycleState};
     use crate::config::{ConfigShared, GatewayConfig};
+    use crate::mgmt::auth_jwt::{now_unix_secs, sign, Claims};
+    use crate::mgmt::rbac::Role;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -776,6 +811,21 @@ frequency_ms = 100
         state
     }
 
+    /// task 57：以 state 的实际签名密钥签发测试 token（默认 dev 兜底密钥，
+    /// 与 `MgmtState::new` 的装配一致；sub 取 "ops-admin" 对齐审计断言）。
+    fn token_for(state: &MgmtState, role: Role) -> String {
+        let now = now_unix_secs();
+        let claims = Claims {
+            sub: "ops-admin".to_string(),
+            role,
+            exp: now + 600,
+            iat: now,
+            nbf: None,
+            jti: "test-jti".to_string(),
+        };
+        sign(&claims, state.auth().key()).expect("sign test token")
+    }
+
     /// 在 127.0.0.1 随机端口启动 axum 服务（本机回环）。
     async fn spawn_server(state: MgmtState) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -802,18 +852,30 @@ frequency_ms = 100
         (status, head.to_string(), body.to_string())
     }
 
-    /// 手写 HTTP 请求（method/path/body），整体 3s 超时防挂死。
-    async fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String, String) {
-        tokio::time::timeout(Duration::from_secs(3), async {
+    /// 手写 HTTP 请求（method/path/body/token），整体 3s 超时防挂死。
+    ///
+    /// task 57：`/api/ops/*` 由 ops_guard 中间件守卫——需带 Bearer token 的
+    /// 用例使用 `http_get_bearer` / `http_post_bearer`。
+    async fn http_request(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        token: Option<&str>,
+    ) -> (u16, String, String) {
+        tokio::time::timeout(Duration::from_secs(3), async move {
             let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
             let body = body.unwrap_or("");
+            let auth = token
+                .map(|t| format!("Authorization: Bearer {t}\r\n"))
+                .unwrap_or_default();
             let request = if method == "POST" {
                 format!(
-                    "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
             } else {
-                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n")
             };
             stream.write_all(request.as_bytes()).await.expect("write");
             stream.flush().await.expect("flush");
@@ -826,11 +888,24 @@ frequency_ms = 100
     }
 
     async fn http_get(port: u16, path: &str) -> (u16, String, String) {
-        http_request(port, "GET", path, None).await
+        http_request(port, "GET", path, None, None).await
     }
 
     async fn http_post(port: u16, path: &str, body: &str) -> (u16, String, String) {
-        http_request(port, "POST", path, Some(body)).await
+        http_request(port, "POST", path, Some(body), None).await
+    }
+
+    async fn http_get_bearer(port: u16, path: &str, token: &str) -> (u16, String, String) {
+        http_request(port, "GET", path, None, Some(token)).await
+    }
+
+    async fn http_post_bearer(
+        port: u16,
+        path: &str,
+        body: &str,
+        token: &str,
+    ) -> (u16, String, String) {
+        http_request(port, "POST", path, Some(body), Some(token)).await
     }
 
     /// 等待事件捕获环达到指定条数（捕获任务是异步的，轮询 + 兜底超时）。
@@ -872,7 +947,8 @@ frequency_ms = 100
 
     // ---- 默认 fail-closed ----
 
-    /// QA 安全: 未 install 的实例同样 fail-closed（403）且审计照记。
+    /// QA 安全: 未带 token 的运维请求 → 401（ops_guard 中间件在 ops runtime
+    /// 之前拒绝；身份未建立，不留审计痕——运行时不可能被匿名请求触达）。
     #[tokio::test]
     async fn restart_fail_closed_even_without_install() {
         // 不走 make_state：裸 MgmtState（无 runtime 注入）。
@@ -888,28 +964,28 @@ frequency_ms = 100
             r#"{"actor":"ops-admin","confirm":"gw-test"}"#,
         )
         .await;
-        assert_eq!(status, 403, "default authorizer must deny: {body}");
-
-        // 拒绝动作同样入审计环（fail-closed ≠ 不留痕）。
-        let audit = ops_runtime(&state).audit_snapshot();
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].action, "restart");
-        assert!(!audit[0].allowed);
-        assert_eq!(audit[0].outcome, OUTCOME_DENIED);
+        assert_eq!(status, 401, "unauthenticated ops request must be 401: {body}");
+        assert!(
+            ops_runtime(&state).audit_snapshot().is_empty(),
+            "request rejected before the ops runtime must not forge audit entries"
+        );
     }
 
     // ---- restart ----
 
-    /// QA 安全: 默认 authorizer 全拒 → restart 403（401/403 语义取 403）。
+    /// QA 安全: ops 角色 token（不持 ops.restart）→ 守卫中间件 403 + 审计
+    ///（被拒动作入审计环；DenyAll 兜底策略不参与该判定链，见模块注释）。
     #[tokio::test]
     async fn restart_denied_by_default_authorizer() {
         let state = make_state(Arc::new(DenyAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::Ops);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) = http_post(
+        let (status, _, body) = http_post_bearer(
             port,
             "/api/ops/restart",
             r#"{"actor":"ops-admin","confirm":"gw-test","reason":"maintenance"}"#,
+            &token,
         )
         .await;
         assert_eq!(status, 403, "{body}");
@@ -919,14 +995,63 @@ frequency_ms = 100
         assert!(audit.iter().any(|e| e.action == "restart" && !e.allowed));
     }
 
-    /// QA: 注入 allow 后，confirm 缺失 → 400（二次确认语义）+ 审计。
+    /// QA: 守卫中间件 403 的审计痕——actor 取 JWT sub、action/outcome 齐备。
+    #[tokio::test]
+    async fn guard_denied_action_is_audited_with_jwt_sub() {
+        let state = make_state(Arc::new(DenyAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        let _ = http_post_bearer(
+            port,
+            "/api/ops/restart",
+            r#"{"actor":"body-actor","confirm":"gw-test"}"#,
+            &token,
+        )
+        .await;
+
+        let audit = ops_runtime(&state).audit_snapshot();
+        assert_eq!(audit.len(), 1);
+        // 中间件层拿不到 body（不可重放读取），actor 以可信 JWT sub 为准。
+        assert_eq!(audit[0].actor, "ops-admin");
+        assert_eq!(audit[0].action, "restart");
+        assert!(!audit[0].allowed);
+        assert_eq!(audit[0].outcome, OUTCOME_DENIED);
+    }
+
+    /// QA（task 57 语义变更锚定）: 已装配 DenyAll 兜底策略的实例，携带**可信
+    /// system 角色** token 的请求照常放行——授权判定 = RBAC 权限矩阵，
+    /// authorizer 仅兜底「无可信角色源」路径。
+    #[tokio::test]
+    async fn restart_accepted_with_denyall_when_role_trusted() {
+        let state = make_state(Arc::new(DenyAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/ops/restart",
+            r#"{"actor":"ops-admin","confirm":"gw-test"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// QA: system 角色守卫通过后，confirm 缺失 → 400（二次确认语义）+ 审计。
     #[tokio::test]
     async fn restart_missing_confirm_is_400() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) =
-            http_post(port, "/api/ops/restart", r#"{"actor":"ops-admin"}"#).await;
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/ops/restart",
+            r#"{"actor":"ops-admin"}"#,
+            &token,
+        )
+        .await;
         assert_eq!(status, 400, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["error"], "confirm_required");
@@ -942,12 +1067,14 @@ frequency_ms = 100
     #[tokio::test]
     async fn restart_confirm_mismatch_is_400() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) = http_post(
+        let (status, _, body) = http_post_bearer(
             port,
             "/api/ops/restart",
             r#"{"actor":"ops-admin","confirm":"gw-wrong","reason":"x"}"#,
+            &token,
         )
         .await;
         assert_eq!(status, 400, "{body}");
@@ -963,14 +1090,16 @@ frequency_ms = 100
     #[tokio::test]
     async fn restart_accepted_triggers_graceful_shutdown() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let shutdown_rx = state.daemon().subscribe_shutdown();
         assert!(!*shutdown_rx.borrow());
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) = http_post(
+        let (status, _, body) = http_post_bearer(
             port,
             "/api/ops/restart",
             r#"{"actor":"ops-admin","confirm":"gw-test","reason":"scheduled maintenance"}"#,
+            &token,
         )
         .await;
         assert_eq!(status, 200, "{body}");
@@ -1005,9 +1134,10 @@ frequency_ms = 100
     #[tokio::test]
     async fn restart_malformed_json_is_400() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, _) = http_post(port, "/api/ops/restart", "not-json{{{").await;
+        let (status, _, _) = http_post_bearer(port, "/api/ops/restart", "not-json{{{", &token).await;
         assert_eq!(status, 400);
         assert!(!state.daemon().shutdown_requested());
         assert!(ops_runtime(&state)
@@ -1020,25 +1150,31 @@ frequency_ms = 100
     #[tokio::test]
     async fn restart_missing_actor_is_400() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
         let (status, _, _) =
-            http_post(port, "/api/ops/restart", r#"{"confirm":"gw-test"}"#).await;
+            http_post_bearer(port, "/api/ops/restart", r#"{"confirm":"gw-test"}"#, &token).await;
         assert_eq!(status, 400);
         assert!(!state.daemon().shutdown_requested());
     }
 
     // ---- collectors ----
 
-    /// QA 安全: 默认 authorizer → collectors 403 + 审计（即使能力未实现也先鉴权）。
+    /// QA 安全: ops 角色（不持 ops.collectors）→ 403 + 审计（即使能力未实现也先鉴权）。
     #[tokio::test]
     async fn collectors_denied_by_default_authorizer() {
         let state = make_state(Arc::new(DenyAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::Ops);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) =
-            http_post(port, "/api/ops/collectors", r#"{"actor":"ops-admin","action":"pause"}"#)
-                .await;
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/ops/collectors",
+            r#"{"actor":"ops-admin","action":"pause"}"#,
+            &token,
+        )
+        .await;
         assert_eq!(status, 403, "{body}");
         let audit = ops_runtime(&state).audit_snapshot();
         assert!(audit
@@ -1050,11 +1186,16 @@ frequency_ms = 100
     #[tokio::test]
     async fn collectors_invalid_action_is_400() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) =
-            http_post(port, "/api/ops/collectors", r#"{"actor":"ops-admin","action":"nuke"}"#)
-                .await;
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/ops/collectors",
+            r#"{"actor":"ops-admin","action":"nuke"}"#,
+            &token,
+        )
+        .await;
         assert_eq!(status, 400, "{body}");
         assert!(ops_runtime(&state)
             .audit_snapshot()
@@ -1067,11 +1208,12 @@ frequency_ms = 100
     #[tokio::test]
     async fn collectors_not_implemented_501_but_audited() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
         for action in ["pause", "resume"] {
             let body = format!(r#"{{"actor":"ops-admin","action":"{action}"}}"#);
-            let (status, _, body) = http_post(port, "/api/ops/collectors", &body).await;
+            let (status, _, body) = http_post_bearer(port, "/api/ops/collectors", &body, &token).await;
             assert_eq!(status, 501, "{body}");
             let value: Value = serde_json::from_str(&body).expect("json");
             assert_eq!(value["error"], "not_implemented");
@@ -1090,13 +1232,14 @@ frequency_ms = 100
 
     // ---- logs ----
 
-    /// QA 安全: 默认 authorizer → logs 403 + 审计。
+    /// QA 安全: ops 角色（不持 ops.logs_read）→ 403 + 审计。
     #[tokio::test]
     async fn logs_denied_by_default_authorizer() {
         let state = make_state(Arc::new(DenyAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::Ops);
         let port = spawn_server(state.clone()).await;
 
-        let (status, _, body) = http_get(port, "/api/ops/logs?actor=ops-admin").await;
+        let (status, _, body) = http_get_bearer(port, "/api/ops/logs?actor=ops-admin", &token).await;
         assert_eq!(status, 403, "{body}");
         let audit = ops_runtime(&state).audit_snapshot();
         assert!(audit.iter().any(|e| e.action == "logs_read" && !e.allowed));
@@ -1106,26 +1249,29 @@ frequency_ms = 100
     #[tokio::test]
     async fn logs_bad_params_are_400() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
         // 缺 actor。
-        let (status, _, _) = http_get(port, "/api/ops/logs").await;
+        let (status, _, _) = http_get_bearer(port, "/api/ops/logs", &token).await;
         assert_eq!(status, 400, "missing actor must be 400");
 
         // since 非数字。
-        let (status, _, _) = http_get(port, "/api/ops/logs?actor=a&since=abc").await;
+        let (status, _, _) = http_get_bearer(port, "/api/ops/logs?actor=a&since=abc", &token).await;
         assert_eq!(status, 400, "bad since must be 400");
 
         // until 非数字。
-        let (status, _, _) = http_get(port, "/api/ops/logs?actor=a&until=-1").await;
+        let (status, _, _) = http_get_bearer(port, "/api/ops/logs?actor=a&until=-1", &token).await;
         assert_eq!(status, 400, "bad until must be 400");
 
         // until < since。
-        let (status, _, _) = http_get(port, "/api/ops/logs?actor=a&since=100&until=50").await;
+        let (status, _, _) =
+            http_get_bearer(port, "/api/ops/logs?actor=a&since=100&until=50", &token).await;
         assert_eq!(status, 400, "until<since must be 400");
 
         // 未知 level。
-        let (status, _, _) = http_get(port, "/api/ops/logs?actor=a&level=debug").await;
+        let (status, _, _) =
+            http_get_bearer(port, "/api/ops/logs?actor=a&level=debug", &token).await;
         assert_eq!(status, 400, "unknown level must be 400");
 
         // 全部入审计（bad_request）。
@@ -1143,6 +1289,7 @@ frequency_ms = 100
     async fn logs_time_range_filter_is_correct() {
         let clock = TestClock::at(10_000_000_000); // T1 = 10000ms
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), Some(clock.clone()));
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
         // T1 发布第一条；先等捕获落盘（时间戳 = 捕获时刻时钟）再推进时钟，
@@ -1158,13 +1305,15 @@ frequency_ms = 100
         wait_for_log_len(&state, 2).await;
 
         // 全范围（无 since/until）→ 两条。
-        let (status, _, body) = http_get(port, "/api/ops/logs?actor=ops-admin").await;
+        let (status, _, body) =
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin", &token).await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 2);
 
         // since=15000 → 只有 T2（dev-b）。
-        let (status, _, body) = http_get(port, "/api/ops/logs?actor=ops-admin&since=15000").await;
+        let (status, _, body) =
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&since=15000", &token).await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "since filter: {rows:?}");
@@ -1172,14 +1321,16 @@ frequency_ms = 100
         assert_eq!(rows[0]["ts_ms"], "20000");
 
         // until=15000 → 只有 T1（dev-a）。
-        let (status, _, body) = http_get(port, "/api/ops/logs?actor=ops-admin&until=15000").await;
+        let (status, _, body) =
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&until=15000", &token).await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "until filter: {rows:?}");
         assert_eq!(rows[0]["device_id"], "dev-a");
 
         // 闭区间端点命中：since=10000 → 两条都在。
-        let (status, _, body) = http_get(port, "/api/ops/logs?actor=ops-admin&since=10000").await;
+        let (status, _, body) =
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&since=10000", &token).await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 2, "since is inclusive");
@@ -1196,6 +1347,7 @@ frequency_ms = 100
     async fn logs_level_filter_by_event_type() {
         let clock = TestClock::at(1_000_000_000);
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), Some(clock.clone()));
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
         state.publish(MgmtEvent::LifecycleChanged {
@@ -1207,7 +1359,8 @@ frequency_ms = 100
         wait_for_log_len(&state, 2).await;
 
         // level=device → 只 device_changed。
-        let (status, _, body) = http_get(port, "/api/ops/logs?actor=ops-admin&level=device").await;
+        let (status, _, body) =
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&level=device", &token).await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1216,7 +1369,7 @@ frequency_ms = 100
 
         // level=lifecycle → 只 lifecycle_changed。
         let (status, _, body) =
-            http_get(port, "/api/ops/logs?actor=ops-admin&level=lifecycle").await;
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&level=lifecycle", &token).await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1225,7 +1378,8 @@ frequency_ms = 100
 
         // 完整类型名同样接受。
         let (status, _, body) =
-            http_get(port, "/api/ops/logs?actor=ops-admin&level=device_changed").await;
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin&level=device_changed", &token)
+                .await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1);
@@ -1237,12 +1391,14 @@ frequency_ms = 100
         // 注入 u64 量级纳秒时钟 → ts_ms = 1.7e15（超 JS 安全整数）。
         let clock = TestClock::at(1_700_000_000_000_000_000);
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), Some(clock));
+        let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
         state.publish(MgmtEvent::ConfigReloaded { version: u64::MAX });
         wait_for_log_len(&state, 1).await;
 
-        let (status, _, body) = http_get(port, "/api/ops/logs?actor=ops-admin").await;
+        let (status, _, body) =
+            http_get_bearer(port, "/api/ops/logs?actor=ops-admin", &token).await;
         assert_eq!(status, 200, "{body}");
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1256,14 +1412,17 @@ frequency_ms = 100
 
     // ---- 路由注册与审计完整性 ----
 
-    /// QA: 三条 ops 路由均已注册（方法不匹配 → 405 而非 404）；
-    /// 且 POST 路径在默认 authorizer 下返回 403 而非 404。
+    /// QA: 三条 ops 路由均已注册（方法不匹配 → 405 而非 404——方法/路径组合
+    /// 不在守卫动作映射内，透传给路由器产生 405）；
+    /// 且正确方法在携带 token 时可达（非 404）。
     #[tokio::test]
     async fn ops_routes_are_registered() {
         let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let system = token_for(&state, Role::System);
+        let ops = token_for(&state, Role::Ops);
         let port = spawn_server(state).await;
 
-        // 方法不匹配 → 405（证明路径已注册）。
+        // 方法不匹配 → 405（证明路径已注册；守卫对未映射组合透传）。
         let (status, _, _) = http_get(port, "/api/ops/restart").await;
         assert_eq!(status, 405, "GET /api/ops/restart must be 405");
         let (status, _, _) = http_get(port, "/api/ops/collectors").await;
@@ -1271,11 +1430,17 @@ frequency_ms = 100
         let (status, _, _) = http_post(port, "/api/ops/logs", "").await;
         assert_eq!(status, 405, "POST /api/ops/logs must be 405");
 
-        // 正确方法可达（非 404）。
-        let (status, _, _) = http_get(port, "/api/ops/logs?actor=ops-admin").await;
+        // 正确方法可达（非 404）：GET logs（system）→ 200；POST restart（ops，
+        // 故意用会被 403 的角色，避免真实触发停机）→ 403。
+        let (status, _, _) = http_get_bearer(port, "/api/ops/logs?actor=ops-admin", &system).await;
         assert_ne!(status, 404, "GET /api/ops/logs must be registered");
-        let (status, _, _) =
-            http_post(port, "/api/ops/restart", r#"{"actor":"a","confirm":"gw-test"}"#).await;
+        let (status, _, _) = http_post_bearer(
+            port,
+            "/api/ops/restart",
+            r#"{"actor":"a","confirm":"gw-test"}"#,
+            &ops,
+        )
+        .await;
         assert_ne!(status, 404, "POST /api/ops/restart must be registered");
     }
 
@@ -1284,22 +1449,25 @@ frequency_ms = 100
     #[tokio::test]
     async fn audit_records_denied_and_accepted_completely() {
         let state = make_state(Arc::new(DenyAllOpsAuthorizer), None);
+        let ops = token_for(&state, Role::Ops);
         let port = spawn_server(state.clone()).await;
 
-        // 三个被拒动作。
-        let _ = http_post(
+        // 三个被拒动作（ops 角色：三条 ops 权限都不持 → 守卫层 403 + 审计）。
+        let _ = http_post_bearer(
             port,
             "/api/ops/restart",
             r#"{"actor":"ops-admin","confirm":"gw-test"}"#,
+            &ops,
         )
         .await;
-        let _ = http_post(
+        let _ = http_post_bearer(
             port,
             "/api/ops/collectors",
             r#"{"actor":"ops-admin","action":"pause"}"#,
+            &ops,
         )
         .await;
-        let _ = http_get(port, "/api/ops/logs?actor=ops-admin").await;
+        let _ = http_get_bearer(port, "/api/ops/logs?actor=ops-admin", &ops).await;
 
         let audit = ops_runtime(&state).audit_snapshot();
         assert_eq!(audit.len(), 3, "all three denied actions must be audited");
@@ -1312,6 +1480,7 @@ frequency_ms = 100
         }
         let actions: Vec<&str> = audit.iter().map(|e| e.action.as_str()).collect();
         assert_eq!(actions, vec!["restart", "collectors_pause", "logs_read"]);
+        // 守卫层拒绝的 actor = JWT sub（token_for 统一取 "ops-admin"）。
         assert!(audit.iter().all(|e| e.actor == "ops-admin"));
 
         // JSON 编码大数红线（审计环虽无 HTTP 端点，编码契约同源）。

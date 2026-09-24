@@ -1,0 +1,37 @@
+# iot-daq 本地人工测试样例配置（与 crates/daemon/src/config.rs 的 GatewayConfig 对齐）
+#
+# 启动（Git Bash / PowerShell 均可）：
+#   cargo run -p daemon --bin iot-daq-daemon -- --config config.example.toml
+# 管理面默认监听 127.0.0.1:8080（--bind <addr> 或环境变量 IOT_DAQ_MGMT_BIND 覆盖）。
+#
+# 开发联调环境变量（生产禁用！）：
+#   IOT_DAQ_DEV_ADMIN_PASS=...   # 启用 dev 管理员（username=dev, role=system），启动日志有 [WARN]
+#   IOT_DAQ_JWT_SECRET=<64位hex>  # JWT 签名密钥；缺省回退 dev 常量并打 [WARN]
+
+[gateway]
+gateway_id = "gw-local-dev"
+# data_dir 缺省 ./data（点位数据库/队列/遥测落盘位置），可按需覆盖：
+# data_dir = "./data"
+
+# ── 北向出口（本地页面测试可不配；留空数组即不转发）──
+# [[outlets]]
+# name = "line1_m1"                     # 对外标识，不暴露内部 id
+# broker = "mqtt://127.0.0.1:1883"
+# topic_prefix = "iotdaq/line1_m1"
+# qos = 1
+# tls = false
+# encoding = "json"                     # protobuf（默认）| json
+
+# ── 采集点位（本地页面测试可不配）──
+# [[points]]
+# device_id = "plc-01"
+# point_id = "temp_01"
+# protocol = "modbus-tcp"               # modbus-tcp | modbus-rtu | s7 ...
+# address = "40001"
+# frequency_ms = 1000
+
+# ── 管理面登录（生产路）。配置了本段则 dev 环境变量路自动关闭 ──
+# [[mgmt_auth.users]]
+# name = "alice"
+# role = "system"                       # ops | lic_ops | risk | system（与前端 rbac.ts 同源）
+# password_hash = "<sha256(密码) 的 64 位小写 hex>"

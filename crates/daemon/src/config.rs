@@ -125,6 +125,28 @@ impl Default for SecuritySection {
     }
 }
 
+/// 管理面登录账号（task 57 全量接线：生产路凭证来源）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MgmtAuthUser {
+    /// 用户名（登录主体；登录时精确匹配）。
+    pub name: String,
+    /// 角色字面量（`ops` / `lic_ops` / `risk` / `system`；由 mgmt 层
+    /// `rbac::Role::from_str` 解析，未知角色该账号被跳过——fail-closed）。
+    pub role: String,
+    /// `SHA-256(password)` 的 hex 编码（服务端只存哈希，比对走恒时比较；
+    /// 明文密码永不写入配置文件）。
+    pub password_hash: String,
+}
+
+/// 管理面登录凭证段（**可选**；缺省时生产路无凭证，登录仅开发路可用，
+/// 详见 `mgmt::auth_login` 的两路 fail-closed 说明）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MgmtAuthSection {
+    /// 登录账号列表（空列表 = 无任何登录凭证 → 登录端点全拒）。
+    #[serde(default)]
+    pub users: Vec<MgmtAuthUser>,
+}
+
 /// `[gateway]` 命名空间。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -200,6 +222,10 @@ pub struct GatewayConfig {
     pub outlets: Vec<OutletConfig>,
     /// `[[points]]` 点位列表。
     pub points: Vec<PointConfig>,
+    /// `[mgmt_auth]` 管理面登录凭证段（**可选**；缺省 = 生产路未配置凭证，
+    /// 登录走 `mgmt::auth_login` 的开发路 / fail-closed 逻辑，既有字段语义不变）。
+    #[serde(default)]
+    pub mgmt_auth: Option<MgmtAuthSection>,
 }
 
 impl GatewayConfig {
@@ -476,6 +502,42 @@ frequency_ms = 100
         assert_eq!(config.gateway.cache.retention_days, 7);
         assert!(config.outlets.is_empty());
         assert!(config.points.is_empty());
+        // task 57：mgmt_auth 可选段缺省 = None（既有配置语义不变）。
+        assert!(config.mgmt_auth.is_none(), "mgmt_auth must default to None");
+    }
+
+    /// QA: task 57 可选 `[mgmt_auth]` 段解析——users 数组逐行承接
+    /// name / role / password_hash；无该段仍为 None（向后兼容）。
+    #[test]
+    fn mgmt_auth_section_parses_optional_users() {
+        // users 缺失 → 空列表（serde(default)），段本身存在。
+        let config = GatewayConfig::parse("[mgmt_auth]").expect("empty mgmt_auth section");
+        let section = config.mgmt_auth.expect("section present");
+        assert!(section.users.is_empty());
+
+        let config = GatewayConfig::parse(
+            r#"
+[[mgmt_auth.users]]
+name = "alice"
+role = "system"
+password_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+[[mgmt_auth.users]]
+name = "bob"
+role = "ops"
+password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+"#,
+        )
+        .expect("mgmt_auth users parse");
+        let section = config.mgmt_auth.expect("section present");
+        assert_eq!(section.users.len(), 2);
+        assert_eq!(section.users[0].name, "alice");
+        assert_eq!(section.users[0].role, "system");
+        assert_eq!(
+            section.users[0].password_hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(section.users[1].role, "ops");
     }
 
     /// 非法 TOML 返回 ConfigError 而非 panic。

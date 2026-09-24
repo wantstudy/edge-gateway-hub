@@ -25,30 +25,20 @@
 //! - 断线重连：客户端带回上次最大 `seq` 重新 GET 即可，历史环（容量 256）保证不丢。
 
 // task 57 切片 2：管理面 JWT 鉴权 + RBAC 原语（服务端判定，红线：授权判定只在
-// Rust 侧，WebView/JS 只做展示）。两模块为**原语层**，本轮不改任何既有路由行为；
-// 全量接线（16 页 web-console 契约不动）由后续任务执行。接线示例（届时替换
-// remote_ops 的 DenyAllOpsAuthorizer 注入即可，端点零改动）：
+// Rust 侧，WebView/JS 只做展示）。
 //
-// ```ignore
-// use crate::mgmt::auth_jwt::{sign, Claims, IssuerKey};
-// use crate::mgmt::rbac::{permission_for_ops_action, AuthedRole, Permission, RbacAuth};
-//
-// // ① axum State 装配（示例：扩展 state 结构或用 FromRef 分发）：
-// let auth = RbacAuth::new(IssuerKey(key_bytes_32));      // 密钥来源由接线任务定
-//
-// // ② 保护某个 handler（extractor 形式，401/403 自动区分）：
-// async fn admin_only(authed: AuthedRole) -> Response {
-//     authed.ensure(Permission::KeyRotate)?;              // 权限不足 → 403
-//     /* ... */
-// }
-//
-// // ③ /api/ops/* 的 authorizer 切换（对齐 remote_ops::install 接线点）：
-// //    authorize(actor, action) 内部改为：
-// //      rbac::permission_for_ops_action(action)
-// //        .map(|perm| rbac::authorize(jwt_role, perm))
-// //        .unwrap_or(false)                                // 未知动作 fail-closed
-// ```
+// task 57 全量接线（本轮）：JWT/RBAC 原语接入 daemon 管理面，本地端到端可测。
+// - **登录**：`POST /api/auth/login`（`auth_login` 模块；凭证生产路 = config
+//   `[mgmt_auth]`，开发路 = `IOT_DAQ_DEV_ADMIN_PASS` dev 管理员，两路皆空 fail-closed）；
+// - **密钥**：`IssuerKey` 来自 `IOT_DAQ_JWT_SECRET`（64 hex），未提供回退 dev
+//   常量并 warn（仅本地），装配见 `auth_login::build`；
+// - **守卫**：`RbacAuth` 挂入 [`MgmtState`]（`FromRef` 分发给
+//   `rbac::AuthedRole` extractor），`/api/ops/*` 由 `from_fn` 中间件
+//   [`ops_guard`] 包裹——AuthedRole（401）+ `permission_for_ops_action`（403），
+//   被拒动作入 ops 审计环；**读接口保持开放**（web-console 16 页契约不变）；
+// - **whoami**：`GET /api/auth/whoami` 返回 sub/role/exp（exp 字符串编码）。
 pub mod auth_jwt;
+pub mod auth_login;
 pub mod rbac;
 
 pub mod remote_ops;
@@ -62,8 +52,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{FromRef, FromRequestParts, Path as AxumPath, Query, Request, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
@@ -172,6 +163,11 @@ struct MgmtStateInner {
     next_seq: AtomicU64,
     /// 测试 / 嵌入式场景的静态根目录覆盖（`None` = 读环境变量 / 默认值）。
     web_dist: Option<PathBuf>,
+    /// task 57：JWT/RBAC 鉴权上下文（`FromRef<MgmtState>` 分发给 extractor；
+    /// 密钥来自 `IOT_DAQ_JWT_SECRET` / dev 兜底，见 `auth_login::build`）。
+    auth: rbac::RbacAuth,
+    /// task 57：登录凭证 + token 签发器（生产路 / 开发路两路 fail-closed）。
+    login: Arc<auth_login::MgmtAuth>,
 }
 
 /// 管理 API 共享状态（axum `State`；`Clone` 廉价，内部 `Arc`）。
@@ -182,7 +178,13 @@ pub struct MgmtState {
 
 impl MgmtState {
     /// 创建管理状态：绑定 daemon 共享态与启动配置快照。
+    ///
+    /// task 57：鉴权上下文在此一并装配（`auth_login::build` 读环境变量与
+    /// 配置内的 `[mgmt_auth]` 可选段；测试可用 [`Self::with_auth`] 覆盖，
+    /// 避免测试间环境变量竞争）。
     pub fn new(daemon: DaemonShared, startup_config: Arc<GatewayConfig>) -> Self {
+        let (auth, login) =
+            auth_login::build(&startup_config, &|key| std::env::var(key).ok());
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(MgmtStateInner {
@@ -192,6 +194,8 @@ impl MgmtState {
                 history: Mutex::new(VecDeque::with_capacity(EVENT_HISTORY_CAPACITY)),
                 next_seq: AtomicU64::new(0),
                 web_dist: None,
+                auth,
+                login: Arc::new(login),
             }),
         }
     }
@@ -202,6 +206,27 @@ impl MgmtState {
             .expect("with_web_dist must be called before cloning/sharing");
         inner.web_dist = Some(dir.into());
         self
+    }
+
+    /// 覆盖鉴权装配（测试注入受控密钥 / 凭证用；生产走 `new` 的
+    /// `auth_login::build` 环境变量装配）。与 [`Self::with_web_dist`] 同约束：
+    /// 必须在 clone / 共享之前调用。
+    pub fn with_auth(mut self, auth: rbac::RbacAuth, login: auth_login::MgmtAuth) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_auth must be called before cloning/sharing");
+        inner.auth = auth;
+        inner.login = Arc::new(login);
+        self
+    }
+
+    /// 鉴权上下文（JWT 签名密钥 / leeway）。
+    pub fn auth(&self) -> &rbac::RbacAuth {
+        &self.inner.auth
+    }
+
+    /// 登录凭证与 token 签发器。
+    pub fn login_auth(&self) -> &auth_login::MgmtAuth {
+        &self.inner.login
     }
 
     /// daemon 共享态句柄。
@@ -323,8 +348,31 @@ impl IntoResponse for ApiError {
 
 // ---- 路由 ----
 
-/// 构建管理 API 路由（全部只读聚合）。
+/// task 57：`RbacAuth` 从 [`MgmtState`] 分发（`rbac::AuthedRole` extractor 的
+/// 约束 `RbacAuth: FromRef<S>` 由此满足）。
+impl FromRef<MgmtState> for rbac::RbacAuth {
+    fn from_ref(state: &MgmtState) -> rbac::RbacAuth {
+        state.inner.auth.clone()
+    }
+}
+
+/// 构建管理 API 路由。
+///
+/// task 57 守卫布局：
+/// - **开放（不变）**：读聚合 `/api/health|status|devices|points|outlets|events`
+///   + 静态资源 + `/api/auth/login`（凭密码建立身份）；
+/// - **守卫**：`/api/ops/*` 三路由挂在独立子路由并由 [`ops_guard`] 中间件
+///   包裹（AuthedRole 401 + `permission_for_ops_action` 403）；
+///   `/api/auth/whoami` 靠 `rbac::AuthedRole` extractor 自行 401。
 pub fn router(state: MgmtState) -> Router {
+    // /api/ops/* 子路由：仅这三条路由被 ops_guard 包裹（route_layer 只作用于
+    // 本子路由已注册路由）。
+    let ops = Router::new()
+        .route("/api/ops/restart", axum::routing::post(remote_ops::restart))
+        .route("/api/ops/collectors", axum::routing::post(remote_ops::collectors))
+        .route("/api/ops/logs", get(remote_ops::logs))
+        .route_layer(from_fn_with_state(state.clone(), ops_guard));
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
@@ -332,12 +380,69 @@ pub fn router(state: MgmtState) -> Router {
         .route("/api/points", get(points))
         .route("/api/outlets", get(outlets))
         .route("/api/events", get(events))
-        .route("/api/ops/restart", axum::routing::post(remote_ops::restart))
-        .route("/api/ops/collectors", axum::routing::post(remote_ops::collectors))
-        .route("/api/ops/logs", get(remote_ops::logs))
+        .route("/api/auth/login", axum::routing::post(auth_login::login))
+        .route("/api/auth/whoami", get(auth_login::whoami))
+        .merge(ops)
         .route("/", get(serve_root))
         .route("/assets/*path", get(serve_asset))
         .with_state(state)
+}
+
+/// `/api/ops/*` 守卫中间件（task 57 全量接线）：
+///
+/// 1. **方法+路径 → 动作字面量**：`POST /api/ops/restart → "restart"`、
+///    `POST /api/ops/collectors → "collectors_pause"`（pause/resume 共享同一
+///    权限，且中间件层不可重放读取 body，按最严口径统一映射）、
+///    `GET /api/ops/logs → "logs_read"`；
+/// 2. **AuthedRole**：校验 `Authorization: Bearer` JWT（签名/时间窗/角色，
+///    全 Rust 侧）→ 失败 401（未知角色 403，见 `rbac::AuthRejection`）；
+/// 3. **permission_for_ops_action**：`authed.ensure(perm)` → 权限不足 403，
+///    且被拒动作**入 ops 审计环**（actor 取 JWT sub；审计不因中间件层拒绝而缺痕）；
+/// 4. 未注册的方法/路径组合（如 GET restart）不在动作映射内 → 透传给路由器
+///    （404/405）。⚠️ **给 `/api/ops/*` 新增路由时必须同步扩充本映射**，
+///    否则新路由将不经守卫（见 router() 注释）。
+///
+/// 注意：`remote_ops` 三个 handler 内还保留 `authed.ensure(perm)` 二次校验
+///（防御纵深）；`DenyAllOpsAuthorizer` 保留为「无可信角色源」的 fail-closed
+/// 兜底（未装配 runtime 的实例 / 非 extractor 路径），不再参与本守卫链判定。
+async fn ops_guard(State(state): State<MgmtState>, req: Request, next: Next) -> Response {
+    let (mut parts, body) = req.into_parts();
+
+    // ① 动作映射（未知组合透传给路由器，由其产生 404/405）。
+    let action: &str = match (parts.method.as_str(), parts.uri.path()) {
+        ("POST", "/api/ops/restart") => "restart",
+        ("POST", "/api/ops/collectors") => "collectors_pause",
+        ("GET", "/api/ops/logs") => "logs_read",
+        _ => "",
+    };
+    let Some(permission) = rbac::permission_for_ops_action(action) else {
+        return next.run(Request::from_parts(parts, body)).await;
+    };
+
+    // ② JWT 鉴权（401；签名验真走恒时比较）。
+    let authed = match rbac::AuthedRole::from_request_parts(&mut parts, &state).await {
+        Ok(authed) => authed,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    // ③ RBAC 判定（403 + 审计；fail-closed：映射外动作在上面已透传/拒绝）。
+    if let Err(rejection) = authed.ensure(permission) {
+        let action_enum = match action {
+            "restart" => remote_ops::OpsAction::Restart,
+            "collectors_pause" => remote_ops::OpsAction::CollectorsPause,
+            _ => remote_ops::OpsAction::LogsRead,
+        };
+        remote_ops::runtime_for(&state).record_audit(
+            &authed.claims.sub,
+            action_enum,
+            false,
+            remote_ops::OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+
+    next.run(Request::from_parts(parts, body)).await
 }
 
 // ---- REST 处理器（全部只读聚合） ----
