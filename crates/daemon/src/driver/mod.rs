@@ -5,9 +5,10 @@
 //!   `disconnect`），统一返回 [`DaemonResult`]；对象安全（`Box<dyn Driver>`），
 //!   支撑后续 Modbus / OPC UA / S7 / MC / HTTP / MQTT 六类驱动（task 9-14）在此契约下实现。
 //! - [`PointAddressParser`]：点位地址字符串 → 结构化 [`PointAddress`]。
-//!   支持 S7 位访问 `DB1.DBX0.0`（DB 号 + 字节偏移 + 位号）与 MC 元件 `M100` / `D100`
-//!   （区 + 元件号）；无效地址返回 [`DaemonError::ProtocolError`]（错误码域 `ERR_PROTOCOL` = 1000）。
-//!   S7 字/字节形式（`DBB/DBW/DBD`）与其余 MC 区不在本任务范围，由对应协议驱动任务扩展。
+//!   S7：位访问 `DB1.DBX0.0`、字节/字/双字 `DBn.DBB/DBW/DBD<off>`（area 记
+//!   `B/W/D`、`db` 记 DB 号）与过程映像位 `I0.1` / `Q0.3`（真实位号入
+//!   `bit_index`）；MC 元件 `M100` / `D100`。无效地址返回
+//!   [`DaemonError::ProtocolError`]（错误码域 `ERR_PROTOCOL` = 1000）。
 //! - [`Reconnector`]：带指数退避的重连基类（默认 1s → 2s → … → 封顶 60s，
 //!   初始 / 上限 / 倍率可配置），纯逻辑无 IO；断线时驱动调用 `next_delay()` 获取
 //!   下次重连等待时长，连接成功后 `reset()` 归零。
@@ -108,10 +109,20 @@ pub struct PointAddress {
 /// | 输入 | 结果 |
 /// |---|---|
 /// | `DB1.DBX0.0` | `db=1, start=0, bit=true, bit_index=0` |
+/// | `DB2.DBB10` / `DB2.DBW20` / `DB2.DBD40` | `db=2, area=B/W/D, bit=false`（字节/字/双字） |
+/// | `I0.1` / `Q2.7` | `area=I/Q, bit=true, bit_index=位号`（过程映像位） |
 /// | `M100` | `area='M', start=100, bit=true` |
 /// | `D100` | `area='D', start=100, bit=false` |
+///
+/// S7 记法与会话层解析器（`s7.rs::parse_s7_address`）对齐：字节偏移受三字节
+/// 地址编码上限约束（≤ `S7_MAX_BYTE_OFFSET`）；`DBB/DBW/DBD` 不允许位后缀；
+/// `I/Q` 仅支持 `<byte>.<bit>` 位形式（IB/IW/ID 等字节/字形式待后续扩展）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PointAddressParser;
+
+/// S7 三字节地址字段的字节偏移上限（与会话层 `s7.rs` 的 `MAX_BYTE_OFFSET`
+/// 同值同规则：`(offset << 3) | bit` 须落在 24 位内）。
+const S7_MAX_BYTE_OFFSET: u32 = 0x1F_FFFF;
 
 impl PointAddressParser {
     /// 解析点位地址字符串为结构化 [`PointAddress`]。
@@ -132,6 +143,8 @@ impl PointAddressParser {
             Self::parse_s7(&normalized).map_err(wrap)
         } else if normalized.starts_with(|c: char| c.is_ascii_digit()) {
             Self::parse_modbus(&normalized).map_err(wrap)
+        } else if normalized.starts_with('I') || normalized.starts_with('Q') {
+            Self::parse_piq(&normalized).map_err(wrap)
         } else {
             Self::parse_mc(&normalized).map_err(wrap)
         }
@@ -179,12 +192,82 @@ impl PointAddressParser {
                     bit_index,
                 })
             }
-            // DBB / DBW / DBD 字节与字访问留待 S7 驱动任务（task 9-14）扩展。
-            "B" | "W" | "D" => Err(format!(
-                "unsupported S7 access type DB{access} (task 8 parser supports bit access DBX only)"
-            )),
-            _ => Err(format!("unknown S7 access type {access:?} (expected DBX)")),
+            // DBB / DBW / DBD 字节/字/双字访问（task 11 扩展，记法对齐会话层）。
+            "B" | "W" | "D" => {
+                if rest.is_empty() {
+                    return Err(format!("missing byte offset after DB{access}"));
+                }
+                if rest.contains('.') {
+                    return Err(format!(
+                        "DB{access} byte/word/dword address must not have bit suffix (got {rest:?})"
+                    ));
+                }
+                if !rest.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(format!("invalid byte offset {rest:?}"));
+                }
+                let start: u32 = rest
+                    .parse()
+                    .map_err(|_| format!("byte offset out of range: {rest:?}"))?;
+                if start > S7_MAX_BYTE_OFFSET {
+                    return Err(format!(
+                        "byte offset {start} out of range (max {S7_MAX_BYTE_OFFSET})"
+                    ));
+                }
+                // area 记 'B'/'W'/'D'（非 MC 区，无冲突；'D' 与 MC D 区以
+                // `db != 0` 区分——MC D 恒为 db=0，真实 PLC DB 号从 1 起）。
+                let area = access.as_bytes()[0] as char;
+                Ok(PointAddress {
+                    db,
+                    area: Some(area),
+                    start,
+                    bit: false,
+                    bit_index: 0,
+                })
+            }
+            _ => Err(format!("unknown S7 access type {access:?} (expected DBX/DBB/DBW/DBD)")),
         }
+    }
+
+    /// S7 过程映像位访问：`I<off>.<bit>` / `Q<off>.<bit>`（bit 0-7）。
+    ///
+    /// 仅位形式（IB/IW/ID、QB/QW/QD 字节/字/双字形式待后续扩展，会话层已支持）。
+    fn parse_piq(upper: &str) -> Result<PointAddress, String> {
+        // 'I' / 'Q' 由 parse() 分派保证。
+        let area = upper.as_bytes()[0] as char;
+        let rest = &upper[1..];
+        let (off_raw, bit_raw) = rest.split_once('.').ok_or_else(|| {
+            format!("{area} bit access requires <byte>.<bit> suffix (e.g. {area}0.1)")
+        })?;
+        if off_raw.is_empty() {
+            return Err(format!("missing byte offset for {area} address"));
+        }
+        if !off_raw.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("invalid byte offset {off_raw:?}"));
+        }
+        let start: u32 = off_raw
+            .parse()
+            .map_err(|_| format!("byte offset out of range: {off_raw:?}"))?;
+        if start > S7_MAX_BYTE_OFFSET {
+            return Err(format!(
+                "byte offset {start} out of range (max {S7_MAX_BYTE_OFFSET})"
+            ));
+        }
+        if bit_raw.is_empty() {
+            return Err(format!("missing bit index for {area} address"));
+        }
+        let bit_index: u8 = bit_raw
+            .parse()
+            .map_err(|_| format!("bit index must be 0-7, got {bit_raw:?}"))?;
+        if bit_index > 7 {
+            return Err(format!("bit index must be 0-7, got {bit_index}"));
+        }
+        Ok(PointAddress {
+            db: 0,
+            area: Some(area),
+            start,
+            bit: true,
+            bit_index,
+        })
     }
 
     /// Modbus 5 位区段编址：`4xxxx` = 保持寄存器（FC03）、`3xxxx` = 输入寄存器（FC04）。
@@ -433,8 +516,6 @@ mod tests {
             "DB1.DBX.0",    // 字节偏移为空
             "DB1.DBX0.9",   // 位号越界（>7）
             "DB1.DBX0.0.1", // 多余分段
-            "DB1.DBW0",     // 字访问不在 task 8 范围（S7 驱动任务扩展）
-            "DB1.DBB0",     // 字节访问不在 task 8 范围
             "M",            // 缺元件号
             "D",            // 缺元件号
             "M-1",          // 负数元件号
@@ -502,6 +583,71 @@ mod tests {
             "40001A", // 尾部非数字
             "465537", // 寄存器号 > 65536
             "90001",  // 未支持的首数字区段
+        ];
+        for raw in cases {
+            let err = PointAddressParser::parse(raw).expect_err(&format!("must reject {raw:?}"));
+            assert!(
+                matches!(err, DaemonError::ProtocolError(_)),
+                "for {raw:?} must be ProtocolError: {err:?}"
+            );
+            assert_eq!(err.error_code(), ERR_PROTOCOL, "for {raw:?}");
+            assert!(
+                err.to_string().contains(raw),
+                "message keeps input for {raw:?}: {err}"
+            );
+        }
+    }
+
+    // ---- 地址解析：S7 字节/字/双字与 I/Q 位（task 11 扩展） ----
+
+    /// QA Happy: DBB/DBW/DBD 解析为 {db, area=B/W/D, bit=false}，trim/大小写归一。
+    #[test]
+    fn parse_s7_dbb_dbw_dbd_sized_access() {
+        let b = PointAddressParser::parse("DB2.DBB10").expect("valid byte access");
+        assert_eq!(
+            (b.db, b.area, b.start, b.bit, b.bit_index),
+            (2, Some('B'), 10, false, 0)
+        );
+        let w = PointAddressParser::parse("DB2.DBW20").expect("valid word access");
+        assert_eq!((w.db, w.area, w.start, w.bit), (2, Some('W'), 20, false));
+        let d = PointAddressParser::parse("DB2.DBD40").expect("valid dword access");
+        assert_eq!((d.db, d.area, d.start, d.bit), (2, Some('D'), 40, false));
+        let padded = PointAddressParser::parse("  db1.dbw6  ").expect("normalized");
+        assert_eq!((padded.db, padded.area, padded.start), (1, Some('W'), 6));
+        // 三字节地址上限内最大值可解析。
+        let max = PointAddressParser::parse("DB1.DBD2097151").expect("valid max offset");
+        assert_eq!((max.area, max.start), (Some('D'), 0x1F_FFFF));
+    }
+
+    /// QA Happy: 过程映像位 I0.1 / Q0.3 → {area, bit=true, bit_index=位号}。
+    #[test]
+    fn parse_s7_iq_bit_addresses() {
+        let i = PointAddressParser::parse("I0.1").expect("valid I bit address");
+        assert_eq!(
+            (i.db, i.area, i.start, i.bit, i.bit_index),
+            (0, Some('I'), 0, true, 1)
+        );
+        let q = PointAddressParser::parse("Q2.7").expect("valid Q bit address");
+        assert_eq!((q.area, q.start, q.bit, q.bit_index), (Some('Q'), 2, true, 7));
+        let padded = PointAddressParser::parse(" i0.1 ").expect("normalized");
+        assert_eq!(padded, i, "trim/case must not change result");
+    }
+
+    /// QA Error: 新地址形式的非法输入全部收敛为 ProtocolError（码 1000，消息含原文）。
+    #[test]
+    fn parse_s7_extended_errors_rejected() {
+        let cases = [
+            "DB1.DBB",        // 缺字节偏移
+            "DB1.DBW1.1",     // 字访问不允许位后缀
+            "DB1.DBD-2",      // 负偏移
+            "DB1.DBB2097152", // 偏移超三字节地址上限
+            "DB1.DBW1A",      // 偏移含非数字
+            "I0",             // I 位访问缺位号后缀
+            "I0.8",           // 位号越界（>7）
+            "Q.1",            // 字节偏移为空
+            "Q1.x",           // 位号非数字
+            "I",              // 缺偏移与位号
+            "Q",              // 同上
         ];
         for raw in cases {
             let err = PointAddressParser::parse(raw).expect_err(&format!("must reject {raw:?}"));

@@ -13,7 +13,7 @@
 //!   参数越界 / PLC 拒绝等协议语义错误）。与 modbus 驱动的映射口径一致。
 //! - **连接生命周期 / 断线重连（语义不回退声明）**：适配层**不做任何额外的
 //!   重连或退避**，直接桥接 `S7Session` 内建的既有策略——
-//!   `S7Session::read_points` / `write_point` 遇「对端关闭类」网络错误
+//!   `S7Session::read_points` / `write_points` 遇「对端关闭类」网络错误
 //!   （peer closed / send 失败，见 `S7Session::is_connection_lost`）时自动
 //!   **重连一次**并整体重试，二次失败上抛；**读超时不重连**（可能是 PLC 忙，
 //!   重连反而放大故障）。该策略由会话层测试
@@ -29,10 +29,12 @@
 //!   经 `tokio::task::spawn_blocking` 桥入 async [`Driver`] trait，
 //!   不阻塞 tokio 运行时线程。
 //!
-//! 统一地址解析器（`PointAddressParser`，task 8）对 S7 仅支持位访问
-//! `DBn.DBX<off>.<bit>` 与 MC 位元件 `M<off>`（bit_index 恒 0），故本层
-//! 仅映射这两类地址；`DBB/DBW/DBD` 与 I/Q 区待统一解析器扩展后接入
-//! （会话层 `parse_s7_address` 已支持，届时仅需放宽 [`point_to_s7_address`]）。
+//! 统一地址解析器（`PointAddressParser`）现支持 `DBn.DBX<off>.<bit>`、
+//! `DBn.DBB/DBW/DBD<off>`（area 记 `B/W/D`）与 `I/Q` 位（`I0.1`）、MC 位
+//! `M<off>`（bit_index 恒 0），本层逐一映射；MC 字区 `D<off>`（db=0）不属
+//! S7，仍拒绝。批量写经 [`S7Session::write_points`] 透出会话层相邻合并能力
+//! （相邻字节 → 单次 Write Var 报文）；Driver trait 本身已有批量写接口
+//! `write(&[WritePoint])`，trait 级进一步扩展（如多 Item Write Var）留后续。
 
 use async_trait::async_trait;
 use tokio::task::spawn_blocking;
@@ -51,12 +53,16 @@ const S7_MAX_BYTE_OFFSET: u32 = 0x1F_FFFF;
 /// 统一 [`PointAddress`] → S7 [`S7Address`] 转换（薄壳：纯类型映射）。
 ///
 /// 支持范围（与统一解析器 `PointAddressParser` 对 S7 的产出对齐）：
-/// - `area == None`（S7 DB 地址）：必须为位访问（`bit == true`，即 `DBn.DBX<off>.<bit>`）；
+/// - `area == None`（S7 DB 地址）：位访问（`bit == true`，即 `DBn.DBX<off>.<bit>`）；
+/// - `area == Some('B' | 'W')`：DB 字节/字（`DBn.DBB/DBW<off>`，`db` 即 DB 号）；
+/// - `area == Some('D')` 且 `db != 0`：DB 双字（`DBn.DBD<off>`）；`db == 0`
+///   视为 MC 字区（与统一解析器的 MC `D` 编码区分，真实 PLC DB 号从 1 起）；
+/// - `area == Some('I' | 'Q')`：过程映像位（`I<off>.<bit>` / `Q<off>.<bit>`）；
 /// - `area == Some('M')`：位元件 `M<off>`（统一解析器固定 `bit_index = 0`）；
-/// - 其余（MC `D` 区、Modbus 数字区、DB 非位访问）→ [`DaemonError::ProtocolError`]。
+/// - 其余（Modbus 数字区、MC `D` 区）→ [`DaemonError::ProtocolError`]。
 ///
 /// # Errors
-/// 非位访问 / 未支持区 / DB 号超 u16 / 偏移超 24 位地址上限 / 位号 > 7。
+/// 非位 DB / 未支持区 / DB 号超 u16 / 偏移超 24 位地址上限 / 位号 > 7。
 fn point_to_s7_address(p: &PointAddress) -> DaemonResult<S7Address> {
     if p.bit_index > 7 {
         return Err(DaemonError::ProtocolError(format!(
@@ -75,7 +81,7 @@ fn point_to_s7_address(p: &PointAddress) -> DaemonResult<S7Address> {
         None => {
             if !p.bit {
                 return Err(DaemonError::ProtocolError(format!(
-                    "s7 driver supports bit access only for DB addresses (DBn.DBX<off>.<bit>), got non-bit {p:?} (DBB/DBW/DBD awaits unified parser extension)"
+                    "s7 DB bit access required (DBn.DBX<off>.<bit>), got non-bit {p:?}"
                 )));
             }
             let db = u16::try_from(p.db).map_err(|_| {
@@ -84,6 +90,66 @@ fn point_to_s7_address(p: &PointAddress) -> DaemonResult<S7Address> {
             Ok(S7Address {
                 area: S7Area::Db,
                 db,
+                byte_offset: p.start,
+                bit_index: p.bit_index,
+                size: S7Size::Bit,
+            })
+        }
+        // DB 字节/字访问：DBn.DBB/DBW<off>（task 11 扩展）。
+        Some('B') | Some('W') => {
+            if p.bit {
+                return Err(DaemonError::ProtocolError(format!(
+                    "s7 DBB/DBW address must be byte/word (non-bit) access, got {p:?}"
+                )));
+            }
+            let db = u16::try_from(p.db).map_err(|_| {
+                DaemonError::ProtocolError(format!("s7 db number {} out of u16 range", p.db))
+            })?;
+            let size = if p.area == Some('B') {
+                S7Size::Byte
+            } else {
+                S7Size::Word
+            };
+            Ok(S7Address {
+                area: S7Area::Db,
+                db,
+                byte_offset: p.start,
+                bit_index: 0,
+                size,
+            })
+        }
+        // DB 双字访问：DBn.DBD<off>（db=0 视为 MC 字区，交由兜底分支拒绝）。
+        Some('D') if p.db != 0 => {
+            if p.bit {
+                return Err(DaemonError::ProtocolError(format!(
+                    "s7 DBD address must be dword (non-bit) access, got {p:?}"
+                )));
+            }
+            let db = u16::try_from(p.db).map_err(|_| {
+                DaemonError::ProtocolError(format!("s7 db number {} out of u16 range", p.db))
+            })?;
+            Ok(S7Address {
+                area: S7Area::Db,
+                db,
+                byte_offset: p.start,
+                bit_index: 0,
+                size: S7Size::DWord,
+            })
+        }
+        // 过程映像位：I<off>.<bit> / Q<off>.<bit>（task 11 扩展）。
+        Some('I') | Some('Q') => {
+            if !p.bit {
+                return Err(DaemonError::ProtocolError(format!(
+                    "s7 I/Q area supports bit access only (e.g. I0.1), got {p:?}"
+                )));
+            }
+            Ok(S7Address {
+                area: if p.area == Some('I') {
+                    S7Area::I
+                } else {
+                    S7Area::Q
+                },
+                db: 0,
                 byte_offset: p.start,
                 bit_index: p.bit_index,
                 size: S7Size::Bit,
@@ -105,7 +171,7 @@ fn point_to_s7_address(p: &PointAddress) -> DaemonResult<S7Address> {
             })
         }
         Some(other) => Err(DaemonError::ProtocolError(format!(
-            "s7 driver does not support address area {other:?} (expected DB… bit or M… bit), got {p:?}"
+            "s7 driver does not support address area {other:?} (expected DB…/B/W/D, I/Q bit or M… bit), got {p:?}"
         ))),
     }
 }
@@ -227,9 +293,11 @@ impl Driver for S7Driver {
             .collect())
     }
 
-    /// 批量写入点位：逐点委托 [`S7Session::write_point`]（对端关闭重连一次的
-    /// 既有策略由会话层保持）。统一解析器仅产出位地址，故写入限定位语义：
-    /// 恰 1 字节且取值 0x00 / 0x01（`build_write_var` 的 Bit 编码约定）。
+    /// 批量写入点位：先全量做类型转换与参数校验（fail-fast，不产出部分结果），
+    /// 再委托 [`S7Session::write_points`]（相邻非位写入合并为单 Item Write Var
+    /// 报文 + 按 PDU 预算切分 + 对端关闭重连一次的既有策略，由会话层保持）。
+    /// 写入宽度约束：位地址恰 1 字节且取值 0x00 / 0x01（`build_write_var` 的
+    /// Bit 编码约定）；字节/字/双字地址载荷须与尺寸宽度严格一致（1/2/4 字节）。
     async fn write(&mut self, points: &[WritePoint]) -> DaemonResult<()> {
         if points.is_empty() {
             return Ok(());
@@ -237,17 +305,25 @@ impl Driver for S7Driver {
         let mut reqs: Vec<(S7Address, Vec<u8>)> = Vec::with_capacity(points.len());
         for p in points {
             let s7_addr = point_to_s7_address(&p.address)?;
-            if s7_addr.size != S7Size::Bit {
-                return Err(DaemonError::ProtocolError(format!(
-                    "s7 driver (unified parser) supports bit addresses only, got {p:?}"
-                )));
-            }
-            if p.value.len() != 1 || (p.value[0] != 0x00 && p.value[0] != 0x01) {
-                return Err(DaemonError::ProtocolError(format!(
-                    "s7 bit write requires exactly 1 byte 0x00/0x01, got {} byte(s) {:?} for {p:?}",
-                    p.value.len(),
-                    p.value
-                )));
+            match s7_addr.size {
+                S7Size::Bit => {
+                    if p.value.len() != 1 || (p.value[0] != 0x00 && p.value[0] != 0x01) {
+                        return Err(DaemonError::ProtocolError(format!(
+                            "s7 bit write requires exactly 1 byte 0x00/0x01, got {} byte(s) {:?} for {p:?}",
+                            p.value.len(),
+                            p.value
+                        )));
+                    }
+                }
+                size => {
+                    let width = usize::from(size.width());
+                    if p.value.len() != width {
+                        return Err(DaemonError::ProtocolError(format!(
+                            "s7 {size:?} write requires exactly {width} byte(s), got {} for {p:?}",
+                            p.value.len()
+                        )));
+                    }
+                }
             }
             reqs.push((s7_addr, p.value.clone()));
         }
@@ -258,12 +334,7 @@ impl Driver for S7Driver {
             .take()
             .ok_or_else(|| DaemonError::NetworkError("s7 driver: session missing".to_string()))?;
         let (session, result) = spawn_blocking(move || {
-            let result = (|| {
-                for (addr, data) in &reqs {
-                    session.write_point(addr, data)?;
-                }
-                Ok(())
-            })();
+            let result = session.write_points(&reqs);
             (session, result)
         })
         .await
@@ -352,6 +423,42 @@ mod tests {
             );
             assert_eq!(err.error_code(), ERR_PROTOCOL, "for {p:?}");
         }
+    }
+
+    // ---- 类型转换：DBB/DBW/DBD 与 I/Q 位（task 11 扩展） ----
+
+    /// QA Happy: 统一地址 → S7Address 与会话层 parse_s7_address 逐字段一致
+    ///（DBB/DBW/DBD 字节/字/双字，含三字节地址上限非平凡取值）。
+    #[test]
+    fn conversion_dbb_dbw_dbd_matches_session_parser() {
+        for raw in ["DB2.DBB10", "DB2.DBW20", "DB2.DBD40", "DB1.DBD2097151"] {
+            assert_same_as_session_parser(raw);
+        }
+        let w = point_to_s7_address(&PointAddressParser::parse("DB2.DBW20").unwrap())
+            .expect("valid");
+        assert_eq!(w.size, S7Size::Word);
+        assert_eq!((w.db, w.byte_offset), (2, 20));
+    }
+
+    /// QA Happy: I/Q 位转换 → S7Area::I/Q + Bit 尺寸 + 真实位号；与会话层
+    /// 解析器逐字段一致；MC 字区（db=0）仍拒绝（既有口径不回退）。
+    #[test]
+    fn conversion_iq_bit_addresses() {
+        let i = point_to_s7_address(&PointAddressParser::parse("I0.1").unwrap()).expect("valid");
+        assert_eq!(
+            i,
+            parse_s7_address("I0.1").expect("session parser"),
+            "unified/session parser mismatch"
+        );
+        assert_eq!((i.area, i.byte_offset, i.bit_index, i.size),
+                   (S7Area::I, 0, 1, S7Size::Bit));
+        let q = point_to_s7_address(&PointAddressParser::parse("Q0.3").unwrap()).expect("valid");
+        assert_eq!(q, parse_s7_address("Q0.3").expect("session parser"));
+        assert_eq!(q.area, S7Area::Q);
+        // MC 字区（db=0）不属 S7：仍收敛为 ProtocolError。
+        let mc_d = PointAddress { db: 0, area: Some('D'), start: 100, bit: false, bit_index: 0 };
+        let err = point_to_s7_address(&mc_d).expect_err("MC D must be rejected");
+        assert_eq!(err.error_code(), ERR_PROTOCOL);
     }
 
     // ---- 错误映射 ----
@@ -604,6 +711,136 @@ mod tests {
         assert!(matches!(err, DaemonError::ProtocolError(_)), "got {err:?}");
         assert_eq!(err.error_code(), ERR_PROTOCOL);
         assert!(err.to_string().contains("count == 1"), "{err}");
+    }
+
+    /// QA Happy: 经 Driver trait 对 mock 服务器端到端读 I/Q 位与 DBW 字
+    ///（mock 过程映像覆盖 I/Q/DB）；DBW 大端 0x1234 断言沿用会话层既有口径；
+    /// 请求帧 Item 的 area 字节逐一为 I=0x81 / Q=0x82 / DB=0x84。
+    #[tokio::test]
+    async fn dyn_driver_read_iq_dbw_mock_end_to_end() {
+        let ack = read_ack_frame_items(&[
+            (0x01, 1, vec![0x01]),       // I0.1 → 1 位 → 1 字节
+            (0x01, 1, vec![0x00]),       // Q0.3 → 1 位 → 1 字节
+            (0x04, 2, vec![0x12, 0x34]), // DB1.DBW0 → 大端 0x1234
+        ]);
+        let mut script = handshake_script();
+        script.push(vec![build_tpkt(&ack).expect("tpkt")]);
+        let (addr, received) = spawn_mock_multi(vec![script]);
+
+        let mut driver: Box<dyn Driver> = Box::new(S7Driver::with_rack_slot(addr.to_string(), 0, 0));
+        let pi = PointAddressParser::parse("I0.1").expect("addr");
+        let pq = PointAddressParser::parse("Q0.3").expect("addr");
+        let pw = PointAddressParser::parse("DB1.DBW0").expect("addr");
+        let points = [
+            ReadPoint { address: pi.clone(), count: 1 },
+            ReadPoint { address: pq.clone(), count: 1 },
+            ReadPoint { address: pw.clone(), count: 1 },
+        ];
+        let samples = driver.read(&points).await.expect("read");
+        assert_eq!(samples.len(), 3, "1:1 with request");
+        assert_eq!(samples[0].address, pi);
+        assert_eq!(samples[0].value, vec![0x01], "I bit sample");
+        assert_eq!(samples[1].address, pq);
+        assert_eq!(samples[1].value, vec![0x00], "Q bit sample");
+        assert_eq!(
+            crate::driver::s7::read_u16_be(&samples[2].value).expect("u16"),
+            0x1234,
+            "DBW big-endian word"
+        );
+        driver.disconnect().await.expect("disconnect");
+
+        // 请求帧 area 字节断言：Item 起始于 payload[15]，area 在 Item+8。
+        let rec = received.lock().expect("lock");
+        let payload = crate::driver::s7::parse_tpkt(&rec[2]).expect("tpkt");
+        assert_eq!(payload[23], 0x81, "item#1 area = I (0x81)");
+        assert_eq!(payload[35], 0x82, "item#2 area = Q (0x82)");
+        assert_eq!(payload[47], 0x84, "item#3 area = DB (0x84)");
+    }
+
+    /// QA Happy: 经 Driver trait 写 I/Q 位（两帧，异区不合并），mock 校验
+    /// Write Var 帧的 area 字节与数据字段。
+    #[tokio::test]
+    async fn dyn_driver_write_iq_mock_end_to_end() {
+        let mut script = handshake_script();
+        script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
+        script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
+        let (addr, received) = spawn_mock_multi(vec![script]);
+
+        let mut driver: Box<dyn Driver> = Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
+        driver
+            .write(&[
+                WritePoint { address: PointAddressParser::parse("Q0.3").expect("addr"), value: vec![0x01] },
+                WritePoint { address: PointAddressParser::parse("I0.1").expect("addr"), value: vec![0x00] },
+            ])
+            .await
+            .expect("write");
+        driver.disconnect().await.expect("disconnect");
+
+        let rec = received.lock().expect("lock");
+        assert_eq!(rec.len(), 4, "CR + Setup + Write(Q) + Write(I)");
+        let pq = crate::driver::s7::parse_tpkt(&rec[2]).expect("tpkt");
+        assert_eq!(pq[13], 0x05, "function = Write Var");
+        assert_eq!(pq[23], 0x82, "area = Q (0x82)");
+        assert_eq!(pq[31], 0x01, "Q bit write data 0x01");
+        let pi = crate::driver::s7::parse_tpkt(&rec[3]).expect("tpkt");
+        assert_eq!(pi[23], 0x81, "area = I (0x81)");
+        assert_eq!(pi[31], 0x00, "I bit write data 0x00");
+    }
+
+    /// QA 合并写: 相邻 3 字节（DBB0/1/2）合并为单 Item 单帧 Write Var，
+    /// 有间隙的 DBB10 独立成帧——报文数断言 CR + Setup + 2 帧。
+    #[tokio::test]
+    async fn dyn_driver_write_merges_adjacent_bytes_single_frame() {
+        let mut script = handshake_script();
+        script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
+        script.push(vec![build_tpkt(&write_ack_frame()).expect("tpkt")]);
+        let (addr, received) = spawn_mock_multi(vec![script]);
+
+        let mut driver: Box<dyn Driver> = Box::new(S7Driver::new(addr.to_string(), derive_tsap(0, 0)));
+        let parse = |raw: &str| PointAddressParser::parse(raw).expect("addr");
+        driver
+            .write(&[
+                WritePoint { address: parse("DB1.DBB0"), value: vec![0xAA] },
+                WritePoint { address: parse("DB1.DBB1"), value: vec![0xBB] },
+                WritePoint { address: parse("DB1.DBB2"), value: vec![0xCC] },
+                WritePoint { address: parse("DB1.DBB10"), value: vec![0xDD] }, // 间隙 → 第二帧
+            ])
+            .await
+            .expect("write");
+        driver.disconnect().await.expect("disconnect");
+
+        let rec = received.lock().expect("lock");
+        assert_eq!(rec.len(), 4, "CR + Setup + merged Write#1 + Write#2(DBB10)");
+        let p1 = crate::driver::s7::parse_tpkt(&rec[2]).expect("tpkt");
+        assert_eq!(p1[14], 1, "3 adjacent bytes merged into a single item");
+        assert_eq!(&p1[29..31], &3u16.to_be_bytes(), "units = 3 bytes");
+        assert_eq!(&p1[31..34], &[0xAA, 0xBB, 0xCC], "merged payload in order");
+        let p2 = crate::driver::s7::parse_tpkt(&rec[3]).expect("tpkt");
+        assert_eq!(&p2[29..31], &1u16.to_be_bytes(), "gap point stays its own frame");
+        assert_eq!(p2[31], 0xDD);
+    }
+
+    /// QA Error: 字节/字/双字写入宽度不符在发起 IO 前被拒（错误码 1000）。
+    #[tokio::test]
+    async fn driver_write_rejects_wrong_value_width() {
+        let mut driver = S7Driver::new("127.0.0.1:1".to_string(), derive_tsap(0, 0));
+        let cases = [
+            ("DB1.DBW0", vec![0x12u8]),            // 字写 1 字节（须 2）
+            ("DB1.DBB0", vec![0x01, 0x02]),        // 字节写 2 字节（须 1）
+            ("DB1.DBD0", vec![0x01, 0x02, 0x03]),  // 双字写 3 字节（须 4）
+        ];
+        for (raw, value) in cases {
+            let err = driver
+                .write(&[WritePoint { address: PointAddressParser::parse(raw).expect("addr"), value }])
+                .await
+                .expect_err("must reject wrong width");
+            assert!(
+                matches!(err, DaemonError::ProtocolError(_)),
+                "for {raw:?}: {err:?}"
+            );
+            assert_eq!(err.error_code(), ERR_PROTOCOL, "for {raw:?}");
+            assert!(err.to_string().contains("byte(s)"), "for {raw:?}: {err}");
+        }
     }
 
     /// QA: 常量健全性——请求 PDU 与会话层默认一致（防止适配层与协议层漂移）。

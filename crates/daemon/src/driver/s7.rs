@@ -693,6 +693,11 @@ const READ_FRAME_OVERHEAD: usize = 4 + 3 + 10 + 2;
 /// 单个 Any 指针 Item 的编码长度（0x12 0x0A + 10 字节体）。
 const ITEM_ENCODED_LEN: usize = 12;
 
+/// 组一个 Write Var 请求帧的固定开销（字节）：TPKT 头 4 + COTP DT 头 3 +
+/// S7 头 10 + 参数头（功能码 + Item 数）2 + Item 12 + 数据头（返回码 +
+/// 传输尺寸 + 长度）4。协商 PDU 扣除该值后为单帧写入数据预算。
+const WRITE_FRAME_OVERHEAD: usize = 4 + 3 + 10 + 2 + ITEM_ENCODED_LEN + 4;
+
 /// io::Error → [`S7Error::NetworkError`] 统一映射。
 fn io_err(ctx: &str, e: std::io::Error) -> S7Error {
     S7Error::NetworkError(format!("{ctx}: {e}"))
@@ -834,13 +839,98 @@ impl S7Session {
         Ok(results)
     }
 
-    /// 单个 Read Var 请求可承载的最大 Item 数：协商 PDU 扣除帧固定开销
-    /// （[`READ_FRAME_OVERHEAD`]）后按每 Item 12 字节取整；至少 1（防御
-    /// 异常小的协商值，避免空请求）。
-    fn max_items_per_request(&self) -> usize {
-        let budget = (self.negotiated_pdu as usize).saturating_sub(READ_FRAME_OVERHEAD);
-        (budget / ITEM_ENCODED_LEN).max(1)
+/// 单个 Read Var 请求可承载的最大 Item 数：协商 PDU 扣除帧固定开销
+/// （[`READ_FRAME_OVERHEAD`]）后按每 Item 12 字节取整；至少 1（防御
+/// 异常小的协商值，避免空请求）。
+fn max_items_per_request(&self) -> usize {
+    let budget = (self.negotiated_pdu as usize).saturating_sub(READ_FRAME_OVERHEAD);
+    (budget / ITEM_ENCODED_LEN).max(1)
+}
+
+/// 批量写入点位：同区同 DB、字节区间相邻衔接的**非位**写入合并为单 Item
+/// 的 Write Var 报文（一帧一个 Item，数据为各点载荷顺序拼接），按协商 PDU
+/// 的单帧数据预算再切分；位写入永不合并（逐点一帧）。结果整体成功或整体
+/// 失败（任一帧 ACK 非 OK → 整体 `Err`，与 Driver 契约一致）。
+/// 遇对端关闭类网络错误自动重连一次并整体重试，二次失败上抛。
+///
+/// `data` 编码语义与 [`build_write_var`] 一致；每个载荷长度必须与对应地址
+/// 尺寸宽度一致（Bit=1 字节 0x00/0x01、Byte=1、Word=2、DWord=4）。
+///
+/// # Errors
+/// 网络 / 帧结构 / ReturnCode / 载荷宽度与地址不符 → [`S7Error`]；空切片直接返回。
+pub fn write_points(&mut self, reqs: &[(S7Address, Vec<u8>)]) -> Result<(), S7Error> {
+    match self.write_points_once(reqs) {
+        Err(e) if Self::is_connection_lost(&e) => {
+            self.reconnect()?;
+            self.write_points_once(reqs)
+        }
+        other => other,
     }
+}
+
+/// 单次批量写尝试（无重连）：合并 → 组内按 PDU 数据预算切帧 → 逐帧执行。
+fn write_points_once(&mut self, reqs: &[(S7Address, Vec<u8>)]) -> Result<(), S7Error> {
+    if reqs.is_empty() {
+        return Ok(());
+    }
+    let addrs: Vec<S7Address> = reqs.iter().map(|(a, _)| a.clone()).collect();
+    let groups = merge_adjacent_groups(&addrs);
+    let max_data = self.max_write_data_bytes();
+    let mut cursor = 0usize; // reqs 下标（与 addrs 同序同长）
+    for (item, widths) in groups {
+        let member_count = widths.len();
+        let mut start = 0usize; // 组内成员下标
+        let mut offset = item.address.byte_offset;
+        while start < member_count {
+            let mut data: Vec<u8> = Vec::new();
+            let mut taken = 0usize;
+            while start + taken < member_count {
+                let width = usize::from(widths[start + taken]);
+                let payload = &reqs[cursor + start + taken].1;
+                // 防御：载荷宽度须与地址尺寸一致（适配层已 fail-fast 校验）。
+                if payload.len() != width {
+                    return Err(S7Error::BadParam(format!(
+                        "write payload {} bytes != address width {width} for {:?}",
+                        payload.len(),
+                        reqs[cursor + start + taken].0
+                    )));
+                }
+                // 首成员必入帧（与 max_items 的 max(1) 同思路）；后续成员按
+                // 单帧数据预算断开。组内地址连续，任意断开均合法。
+                if !data.is_empty() && data.len() + width > max_data {
+                    break;
+                }
+                data.extend_from_slice(payload);
+                taken += 1;
+            }
+            let mut frame_addr = item.address.clone();
+            frame_addr.byte_offset = offset;
+            let pdu_ref = self.next_pdu_ref;
+            self.next_pdu_ref = self.next_pdu_ref.wrapping_add(1);
+            let mut cotp_s7 = build_cotp_dt_data().to_vec();
+            cotp_s7.extend_from_slice(&build_write_var(pdu_ref, &frame_addr, &data)?);
+            let frame = build_tpkt(&cotp_s7)?;
+            self.stream
+                .write_all(&frame)
+                .map_err(|e| io_err("send write var", e))?;
+            let resp_frame = recv_frame(&mut self.stream)?;
+            parse_write_ack(parse_tpkt(&resp_frame)?)?;
+            // 每个载荷长度 == 其宽度（上方防御校验），故累计字节数即宽度之和。
+            offset += data.len() as u32;
+            start += taken;
+        }
+        cursor += member_count;
+    }
+    Ok(())
+}
+
+/// 单个 Write Var 请求的数据区预算（字节）：协商 PDU 扣除帧固定开销
+/// [`WRITE_FRAME_OVERHEAD`]；至少 1（防御异常小的协商值）。
+fn max_write_data_bytes(&self) -> usize {
+    (self.negotiated_pdu as usize)
+        .saturating_sub(WRITE_FRAME_OVERHEAD)
+        .max(1)
+}
 
     /// 写单个点位（一次 Write Var 请求）。
     ///
