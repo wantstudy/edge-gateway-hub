@@ -24,6 +24,8 @@
 //!   配置版本 watch；心跳注释行由 `KeepAlive`（15s）承担；
 //! - 断线重连：客户端带回上次最大 `seq` 重新 GET 即可，历史环（容量 256）保证不丢。
 
+pub mod remote_ops;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::{Component, Path, PathBuf};
@@ -303,6 +305,9 @@ pub fn router(state: MgmtState) -> Router {
         .route("/api/points", get(points))
         .route("/api/outlets", get(outlets))
         .route("/api/events", get(events))
+        .route("/api/ops/restart", axum::routing::post(remote_ops::restart))
+        .route("/api/ops/collectors", axum::routing::post(remote_ops::collectors))
+        .route("/api/ops/logs", get(remote_ops::logs))
         .route("/", get(serve_root))
         .route("/assets/*path", get(serve_asset))
         .with_state(state)
