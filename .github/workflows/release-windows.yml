@@ -34,6 +34,17 @@ jobs:
         with:
           node-version: '22'
 
+      # windows-latest 默认未预装 NSIS，而 Tauri 的 NSIS 打包依赖 `makensis`——
+      # 不装则 Rust 二进制能编出、但最终的 .exe 安装包不会产出。这是 Tauri Windows CI 最常见的失败点。
+      - name: Install NSIS (Tauri 打包必需)
+        shell: pwsh
+        run: |
+          choco install nsis -y
+          $nsis = "C:\Program Files (x86)\NSIS"
+          Add-Content -Path $env:GITHUB_PATH -Value $nsis -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "NSIS_PATH=$nsis" -Encoding utf8
+          & "$nsis\makensis.exe" /VERSION
+
       - name: Cache cargo & tauri target
         uses: actions/cache@v4
         with:
