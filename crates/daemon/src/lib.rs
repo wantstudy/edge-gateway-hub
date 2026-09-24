@@ -17,10 +17,12 @@
 //! - `north`    北向 MQTT 转发（Wave 3 task 19+）
 
 pub mod auth;
+pub mod bootstrap;
 pub mod config;
 pub mod driver;
 pub mod error;
 pub mod logging;
+pub mod mgmt;
 pub mod north;
 pub mod offline_queue;
 pub mod pipeline;

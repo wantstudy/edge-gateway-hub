@@ -38,7 +38,7 @@ tokio-modbus = { version = "0.17", features = ["tcp-server"] }
 # rt+macros 执行异步单测，net 连接 TCP/RTU 传输，time 支撑请求超时与重连退避，
 # io-util 供传输层 AsyncRead/Write，sync 供单测 oneshot 断言通道。
 # tcp-server 特性会额外启用 rt-multi-thread。
-tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros", "sync", "signal", "fs"] }
 rumqttc = "0.25.1"
 # task 19 mqtts 依赖修正：rumqttc/tokio-rustls 引入的 rustls 未启用任何 crypto provider，
 # `CryptoProvider::get_default()` 返回 None → mqtts 握手必然无 provider。
@@ -52,6 +52,13 @@ base64 = "0.23.1"
 uuid = { version = "1.26.1", features = ["v4"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 prost = "0.13"
+# task 52 管理 API：axum 0.7.9 已在 Cargo.lock（licensing-server 引入），零新增下载；
+# 纯 Rust 栈合规（hyper/tower 全 Rust，无系统 C 库）。
+axum = "0.7.9"
+# task 52 SSE：Stream trait 来源（0.1.19 已在 Cargo.lock；SSE 的 Sse<S> 需要 impl Stream）。
+tokio-stream = "0.1"
+# task 52 SSE：Sse<S> 的 TryStream 约束来自 futures-core（0.3.34 已在 Cargo.lock，零下载）。
+futures-core = "0.3"
 
 [dev-dependencies]
 # 热重载/日志轮转测试用临时目录。

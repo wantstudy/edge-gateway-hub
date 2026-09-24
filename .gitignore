@@ -1,6 +1,7 @@
 # ---- Rust / Cargo ----
 /target/
 **/target/
+/target-*/
 # Cargo.lock：workspace 含服务/守护进程等可执行产物，锁定版本入库（首批 commit 一并提交）。
 
 # ---- 密钥与敏感文件：严禁入库（红线） ----
