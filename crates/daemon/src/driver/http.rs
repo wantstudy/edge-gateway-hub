@@ -277,7 +277,7 @@ impl HttpDriver {
     /// # Errors
     /// URL / 连接 / 超时 / 状态码 / JSON 解析失败 → [`DaemonError`]（映射见局部错误）。
     pub async fn poll(&mut self) -> DaemonResult<Vec<JsonPointSample>> {
-        let (host, port, path) = parse_http_url(&self.config.url).map_err(HttpError::from)?;
+        let (host, port, path) = parse_http_url(&self.config.url)?;
         let raw = Self::fetch(
             &host,
             port,
@@ -285,8 +285,7 @@ impl HttpDriver {
             &self.config.headers,
             self.config.timeout,
         )
-        .await
-        .map_err(HttpError::from)?;
+        .await?;
         let payload: Value = serde_json::from_slice(&raw)
             .map_err(|e| DaemonError::ProtocolError(format!("http payload json parse: {e}")))?;
         Ok(self
@@ -337,7 +336,7 @@ impl HttpDriver {
 impl Driver for HttpDriver {
     /// 预检：对目标 TCP 连接一次即断（不做 HTTP 层校验）。
     async fn connect(&mut self) -> DaemonResult<()> {
-        let (host, port, _) = parse_http_url(&self.config.url).map_err(HttpError::from)?;
+        let (host, port, _) = parse_http_url(&self.config.url)?;
         let addr = format!("{host}:{port}");
         let stream = TcpStream::connect(&addr)
             .await
@@ -796,7 +795,10 @@ mod tests {
             address: HttpDriver::point_address(0),
             count: 1,
         };
-        let samples = driver.read(&[point.clone()]).await.expect("read");
+        let samples = driver
+            .read(std::slice::from_ref(&point))
+            .await
+            .expect("read");
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].address, point.address, "echoes request address");
         assert_eq!(

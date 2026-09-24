@@ -47,7 +47,10 @@ use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64NP;
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Signer as _, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
+// ed25519-dalek 2.x 的 `SigningKey::sign` 需 `Signer` trait 在作用域；生产路径只验签，仅测试用。
+#[cfg(test)]
+use ed25519_dalek::Signer as _;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::signing::{AuthSigner, HandleSigner, LicenseGate};

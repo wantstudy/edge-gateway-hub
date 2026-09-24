@@ -570,6 +570,7 @@ async fn run_ota_boot_check(hook: &Option<OtaBootCheckHook>) {
 
 /// 完整性 manifest 文件名约定：`<exe 全名>.integrity-manifest`，内容为
 /// 64 字符小写 hex 的 exe SHA-256（task 58 打包期注入点；缺失即受限）。
+#[cfg_attr(debug_assertions, allow(dead_code))] // debug 构建下自检被跳过，仅 release 引用
 const INTEGRITY_MANIFEST_SUFFIX: &str = ".integrity-manifest";
 
 /// 从 manifest 文件读取 expected 哈希（64 hex → 32 字节）。
@@ -585,12 +586,12 @@ fn read_expected_exe_hash(manifest: &Path) -> Option<[u8; 32]> {
     }
     let mut expected = [0u8; 32];
     // 长度与字符集已校验，逐字节配对解码不会越界（防御式写法，零 panic）。
-    for i in 0..32 {
-        let hi = (i * 2) as usize;
+    for (i, slot) in expected.iter_mut().enumerate() {
+        let hi = i * 2;
         let lo = hi + 1;
         let hi_val = (trimmed.as_bytes()[hi] as char).to_digit(16)?;
         let lo_val = (trimmed.as_bytes()[lo] as char).to_digit(16)?;
-        expected[i] = ((hi_val << 4) | lo_val) as u8;
+        *slot = ((hi_val << 4) | lo_val) as u8;
     }
     Some(expected)
 }

@@ -139,7 +139,7 @@ pub fn extract_path<'a>(root: &'a Value, path: &str) -> Result<&'a Value, PathEr
                 let index: usize = segment.parse().map_err(|_| PathError::InvalidIndex {
                     segment: segment.to_string(),
                 })?;
-                current = arr.get(index).ok_or_else(|| PathError::IndexOutOfRange {
+                current = arr.get(index).ok_or(PathError::IndexOutOfRange {
                     index,
                     len: arr.len(),
                 })?;
@@ -471,6 +471,7 @@ mod tests {
     use rumqttc::{ConnectionError, Outgoing, Publish};
 
     /// 组装测试用 Incoming Publish 事件。
+    #[allow(clippy::result_large_err)] // 刻意镜像生产 EventOutcome 别名；Err 为 rumqttc 大类型
     fn publish_event(topic: &str, payload: &str) -> EventOutcome {
         Ok(Event::Incoming(Packet::Publish(Publish::new(
             topic,
@@ -480,6 +481,7 @@ mod tests {
     }
 
     /// 组装测试用错误事件（模拟断线）。
+    #[allow(clippy::result_large_err)] // 刻意镜像生产 EventOutcome 别名；Err 为 rumqttc 大类型
     fn error_event() -> EventOutcome {
         Err(ConnectionError::Io(io::Error::new(
             io::ErrorKind::ConnectionReset,

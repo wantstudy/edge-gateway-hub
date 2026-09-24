@@ -60,6 +60,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
+#[cfg(test)]
 use crate::auth::client::RECEIPT_FIELD_WHITELIST;
 use crate::error::{DaemonError, DaemonResult};
 use crate::north::encoder::semantic_digest;
@@ -910,6 +911,7 @@ impl ReceiptReporter {
     }
 
     /// 队列内待报回执的人读标识（FIFO 顺序；测试断言丢最旧 / 按序补报用）。
+    #[cfg(test)]
     fn queue_identities(&self) -> Vec<String> {
         lock_recover(&self.inner.queue)
             .iter()

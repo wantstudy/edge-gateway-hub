@@ -67,7 +67,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+// 生产路径只验签（`Verifier`/`VerifyingKey`）；`Signer`/`SigningKey` 仅测试构造密钥与签名用。
+#[cfg(test)]
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

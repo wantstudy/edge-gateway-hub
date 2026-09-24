@@ -475,10 +475,10 @@ impl ReliableDispatch {
                 self.on_ack().await?;
             }
             // CONNACK：会话未恢复（全新会话）→ 排空 ready + sent-unacked 两层并重放补上。
-            Event::Incoming(Packet::ConnAck(ack)) => {
-                if ack.code == ConnectReturnCode::Success && !ack.session_present {
-                    self.drain_and_replay().await?;
-                }
+            Event::Incoming(Packet::ConnAck(ack))
+                if ack.code == ConnectReturnCode::Success && !ack.session_present =>
+            {
+                self.drain_and_replay().await?;
             }
             _ => {}
         }

@@ -25,6 +25,7 @@
 //! - 不做写探测（只读语义）：可写性经 unix 权限位判定，局限见
 //!   [`check_host_anchor_mounts`] 的误判风险注释。
 
+#[cfg(target_os = "linux")]
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -39,8 +40,10 @@ use crate::error::{DaemonError, DaemonResult};
 pub const SERVICE_MODE_ENV: &str = "IOT_DAQ_SERVICE_MODE";
 
 /// 容器标记文件（Docker 约定）。
+#[cfg(target_os = "linux")]
 const DOCKERENV_MARKER: &str = "/.dockerenv";
 /// 容器标记文件（podman / 通用 OCI 约定）。
+#[cfg(target_os = "linux")]
 const CONTAINERENV_MARKER: &str = "/run/.containerenv";
 
 /// 网关运行形态。
@@ -140,8 +143,8 @@ pub fn detect_with_root(root: &Path) -> Detection {
 }
 
 /// 探测路径是否存在。`None` = 探测失败（非 NotFound 的 IO 错误，证据不可得）。
-/// （仅 Linux 编译路径使用；`test` 使参数化测试在任意宿主可用。）
-#[cfg(any(target_os = "linux", test))]
+/// 仅 Linux 形态检测使用（Windows 走环境变量判定，不需文件探测）。
+#[cfg(target_os = "linux")]
 fn probe_exists(path: &Path) -> Option<bool> {
     match std::fs::metadata(path) {
         Ok(_) => Some(true),

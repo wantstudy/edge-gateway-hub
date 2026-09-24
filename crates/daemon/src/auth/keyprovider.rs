@@ -140,12 +140,12 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     }
 
     let mut inner = Sha256::new();
-    inner.update(&ipad);
+    inner.update(ipad);
     inner.update(data);
     let inner_digest = inner.finalize();
 
     let mut outer = Sha256::new();
-    outer.update(&opad);
+    outer.update(opad);
     outer.update(inner_digest);
     outer.finalize().into()
 }
@@ -546,7 +546,7 @@ mod tests {
         let sig = handle.sign(msg).expect("sign");
 
         assert!(!handle.verify(b"iotdaq verify profX", &sig), "msg tamper");
-        assert!(!handle.verify(msg, &sig) == false, "sanity: own sig ok");
+        assert!(handle.verify(msg, &sig), "sanity: own sig ok");
 
         let foreign = provider_at(&dir, "other.key", &fingerprint_b())
             .load_or_create()

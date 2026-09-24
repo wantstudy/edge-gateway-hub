@@ -726,7 +726,7 @@ impl Driver for McDriver {
             let data = self.run_request(&frame).await?;
             // 响应数据长度校验：字区每点 2 字节；位区 2 点/字节。
             let expected = if batch.code.is_bit() {
-                ((batch.count + 1) / 2) as usize
+                batch.count.div_ceil(2) as usize
             } else {
                 batch.count as usize * 2
             };
@@ -1277,7 +1277,10 @@ mod tests {
             address: parse_mc_address("D100").expect("addr"),
             count: 2,
         };
-        let samples = driver.read(&[point.clone()]).await.expect("read");
+        let samples = driver
+            .read(std::slice::from_ref(&point))
+            .await
+            .expect("read");
         assert_eq!(samples.len(), 1, "1:1 with request");
         assert_eq!(samples[0].address, point.address, "echoes request address");
         assert_eq!(
@@ -1287,7 +1290,8 @@ mod tests {
         );
 
         // 请求帧与 golden bytes 完全一致。
-        let logged = requests.lock().expect("req lock");
+        // 快照即释放锁，避免 guard 跨 `disconnect().await` 持有（await_holding_lock）。
+        let logged = requests.lock().expect("req lock").clone();
         assert_eq!(
             logged.as_slice(),
             &[McDriver::build_request(
@@ -1350,7 +1354,8 @@ mod tests {
             .await
             .expect("write");
 
-        let logged = requests.lock().expect("req lock");
+        // 快照即释放锁，避免 guard 跨 `disconnect().await` 持有（await_holding_lock）。
+        let logged = requests.lock().expect("req lock").clone();
         assert_eq!(logged.len(), 1, "single write frame");
         assert_eq!(
             logged[0],

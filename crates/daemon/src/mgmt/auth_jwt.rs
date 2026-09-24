@@ -308,7 +308,6 @@ pub fn verify(
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-    use base64::Engine as _;
 
     /// 测试密钥（固定 32 字节）。
     const KEY: IssuerKey = IssuerKey([0x42u8; 32]);
