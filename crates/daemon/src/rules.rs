@@ -1,12 +1,15 @@
 //! MQTT 转发规则引擎（计划 task 20，Wave 3）。
 //!
-//! **边界声明**（与 task 15 / task 37 互斥，越界即返工）：
+//! **边界声明**（与 task 15 互斥，越界即返工）：
 //! - 本模块只交付**规则引擎框架**：规则 JSON schema、解析器、SELECT / WHERE / DO 求值、
 //!   Topic 路由与 JSONPath 字段重映射；
 //! - **动作集限于 P0 子集**：过滤（WHERE）+ 路由（Publish）+ 字段重映射（Remap）；
 //! - `点位映射 / 单位换算 / 死区过滤` **一律复用 task 15 的
 //!   [`crate::pipeline::DataProcessor`]**，本模块**不复制**其任何逻辑（见 [`Rule::transform`]）；
-//! - **不**签序列化字节（= task 21）；**不**做规则版本管理、规则间组合与循环依赖检测（= task 37）。
+//! - **不**签序列化字节（= task 21）；
+//! - task 37（在本模块内交付）：规则 schema `version` 字段与向后兼容策略、
+//!   `depends_on` 组合依赖的 DAG 校验（环 / 自依赖 / 未知 id → `ConfigError`）、
+//!   [`RuleSet`] 双版本灰度切换（staging / promote / rollback）。
 //!
 //! ## 数据流位置
 //!
@@ -57,9 +60,16 @@
 //!    运行期路径解析不到值一律视为「不匹配」，绝不 `unwrap` / `expect` / `panic`。
 //! 6. **JSONPath 最小子集**：`$` 根 + `.` 分隔字段 + `[n]` 数组下标。payload 是扁平对象，
 //!    支持下标仅为健壮性（越界 / 非数字下标在构造期即报 `ConfigError`）。
+//! 7. **版本与组合（task 37）**：`version` 缺省 = v1，同大版本（`1.x`）只做向后兼容增量、
+//!    未知大版本在构造期明确拒绝（不得静默按 v1 处理）；`depends_on` 在构造期做 DAG
+//!    校验并把求值顺序整理为**稳定拓扑序**（Kahn + 原数组序平局——无 `depends_on` 的
+//!    规则集求值顺序与 task 20 完全一致，通配多命中 = 多出口分发的既有语义不变）；
+//!    [`RuleSet`] 用 active + staging 双槽位做灰度，`promote` 在一把写锁内原子切换，
+//!    回滚 = 重新 promote 旧版本。
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use serde::de::{Deserializer, Error as DeError};
 use serde::Deserialize;
@@ -97,6 +107,97 @@ const KNOWN_FIELDS: [&str; 7] = [
 /// 统一构造配置错误（错误码 2000，见 [`crate::error::ERR_CONFIG`]）。
 fn config_error(message: impl std::fmt::Display) -> DaemonError {
     DaemonError::ConfigError(message.to_string())
+}
+
+// ---- 规则 schema 版本（task 37）----
+
+/// 本引擎支持的规则 schema **大版本**。
+const SUPPORTED_SCHEMA_MAJOR: u32 = 1;
+
+/// 规则 schema 版本号（规则可选 `version` 字段；**缺省 = v1**）。
+///
+/// JSON 书写形式（向后兼容）：
+/// - 整数：`1` → `1.0`；
+/// - 字符串：`"1"` / `"1.0"` / `"1.2"`。
+///
+/// **兼容策略**：同大版本（`1.x`）一律接受——minor 只做向后兼容增量（如新增可选字段）；
+/// 未知大版本（major > 1）在 [`RuleEngine::from_rules`] 构造期报
+/// [`DaemonError::ConfigError`]，绝不静默按 v1 处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaVersion {
+    /// 大版本：不兼容变更时递增（当前支持 `1`）。
+    pub major: u32,
+    /// 小版本：向后兼容增量（如 `1.1` 新增可选字段）。
+    pub minor: u32,
+}
+
+impl SchemaVersion {
+    /// v1.0（`version` 字段缺省时的等价版本）。
+    pub const V1: Self = Self { major: 1, minor: 0 };
+
+    /// 从整数 / 字符串 JSON 值解析（见类型文档）。
+    fn from_value(raw: &Value) -> Result<Self, String> {
+        match raw {
+            Value::Number(number) => {
+                let major = number.as_u64().ok_or_else(|| {
+                    format!("rule `version` must be a non-negative integer or \"M.m\" string, got {number}")
+                })?;
+                Self::from_parts(major, 0)
+            }
+            Value::String(text) => Self::parse(text),
+            other => Err(format!(
+                "rule `version` must be a non-negative integer or \"M.m\" string, got {}",
+                kind_of(other)
+            )),
+        }
+    }
+
+    /// 解析字符串形式：`"M"` / `"M.m"`（两侧允许空白）。
+    fn parse(text: &str) -> Result<Self, String> {
+        let trimmed = text.trim();
+        let (major_raw, minor_raw) = match trimmed.split_once('.') {
+            Some((major, minor)) => (major, Some(minor)),
+            None => (trimmed, None),
+        };
+        let major = major_raw.trim().parse::<u64>().map_err(|_| {
+            format!("rule `version` {text:?}: major must be a non-negative integer")
+        })?;
+        let minor = match minor_raw {
+            Some(minor) => minor.trim().parse::<u64>().map_err(|_| {
+                format!("rule `version` {text:?}: minor must be a non-negative integer")
+            })?,
+            None => 0,
+        };
+        Self::from_parts(major, minor)
+    }
+
+    /// 组装并做范围检查（major ≥ 1，拒绝 `0.x` 这类无意义版本）。
+    fn from_parts(major: u64, minor: u64) -> Result<Self, String> {
+        if major == 0 {
+            return Err("rule `version`: major must be >= 1".to_string());
+        }
+        let major = u32::try_from(major)
+            .map_err(|_| format!("rule `version`: major {major} is out of range"))?;
+        let minor = u32::try_from(minor)
+            .map_err(|_| format!("rule `version`: minor {minor} is out of range"))?;
+        Ok(Self { major, minor })
+    }
+}
+
+impl std::fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        SchemaVersion::from_value(&raw).map_err(D::Error::custom)
+    }
 }
 
 // ---- 规则模型 ----
@@ -333,6 +434,9 @@ impl<'de> Deserialize<'de> for Action {
 pub struct Rule {
     /// 规则唯一标识（全局唯一，重复 → `ConfigError`）。
     pub id: String,
+    /// 规则 schema 版本（task 37）；缺省 = v1（`1.0`）。未知大版本在构造期拒绝。
+    #[serde(default)]
+    pub version: Option<SchemaVersion>,
     /// SELECT：JSONPath 白名单；**空 = 输出全部字段**。
     #[serde(default)]
     pub select: Vec<String>,
@@ -343,6 +447,10 @@ pub struct Rule {
     pub actions: Vec<Action>,
     /// 数值变换规格（委托 task 15）；`None` = 本规则为**通配规则**，匹配所有样本。
     pub transform: Option<Transform>,
+    /// 依赖的规则 id 列表（task 37）：被依赖规则先执行；构造期做 DAG 校验，
+    /// 环（附环路径）/ 自依赖 / 未知 id 一律 `ConfigError`。
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// 路由结果：一条待发布的消息（topic + payload 均已定型，可直接交北向 MQTT）。
@@ -525,6 +633,121 @@ fn register_path(raw: &str, cache: &mut HashMap<String, Vec<Segment>>) -> Result
     Ok(())
 }
 
+// ---- 规则组合与依赖图（task 37）----
+
+/// 校验 `depends_on` 依赖图并返回**稳定拓扑序**（规则求值顺序）。
+///
+/// - 自依赖 → `ConfigError`（独立于环检测的明确报错）；
+/// - 未知依赖 id → `ConfigError`；
+/// - 环 → `ConfigError`，错误信息附完整环路径（如 `a→b→a`）；
+/// - 无环时返回拓扑序，**平局按原数组顺序**（Kahn 算法 + 有序就绪集），
+///   保证无依赖规则集的求值顺序与 task 20 完全一致。
+fn topological_order(rules: &[Rule]) -> DaemonResult<Vec<usize>> {
+    let index: HashMap<&str, usize> = rules
+        .iter()
+        .enumerate()
+        .map(|(position, rule)| (rule.id.as_str(), position))
+        .collect();
+
+    // 依赖边：规则 i 依赖 j ⇒ j 必须先于 i 执行（j → i 的先序关系）。
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); rules.len()];
+    let mut indegree = vec![0usize; rules.len()];
+    for (position, rule) in rules.iter().enumerate() {
+        for dep in &rule.depends_on {
+            if dep == &rule.id {
+                return Err(config_error(format!(
+                    "rule {:?}: self-dependency in `depends_on` is not allowed",
+                    rule.id
+                )));
+            }
+            let Some(&upstream) = index.get(dep.as_str()) else {
+                return Err(config_error(format!(
+                    "rule {:?}: `depends_on` references unknown rule id {:?}",
+                    rule.id, dep
+                )));
+            };
+            dependents[upstream].push(position);
+            indegree[position] += 1;
+        }
+    }
+
+    // Kahn：就绪集用 BTreeSet 保证同层按原数组序出队。
+    let mut ready: BTreeSet<usize> = (0..rules.len()).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(rules.len());
+    while let Some(&i) = ready.iter().next() {
+        ready.remove(&i);
+        order.push(i);
+        for &downstream in &dependents[i] {
+            indegree[downstream] -= 1;
+            if indegree[downstream] == 0 {
+                ready.insert(downstream);
+            }
+        }
+    }
+
+    if order.len() != rules.len() {
+        // 有剩余节点 ⇒ 必有环；找出一条具体环路径用于报错。
+        let cycle = find_cycle_path(rules, &index);
+        return Err(config_error(format!(
+            "rule dependency cycle detected: {cycle}"
+        )));
+    }
+    Ok(order)
+}
+
+/// 在确认有环的依赖图上找出一条环路径（`a→b→a` 风格，沿 `depends_on` 方向）。
+fn find_cycle_path(rules: &[Rule], index: &HashMap<&str, usize>) -> String {
+    const WHITE: u8 = 0; // 未访问
+    const GRAY: u8 = 1; // 在当前 DFS 路径上
+    const BLACK: u8 = 2; // 已探明无环
+
+    fn visit(
+        position: usize,
+        rules: &[Rule],
+        index: &HashMap<&str, usize>,
+        mark: &mut [u8],
+        path: &mut Vec<usize>,
+    ) -> Option<String> {
+        mark[position] = GRAY;
+        path.push(position);
+        for dep in &rules[position].depends_on {
+            let Some(&next) = index.get(dep.as_str()) else {
+                continue; // 未知 id 由 topological_order 先行报错
+            };
+            match mark[next] {
+                GRAY => {
+                    // 环：从 path 中 next 首次出现处截断，再回到 next 闭合。
+                    let start = path.iter().position(|&n| n == next).unwrap_or(0);
+                    let mut names: Vec<&str> =
+                        path[start..].iter().map(|&n| rules[n].id.as_str()).collect();
+                    names.push(rules[next].id.as_str());
+                    return Some(names.join("→"));
+                }
+                WHITE => {
+                    if let Some(cycle) = visit(next, rules, index, mark, path) {
+                        return Some(cycle);
+                    }
+                }
+                _ => {} // BLACK：已探明无环，跳过
+            }
+        }
+        path.pop();
+        mark[position] = BLACK;
+        None
+    }
+
+    let mut mark = vec![WHITE; rules.len()];
+    let mut path = Vec::new();
+    for position in 0..rules.len() {
+        if mark[position] == WHITE {
+            if let Some(cycle) = visit(position, rules, index, &mut mark, &mut path) {
+                return cycle;
+            }
+        }
+    }
+    "unknown".to_string() // 仅在确认有环后调用，理论不可达；保底不 panic
+}
+
 // ---- 引擎 ----
 
 /// 声明式规则引擎（有状态：持有 task 15 的 [`DataProcessor`] 死区基准）。
@@ -532,7 +755,7 @@ fn register_path(raw: &str, cache: &mut HashMap<String, Vec<Segment>>) -> Result
 /// 构造即完成全部语义校验，运行期只做匹配与投影，不返回配置类错误。
 #[derive(Debug)]
 pub struct RuleEngine {
-    /// 规则列表（求值顺序 = 数组顺序）。
+    /// 规则列表（求值顺序 = `depends_on` 稳定拓扑序；无依赖时与数组顺序一致）。
     rules: Vec<Rule>,
     /// 数值变换 / 死区：由所有规则的 `transform` 汇总而成。
     processor: DataProcessor,
@@ -555,9 +778,25 @@ impl RuleEngine {
             .map_err(|err| config_error(format!("rule json parse: {err}")))?;
         let rules_value: Value = match &root {
             Value::Array(_) => root.clone(),
-            Value::Object(map) => map.get("rules").cloned().ok_or_else(|| {
-                config_error("rule json: object form must contain a `rules` array")
-            })?,
+            Value::Object(map) => {
+                let mut rules_value = map.get("rules").cloned().ok_or_else(|| {
+                    config_error("rule json: object form must contain a `rules` array")
+                })?;
+                // task 37：对象形式的顶层 `version` 作为全部规则的缺省版本
+                //（规则自身的 `version` 字段优先）。
+                if let Some(default_version) = map.get("version") {
+                    if let Value::Array(items) = &mut rules_value {
+                        for item in items.iter_mut() {
+                            if let Value::Object(rule_object) = item {
+                                rule_object
+                                    .entry("version".to_string())
+                                    .or_insert_with(|| default_version.clone());
+                            }
+                        }
+                    }
+                }
+                rules_value
+            }
             other => {
                 return Err(config_error(format!(
                     "rule json: expected an array or an object with `rules`, got {}",
@@ -584,6 +823,15 @@ impl RuleEngine {
             }
             if !seen_ids.insert(rule.id.as_str()) {
                 return Err(config_error(format!("duplicate rule id {:?}", rule.id)));
+            }
+
+            // 0) schema 版本（task 37）：缺省 = v1；未知大版本在此明确拒绝。
+            let version = rule.version.unwrap_or(SchemaVersion::V1);
+            if version.major > SUPPORTED_SCHEMA_MAJOR {
+                return Err(config_error(format!(
+                    "rule {:?}: unsupported rule schema version {version} (this engine supports {SUPPORTED_SCHEMA_MAJOR}.x)",
+                    rule.id
+                )));
             }
 
             // 1) Remap 产物先收集：它们也是 WHERE / SELECT / Remap 路径的合法根字段。
@@ -668,9 +916,21 @@ impl RuleEngine {
             }
         }
 
+        // 6) 依赖图校验 + 稳定拓扑排序（task 37）：有依赖的规则保证其后执行；
+        //    无 `depends_on` 的规则集求值顺序与原数组顺序一致（向后兼容 task 20）。
+        let order = topological_order(&rules)?;
+        let mut slots: Vec<Option<Rule>> = rules.into_iter().map(Some).collect();
+        let mut ordered_rules: Vec<Rule> = Vec::with_capacity(slots.len());
+        for position in order {
+            let rule = slots[position]
+                .take()
+                .ok_or_else(|| config_error("internal: rule order index used twice"))?;
+            ordered_rules.push(rule);
+        }
+
         let processor = DataProcessor::new(configs)?;
         Ok(Self {
-            rules,
+            rules: ordered_rules,
             processor,
             passthrough: HashMap::new(),
             sources,
@@ -807,6 +1067,140 @@ impl RuleEngine {
                 }),
             }
         }
+    }
+}
+
+// ---- 规则版本管理与灰度切换（task 37）----
+
+/// 读锁（毒化恢复：不 panic，取内部数据继续）。
+fn read_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 写锁（毒化恢复：不 panic，取内部数据继续）。
+fn write_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 双槽位快照（active + staging + previous）。
+#[derive(Debug, Default)]
+struct RuleSetSlots {
+    /// 当前生效版本（promote 之后）。
+    active: Option<Arc<RwLock<RuleEngine>>>,
+    /// 预发版本（load_staging 之后、promote 之前）。
+    staging: Option<Arc<RwLock<RuleEngine>>>,
+    /// 上一版 active（promote 时保留，供 [`RuleSet::rollback`] 重新 promote）。
+    previous: Option<Arc<RwLock<RuleEngine>>>,
+}
+
+/// 规则集版本管理器（task 37）：双版本并存 + 原子灰度切换。
+///
+/// - **并存**：[`Self::load_staging`] 完成全部校验（含版本兼容 / 依赖 DAG）后进入
+///   staging 槽，active 不受影响，生产流量继续由 active 服务；
+/// - **切换**：[`Self::promote`] 在一把写锁内完成 `staging → active` 的原子搬移，
+///   单样本视角下不存在半新半旧窗口（切换瞬间的样本要么全走旧版、要么全走新版）；
+/// - **回滚**：[`Self::rollback`] = 重新 promote 旧版本——旧 active 在 promote 时
+///   保留于 previous 槽，rollback 将其原子换回 active，当前 active 降级为 staging
+///   （可再次 promote，支持 A/B 来回切换）；
+/// - **线程安全**：槽位操作在 `RwLock` 内完成；引擎本身再包一层 `RwLock`
+///   （死区基准有状态，`RuleEngine::evaluate` 需要 `&mut`）。锁毒化一律取内部
+///   数据继续，**绝不 panic**。
+#[derive(Debug)]
+pub struct RuleSet {
+    /// 槽位（active / staging / previous）。
+    inner: RwLock<RuleSetSlots>,
+}
+
+impl RuleSet {
+    /// 空规则集（无 active：`evaluate` / `route` 返回空，不报错）。
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(RuleSetSlots::default()),
+        }
+    }
+
+    /// 解析并校验一份新规则 JSON，放入 staging 槽（active 不受影响）。
+    ///
+    /// 校验失败（含未知大版本 / 依赖环）→ [`DaemonError::ConfigError`]，
+    /// staging 与 active 均保持原状。
+    pub fn load_staging(&self, json: &str) -> DaemonResult<()> {
+        let engine = RuleEngine::from_json(json)?;
+        write_guard(&self.inner).staging = Some(Arc::new(RwLock::new(engine)));
+        Ok(())
+    }
+
+    /// 原子切换：staging → active（旧 active 移入 previous 供回滚）。
+    ///
+    /// staging 为空 → [`DaemonError::ConfigError`]。
+    pub fn promote(&self) -> DaemonResult<()> {
+        let mut slots = write_guard(&self.inner);
+        let staging = slots.staging.take().ok_or_else(|| {
+            config_error("promote: no staging rule version (call load_staging first)")
+        })?;
+        slots.previous = slots.active.take();
+        slots.active = Some(staging);
+        Ok(())
+    }
+
+    /// 便捷路径：加载 + 校验 + 原子切换一步完成（校验失败则 active 原状不动）。
+    pub fn promote_json(&self, json: &str) -> DaemonResult<()> {
+        self.load_staging(json)?;
+        self.promote()
+    }
+
+    /// 回滚 = 重新 promote 旧版本：previous → active，当前 active 降级为 staging。
+    ///
+    /// 无可回滚版本（从未 promote 过）→ [`DaemonError::ConfigError`]。
+    pub fn rollback(&self) -> DaemonResult<()> {
+        let mut slots = write_guard(&self.inner);
+        let previous = slots.previous.take().ok_or_else(|| {
+            config_error("rollback: no previous active rule version to re-promote")
+        })?;
+        slots.staging = slots.active.take();
+        slots.active = Some(previous);
+        Ok(())
+    }
+
+    /// 是否已有生效版本。
+    pub fn has_active(&self) -> bool {
+        read_guard(&self.inner).active.is_some()
+    }
+
+    /// 是否已有预发版本。
+    pub fn has_staging(&self) -> bool {
+        read_guard(&self.inner).staging.is_some()
+    }
+
+    /// 当前生效版本的规则条数（无 active → 0）。
+    pub fn active_rule_count(&self) -> usize {
+        let active = read_guard(&self.inner).active.clone();
+        active.map_or(0, |engine| read_guard(&engine).rule_count())
+    }
+
+    /// 完整链路求值（委托当前 active 版本）：先 task 15 处理，再 WHERE + SELECT + DO。
+    ///
+    /// 无 active 版本 → 空 `Vec`（不是错误）。
+    pub fn evaluate(&self, sample: RawSample) -> DaemonResult<Vec<RoutedMessage>> {
+        let active = read_guard(&self.inner).active.clone();
+        match active {
+            Some(engine) => write_guard(&engine).evaluate(sample),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 纯路由（委托当前 active 版本）；无 active → 空 `Vec`。
+    pub fn route(&self, sample: &ProcessedSample) -> Vec<RoutedMessage> {
+        let active = read_guard(&self.inner).active.clone();
+        match active {
+            Some(engine) => read_guard(&engine).route(sample),
+            None => Vec::new(),
+        }
+    }
+}
+
+impl Default for RuleSet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1473,5 +1867,356 @@ mod tests {
         .expect_err("transform 内部未知字段必须报错");
         assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
         assert!(err.to_string().contains("scal"), "应指出 scal: {err}");
+    }
+
+    // ===================== task 37：schema 版本管理 =====================
+
+    /// `version` 字段的合法书写形式：整数 / `"M"` / `"M.m"`，全部按 v1 接受。
+    #[test]
+    fn version_field_accepts_all_v1_notations() {
+        for version in ["1", "1.0", "1.1"] {
+            let json = format!(
+                r#"[{{"id": "r", "version": "{version}", "actions": [{{"kind": "publish", "topic": "t"}}],
+                     "transform": {{"source_id": "s", "target_point": "p", "device_id": "d"}}}}]"#
+            );
+            let mut engine = RuleEngine::from_json(&json).expect("valid v1 notations");
+            let out = engine.evaluate(raw("s", 1.0)).expect("ok");
+            assert_eq!(out.len(), 1, "version {version:?} must evaluate");
+        }
+        let integer =
+            r#"[{"id": "r", "version": 1, "actions": [{"kind": "publish", "topic": "t"}]}]"#;
+        assert!(RuleEngine::from_json(integer).is_ok(), "integer 1 == v1");
+    }
+
+    /// 缺省（无 `version` 字段）= v1，与 task 20 行为完全一致；对象形式顶层
+    /// `version` 作为全部规则的缺省（规则自身字段优先）。
+    #[test]
+    fn missing_version_defaults_to_v1_and_top_level_version_applies() {
+        let without = r#"[{"id": "r", "actions": [{"kind": "publish", "topic": "t"}]}]"#;
+        assert!(RuleEngine::from_json(without).is_ok(), "no version field == v1");
+
+        let top_level = r#"{"version": "1.0", "rules": [
+            {"id": "a", "actions": [{"kind": "publish", "topic": "a"}]},
+            {"id": "b", "version": "1.1", "actions": [{"kind": "publish", "topic": "b"}]}
+        ]}"#;
+        let mut engine = RuleEngine::from_json(top_level).expect("top-level default version");
+        let out = engine.evaluate(raw("s", 1.0)).expect("ok");
+        assert_eq!(out.len(), 2, "both wildcard rules hit");
+    }
+
+    /// 未知大版本（major > 1）必须明确拒绝，不得静默按 v1 处理。
+    #[test]
+    fn unknown_major_version_is_rejected() {
+        let cases = [
+            r#"[{"id": "r", "version": 2, "actions": [{"kind": "publish", "topic": "t"}]}]"#,
+            r#"[{"id": "r", "version": "2.0", "actions": [{"kind": "publish", "topic": "t"}]}]"#,
+            r#"[{"id": "r", "version": "999.3", "actions": [{"kind": "publish", "topic": "t"}]}]"#,
+        ];
+        for json in cases {
+            let err = RuleEngine::from_json(json).expect_err("unknown major version");
+            assert_eq!(err.error_code(), crate::error::ERR_CONFIG, "got {err:?}");
+            assert!(
+                err.to_string().contains("version"),
+                "error must name the version problem: {err}"
+            );
+        }
+    }
+
+    /// 非法 version 值（0 / 负数 / 非版本字符串 / 非标量）→ ConfigError。
+    #[test]
+    fn invalid_version_value_is_rejected() {
+        let cases = [
+            r#"[{"id": "r", "version": 0, "actions": []}]"#,
+            r#"[{"id": "r", "version": -1, "actions": []}]"#,
+            r#"[{"id": "r", "version": "abc", "actions": []}]"#,
+            r#"[{"id": "r", "version": "1.2.3", "actions": []}]"#,
+            r#"[{"id": "r", "version": true, "actions": []}]"#,
+        ];
+        for json in cases {
+            let err = RuleEngine::from_json(json).expect_err("invalid version");
+            assert_eq!(err.error_code(), crate::error::ERR_CONFIG, "got {err:?}");
+        }
+    }
+
+    // ===================== task 37：depends_on 组合与循环依赖 =====================
+
+    /// depends_on 拓扑排序：数组顺序故意与依赖顺序相反，输出顺序必须按依赖序。
+    #[test]
+    fn depends_on_orders_evaluation_topologically() {
+        let json = r#"[
+            {"id": "c_summary", "depends_on": ["b_enriched"],
+             "actions": [{"kind": "publish", "topic": "chain/summary"}]},
+            {"id": "b_enriched", "depends_on": ["a_base"],
+             "actions": [{"kind": "remap", "fields": {"t": "$.value"}},
+                         {"kind": "publish", "topic": "chain/enriched"}]},
+            {"id": "a_base", "actions": [{"kind": "publish", "topic": "chain/base"}]}
+        ]"#;
+        let mut engine = RuleEngine::from_json(json).expect("valid dag");
+        let out = engine.evaluate(raw("s", 36.5)).expect("ok");
+        let ids: Vec<&str> = out.iter().map(|m| m.rule_id.as_str()).collect();
+        assert_eq!(ids, vec!["a_base", "b_enriched", "c_summary"], "topological order");
+        // 拓扑序下的 remap 语义不变：b_enriched 的精简 payload。
+        assert_eq!(out[1].payload.as_object().expect("obj").len(), 1);
+        assert_eq!(out[1].payload["t"].as_f64(), Some(36.5));
+    }
+
+    /// 二元环：a depends_on b、b depends_on a → ConfigError，附环路径 `a→b→a`。
+    #[test]
+    fn two_node_cycle_is_rejected_with_path() {
+        let json = r#"[
+            {"id": "a", "depends_on": ["b"], "actions": [{"kind": "publish", "topic": "t"}]},
+            {"id": "b", "depends_on": ["a"], "actions": [{"kind": "publish", "topic": "t"}]}
+        ]"#;
+        let err = RuleEngine::from_json(json).expect_err("cycle");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+        assert!(
+            err.to_string().contains("a→b→a"),
+            "cycle path must be included: {err}"
+        );
+    }
+
+    /// 三元环 a→c→b→a 同样拒绝，环路径完整。
+    #[test]
+    fn three_node_cycle_is_rejected_with_path() {
+        let json = r#"[
+            {"id": "a", "depends_on": ["c"], "actions": []},
+            {"id": "b", "depends_on": ["a"], "actions": []},
+            {"id": "c", "depends_on": ["b"], "actions": []}
+        ]"#;
+        let err = RuleEngine::from_json(json).expect_err("cycle");
+        let msg = err.to_string();
+        assert!(msg.contains("cycle"), "must say cycle: {msg}");
+        assert!(msg.contains("a→c→b→a"), "full path: {msg}");
+    }
+
+    /// 自依赖：depends_on 含自身 id → ConfigError（独立于环检测的明确报错）。
+    #[test]
+    fn self_dependency_is_rejected() {
+        let json =
+            r#"[{"id": "a", "depends_on": ["a"], "actions": [{"kind": "publish", "topic": "t"}]}]"#;
+        let err = RuleEngine::from_json(json).expect_err("self dependency");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+        assert!(
+            err.to_string().contains("self-dependency"),
+            "must name self-dependency: {err}"
+        );
+    }
+
+    /// 未知依赖 id → ConfigError。
+    #[test]
+    fn unknown_dependency_id_is_rejected() {
+        let json =
+            r#"[{"id": "a", "depends_on": ["ghost"], "actions": [{"kind": "publish", "topic": "t"}]}]"#;
+        let err = RuleEngine::from_json(json).expect_err("unknown dep");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+        assert!(err.to_string().contains("ghost"), "must name the id: {err}");
+    }
+
+    /// 合法 DAG（菱形）通过且求值顺序稳定：Kahn 平局按原数组序。
+    #[test]
+    fn diamond_dag_is_accepted_with_stable_order() {
+        let json = r#"[
+            {"id": "c", "depends_on": ["a", "b"], "actions": [{"kind": "publish", "topic": "c"}]},
+            {"id": "b", "depends_on": ["a"], "actions": [{"kind": "publish", "topic": "b"}]},
+            {"id": "a", "actions": [{"kind": "publish", "topic": "a"}]},
+            {"id": "d", "depends_on": ["c"], "actions": [{"kind": "publish", "topic": "d"}]}
+        ]"#;
+        let mut engine = RuleEngine::from_json(json).expect("diamond dag");
+        let out = engine.evaluate(raw("s", 1.0)).expect("ok");
+        let ids: Vec<&str> = out.iter().map(|m| m.rule_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"], "stable topological order");
+    }
+
+    // ===================== task 37：RuleSet 版本管理与灰度 =====================
+
+    /// staging 与 active 并存；promote 原子切换；未 promote 时流量仍不走 staging。
+    #[test]
+    fn rule_set_promote_switches_atomically() {
+        let set = RuleSet::new();
+        assert!(!set.has_active());
+        assert!(
+            set.evaluate(raw("t", 1.0)).expect("ok").is_empty(),
+            "no active version → no messages"
+        );
+
+        set.load_staging(r#"[{"id": "v2", "actions": [{"kind": "publish", "topic": "v2"}]}]"#)
+            .expect("valid staging");
+        assert!(
+            set.has_staging() && !set.has_active(),
+            "staging co-exists, active untouched"
+        );
+        assert!(
+            set.evaluate(raw("t", 1.0)).expect("ok").is_empty(),
+            "not promoted yet → still no active"
+        );
+
+        set.promote().expect("promote");
+        assert!(set.has_active() && !set.has_staging(), "staging consumed by promote");
+        assert_eq!(set.active_rule_count(), 1);
+
+        let out = set.evaluate(raw("t", 1.0)).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].topic, "v2");
+    }
+
+    /// 回滚 = 重新 promote 旧版本：rollback 把 previous 换回 active，
+    /// 当前 active 降级为 staging（可再次 promote，支持 A/B 来回切换）。
+    #[test]
+    fn rule_set_rollback_repromotes_previous_version() {
+        let set = RuleSet::new();
+        set.promote_json(r#"[{"id": "v1", "actions": [{"kind": "publish", "topic": "v1"}]}]"#)
+            .expect("first promote");
+        assert_eq!(set.evaluate(raw("t", 1.0)).expect("ok")[0].topic, "v1");
+
+        set.promote_json(r#"[{"id": "v2", "actions": [{"kind": "publish", "topic": "v2"}]}]"#)
+            .expect("second promote");
+        assert_eq!(set.evaluate(raw("t", 1.0)).expect("ok")[0].topic, "v2");
+
+        set.rollback().expect("rollback to v1");
+        assert_eq!(set.evaluate(raw("t", 1.0)).expect("ok")[0].topic, "v1");
+        assert!(set.has_staging(), "old v2 demoted to staging");
+
+        set.promote().expect("re-promote v2 (A/B flip)");
+        assert_eq!(set.evaluate(raw("t", 1.0)).expect("ok")[0].topic, "v2");
+    }
+
+    /// 空 staging 时 promote / 从未 promote 时 rollback → ConfigError(2000)，不 panic。
+    #[test]
+    fn rule_set_promote_and_rollback_error_paths() {
+        let set = RuleSet::new();
+        let err = set.promote().expect_err("no staging");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+
+        let err = set.rollback().expect_err("no previous");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+
+        set.promote_json(r#"[{"id": "v1", "actions": [{"kind": "publish", "topic": "v1"}]}]"#)
+            .expect("promote");
+        set.promote().expect_err("staging consumed by the first promote");
+    }
+
+    /// staging 校验失败（依赖环 / 未知大版本）→ ConfigError，active 保持原状。
+    #[test]
+    fn rule_set_rejects_invalid_staging_and_keeps_active() {
+        let set = RuleSet::new();
+        set.promote_json(r#"[{"id": "good", "actions": [{"kind": "publish", "topic": "good"}]}]"#)
+            .expect("active");
+
+        let cycle = r#"[
+            {"id": "x", "depends_on": ["y"], "actions": []},
+            {"id": "y", "depends_on": ["x"], "actions": []}
+        ]"#;
+        let err = set.load_staging(cycle).expect_err("cycle in staging");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+        assert!(!set.has_staging(), "failed load must not leave staging behind");
+
+        let future =
+            r#"[{"id": "r", "version": 2, "actions": [{"kind": "publish", "topic": "t"}]}]"#;
+        let err = set.load_staging(future).expect_err("unknown major version");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+
+        let out = set.evaluate(raw("t", 1.0)).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].topic, "good", "active version untouched");
+    }
+
+    /// route 旁路：无 active → 空；有 active → 委托 active 引擎。
+    #[test]
+    fn rule_set_route_delegates_to_active_version() {
+        let set = RuleSet::new();
+        assert!(set.route(&processed("temp", 1.0, "degC")).is_empty());
+
+        set.promote_json(
+            r#"[{"id": "alarm", "when": {"kind": "cmp", "field": "value", "op": "gt", "value": 30},
+                 "actions": [{"kind": "publish", "topic": "alarms"}],
+                 "transform": {"source_id": "t", "target_point": "temp", "device_id": "m1"}}]"#,
+        )
+        .expect("promote");
+        let out = set.route(&processed("temp", 36.5, "degC"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].topic, "alarms");
+    }
+
+    // ===================== task 37：端到端规则链 =====================
+
+    /// 端到端链路：一条数据流经「换算（transform）→ 死区（deadband）→ 映射（remap）→
+    /// publish」多规则链，链路顺序由 depends_on 声明（数组顺序故意倒置）。
+    ///
+    /// - 规则 `normalized`：transform scale 0.1 / offset 2.0 / deadband 1.0（委托 task 15）；
+    /// - 规则 `enriched`：depends_on ["normalized"]，remap 产出 {t, dev}；
+    /// - 规则 `summary`：depends_on ["enriched"]，WHERE 过滤后 publish。
+    #[test]
+    fn end_to_end_chain_transform_deadband_remap_publish() {
+        let json = r#"[
+            {"id": "summary", "depends_on": ["enriched"],
+             "when": {"kind": "cmp", "field": "value", "op": "lt", "value": 100},
+             "actions": [{"kind": "publish", "topic": "chain/summary"}]},
+            {"id": "enriched", "depends_on": ["normalized"],
+             "actions": [
+                {"kind": "remap", "fields": {"t": "$.value", "dev": "$.device_id"}},
+                {"kind": "publish", "topic": "chain/enriched"}
+             ]},
+            {"id": "normalized",
+             "transform": {"source_id": "s", "target_point": "temp", "device_id": "m1",
+                           "unit": "degC", "scale": 0.1, "offset": 2.0, "deadband": 1.0},
+             "actions": [{"kind": "publish", "topic": "chain/normalized"}]}
+        ]"#;
+        let mut engine = RuleEngine::from_json(json).expect("valid chain");
+
+        // 首个样本：建立死区基线，三个规则按依赖序产出。
+        let out = engine.evaluate(raw("s", 500.0)).expect("ok");
+        let ids: Vec<&str> = out.iter().map(|m| m.rule_id.as_str()).collect();
+        assert_eq!(ids, vec!["normalized", "enriched", "summary"], "dependency order");
+
+        // normalized：500 * 0.1 + 2.0 = 52.0 degC。
+        assert_eq!(out[0].topic, "chain/normalized");
+        assert!((out[0].payload["value"].as_f64().expect("num") - 52.0).abs() < 1e-9);
+        assert_eq!(out[0].payload["unit"].as_str(), Some("degC"));
+
+        // enriched：remap 之后的精简 payload（通配规则匹配处理后的样本 value=52.0）。
+        assert_eq!(out[1].topic, "chain/enriched");
+        assert!((out[1].payload["t"].as_f64().expect("num") - 52.0).abs() < 1e-9);
+        assert_eq!(out[1].payload["dev"].as_str(), Some("m1"));
+        assert!(!out[1].payload.as_object().expect("obj").contains_key("value"));
+
+        // summary：WHERE value < 100 命中（52.0）。
+        assert_eq!(out[2].topic, "chain/summary");
+        assert!((out[2].payload["value"].as_f64().expect("num") - 52.0).abs() < 1e-9);
+
+        // 死区内的小变化（0.5 < 1.0）：task 15 吞掉样本 → 整条链路本样本静默。
+        let small = engine.evaluate(raw("s", 505.0)).expect("ok");
+        assert!(small.is_empty(), "deadband swallows the whole sample");
+
+        // 超过死区（1.5 >= 1.0）：链路重新产出，53.5 = 515 * 0.1 + 2.0
+        //（上次发出 52.0；死区内样本 505→52.5 已被吞且不重置基准）。
+        let big = engine.evaluate(raw("s", 515.0)).expect("ok");
+        assert_eq!(big.len(), 3);
+        assert!((big[0].payload["value"].as_f64().expect("num") - 53.5).abs() < 1e-9);
+        assert!((big[1].payload["t"].as_f64().expect("num") - 53.5).abs() < 1e-9);
+    }
+
+    /// 端到端经 RuleSet：先 load_staging 校验（环被拒、active 不受影响），再 promote，
+    /// 流量切换到新链。
+    #[test]
+    fn end_to_end_chain_via_rule_set_promote() {
+        let set = RuleSet::new();
+        set.promote_json(r#"[{"id": "live", "actions": [{"kind": "publish", "topic": "live"}],
+            "transform": {"source_id": "s", "target_point": "p", "device_id": "d"}}]"#)
+            .expect("good version");
+
+        let broken = r#"[
+            {"id": "a", "depends_on": ["b"], "actions": [{"kind": "publish", "topic": "x"}]},
+            {"id": "b", "depends_on": ["a"], "actions": [{"kind": "publish", "topic": "x"}]}
+        ]"#;
+        set.load_staging(broken).expect_err("cycle rejected at load time");
+        assert!(!set.has_staging());
+        assert_eq!(set.evaluate(raw("s", 1.0)).expect("ok")[0].topic, "live");
+
+        set.promote_json(r#"[{"id": "next", "depends_on": [], "actions": [
+            {"kind": "publish", "topic": "next"}]}]"#)
+            .expect("promote new chain");
+        let out = set.evaluate(raw("s", 1.0)).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].topic, "next");
     }
 }
