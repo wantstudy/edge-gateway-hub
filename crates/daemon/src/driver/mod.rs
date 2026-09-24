@@ -24,7 +24,10 @@ use crate::error::{DaemonError, DaemonResult};
 // ---- 具体协议驱动 ----
 
 /// Modbus TCP / RTU-over-TCP 驱动（plan task 9）。
+pub mod http;
+pub mod mc;
 pub mod modbus;
+pub mod mqtt_in;
 
 // ---- Driver trait ----
 
