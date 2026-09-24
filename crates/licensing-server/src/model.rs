@@ -504,6 +504,13 @@ pub struct ActivationCode {
     pub idempotency_key: Option<String>,
     /// 创建时间（UTC 秒）。
     pub created_at: i64,
+    /// 预绑定机器码（task 46）：厂商在**发放 / 重发**时指定，`None` = 留待首次激活自由绑定。
+    ///
+    /// 一机一码红线：一旦预绑定，该码**只能**被 `machine_code` 等于本值的设备激活
+    /// （校验在 `LicensingService::activate` 内、绑定之前执行）。
+    /// **空白串一律视为「未预绑定」**——统一以 `trim().is_empty()` 判定，
+    /// 避免 `"   "` 被当成有效机器码而把设备永久锁死在空指纹上。
+    pub prebind_machine_code: Option<String>,
 }
 
 impl ActivationCode {
@@ -539,6 +546,26 @@ impl ActivationCode {
             revoked_reason: None,
             idempotency_key: None,
             created_at,
+            prebind_machine_code: None,
+        }
+    }
+
+    /// 设置**预绑定机器码**（task 46 换机迁移：新码可直接锁定到新机）。
+    ///
+    /// 空白串统一归一为 `None`（"   " 不算「已提供」），保证
+    /// 「留待首次激活绑定」与「显式留空」语义一致。
+    pub fn with_prebind(mut self, machine_code: Option<String>) -> Self {
+        self.prebind_machine_code = machine_code
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        self
+    }
+
+    /// 预绑定是否命中给定机器码（`None` = 未预绑定 → 任意机器均可激活）。
+    pub fn prebind_matches(&self, machine_code: &str) -> bool {
+        match self.prebind_machine_code.as_deref() {
+            None => true,
+            Some(expected) => expected == machine_code,
         }
     }
 
@@ -549,12 +576,22 @@ impl ActivationCode {
     /// 2. `status == Revoked` → `revoked_at.is_some()` 且 `revoked_reason` 非空白；
     /// 3. `status == Bound` → `bound_device_id.is_some()` 且非空白；
     /// 4. `status != Revoked` → 不得携带 `revoked_at`（避免「未废弃却有废弃时间」的脏数据）。
+    /// 5. 预绑定机器码若存在必须**非空白**（`"   "` 不得锁死设备指纹）。
     ///
     /// 错误信息**绝不包含码值 `code`**（错误会进日志与审计）。
     pub fn validate(&self) -> LicenseResult<()> {
         if self.valid_until <= self.valid_from {
             return Err(LicenseError::KeyStateIllegal(
                 "activation_code validity window is empty: valid_until must be > valid_from".into(),
+            ));
+        }
+        if self
+            .prebind_machine_code
+            .as_deref()
+            .is_some_and(|m| m.trim().is_empty())
+        {
+            return Err(LicenseError::KeyStateIllegal(
+                "activation_code prebind_machine_code must be non-blank when present".into(),
             ));
         }
         match self.status {

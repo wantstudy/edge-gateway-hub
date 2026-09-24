@@ -31,6 +31,28 @@ use crate::model::{
     SigningKeyStatus, Tenant, VerifyMode,
 };
 
+/// **增量列迁移表**：`(表名, 列名, 补齐该列的 DDL)`。
+///
+/// 只对**已建库后**新增的列登记；`migrate` 会先查 `PRAGMA table_info`，缺列才执行 DDL，
+/// 因此对全新库（列已在 `CREATE TABLE` 中）与旧库都幂等。
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[(
+    "activation_code",
+    "prebind_machine_code",
+    "ALTER TABLE activation_code ADD COLUMN prebind_machine_code TEXT",
+)];
+
+/// 判断表中是否已存在某列（基于 `PRAGMA table_info`，不受 SQLite 版本差异影响）。
+fn column_exists(conn: &Connection, table: &str, column: &str) -> LicenseResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<usize, String>(1))?;
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // ---- 列表过滤条件 ----
 
 /// `activation_code` 列表过滤条件（`None` 字段 = 不施加该条件）。
@@ -103,10 +125,17 @@ const SCHEMA: &[&str] = &[
         revoked_at       INTEGER,
         revoked_reason   TEXT,
         idempotency_key  TEXT,
-        created_at       INTEGER NOT NULL
+        created_at       INTEGER NOT NULL,
+        -- task 46：预绑定机器码。NULL = 留待首次激活自由绑定。
+        prebind_machine_code TEXT
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_code_tenant ON activation_code(tenant_id)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_code_bound_device ON activation_code(bound_device_id)"#,
+    // task 46：重发溯源链与预绑定冲突检测都必须**走索引直查**——
+    // 早期实现靠 `list_codes` 分页 + 内存过滤，租户码数超过一页时会被**截断漏命中**，
+    // 导致换机重发被误判为「首次」而**重复签发新码**（一机一码破口）。
+    r#"CREATE INDEX IF NOT EXISTS idx_code_reissued_from ON activation_code(reissued_from_id)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_code_prebind ON activation_code(prebind_machine_code)"#,
     // `idempotency_key` 标识**一次发放批次**（一批多码共用同一 key），因此**不建唯一索引**：
     // 唯一约束属于「批次」而非「单行」，行级唯一会让批量发码直接失败。幂等语义由
     // service 层按 key 查询既有批次实现（见 `LicensingService::issue_codes`）。
@@ -302,6 +331,7 @@ fn row_to_code(row: &Row<'_>) -> rusqlite::Result<ActivationCode> {
         revoked_reason: row.get(12)?,
         idempotency_key: row.get(13)?,
         created_at: row.get(14)?,
+        prebind_machine_code: row.get(15)?,
     })
 }
 
@@ -507,10 +537,20 @@ impl Store {
     }
 
     /// 执行建表 + 索引（**幂等**：全部 `IF NOT EXISTS`）。
+    ///
+    /// 建表之后追加 **列级增量迁移**（[`ADDED_COLUMNS`]）：`CREATE TABLE IF NOT EXISTS`
+    /// 对**已存在**的旧库不会补列，故 task 46 新增的 `prebind_machine_code` 必须以
+    /// 「查 `PRAGMA table_info` → 缺则 `ALTER TABLE ADD COLUMN`」的方式补齐，
+    /// 否则旧库上所有预绑定查询都会因 `no such column` 而整体失败。
     pub fn migrate(&self) -> LicenseResult<()> {
         let conn = self.conn.lock();
         for statement in SCHEMA {
             conn.execute_batch(statement)?;
+        }
+        for (table, column, ddl) in ADDED_COLUMNS {
+            if !column_exists(&conn, table, column)? {
+                conn.execute_batch(ddl)?;
+            }
         }
         Ok(())
     }
@@ -714,8 +754,8 @@ impl Store {
             "INSERT INTO activation_code
                (code_id, code, status, bound_device_id, tenant_id, tier, valid_from, valid_until,
                 source_order_id, reissued_from_id, issued_by, revoked_at, revoked_reason,
-                idempotency_key, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                idempotency_key, created_at, prebind_machine_code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 code.code_id,
                 code.code,
@@ -732,6 +772,7 @@ impl Store {
                 code.revoked_reason,
                 code.idempotency_key,
                 code.created_at,
+                code.prebind_machine_code,
             ],
         )?;
         Ok(())
@@ -746,7 +787,8 @@ impl Store {
             .query_row(
                 "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
                         valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
-                        revoked_reason, idempotency_key, created_at
+                        revoked_reason, idempotency_key, created_at,
+                        prebind_machine_code
                  FROM activation_code WHERE code = ?1",
                 params![code_value],
                 row_to_code,
@@ -762,13 +804,84 @@ impl Store {
             .query_row(
                 "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
                         valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
-                        revoked_reason, idempotency_key, created_at
+                        revoked_reason, idempotency_key, created_at,
+                        prebind_machine_code
                  FROM activation_code WHERE code_id = ?1",
                 params![code_id],
                 row_to_code,
             )
             .optional()?;
         Ok(found)
+    }
+
+    /// 按**原码 ID** 直查重发产出的新码（task 46 重发溯源 / 幂等）。
+    ///
+    /// ⚠️ **为什么必须走 SQL 直查**：重发幂等早期实现是「`list_codes` 取第一页 +
+    /// 内存 `.find(reissued_from_id == 原码)`」。一旦某租户的码数超过一页
+    /// （`MAX_ISSUE_BATCH = 1000`），新码就可能落在第二页之外 → **漏命中** →
+    /// 同一次重发被判为「首次」而**再签发一张新码**，换机迁移因此一码变两码。
+    /// 本方法以索引直查替代分页扫描，**不受总量与分页边界影响**。
+    pub fn find_code_by_reissued_from(
+        &self,
+        original_code_id: &str,
+    ) -> LicenseResult<Option<ActivationCode>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
+                    valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
+                    revoked_reason, idempotency_key, created_at, prebind_machine_code
+             FROM activation_code WHERE reissued_from_id = ?1
+             ORDER BY rowid ASC LIMIT 1",
+            params![original_code_id],
+            row_to_code,
+        )
+        .optional()
+        .map_err(LicenseError::from)
+    }
+
+    /// 查某设备当前**仍生效**的绑定码（task 46 预绑定冲突检测的设备侧）。
+    ///
+    /// 只认 `status = 'bound'`：`revoked` / `reissued` 的历史绑定**不构成冲突**
+    /// （否则换机迁移后原设备永远无法再绑定任何新码）。
+    pub fn find_bound_code_for_device(
+        &self,
+        device_id: &str,
+    ) -> LicenseResult<Option<ActivationCode>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
+                    valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
+                    revoked_reason, idempotency_key, created_at, prebind_machine_code
+             FROM activation_code WHERE bound_device_id = ?1 AND status = 'bound'
+             ORDER BY rowid ASC LIMIT 1",
+            params![device_id],
+            row_to_code,
+        )
+        .optional()
+        .map_err(LicenseError::from)
+    }
+
+    /// 查**预绑定**到某机器码的仍可用激活码（task 46 预绑定冲突检测的码侧）。
+    ///
+    /// 覆盖「码已预绑定但**尚未激活**」这一状态：此时 `bound_device_id` 仍是 `NULL`，
+    /// 只看 `bound_device_id` 会漏判冲突，导致两台设备各自拿到预绑定到同一机器的码。
+    pub fn find_code_by_prebind(
+        &self,
+        machine_code: &str,
+    ) -> LicenseResult<Option<ActivationCode>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
+                    valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
+                    revoked_reason, idempotency_key, created_at, prebind_machine_code
+             FROM activation_code
+             WHERE prebind_machine_code = ?1 AND status IN ('issued', 'bound')
+             ORDER BY rowid ASC LIMIT 1",
+            params![machine_code],
+            row_to_code,
+        )
+        .optional()
+        .map_err(LicenseError::from)
     }
 
     /// 按过滤条件分页列出激活码（`page` 从 1 起）。
@@ -790,7 +903,8 @@ impl Store {
         let mut sql = String::from(
             "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
                     valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
-                    revoked_reason, idempotency_key, created_at
+                    revoked_reason, idempotency_key, created_at,
+                        prebind_machine_code
              FROM activation_code WHERE 1 = 1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1197,7 +1311,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT code_id, code, status, bound_device_id, tenant_id, tier, valid_from,
                     valid_until, source_order_id, reissued_from_id, issued_by, revoked_at,
-                    revoked_reason, idempotency_key, created_at
+                    revoked_reason, idempotency_key, created_at,
+                        prebind_machine_code
              FROM activation_code WHERE idempotency_key = ?1
              ORDER BY rowid ASC",
         )?;

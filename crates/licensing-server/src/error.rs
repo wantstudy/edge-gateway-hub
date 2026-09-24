@@ -15,6 +15,8 @@ pub const ERR_LICENSE_QUOTA: u16 = 1030;
 pub const ERR_LICENSE_KEYSTATE: u16 = 1040;
 /// 授权域错误码：存储层（SQLite / 迁移 / 约束冲突）。
 pub const ERR_LICENSE_STORAGE: u16 = 1050;
+/// 授权域错误码：预绑定冲突（task 46 一机一码）。
+pub const ERR_LICENSE_PREBIND: u16 = 1060;
 
 /// licensing-server 主错误枚举。
 #[derive(Debug, thiserror::Error)]
@@ -45,9 +47,64 @@ pub enum LicenseError {
     /// 指纹原文塞进字符串（错误会被写日志与审计）。
     #[error("LicenseError: storage: {0}")]
     Storage(String),
+
+    /// 预绑定冲突（task 46 一机一码）。
+    ///
+    /// **为什么必须是独立的结构化变体**：这类错误早期走 `ActivationRejected(String)`，
+    /// HTTP 层再用 `msg.contains("prebind")` 反查错误码。那是**脆弱耦合**——任何人改
+    /// 一句文案，错误码就静默退化成泛化 `BAD_REQUEST`，而单测通常察觉不到。
+    /// 改为变体后 [`crate::http::error_to_code`] 直接 match 变体，
+    /// **文案与错误码彻底解耦**（见 `service.rs` 的 `t46_prebind_*` 测试）。
+    ///
+    /// 消息**一律不含**机器码（指纹属敏感值），也**不含**任何他码 ID（避免跨租户泄漏）。
+    #[error("LicenseError: prebind conflict: {kind}")]
+    PrebindConflict {
+        /// 冲突细分种类（结构化，供调用方与 HTTP 层按类型分支）。
+        kind: PrebindKind,
+    },
 }
 
+/// 预绑定冲突的细分种类。
+///
+/// 用途：让上层（HTTP 错误码映射、admin-console 提示、风控统计）能**按类型分支**，
+/// 而不必解析错误消息文本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrebindKind {
+    /// 激活：该码已被预绑定到另一台机器（请求 `machine_code` 与预绑定值不符）。
+    ActivationMachineMismatch,
+    /// 发放 / 重发：目标机器码已被**另一张仍可用的码**预绑定。
+    MachineAlreadyClaimed,
+    /// 发放 / 重发：目标机器码对应的设备已被**另一张码**实际绑定。
+    MachineAlreadyBound,
+    /// 重发：提供了空白的 `prebind.machine_code`（`"   "` 不算「已提供」）。
+    BlankMachineCode,
+}
+
+impl PrebindKind {
+    /// 稳定字符串标识（日志 / 审计 / 前端 i18n key 用）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PrebindKind::ActivationMachineMismatch => "activation_machine_mismatch",
+            PrebindKind::MachineAlreadyClaimed => "machine_already_claimed",
+            PrebindKind::MachineAlreadyBound => "machine_already_bound",
+            PrebindKind::BlankMachineCode => "blank_machine_code",
+        }
+    }
+}
+
+impl std::fmt::Display for PrebindKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+
 impl LicenseError {
+    /// 构造预绑定冲突错误（语法糖，避免调用方写嵌套结构体字面量）。
+    pub fn prebind_conflict(kind: PrebindKind) -> Self {
+        LicenseError::PrebindConflict { kind }
+    }
+
     /// 错误码（u16，非零）。
     pub fn error_code(&self) -> u16 {
         match self {
@@ -57,6 +114,7 @@ impl LicenseError {
             LicenseError::QuotaExceeded(_) => ERR_LICENSE_QUOTA,
             LicenseError::KeyStateIllegal(_) => ERR_LICENSE_KEYSTATE,
             LicenseError::Storage(_) => ERR_LICENSE_STORAGE,
+            LicenseError::PrebindConflict { .. } => ERR_LICENSE_PREBIND,
         }
     }
 }
