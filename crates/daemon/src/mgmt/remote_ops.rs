@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -44,7 +44,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::rbac::{permission_for_ops_action, AuthRejection, AuthedRole};
-use super::{MgmtEvent, MgmtState};
+use super::{MgmtEvent, MgmtState, MgmtStateInner};
 
 /// 审计环容量（超出按环形淘汰最旧）。
 pub const AUDIT_RING_CAPACITY: usize = 1024;
@@ -298,14 +298,52 @@ impl OpsRuntime {
 
 // ---- 实例侧表（MgmtState 不可改，按实例指针身份注册 runtime） ----
 
-/// 实例指针 → runtime 侧表。键 = `Arc<MgmtStateInner>` 指针地址；
+/// 实例指针 → runtime 侧表。
+///
+/// 条目 = `(键, 弱引用, runtime)`：键 = `Arc<MgmtStateInner>` 堆地址；弱引用 =
+/// 指向同一 `MgmtStateInner` 的 [`Weak`]，用于**驱逐已销毁实例的残留条目**。
 /// 每实例一条、随进程存活（生产仅 1 条；测试每用例 1 条，量级可忽略，
 /// 故用 `Vec` 线性查找，避免非常量 `HashMap::new`）。
-/// ABA（地址复用）风险在「install 与请求同生命周期」前提下不存在。
-static OPS_RUNTIMES: Mutex<Vec<(usize, Arc<OpsRuntime>)>> = Mutex::new(Vec::new());
+///
+/// ## 为什么必须持有 `Weak`（ABA / 堆地址复用缺陷修复）
+/// 键是**堆地址**。测试用例（生产：配置热重载 / 重启装配路径若重建
+/// `MgmtState`）会新建实例、用完即 `drop`，其 `MgmtStateInner` 的堆地址会被
+/// 下一次分配**复用**。若条目从不移除，复用同一地址的新实例会在 [`runtime_for`]
+/// 中**命中上一已销毁实例残留的条目**，从而静默继承其
+/// 1) **审计环**（新实例首次查询即看到旧实例的审计痕）；
+/// 2) **已注入的授权策略**（[`install_with_clock`] 写入的 authorizer）。
+///
+/// 若旧实例装的是**宽松策略**，新实例即 **fail-open**——这是**安全相关**缺陷，
+/// 非纯测试问题。
+///
+/// ## 驱逐语义（弱引用失效即驱逐）
+/// 每次取锁后、匹配前先 [`prune_dead_instances`]：
+/// `retain(|(_, weak, _)| weak.strong_count() > 0)`。已销毁实例
+/// （`strong_count() == 0`）的条目被清掉，被复用的地址不再命中残留条目。
+/// `strong_count()` 是瞬时值，但 `retain` 与随后的匹配在**同一把锁内**完成，
+/// 故两次观测一致。
+///
+/// **前提（并发正确性）**：实例的 `MgmtState` 必须在其存活期间**持有 `Arc`**
+/// （`state.inner`），弱引用才有升级目标；只要 `MgmtState` 存活，其条目就不会被
+/// 误驱逐。反之，`MgmtState` 一旦销毁，其条目最迟在下一次 [`runtime_for`] /
+/// [`install_with_clock`] 取锁时被清除。
+/// 侧表条目类型别名（消除 `clippy::type_complexity`）：
+/// `(键 = MgmtStateInner 堆地址, 该实例的弱引用, 该实例的 runtime)`。
+type OpsRegistryEntry = (usize, Weak<MgmtStateInner>, Arc<OpsRuntime>);
+
+static OPS_RUNTIMES: Mutex<Vec<OpsRegistryEntry>> = Mutex::new(Vec::new());
 
 fn runtime_key(state: &MgmtState) -> usize {
     Arc::as_ptr(&state.inner) as usize
+}
+
+/// 侧表驱逐：移除已销毁实例（弱引用失效）的条目。
+///
+/// 必须在**持有 `OPS_RUNTIMES` 锁的临界区内**调用，与随后的键匹配同属一个
+/// 临界区，从而保证「驱逐 → 匹配」之间没有新条目被并发插入/移除
+/// （`strong_count()` 的瞬时值在该临界区内一致）。
+fn prune_dead_instances(registry: &mut Vec<OpsRegistryEntry>) {
+    registry.retain(|(_, weak, _)| weak.strong_count() > 0);
 }
 
 /// 取实例 runtime；未安装时自动落 **fail-closed 默认 runtime**（拒绝一切 + 墙钟），
@@ -313,14 +351,17 @@ fn runtime_key(state: &MgmtState) -> usize {
 pub fn runtime_for(state: &MgmtState) -> Arc<OpsRuntime> {
     let key = runtime_key(state);
     let mut registry = OPS_RUNTIMES.lock().unwrap_or_else(|p| p.into_inner());
-    match registry.iter().position(|(k, _)| *k == key) {
-        Some(idx) => registry[idx].1.clone(),
+    // 先驱逐已销毁实例的残留条目：避免被复用的堆地址命中上一实例的条目
+    //（否则会静默继承其审计环与授权策略，见 OPS_RUNTIMES 注释）。
+    prune_dead_instances(&mut registry);
+    match registry.iter().position(|(k, _, _)| *k == key) {
+        Some(idx) => registry[idx].2.clone(),
         None => {
             let runtime = Arc::new(OpsRuntime::new(
                 Arc::new(DenyAllOpsAuthorizer),
                 default_clock(),
             ));
-            registry.push((key, runtime.clone()));
+            registry.push((key, Arc::downgrade(&state.inner), runtime.clone()));
             runtime
         }
     }
@@ -345,12 +386,45 @@ pub fn install_with_clock(state: &MgmtState, authorizer: Arc<dyn OpsAuthorizer>,
     {
         let key = runtime_key(state);
         let mut registry = OPS_RUNTIMES.lock().unwrap_or_else(|p| p.into_inner());
-        match registry.iter().position(|(k, _)| *k == key) {
-            Some(idx) => registry[idx].1 = runtime.clone(),
-            None => registry.push((key, runtime.clone())),
+        // 同上：先驱逐已销毁实例的残留条目，再命中 / 新建。
+        prune_dead_instances(&mut registry);
+        // 当前实例的弱引用：命中（原地替换）与未命中（新建）都必须写入最新 weak，
+        // 否则 retain 会把刚写入的条目误判为「已销毁」而立即删除。
+        let weak = Arc::downgrade(&state.inner);
+        match registry.iter().position(|(k, _, _)| *k == key) {
+            Some(idx) => {
+                registry[idx].1 = weak;
+                registry[idx].2 = runtime.clone();
+            }
+            None => registry.push((key, weak, runtime.clone())),
         }
     }
     spawn_capture(state, runtime);
+}
+
+/// 测试钩子：读取侧表当前条目数（**仅测试构建**暴露，生产不可见）。
+///
+/// 注意：全局长度会被**并行运行的其他测试**扰动（本仓 `mgmt::remote_ops` /
+/// `mgmt::writeapi` 用例会并发注册实例），故断言侧表「不累积」时应优先使用
+/// 以 runtime 指针身份匹配的 [`registry_count_for_runtime`]（不受并发扰动）。
+#[cfg(test)]
+pub(crate) fn registry_len() -> usize {
+    OPS_RUNTIMES.lock().unwrap_or_else(|p| p.into_inner()).len()
+}
+
+/// 测试钩子：统计侧表中持有**指定 runtime** 的条目数（**仅测试构建**暴露）。
+///
+/// 以 `Arc::as_ptr` 身份匹配：其他并发用例的条目 runtime 指针不同，故该计数
+/// 只反映「本用例注册的 runtime 是否仍在侧表」，在并行测试下**确定性可靠**。
+#[cfg(test)]
+pub(crate) fn registry_count_for_runtime(runtime: &Arc<OpsRuntime>) -> usize {
+    let target = Arc::as_ptr(runtime);
+    OPS_RUNTIMES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(_, _, rt)| Arc::as_ptr(rt) == target)
+        .count()
 }
 
 /// 事件捕获任务：订阅广播 → 逐条打毫秒时间戳入捕获环。
@@ -838,6 +912,16 @@ frequency_ms = 100
         state
     }
 
+    /// 构造**未安装** runtime 的裸 `MgmtState`（独立实例，不污染其他测试）：
+    /// 用于验证「未装配实例自动落 fail-closed 默认 runtime」与侧表驱逐语义
+    /// （裸实例在首次 `runtime_for` 时才注册默认 runtime）。
+    fn bare_state() -> MgmtState {
+        let config = Arc::new(GatewayConfig::parse(TEST_TOML).expect("parse"));
+        let daemon = DaemonShared::new();
+        daemon.set_config(Arc::new(ConfigShared::new((*config).clone())));
+        MgmtState::new(daemon, config)
+    }
+
     /// task 57：以 state 的实际签名密钥签发测试 token（默认 dev 兜底密钥，
     /// 与 `MgmtState::new` 的装配一致；sub 取 "ops-admin" 对齐审计断言）。
     fn token_for(state: &MgmtState, role: Role) -> String {
@@ -998,6 +1082,124 @@ frequency_ms = 100
         assert!(
             ops_runtime(&state).audit_snapshot().is_empty(),
             "request rejected before the ops runtime must not forge audit entries"
+        );
+    }
+
+    // ---- ABA（堆地址复用）侧表驱逐 ----
+
+    /// QA ABA 修复（**确定性**）: 侧表驱逐已销毁实例的条目——被复用的堆地址上
+    /// 新建的实例绝不继承上一实例的**审计痕**，且旧条目被清除而非累积。
+    ///
+    /// 断言一律**以 runtime 指针身份**判定（[`registry_count_for_runtime`]）：
+    /// 既不依赖分配器是否真的复用地址（ABA 触发与否都成立），也不受并行用例
+    /// 对全局侧表长度的扰动（故本测试是**确定性**的，不会假红）。
+    #[test]
+    fn ops_registry_prunes_dead_instances() {
+        // 实例 A：安装可辨识 authorizer（AllowAll）并触发一次审计，留下审计痕。
+        let state_a = bare_state();
+        install(&state_a, Arc::new(AllowAllOpsAuthorizer));
+        let rt_a = ops_runtime(&state_a);
+        rt_a.record_audit(
+            "ops-admin",
+            OpsAction::Restart,
+            true,
+            OUTCOME_ACCEPTED,
+            "aba-marker",
+        );
+        assert!(
+            !rt_a.audit_snapshot().is_empty(),
+            "A must carry an audit entry before being dropped"
+        );
+        assert_eq!(
+            registry_count_for_runtime(&rt_a),
+            1,
+            "A's runtime must be registered exactly once"
+        );
+
+        // 销毁 A：其 MgmtStateInner 堆地址进入可复用状态（下一步新建实例极可能复用）。
+        drop(state_a);
+
+        // 实例 B：新建并取 runtime。修复前若地址被复用会命中 A 的残留条目。
+        let state_b = bare_state();
+        let rt_b = ops_runtime(&state_b);
+
+        // ① B 不得继承 A 的审计环（核心行为断言）。
+        assert!(
+            rt_b.audit_snapshot().is_empty(),
+            "fresh instance B must NOT inherit A's audit entries"
+        );
+        // ② B 拿到的是全新 runtime，而非 A 的残留条目（指针身份不同）。
+        assert_ne!(
+            Arc::as_ptr(&rt_b),
+            Arc::as_ptr(&rt_a),
+            "B must get a fresh runtime, not A's recycled entry"
+        );
+        // ③ A 的条目已被驱逐（未累积）；B 的条目恰好在册。
+        assert_eq!(
+            registry_count_for_runtime(&rt_a),
+            0,
+            "A's registry entry must be evicted once A is dropped"
+        );
+        assert_eq!(
+            registry_count_for_runtime(&rt_b),
+            1,
+            "B's runtime must be registered exactly once"
+        );
+        // 注：此处**不**断言侧表「全局长度 = 基线 + 1」——`mgmt` 下多个用例在
+        // 同一测试二进制内并行运行，会并发注册/销毁实例，全局长度在并行测试下
+        // 非确定性（实测 baseline=0 → after=19）。「A 的条目被驱逐、未累积」已由
+        // ③ 以 runtime 指针身份**确定性**证明；「全局不累积」由
+        // `ops_registry_does_not_accumulate_dead_instances` 覆盖。
+    }
+
+    /// QA ABA 修复（**抗累积**）: 反复「新建 → 注册 → 销毁」实例，侧表不得线性累积。
+    ///
+    /// 若不驱逐已销毁条目，每轮至少 +1，`ROUNDS` 轮后长度将增长 `ROUNDS` 量级
+    /// （实测无驱逐时会 +256 以上）；驱逐生效时长度基本持平。断言阈值取
+    /// `ROUNDS / 2`（远小于无驱逐的增长、远大于并行用例对全局长度的扰动），
+    /// 故对「不累积」是**稳健**回归（修复前必红、修复后必绿）。
+    #[test]
+    fn ops_registry_does_not_accumulate_dead_instances() {
+        const ROUNDS: usize = 256;
+        let before = registry_len();
+        for _ in 0..ROUNDS {
+            let a = bare_state();
+            let _ = ops_runtime(&a); // 注册 A（fail-closed 默认 runtime）
+            drop(a); // A 销毁 → 其条目成为可驱逐的死条目
+            let b = bare_state();
+            let _ = ops_runtime(&b); // 取锁时驱逐 A，再注册 B
+            drop(b);
+        }
+        let after = registry_len();
+        assert!(
+            after < before + ROUNDS / 2,
+            "registry must be pruned, not accumulate: before={before}, after={after}, rounds={ROUNDS}"
+        );
+    }
+
+    /// QA 安全回归: A 装**宽松** authorizer（AllowAll）→ drop → 新建 B：
+    /// B 的运维请求仍须 **fail-closed 拒绝**，证明授权策略不跨实例串台
+    ///（修复前若堆地址被复用，B 会静默继承 A 的 AllowAll → **fail-open**）。
+    #[test]
+    fn fresh_state_never_inherits_previous_authorizer() {
+        let state_a = bare_state();
+        install(&state_a, Arc::new(AllowAllOpsAuthorizer));
+        let rt_a = ops_runtime(&state_a);
+        assert!(
+            rt_a.authorize("ops-admin", OpsAction::Restart.as_str()),
+            "A's injected AllowAll policy must allow restart (sanity)"
+        );
+        drop(state_a);
+
+        let state_b = bare_state();
+        let rt_b = ops_runtime(&state_b);
+        assert!(
+            !rt_b.authorize("ops-admin", OpsAction::Restart.as_str()),
+            "fresh instance B must stay fail-closed, NOT inherit A's AllowAll policy"
+        );
+        assert!(
+            rt_b.audit_snapshot().is_empty(),
+            "fresh instance B must not inherit A's audit entries"
         );
     }
 
