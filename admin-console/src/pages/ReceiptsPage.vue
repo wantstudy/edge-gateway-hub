@@ -155,7 +155,7 @@ import {
   type RadioOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, TENANT_NAMES, DEFAULT_ACTOR, type ReceiptAnomaly } from '../mock/mock-data';
+import { repo, TENANT_NAMES, DEFAULT_ACTOR, type ReceiptAnomaly } from '../api/repo';
 import { session } from '../store/session';
 
 /** 备注最小字数。 */
@@ -280,7 +280,7 @@ function submitDispose(): void {
   if (!canSubmitDispose.value || !disposeTargetId.value) {
     return;
   }
-  repo.resolveAnomaly({
+  void repo.resolveAnomaly({
     id: disposeTargetId.value,
     note: disposeNote.value.trim(),
     verified: disposeVerified.value === 'verified',

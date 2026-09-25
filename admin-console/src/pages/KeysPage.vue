@@ -140,7 +140,7 @@
  */
 import { computed, ref } from 'vue';
 import { PageHeader, StatusTag, UiTable, EmptyState, RoleGate, DangerConfirmModal, can, type TableColumn } from '@ui-kit';
-import { repo, DEFAULT_ACTOR } from '../mock/mock-data';
+import { repo, DEFAULT_ACTOR } from '../api/repo';
 import { session } from '../store/session';
 
 /** 权限。 */
@@ -207,7 +207,7 @@ function openRotate(): void {
 
 /** 提交轮换（四要素已校验）。 */
 function submitRotate(): void {
-  repo.rotateKey({ newKid: nextKid.value, actor: DEFAULT_ACTOR });
+  void repo.rotateKey({ newKid: nextKid.value, actor: DEFAULT_ACTOR });
   rotateOpen.value = false;
   reloadKey.value += 1;
 }
@@ -218,7 +218,7 @@ function retire(kid: string): void {
   if (!ok) {
     return;
   }
-  repo.retireKey({ kid, actor: DEFAULT_ACTOR });
+  void repo.retireKey({ kid, actor: DEFAULT_ACTOR });
   reloadKey.value += 1;
 }
 </script>

@@ -153,7 +153,7 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, TIER_NAMES, DEFAULT_ACTOR, type TenantRecord } from '../mock/mock-data';
+import { repo, TIER_NAMES, DEFAULT_ACTOR, type TenantRecord } from '../api/repo';
 
 /** 变更原因最小字数。 */
 const MIN_REASON = 10;
@@ -293,7 +293,7 @@ function submitPolicy(): void {
   if (!canSubmitPolicy.value || !policyTargetId.value) {
     return;
   }
-  repo.updateTenant({
+  void repo.updateTenant({
     id: policyTargetId.value,
     defaultGrade: policyForm.defaultGrade as 'A' | 'B' | 'C',
     defaultTier: policyForm.defaultTier,
@@ -309,7 +309,7 @@ function submitPolicy(): void {
 
 /** 启用 / 停用租户（按钮文案随状态取反，见模板）。 */
 function toggleEnabled(row: TenantRecord): void {
-  repo.setTenantEnabled({ id: row.id, enabled: !row.enabled, actor: DEFAULT_ACTOR });
+  void repo.setTenantEnabled({ id: row.id, enabled: !row.enabled, actor: DEFAULT_ACTOR });
   reloadKey.value += 1;
 }
 </script>

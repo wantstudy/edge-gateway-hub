@@ -230,7 +230,7 @@ import {
   can,
 } from '@ui-kit';
 import BarChart, { type BarSeries } from '../components/BarChart.vue';
-import { repo, REVOKE_REASONS, DEFAULT_ACTOR } from '../mock/mock-data';
+import { repo, REVOKE_REASONS, DEFAULT_ACTOR } from '../api/repo';
 import { session } from '../store/session';
 
 const route = useRoute();
@@ -339,7 +339,7 @@ function submitMark(): void {
   if (markNote.value.trim().length < 10 || !device.value) {
     return;
   }
-  repo.markDeviceAnomaly({ id: device.value.id, note: markNote.value.trim(), actor: DEFAULT_ACTOR });
+  void repo.markDeviceAnomaly({ id: device.value.id, note: markNote.value.trim(), actor: DEFAULT_ACTOR });
   closeMark();
   reloadKey.value += 1;
 }

@@ -161,7 +161,7 @@ import {
   type Action,
   type TableColumn,
 } from '@ui-kit';
-import { repo, DEFAULT_ACTOR } from '../mock/mock-data';
+import { repo, DEFAULT_ACTOR } from '../api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -237,7 +237,7 @@ function switchTo(role: Role): void {
 
 /** 启用 / 停用账号（按钮文案随状态取反）。 */
 function toggleUser(row: { account: string; status: string }): void {
-  repo.setUserStatus({ account: row.account, enabled: row.status !== 'user_enabled', actor: DEFAULT_ACTOR });
+  void repo.setUserStatus({ account: row.account, enabled: row.status !== 'user_enabled', actor: DEFAULT_ACTOR });
   reloadKey.value += 1;
 }
 </script>

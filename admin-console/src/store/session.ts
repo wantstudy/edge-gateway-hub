@@ -3,20 +3,26 @@
  * @module admin-console/store/session
  * @description 管理员会话与全局运营状态（登录态、角色、双人复核开关、回执告警计数）。
  *
- * 说明：本原型不接后端，会话仅存在于内存（刷新即回登录页），
- * 符合「前端不持有私钥、不直连授权数据库」的边界要求。
+ * 会话策略（real 模式联调约定）：
+ *  · 后端当前未实现管理员登录 / RBAC（后端缺口 #1），会话仍为前端本地态；
+ *  · real 模式登录时额外记录「默认租户 ID」——它既是 `POST /admin/codes/issue`
+ *    的 `tenant_id` 来源，也是废弃 / 重发请求 `X-Tenant-Id` 头的兜底值；
+ *  · 操作者账号会同步写入 localStorage（client.ts 读取后作为 `X-Actor-Id` 头）。
  */
 import { reactive, readonly, computed } from 'vue';
 import type { Role } from '@ui-kit';
+import { setStoredActor, setStoredTenantId, clearAuth } from '../api/client';
 
 /** 会话内部可变状态。 */
 interface SessionState {
   /** 是否已登录 */
   loggedIn: boolean;
-  /** 当前管理员账号 */
+  /** 当前管理员账号（同时作为 X-Actor-Id 操作者标识） */
   account: string;
   /** 当前角色（可在顶栏切换，用于演示权限矩阵真实生效） */
   role: Role;
+  /** 默认租户 ID（real 模式发放 / 废弃 / 重发请求的租户兜底） */
+  tenantId: string;
   /** 是否开启双人复核（开启后废弃 / 重发必须填写第二审批人） */
   dualApproval: boolean;
   /** 待处理项计数（顶栏徽标） */
@@ -31,24 +37,31 @@ const state: SessionState = reactive<SessionState>({
   loggedIn: false,
   account: '',
   role: 'system',
+  tenantId: '',
   dualApproval: false,
   pendingCount: 9,
   receiptOk: 398,
   receiptTotal: 412,
 });
 
-/** 登录：记录账号并重置为默认角色（system，便于演示密钥/租户页）。 */
-function login(account: string): void {
+/** 登录：记录账号（与可选的默认租户 ID）并重置为默认角色（system，便于演示密钥/租户页）。 */
+function login(account: string, tenantId = ''): void {
   state.loggedIn = true;
   state.account = account || 'admin';
+  state.tenantId = tenantId.trim();
   state.role = 'system';
+  // 同步到 localStorage：client.ts 的请求头（X-Actor-Id / X-Tenant-Id）同源于此
+  setStoredActor(state.account);
+  setStoredTenantId(state.tenantId);
 }
 
-/** 登出：清空会话。 */
+/** 登出：清空会话与本地认证信息。 */
 function logout(): void {
   state.loggedIn = false;
   state.account = '';
+  state.tenantId = '';
   state.role = 'system';
+  clearAuth();
 }
 
 /** 切换角色（顶栏下拉）——用于验证权限矩阵真实生效。 */

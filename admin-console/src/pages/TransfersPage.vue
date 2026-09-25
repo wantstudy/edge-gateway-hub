@@ -209,7 +209,7 @@ import {
   type RadioOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, REVOKE_REASONS, TIER_NAMES, DEFAULT_ACTOR, type TransferTicket } from '../mock/mock-data';
+import { repo, REVOKE_REASONS, TIER_NAMES, DEFAULT_ACTOR, type TransferTicket } from '../api/repo';
 
 const router = useRouter();
 
@@ -360,12 +360,12 @@ function resolveValidUntil(): string {
   return `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}-${String(next.getDate()).padStart(2, '0')}`;
 }
 
-/** 仅废弃旧码。 */
-function submitOnlyRevoke(): void {
+/** 仅废弃旧码（real：等待后端确认后才关弹窗刷新）。 */
+async function submitOnlyRevoke(): Promise<void> {
   if (!canSubmitProcess.value || !processTarget.value) {
     return;
   }
-  repo.processTransfer({
+  await repo.processTransfer({
     ticketId: processTarget.value.id,
     prebindNew: false,
     inheritTier: processForm.tier,
@@ -379,11 +379,11 @@ function submitOnlyRevoke(): void {
 }
 
 /** 废弃并重发（二次确认后执行，同一事务语义）。 */
-function submitProcess(payload: { note: string }): void {
+async function submitProcess(payload: { note: string }): Promise<void> {
   if (!processTarget.value) {
     return;
   }
-  repo.processTransfer({
+  const result = await repo.processTransfer({
     ticketId: processTarget.value.id,
     prebindNew: processForm.mode === 'prebind',
     inheritTier: processForm.tier,
@@ -392,6 +392,9 @@ function submitProcess(payload: { note: string }): void {
     actor: DEFAULT_ACTOR,
     reissue: true,
   });
+  if (!result.ok) {
+    return; // real 模式失败原因见全局横幅；保留弹窗便于调整后重试
+  }
   closeProcess();
   reloadKey.value += 1;
 }

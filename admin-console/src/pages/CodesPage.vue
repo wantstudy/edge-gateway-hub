@@ -167,8 +167,9 @@
         <div class="ac-modal__head"><h3>发放激活码</h3></div>
         <div class="ac-modal__body">
           <div class="ac-grid ac-grid--2">
-            <UiField label="租户" required>
-              <UiSelect v-model="issueForm.tenant" :options="issueTenantOptions" />
+            <UiField label="租户" required :hint="isReal ? 'real 模式：填写 licensing-server 中的租户 ID（后端无租户列表端点，缺口 #2）' : ''">
+              <UiInput v-if="isReal" v-model="issueForm.tenant" placeholder="租户 ID，如 t-1" />
+              <UiSelect v-else v-model="issueForm.tenant" :options="issueTenantOptions" />
             </UiField>
             <UiField label="tier" required>
               <UiSelect v-model="issueForm.tier" :options="issueTierOptions" />
@@ -357,10 +358,13 @@ import {
   type RadioOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, TENANT_NAMES, TIER_NAMES, REVOKE_REASONS, DEFAULT_ACTOR, type CodeRecord } from '../mock/mock-data';
+import { repo, TENANT_NAMES, TIER_NAMES, REVOKE_REASONS, DEFAULT_ACTOR, API_MODE, type CodeRecord } from '../api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();
+
+/** 是否 real 模式（构建期常量；real 下发放弹窗的「租户」为后端租户 ID 直填）。 */
+const isReal = API_MODE === 'real';
 
 /** 每页条数。 */
 const PAGE_SIZE = 8;
@@ -539,9 +543,9 @@ const canSubmitIssue = computed(() => {
   );
 });
 
-/** 打开发放弹窗：重置草稿（草稿隔离）。 */
+/** 打开发放弹窗：重置草稿（草稿隔离）。real 模式租户取会话默认租户 ID。 */
 function openIssue(): void {
-  issueForm.tenant = TENANT_NAMES[0];
+  issueForm.tenant = isReal ? session.state.tenantId || 't-1' : TENANT_NAMES[0];
   issueForm.tier = TIER_NAMES[0];
   issueForm.validFrom = '2026-09-23';
   issueForm.validUntil = '2027-09-23';
@@ -558,12 +562,12 @@ function closeIssue(): void {
   issueForm.note = '';
 }
 
-/** 提交发放。 */
-function submitIssue(): void {
+/** 提交发放（real：等待后端确认后才展示明文——明文仅展示一次，绝不能是本地伪造值）。 */
+async function submitIssue(): Promise<void> {
   if (!canSubmitIssue.value) {
     return;
   }
-  issuedCodes.value = repo.issueCode({
+  const created = await repo.issueCode({
     tenant: issueForm.tenant,
     tier: issueForm.tier,
     validFrom: issueForm.validFrom,
@@ -573,6 +577,10 @@ function submitIssue(): void {
     note: issueForm.note.trim(),
     actor: DEFAULT_ACTOR,
   });
+  if (created.length === 0) {
+    return; // real 模式发放失败：全局横幅已给出原因（含业务码 / trace_id），不关弹窗以便重试
+  }
+  issuedCodes.value = created;
   closeIssue();
   resetFilters();
 }
@@ -638,11 +646,11 @@ function closeVoid(): void {
   voidTargetId.value = '';
 }
 /** 提交作废（原因由弹窗提供，语义上等同于「误发放」类回收）。 */
-function submitVoid(payload: { note: string }): void {
+async function submitVoid(payload: { note: string }): Promise<void> {
   if (!voidTargetId.value) {
     return;
   }
-  repo.revokeCode({ id: voidTargetId.value, reason: '误发放（未绑定作废）', note: payload.note, actor: DEFAULT_ACTOR });
+  await repo.revokeCode({ id: voidTargetId.value, reason: '误发放（未绑定作废）', note: payload.note, actor: DEFAULT_ACTOR });
   closeVoid();
   resetFilters();
 }
@@ -658,11 +666,11 @@ function closeRevoke(): void {
   revokeTargetId.value = '';
 }
 /** 提交废弃（四要素已由弹窗校验通过）。 */
-function submitRevoke(payload: { reason: string; note: string; secondApprover: string }): void {
+async function submitRevoke(payload: { reason: string; note: string; secondApprover: string }): Promise<void> {
   if (!revokeTargetId.value) {
     return;
   }
-  repo.revokeCode({
+  await repo.revokeCode({
     id: revokeTargetId.value,
     reason: payload.reason,
     note: payload.secondApprover ? `${payload.note}（第二审批人：${payload.secondApprover}）` : payload.note,
@@ -737,12 +745,12 @@ function closeReissue(): void {
   reissueForm.note = '';
 }
 
-/** 提交重发。 */
-function submitReissue(): void {
+/** 提交重发（real：等待后端返回新码后才展示明文）。 */
+async function submitReissue(): Promise<void> {
   if (!canSubmitReissue.value || !reissueTargetId.value) {
     return;
   }
-  const created = repo.reissueCode({
+  const created = await repo.reissueCode({
     sourceId: reissueTargetId.value,
     inheritTier: reissueForm.tier,
     inheritValidUntil: reissueForm.validUntil,

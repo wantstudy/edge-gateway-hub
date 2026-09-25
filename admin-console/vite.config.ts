@@ -22,6 +22,19 @@ export default defineConfig({
   server: {
     port: 5273,
     open: false,
+    /**
+     * real 模式联调代理：`/licensing/*` → licensing-server（默认 0.0.0.0:7080，
+     * 经 `IOT_DAQ_LISTEN_ADDR` 配置）。仅 `VITE_API_MODE=real` 时数据层会发请求，
+     * mock 模式完全不经过此代理（零影响）。前缀在转发前剥掉，保持后端原始路径
+     * （如 `/admin/codes/issue`）。
+     */
+    proxy: {
+      '/licensing': {
+        target: 'http://127.0.0.1:7080',
+        changeOrigin: true,
+        rewrite: (path: string) => path.replace(/^\/licensing/, ''),
+      },
+    },
   },
   build: {
     outDir: 'dist',

@@ -112,7 +112,7 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo } from '../mock/mock-data';
+import { repo } from '../api/repo';
 import { session } from '../store/session';
 
 /** 权限。 */

@@ -211,7 +211,7 @@ import {
   can,
   type TimelineNode,
 } from '@ui-kit';
-import { repo, REVOKE_REASONS, DEFAULT_ACTOR } from '../mock/mock-data';
+import { repo, REVOKE_REASONS, DEFAULT_ACTOR } from '../api/repo';
 import { session } from '../store/session';
 
 const route = useRoute();
@@ -235,10 +235,10 @@ const dualApproval = computed(() => session.state.dualApproval);
 /** 是否已揭示明文（用于展示审计提示）。 */
 const revealed = ref(false);
 
-/** 揭示回调：落审计（真实系统为服务端记录，此处前端显式留痕）。 */
+/** 揭示回调：落审计（mock 为前端留痕；real 模式后端无此端点——缺口 #8b，静默跳过）。 */
 function onReveal(): void {
   revealed.value = true;
-  repo.logReveal({ entityId: codeId.value, actor: DEFAULT_ACTOR });
+  void repo.logReveal({ entityId: codeId.value, actor: DEFAULT_ACTOR });
 }
 
 /** 生命周期节点 → 时间线组件所需结构。 */
@@ -312,9 +312,9 @@ const revokeFacts = computed(() => [
 /** 废弃弹窗开关。 */
 const revokeOpen = ref(false);
 
-/** 提交废弃：立即失效 + 落审计 + 刷新。 */
-function submitRevoke(payload: { reason: string; note: string; secondApprover: string }): void {
-  repo.revokeCode({
+/** 提交废弃：立即失效 + 落审计 + 刷新（real：等待后端确认后才关弹窗刷新）。 */
+async function submitRevoke(payload: { reason: string; note: string; secondApprover: string }): Promise<void> {
+  await repo.revokeCode({
     id: codeId.value,
     reason: payload.reason,
     note: payload.secondApprover ? `${payload.note}（第二审批人：${payload.secondApprover}）` : payload.note,

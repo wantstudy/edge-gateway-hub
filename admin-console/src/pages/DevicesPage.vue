@@ -111,7 +111,7 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, TENANT_NAMES } from '../mock/mock-data';
+import { repo, TENANT_NAMES } from '../api/repo';
 
 const router = useRouter();
 

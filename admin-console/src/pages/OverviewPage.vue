@@ -132,7 +132,7 @@
 import { computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { PageHeader, StatCard, StatusTag, SEMANTIC, type PageId } from '@ui-kit';
-import { repo } from '../mock/mock-data';
+import { repo } from '../api/repo';
 import BarChart, { type BarSeries } from '../components/BarChart.vue';
 
 const router = useRouter();

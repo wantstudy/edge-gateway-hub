@@ -62,6 +62,18 @@
       <button type="button" class="ac-btn ac-btn--sm" @click="onLogout">退出</button>
     </header>
 
+    <!--
+      全局提示横幅（real 模式联调专用）：
+      数据层（api/repo.ts）在后端端点缺失（诚实空态降级）或写操作失败时推入
+      `adminNotices`，此处统一展示、逐条可关闭。mock 模式下恒为空、不渲染。
+    -->
+    <div v-if="adminNotices.length > 0" class="ac-notices" role="status">
+      <div v-for="n in adminNotices" :key="n.id" class="ac-notice" :class="`ac-notice--${n.tone}`">
+        <span class="ac-notice__msg">{{ n.message }}</span>
+        <button type="button" class="ac-notice__close" aria-label="关闭提示" @click="dismissNotice(n.id)">×</button>
+      </div>
+    </div>
+
     <div class="ac-body">
       <!-- 侧边导航：按运维动线分组 -->
       <nav class="ac-sidebar" aria-label="主导航">
@@ -107,6 +119,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { PAGES, ROLE_META, ROLES, canSeePage, firstAllowedPage, type PageId, type Role } from '@ui-kit';
 import { session } from './store/session';
 import { accountInitial } from './store/session';
+import { adminNotices, dismissNotice } from './api/repo';
 
 const route = useRoute();
 const router = useRouter();
@@ -193,3 +206,45 @@ function onDualApprovalChange(event: Event): void {
   session.setDualApproval((event.target as HTMLInputElement).checked);
 }
 </script>
+
+<style scoped>
+/* 全局提示横幅（real 模式降级 / 失败提示；本页自用样式，避免污染 ui-kit） */
+.ac-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 20px 0;
+}
+.ac-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  border: 1px solid;
+}
+.ac-notice--warn {
+  background: #fff7e8;
+  border-color: #ffe4ba;
+  color: #874d00;
+}
+.ac-notice--error {
+  background: #ffece8;
+  border-color: #fdcaca;
+  color: #a02c2c;
+}
+.ac-notice__msg {
+  flex: 1;
+}
+.ac-notice__close {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+</style>
