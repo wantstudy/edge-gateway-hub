@@ -372,12 +372,23 @@ fn check_host_anchors() -> Vec<String> {
         ));
     }
 
-    // DMI 锚点。
+    // DMI 锚点（D-17：逐条目统计可读数而非二元「缺失」——标准 Linux 上
+    // product_uuid / product_serial 为 0400 root-only，非 root 容器读不到是
+    // **预期常态**；board_serial 等个别条目常为 0444，读得到即计入）。
+    let dmi_dir = root.join("sys/class/dmi/id");
+    let dmi_readable = platform::count_readable_dmi_entries(&dmi_dir);
     let dmi_ok = report.dmi == AnchorMountStatus::Ok;
+    let dmi_note = if dmi_readable == 0 {
+        "（0 条目可读：目录未挂载或 0400 条目对非 root 不可读，属预期；由 machine-id / 宿主 MAC / 指纹文件凑 quorum）"
+    } else {
+        ""
+    };
     println!(
-        "[iot-daq-daemon]     宿主 DMI ({}): {}",
-        root.join("sys/class/dmi/id").display(),
-        if dmi_ok { "成" } else { "缺失" }
+        "[iot-daq-daemon]     宿主 DMI ({}): {}/{} 条目可读{}",
+        dmi_dir.display(),
+        dmi_readable,
+        platform::DMI_ANCHOR_ENTRIES.len(),
+        dmi_note
     );
 
     // 宿主 MAC：三选一（只读文件挂载 / 环境变量注入 / 签名指纹文件降级）。

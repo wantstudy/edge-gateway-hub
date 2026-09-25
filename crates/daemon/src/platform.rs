@@ -297,7 +297,7 @@ pub enum AnchorMountStatus {
 pub struct AnchorMountReport {
     /// 宿主 machine-id（`/etc/machine-id`）。
     pub machine_id: AnchorMountStatus,
-    /// DMI 锚点（`/sys/class/dmi/id/product_uuid` 或 `product_serial`）。
+    /// DMI 锚点（`/sys/class/dmi/id/` 下的 [`DMI_ANCHOR_ENTRIES`] 条目，任一可用即 Ok）。
     pub dmi: AnchorMountStatus,
     /// 宿主 MAC 注入文件（`/run/iot-daq/host-mac`）。
     pub mac: AnchorMountStatus,
@@ -356,24 +356,61 @@ fn check_machine_id_anchor(root: &Path) -> AnchorMountStatus {
     }
 }
 
-/// machine-id 内容校验：恰好 32 个 hex 字符且非全零（systemd 语义）。
+/// machine-id 内容校验：**trim 首尾空白后**恰好 32 个 hex 字符且非全零（systemd 语义）。
+///
+/// D-16：真实 systemd `/etc/machine-id` 为 32 hex + 尾部换行 = 33 字节（权限
+/// `-r--r--r--`）；若按「恰好 32 字节」判定，真实宿主 machine-id 一律误报缺失。
+/// 因此先用 [`str::trim`]（全空白：`\n` / `\r\n` / 空格 / tab）剔除首尾空白再判——
+/// 放宽的**只有空白**：32 hex 字符集校验、非全零（容器自生成全零占位）保持不变。
 fn is_valid_machine_id(bytes: &[u8]) -> bool {
-    bytes.len() == 32
-        && bytes.iter().all(|b| b.is_ascii_hexdigit())
-        && bytes.iter().any(|b| *b != b'0')
+    // 非 UTF-8 内容直接视为无效（合法 machine-id 必为 ASCII hex + 可选换行）。
+    let text = std::str::from_utf8(bytes).unwrap_or("");
+    let trimmed = text.trim();
+    trimmed.len() == 32
+        && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+        && trimmed.bytes().any(|b| b != b'0')
 }
 
-/// DMI 锚点判定：`product_uuid` 与 `product_serial` 任一可用即 Ok。
+/// DMI 锚点条目清单（与 `auth::assembly` Linux 锚点集的 DMI 部分一一对应）。
+///
+/// D-17：标准 Linux 上 `product_uuid` / `product_serial` 为 0400 root-only，
+/// 非 root 容器（交付形态 USER=65532）读不到属**预期常态**；`board_serial` 等
+/// 个别条目常为 0444，逐条目读取时「读得到就用、读不到静默跳过」。
+pub const DMI_ANCHOR_ENTRIES: &[&str] = &["product_uuid", "product_serial", "board_serial"];
+
+/// 统计 DMI 目录下可读且非空的锚点条目数（纯读、零副作用、永不 panic）。
+///
+/// 供 preflight 输出「N/M 条目可读」而非二元「缺失」，让现场能区分
+/// 「目录未挂载 / 条目 0400 不可读（预期）」与「条目真实可读」。
+pub fn count_readable_dmi_entries(dmi_dir: &Path) -> usize {
+    DMI_ANCHOR_ENTRIES
+        .iter()
+        .filter(|entry| {
+            matches!(
+                evaluate_anchor_file(&dmi_dir.join(entry), 1),
+                AnchorMountStatus::Ok | AnchorMountStatus::ReadOnlyViolation
+            )
+        })
+        .count()
+}
+
+/// DMI 锚点判定：**逐条目**读取（不做整个目录一刀切），任一条目可读即 Ok；
+/// 全部不可读时若存在可写特征 → ReadOnlyViolation，否则 Missing。
+///
+/// D-17 权限模型：非 root 容器读 0400 条目失败是预期常态，本函数只做**事实
+/// 判定**（不告警、不 panic）；锚点采集循环对读不到的条目静默跳过（不计入
+/// quorum），最终由 N-of-M 配额（本地 `PRODUCTION_MIN_ANCHORS=2`）兜底。
 fn check_dmi_anchor(root: &Path) -> AnchorMountStatus {
-    let uuid = root.join("sys/class/dmi/id/product_uuid");
-    let serial = root.join("sys/class/dmi/id/product_serial");
-    if evaluate_anchor_file(&uuid, 1) == AnchorMountStatus::Ok
-        || evaluate_anchor_file(&serial, 1) == AnchorMountStatus::Ok
-    {
-        AnchorMountStatus::Ok
-    } else if evaluate_anchor_file(&uuid, 1) == AnchorMountStatus::ReadOnlyViolation
-        || evaluate_anchor_file(&serial, 1) == AnchorMountStatus::ReadOnlyViolation
-    {
+    let dmi_dir = root.join("sys/class/dmi/id");
+    let mut violation = false;
+    for entry in DMI_ANCHOR_ENTRIES {
+        match evaluate_anchor_file(&dmi_dir.join(entry), 1) {
+            AnchorMountStatus::Ok => return AnchorMountStatus::Ok,
+            AnchorMountStatus::ReadOnlyViolation => violation = true,
+            AnchorMountStatus::Missing => {}
+        }
+    }
+    if violation {
         AnchorMountStatus::ReadOnlyViolation
     } else {
         AnchorMountStatus::Missing
@@ -727,5 +764,123 @@ mod tests {
         ] {
             assert!(rules.contains(needle), "rules missing {needle:?}");
         }
+    }
+
+    // ---- D-16：machine-id 33 字节换行形态（真实 systemd 文件）不误报 ----
+
+    const MID_HEX32: &str = "0123456789abcdef0123456789abcdef";
+
+    /// machine-id 校验参数化：33 字节（32hex+LF）/ 34 字节（32hex+CRLF）等
+    /// 真实形态接受；纯空白 / 空 / 31 字节 / 33 hex / 非 hex / 全零拒绝。
+    #[test]
+    fn machine_id_validation_trims_whitespace_and_keeps_hex_semantics() {
+        // 真实形态：32 hex + 尾部换行（systemd），含 CRLF。
+        assert!(is_valid_machine_id(MID_HEX32.as_bytes()), "32 bytes raw");
+        assert!(
+            is_valid_machine_id(format!("{MID_HEX32}\n").as_bytes()),
+            "32 hex + LF (33 bytes, real systemd form) must be accepted (D-16)"
+        );
+        assert!(
+            is_valid_machine_id(format!("{MID_HEX32}\r\n").as_bytes()),
+            "32 hex + CRLF (34 bytes) must be accepted"
+        );
+        assert!(
+            is_valid_machine_id(format!("  {MID_HEX32}\n").as_bytes()),
+            "surrounding whitespace must be trimmed"
+        );
+        assert!(
+            is_valid_machine_id(MID_HEX32.to_uppercase().as_bytes()),
+            "uppercase hex is still hex"
+        );
+
+        // 占位 / 损坏形态：一律拒绝。
+        assert!(!is_valid_machine_id(b""), "empty file");
+        assert!(
+            !is_valid_machine_id(b" \n\r\n\t"),
+            "pure-whitespace file must be rejected"
+        );
+        assert!(
+            !is_valid_machine_id(&MID_HEX32.as_bytes()[..31]),
+            "31 hex chars must be rejected"
+        );
+        assert!(
+            !is_valid_machine_id(format!("{MID_HEX32}a").as_bytes()),
+            "33 hex chars must be rejected"
+        );
+        assert!(
+            !is_valid_machine_id(b"g123456789abcdef0123456789abcde"),
+            "non-hex charset must be rejected"
+        );
+        assert!(
+            !is_valid_machine_id(b"0".repeat(32).as_slice()),
+            "all-zero placeholder must be rejected"
+        );
+        assert!(
+            !is_valid_machine_id(b"\xff".repeat(32).as_slice()),
+            "non-UTF-8 content must be rejected"
+        );
+    }
+
+    /// 容器锚点判定端到端：带换行的真实 machine-id（33 字节）→ Ok（不再误报缺失）。
+    #[test]
+    fn anchor_machine_id_with_trailing_newline_is_ok() {
+        let dir = TempDir::new().expect("tempdir");
+        let etc = dir.path().join("etc");
+        std::fs::create_dir_all(&etc).expect("mkdir etc");
+        std::fs::write(etc.join("machine-id"), format!("{MID_HEX32}\n")).expect("write 33 bytes");
+
+        let r = check_host_anchor_mounts(RuntimeForm::LinuxDocker, dir.path());
+        assert_eq!(
+            r.machine_id,
+            AnchorMountStatus::Ok,
+            "real systemd machine-id (32 hex + LF) must not be reported missing (D-16)"
+        );
+    }
+
+    // ---- D-17：DMI 逐条目读取与可读条目计数 ----
+
+    /// DMI 可读条目计数：目录缺失 → 0；仅 board_serial 可读 → 1（0400 条目
+    /// 不可读属预期，逐条目统计而非整目录一刀切）；三条目齐 → 3。
+    #[test]
+    fn dmi_readable_entry_count_is_per_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let dmi_dir = dir.path().join("sys/class/dmi/id");
+
+        // 目录不存在（容器未挂载 DMI）→ 0。
+        assert_eq!(count_readable_dmi_entries(&dmi_dir), 0);
+
+        // 仅 board_serial（常见 0444 条目）可读 → 1/3。
+        std::fs::create_dir_all(&dmi_dir).expect("mkdir dmi");
+        std::fs::write(dmi_dir.join("board_serial"), "BOARD-SERIAL-1\n").expect("write");
+        assert_eq!(
+            count_readable_dmi_entries(&dmi_dir),
+            1,
+            "only the readable 0444 entry counts"
+        );
+        // report 判定：board_serial 可读即视为 DMI 锚点 Ok。
+        let r = check_host_anchor_mounts(RuntimeForm::LinuxDocker, dir.path());
+        assert_eq!(r.dmi, AnchorMountStatus::Ok, "one readable entry ⇒ Ok");
+
+        // 三个条目全部可读 → 3/3。
+        std::fs::write(dmi_dir.join("product_uuid"), "uuid-1111\n").expect("write");
+        std::fs::write(dmi_dir.join("product_serial"), "serial-2222\n").expect("write");
+        assert_eq!(count_readable_dmi_entries(&dmi_dir), 3);
+
+        // 条目存在但纯空白 → 不计（占位不可信）。
+        std::fs::write(dmi_dir.join("board_serial"), "  \n").expect("write blank");
+        assert_eq!(
+            count_readable_dmi_entries(&dmi_dir),
+            2,
+            "blank entry must not count as readable"
+        );
+    }
+
+    /// DMI 条目常量与 assembly Linux 锚点集的 DMI 部分一致（防漂移口径）。
+    #[test]
+    fn dmi_entries_match_assembly_anchor_plan() {
+        assert_eq!(
+            DMI_ANCHOR_ENTRIES,
+            &["product_uuid", "product_serial", "board_serial"]
+        );
     }
 }

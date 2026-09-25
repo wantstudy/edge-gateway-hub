@@ -95,6 +95,12 @@ pub const DEVICE_KEY_SUBDIR: &str = "license";
 ///
 /// ⚠️ 这**不是**服务端 N-of-M 同机判定阈值（4/5）——客户端不参与同机判定。
 /// 取 2：容忍单锚点漂移，同时保证指纹至少组合两个独立锚点（单锚点不足以代表机器）。
+///
+/// D-17 权限模型口径：Linux 交付形态（非 root 容器）读不到 0400 的
+/// `product_uuid` / `product_serial` 是**预期常态**——这些条目不计入可用集，
+/// 由其余锚点（machine-id、可读的 `board_serial`、宿主 MAC、签名指纹文件）
+/// 凑 quorum。语义恒为「可采集锚点凑不满 quorum 才失败」，**不要求**锚点计划
+/// 全集（M）可用；验收实测交付形态 3 个可用源（machine-id + MAC + 指纹文件）> 2。
 pub const PRODUCTION_MIN_ANCHORS: usize = 2;
 
 /// HTTPS 响应体最大字节数（防异常服务端 / 中间人灌大响应）。
@@ -471,11 +477,24 @@ pub fn production_anchor_providers(data_dir: &Path) -> Vec<Box<dyn AnchorProvide
 
 /// Linux 锚点集：容器形态（宿主锚点可读）只用宿主锚点（**红线**：绝不采容器内
 /// `/etc/machine-id`）；原生形态读本机路径。宿主 MAC / 签名指纹文件作降级锚点。
+///
+/// D-17 权限模型：`product_uuid` / `product_serial` 在标准 Linux 上为 0400
+/// root-only，非 root 容器（交付形态 USER=65532）读不到是**预期常态**而非异常——
+/// [`FileAnchor`] 读失败返回 `None`，条目静默跳过（不告警、不计入 quorum）；
+/// `board_serial` 等个别条目常为 0444，逐条目读取时「读得到就是白赚的锚点」。
 #[cfg(not(windows))]
 fn linux_anchor_providers(data_dir: &Path) -> Vec<Box<dyn AnchorProvider>> {
+    linux_anchor_providers_at(&host_anchor_root(), data_dir)
+}
+
+/// [`linux_anchor_providers`] 的宿主锚点根参数化版本（测试注入入口）。
+///
+/// 全平台编译（`not(windows)` + `test`）：Windows 测试同样用它驱动交付形态
+/// 锚点集语义的单测（FileAnchor 读不到 → `None` → 跳过，与 0400 代码路径一致）。
+#[cfg(any(not(windows), test))]
+fn linux_anchor_providers_at(host_root: &Path, data_dir: &Path) -> Vec<Box<dyn AnchorProvider>> {
     use crate::auth::machine_id::{EnvAnchor, FileAnchor};
 
-    let host_root = host_anchor_root();
     // 宿主锚点存在 ⇒ 容器形态：etc/sys 根都切到宿主挂载。
     let host_machine_id = host_root.join("etc").join("machine-id");
     let (etc_root, sys_root) = if host_machine_id.is_file() {
@@ -1488,6 +1507,159 @@ mod tests {
         assert_eq!(keys.len(), 1, "only the valid entry survives: {keys:?}");
         assert_eq!(keys[0].0, "kid-a");
         assert_eq!(keys[0].1, vec![0x42u8; 32]);
+    }
+
+    // ---- D-17：Linux 交付形态锚点集（DMI 0400 读不到 = 预期常态，quorum 兜底） ----
+
+    /// 交付形态环境护栏：HOST_MAC / 指纹文件环境变量被占用时跳过（不污染并行测试）。
+    fn delivery_form_env_is_clean() -> bool {
+        std::env::var(HOST_MAC_ENV).is_err() && std::env::var(HOST_FINGERPRINT_FILE_ENV).is_err()
+    }
+
+    /// 在临时目录构造交付形态宿主锚点根（宿主 machine-id 可选、DMI 条目可选）。
+    /// DMI「0400 读不到」用**文件不存在**表达——与真机 EACCES 走同一条
+    /// `FileAnchor::collect` 读失败 → `None` 代码路径（Windows 权限位无效，无法
+    /// 直接 chmod 0400 模拟，缺失文件即等价驱动同一分支）。
+    fn delivery_host_root(dir: &Path, with_machine_id: bool) -> PathBuf {
+        let root = dir.join("host");
+        std::fs::create_dir_all(root.join("etc")).expect("mkdir host/etc");
+        if with_machine_id {
+            std::fs::write(
+                root.join("etc/machine-id"),
+                "0123456789abcdef0123456789abcdef\n",
+            )
+            .expect("write machine-id");
+        }
+        root
+    }
+
+    /// DMI 三条目全不可读（0400 常态）→ 全部跳过；machine-id + 签名指纹文件
+    /// = 2 个可用锚点，恰好凑 quorum（PRODUCTION_MIN_ANCHORS=2）→ 装配语义成功。
+    #[test]
+    fn delivery_form_dmi_unreadable_skips_and_remaining_meet_quorum() {
+        if !delivery_form_env_is_clean() {
+            return;
+        }
+        let dir = temp_dir();
+        let host_root = delivery_host_root(dir.path(), true);
+        std::fs::write(
+            dir.path().join("host-fingerprint.json"),
+            r#"{"signed":true}"#,
+        )
+        .expect("write fingerprint file");
+
+        let providers = linux_anchor_providers_at(&host_root, dir.path());
+        assert_eq!(
+            providers.len(),
+            6,
+            "plan: machine-id + 3 DMI + MAC env + fingerprint"
+        );
+        let identity = MachineIdentity::new(providers, PRODUCTION_MIN_ANCHORS, test_key());
+
+        let fingerprint = identity
+            .get_machine_fingerprint()
+            .expect("machine-id + fingerprint = 2 usable >= quorum 2 (exactly met)");
+        assert_eq!(fingerprint.len(), 64, "SHA-256 hex");
+
+        let hashes = identity.get_anchor_hashes().expect("same quorum");
+        assert_eq!(
+            hashes.len(),
+            2,
+            "unreadable DMI entries must be skipped from the per-anchor hash set: {hashes:?}"
+        );
+    }
+
+    /// 逐条目读取：`board_serial`（常见 0444）可读 → 白赚一个锚点；
+    /// 0400 的 product_uuid / product_serial 静默跳过、不告警不致命。
+    #[test]
+    fn dmi_board_serial_readable_counts_as_extra_anchor() {
+        if !delivery_form_env_is_clean() {
+            return;
+        }
+        let dir = temp_dir();
+        let host_root = delivery_host_root(dir.path(), true);
+        // 只放 board_serial（模拟 0444 可读条目），其余两条目 0400 不可读（缺失等价）。
+        let board = host_root
+            .join("sys")
+            .join("class")
+            .join("dmi")
+            .join("id")
+            .join("board_serial");
+        std::fs::create_dir_all(board.parent().expect("dmi dir")).expect("mkdir dmi");
+        std::fs::write(&board, "BOARD-SERIAL-XYZ\n").expect("write board_serial");
+        std::fs::write(
+            dir.path().join("host-fingerprint.json"),
+            r#"{"signed":true}"#,
+        )
+        .expect("write fingerprint file");
+
+        let providers = linux_anchor_providers_at(&host_root, dir.path());
+        let identity = MachineIdentity::new(providers, PRODUCTION_MIN_ANCHORS, test_key());
+        let hashes = identity.get_anchor_hashes().expect("3 usable >= quorum 2");
+        assert_eq!(
+            hashes.len(),
+            3,
+            "machine-id + readable board_serial + fingerprint = 3 anchors"
+        );
+    }
+
+    /// quorum 恰好不达标 → fail-closed（QuorumFailed 含 collected/required 数字）。
+    /// 交付形态只剩 machine-id 1 个可用源（DMI 0400、无 MAC env、无指纹文件）。
+    #[test]
+    fn delivery_form_below_quorum_fails_closed() {
+        if !delivery_form_env_is_clean() {
+            return;
+        }
+        let dir = temp_dir();
+        let host_root = delivery_host_root(dir.path(), true);
+
+        let providers = linux_anchor_providers_at(&host_root, dir.path());
+        let identity = MachineIdentity::new(providers, PRODUCTION_MIN_ANCHORS, test_key());
+        let err = identity
+            .get_machine_fingerprint()
+            .expect_err("1 usable < quorum 2 must fail closed");
+        assert!(
+            matches!(
+                err,
+                crate::auth::machine_id::FingerprintError::QuorumFailed {
+                    collected: 1,
+                    required: 2,
+                    total: 6
+                }
+            ),
+            "quorum error must carry exact numbers: {err}"
+        );
+        assert!(err.to_string().contains("quorum"), "display: {err}");
+    }
+
+    /// quorum 语义锁定：判定基于**可采集锚点数**而非锚点计划全集——
+    /// 2 个可用 / 计划 6 个、min=2 → 成功；同一集合 min=3 → 失败（不要求全集可用）。
+    #[test]
+    fn quorum_is_about_collected_count_not_plan_total() {
+        if !delivery_form_env_is_clean() {
+            return;
+        }
+        let dir = temp_dir();
+        let host_root = delivery_host_root(dir.path(), true);
+        std::fs::write(
+            dir.path().join("host-fingerprint.json"),
+            r#"{"signed":true}"#,
+        )
+        .expect("write fingerprint file");
+
+        let make = |min: usize| {
+            MachineIdentity::new(
+                linux_anchor_providers_at(&host_root, dir.path()),
+                min,
+                test_key(),
+            )
+        };
+        assert!(make(PRODUCTION_MIN_ANCHORS)
+            .get_machine_fingerprint()
+            .is_ok());
+        assert!(make(PRODUCTION_MIN_ANCHORS + 1)
+            .get_machine_fingerprint()
+            .is_err());
     }
 
     /// URL 解析：scheme / 默认端口 / 显式端口 / path 缺省 / 非法 scheme / IPv6 拒绝。
