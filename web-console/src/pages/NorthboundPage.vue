@@ -231,6 +231,30 @@
             <UiField label="客户端 ID">
               <UiInput v-model="outletForm.clientId" placeholder="iotdaq-line1-01" :disabled="!canEdit" />
             </UiField>
+            <!-- ── MQTT 凭据（敏感字段，红线：口令掩码，明文绝不落前端状态）── -->
+            <UiField label="MQTT 用户名" hint="与口令成对；留空表示匿名连接">
+              <UiInput v-model="outletForm.username" placeholder="如：gw-user" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="MQTT 口令" hint="敏感凭据：仅在网关侧加密存储（config_crypto 字段级加密），前端不以明文留存">
+              <div class="nb-pwd">
+                <UiInput
+                  :type="showMqttPassword ? 'text' : 'password'"
+                  v-model="mqttPassword"
+                  placeholder="••••••••"
+                  :disabled="!canEdit"
+                  :maxlength="256"
+                  data-testid="mqtt-password"
+                />
+                <button
+                  type="button"
+                  class="nb-pwd__toggle"
+                  :disabled="!canEdit"
+                  @click="showMqttPassword = !showMqttPassword"
+                >
+                  {{ showMqttPassword ? '隐藏' : '显示' }}
+                </button>
+              </div>
+            </UiField>
             <UiField label="数据编码" required hint="每路出口独立可选；默认 protobuf">
               <UiSelect v-model="outletForm.encoding" :options="encodingSelectOptions" :disabled="!canEdit" />
             </UiField>
@@ -767,6 +791,8 @@ const outletForm = reactive({
   name: '',
   brokerUrl: '',
   clientId: '',
+  /** MQTT 用户名（非敏感，随草稿保留；与口令成对，留空=匿名）。 */
+  username: '',
   topicTemplate: 'factory/line1/${device}/${point}',
   encoding: 'protobuf' as Encoding,
   deviceIds: [] as string[],
@@ -781,6 +807,16 @@ const outletForm = reactive({
   /** 批量大小（HTTP 分支；原型 :1333） */
   batchSize: '100 条 / 请求',
 });
+
+/**
+ * MQTT 口令（敏感）：独立 ref，刻意**不**放进 `outletForm` 响应式草稿，
+ * 以免明文混入可被序列化/审计的表单对象。仅用于拼装 POST 报文，发出后立即清空，
+ * 屏幕上也始终以掩码形态呈现（type=password），满足红线「明文绝不落前端状态」。
+ */
+const mqttPassword = ref('');
+
+/** 口令显隐切换（默认隐藏，掩码态）。 */
+const showMqttPassword = ref(false);
 
 /** 设备 chips（来自 mock 仓库）。 */
 const deviceChips = repo.allDevices().map((d) => ({ id: d.id, name: d.name }));
@@ -839,6 +875,9 @@ async function saveOutlet(): Promise<void> {
           topic_prefix: outletForm.topicTemplate.trim(),
           qos: outletForm.qos,
           encoding: outletForm.encoding,
+          // 敏感凭据：随报文上送，由网关侧 config_crypto 字段级加密落盘。
+          username: outletForm.username.trim(),
+          password: mqttPassword.value,
         }
       : {
           name: outletForm.name.trim(),
@@ -849,6 +888,8 @@ async function saveOutlet(): Promise<void> {
           batch_size: outletForm.batchSize,
           encoding: 'json',
         };
+  // 红线：口令明文仅在内存中短暂存在，拼好报文后立刻清空，绝不留存在前端状态。
+  mqttPassword.value = '';
   try {
     await apiRequest<unknown>('/api/forwarders', { method: 'POST', body: JSON.stringify(payload) });
     outletMessage.value = `出口「${outletForm.name}」已登记：范围 ${scopeText}。`;
@@ -974,6 +1015,35 @@ function nowText(): string {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px 16px;
+}
+/* MQTT 口令：输入框 + 显隐切换，掩码态默认；口令明文不进入可序列化草稿 */
+.nb-pwd {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.nb-pwd .uik-input {
+  flex: 1 1 auto;
+}
+.nb-pwd__toggle {
+  flex: 0 0 auto;
+  font-family: inherit;
+  font-size: var(--fs-caption);
+  padding: 0 12px;
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.nb-pwd__toggle:hover:not(:disabled) {
+  border-color: var(--brand);
+  color: var(--brand);
+}
+.nb-pwd__toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 @media (max-width: 1280px) {
   .nb-form-grid {

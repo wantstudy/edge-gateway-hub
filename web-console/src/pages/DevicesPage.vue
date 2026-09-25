@@ -206,7 +206,6 @@ import {
   type DangerFact,
 } from '@ui-kit';
 import { API_MODE, repo, PROTOCOL_OPTIONS, type DeviceRecord } from '@/api/repo';
-import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -397,36 +396,10 @@ const probeSummary = computed<string>(() => {
   return `测试全部连接：${okCount} / ${probeResults.value.length} 台连通 · 数据源 ${source}`;
 });
 
-/** 取字符串字段（缺失回默认；数字也按字符串透传，不做数值转换）。 */
-function pickText(src: Record<string, unknown>, key: string, dflt: string): string {
-  const v = src[key];
-  if (typeof v === 'string') {
-    return v;
-  }
-  if (typeof v === 'number' && Number.isFinite(v)) {
-    return String(v);
-  }
-  return dflt;
-}
-
-/** HTTP 状态 → 可解释失败文案（不静默吞错，写清原因与恢复路径）。 */
-function probeHttpErrorText(status: number): { errorKind: string; reason: string } {
-  if (status === 404) {
-    return { errorKind: 'unknown_device', reason: '后端未收录该设备（HTTP 404）：请先在网关侧登记设备与点位' };
-  }
-  if (status === 403) {
-    return { errorKind: 'forbidden', reason: '当前账号无 device.view 权限（HTTP 403）：请用具备该权限的账号登录' };
-  }
-  if (status === 0) {
-    return { errorKind: 'network', reason: '网关不可达（网络层失败）：请确认网关进程在监听 8080 端口' };
-  }
-  return { errorKind: `http_${status}`, reason: `探测请求失败（HTTP ${status}）：详见网关日志` };
-}
-
 /**
  * 逐台探测连通性。
  *
- * real：`POST /api/devices/test {device_id}`（后端恒 200，结构化失败不 500；
+ * real：`repo.actions.testDevice({deviceId})`（后端恒 200，结构化失败不 500；
  * 非 Modbus 协议返回 `unsupported_protocol`）；
  * mock：不发请求，按设备当前状态给出**明确标注为演示**的结果。
  */
@@ -454,29 +427,27 @@ async function testAllConnections(): Promise<void> {
         continue;
       }
       try {
-        const raw = await apiRequest<Record<string, unknown>>('/api/devices/test', {
-          method: 'POST',
-          body: JSON.stringify({ device_id: device.id }),
-        });
-        const ok = raw['ok'] === true;
+        // real：统一走 repo.actions.testDevice（已封装 POST /api/devices/test，
+        // 返回结构化 ProbeResult；mock 走下方演示分支）。
+        const pr = await repo.actions.testDevice({ deviceId: device.id });
         results.push({
           id: device.id,
           name: device.name,
-          ok,
-          errorKind: ok ? '' : pickText(raw, 'error_kind', 'failed'),
-          reason: ok ? pickText(raw, 'detail', 'TCP connect + read 1 holding register succeeded') : pickText(raw, 'reason', '探测失败（后端未给出原因）'),
-          elapsedMs: pickText(raw, 'elapsed_ms', '—'),
-          _rowClass: ok ? '' : 'row-danger',
+          ok: pr.ok,
+          errorKind: pr.ok ? '' : pr.errorKind,
+          reason: pr.ok
+            ? pr.reason || 'TCP connect + read 1 holding register succeeded'
+            : pr.reason || '探测失败（后端未给出原因）',
+          elapsedMs: pr.elapsedMs || '—',
+          _rowClass: pr.ok ? '' : 'row-danger',
         });
-      } catch (err) {
-        const status = err instanceof ApiError ? err.status : 0;
-        const text = probeHttpErrorText(status);
+      } catch {
         results.push({
           id: device.id,
           name: device.name,
           ok: false,
-          errorKind: text.errorKind,
-          reason: text.reason,
+          errorKind: 'error',
+          reason: '探测请求失败（网络层错误）：请确认网关进程在监听 8080 端口',
           elapsedMs: '—',
           _rowClass: 'row-danger',
         });

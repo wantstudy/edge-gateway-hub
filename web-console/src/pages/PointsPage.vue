@@ -383,7 +383,7 @@
           <button
             type="button"
             class="wc-btn wc-btn--primary"
-            :disabled="importResult.validRows.length === 0"
+            :disabled="importResult.validRows.length === 0 || importResult.errors.length > 0"
             @click="commitImport"
           >
             导入合法行（{{ importResult.validRows.length }} 条）
@@ -445,6 +445,8 @@ import {
   type DangerFact,
 } from '@ui-kit';
 import {
+  API_MODE,
+  dataVersion,
   repo,
   DATA_TYPE_OPTIONS,
   BYTE_ORDER_OPTIONS,
@@ -485,6 +487,9 @@ const columns: readonly TableColumn[] = [
   { key: 'value', label: '当前值' },
   { key: 'quality', label: '质量' },
 ];
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式完全不发请求。 */
+const IS_REAL = API_MODE === 'real';
 
 /** 是否可写（工程师及以上）。 */
 const canWrite = computed(() => session.state.role === 'admin' || session.state.role === 'engineer');
@@ -995,8 +1000,8 @@ const CSV_HEADER = ['地址', '点位名', '数据类型', '字节序', '单位'
 const CSV_HEADER_LEGACY = ['设备', '点位名', '类型', '地址', '数据类型', '字节序', '单位', '死区', '北向目标点名', '公式'];
 
 interface ImportError {
-  /** 行号（表体行号，从 1 开始） */
-  line: number;
+  /** 行号（表体行号或后端物理行号字符串；大数红线：字符串透传，绝不 parseInt） */
+  line: string;
   /** 原因 */
   reason: string;
   /** 允许值 */
@@ -1036,11 +1041,6 @@ function parseCsv(text: string): string[][] {
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .map((line) => line.split(',').map((cell) => cell.trim()));
-}
-
-/** 序列化为 CSV 文本（UTF-8 BOM，便于 Excel 识别中文）。 */
-function toCsv(rows: string[][]): string {
-  return '﻿' + rows.map((r) => r.join(',')).join('\r\n');
 }
 
 function onFile(event: Event): void {
@@ -1091,7 +1091,7 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
       typeRaw === 'physical' ? 'physical' : typeRaw === 'derived' || typeRaw === 'calc' ? 'derived' : formula ? 'derived' : 'physical';
 
     const push = (reason: string, allowed: string): void => {
-      errors.push({ line, reason, allowed });
+      errors.push({ line: String(line), reason, allowed });
     };
 
     if (!name) {
@@ -1122,7 +1122,7 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
       push('计算点公式必填', '如 M_Good / M_Count * 100');
     }
 
-    if (errors.some((e) => e.line === line)) {
+    if (errors.some((e) => e.line === String(line))) {
       return;
     }
 
@@ -1145,58 +1145,99 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
   return { deviceId: dev.id, validRows, errors };
 }
 
-/** 提交导入（按设备覆盖写库）。 */
-function commitImport(): void {
+/**
+ * 提交导入：real 走 `repo.actions.importPoints`（`POST /api/points/import`，
+ * 后端 fail-closed：任一坏行整批拒绝、零落盘，错误体 `{line, reason, allowed}`）；
+ * mock 落本地覆盖层（`repo.replacePointsOfDevice`，语义一致）。
+ *
+ * 无论哪种模式，凡存在异常行都**整批拒绝**（`fail-closed`），与页面提示一致。
+ */
+async function commitImport(): Promise<void> {
   const result = importResult.value;
   if (!result || result.validRows.length === 0) {
     return;
   }
-  const count = repo.replacePointsOfDevice({
-    deviceId: result.deviceId,
-    rows: result.validRows,
-    actor: session.state.displayName,
-  });
-  importResult.value = null;
-  importDone.value = count;
-  page.value = 1;
-  reload();
+  if (result.errors.length > 0) {
+    // 整批拒绝：一条都不写（与导入校验结果横幅文案一致）。
+    note('存在异常行，整批拒绝：请按「行号 + 原因 + 允许值」修正后重新导入。', 'warn');
+    return;
+  }
+  const dev = selected.value;
+  if (!dev) {
+    return;
+  }
+
+  if (IS_REAL) {
+    // 后端契约 CSV：device_id,point_id,protocol,address,frequency_ms
+    // （page 的 dataType/字节序/单位/死区/目标点名/公式 后端暂未建模，落盘后不保留）。
+    const csv = buildBackendCsv(dev, result.validRows);
+    const res = await repo.actions.importPoints({ csv, deviceId: dev.id, replace: true });
+    if (!res.ok) {
+      // 回填后端结构化错误（line/reason/allowed），横幅与错误表复用同一渲染。
+      importResult.value = { deviceId: result.deviceId, validRows: result.validRows, errors: res.errors };
+      importDone.value = 0;
+      note(`导入被整批拒绝（零落盘）：${res.message}`, 'warn');
+      return;
+    }
+    importResult.value = null;
+    importDone.value = Number(res.imported) || result.validRows.length;
+    page.value = 1;
+    reload();
+    note(`后端已落盘并热生效：${res.message}`, 'ok');
+  } else {
+    const count = repo.replacePointsOfDevice({
+      deviceId: result.deviceId,
+      rows: result.validRows,
+      actor: session.state.displayName,
+    });
+    importResult.value = null;
+    importDone.value = count;
+    page.value = 1;
+    reload();
+  }
+}
+
+/**
+ * 把页面点位草稿映射为后端契约 CSV（`device_id,point_id,protocol,address,frequency_ms`）。
+ *
+ * 字段对齐（后端 `config.rs::PointConfig`，见 pages.rs 注释）：
+ *  · `point_id` = 点位的**地址**（寄存器号 / 端点式，如 `40001` / `DB1.0`）；
+ *  · `address`   = 设备的**连接端点**（取 `connectionSummary` 首段，去掉「 · 」分隔的
+ *    从站 / 槽位等可读后缀，避免逗号污染 CSV 该列）；
+ *  · `protocol` / `frequency_ms` = 设备级配置（后端按设备聚合，逐点不重复存）。
+ *
+ * 注意：后端 PointConfig 仅持久化这 5 个字段；计算点（derived）无 PLC 地址，其
+ * `point_id` 会被后端以「非法地址」整批拒绝（诚实限制，不伪造落盘）。
+ */
+function buildBackendCsv(dev: DeviceRecord, rows: PointDraft[]): string {
+  const endpoint = (dev.connectionSummary.split(' · ')[0] ?? '').trim() || dev.connectionSummary;
+  const header = 'device_id,point_id,protocol,address,frequency_ms';
+  const lines = [header];
+  for (const r of rows) {
+    const pointId = r.pointType === 'derived' ? (r.formula ?? '') : r.address.trim();
+    lines.push([dev.id, pointId, dev.protocol, endpoint, String(dev.intervalMs)].join(','));
+  }
+  return lines.join('\n');
 }
 
 function clearImport(): void {
   importResult.value = null;
 }
 
-/** 导出点表 CSV（选中设备 → 该设备；否则导出全部，便于整体核对）。 */
-function exportTemplate(): void {
-  const rows: string[][] = [CSV_HEADER];
+/**
+ * 导出点表 CSV（real：`repo.actions.downloadPointsCsv` → `GET /api/points/export`；
+ * mock：repo 本地生成）。后端导出列即导入模板（`device_id,point_id,protocol,
+ * address,frequency_ms`），因此「导出即可当导入模板」由后端契约保证，前端不再
+ * 自行拼装 Chinese-header CSV。
+ */
+async function exportTemplate(): Promise<void> {
   const dev = selected.value;
-  const source = dev ? repo.pointsOfDevice(dev.id) : repo.allPoints();
-  if (source.length === 0) {
-    const sampleAddr = dev ? (PT_TEMPLATE[dev.protocol]?.[0]?.addr ?? '40001') : '40001';
-    rows.push([sampleAddr, '示例点位', 'uint16', 'CD AB', '℃', '0', 'example_point', '']);
-  } else {
-    for (const p of source) {
-      rows.push([
-        p.address === '—' ? '' : p.address,
-        p.name,
-        p.dataType,
-        p.byteOrder === '—' ? '' : p.byteOrder,
-        p.unit,
-        String(p.deadband),
-        p.targetKey,
-        p.formula ?? '',
-      ]);
-    }
+  const result = await repo.actions.downloadPointsCsv(dev?.id);
+  if (!result.ok) {
+    note(`点表导出失败：${result.message}`, 'warn');
+    return;
   }
-  const blob = new Blob([toCsv(rows)], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = dev ? `points-${dev.id}.csv` : 'points-all.csv';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  note(result.message || '已导出点表 CSV（可直接当导入模板）。', 'ok');
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1298,10 @@ watch(selectedDeviceId, () => {
   pointForm.value = null;
   lastNote.value = '';
 });
+
+// real 模式：后端写操作（导入 / 删除）经 repo.actions 热生效并自增 dataVersion，
+// 此处响应式刷新列表 / 点表，使真实落盘即时可见（不依赖重新进入页面）。
+watch(dataVersion, reload);
 </script>
 
 <style scoped>

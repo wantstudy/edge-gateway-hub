@@ -262,13 +262,20 @@ function mapForwarder(raw: Record<string, unknown>, idx: number): ForwarderRecor
   return {
     id: pickStr(raw, 'id', `fwd-real-${idx}`),
     name: pickStr(raw, 'name', `出口-${idx + 1}`),
-    brokerUrl: pickStr(raw, 'brokerUrl', pickStr(raw, 'broker_url', '—')),
-    transportSecurity: pickStr(raw, 'transportSecurity', pickStr(raw, 'transport_security', '—')),
+    // 后端 /api/forwarders 实测契约（2026-09-25 live 联调）：
+    // target / qos(数字字符串) / tls(bool) / topic_prefix；mock 与旧字段名保留为回退。
+    brokerUrl: pickStr(raw, 'target', pickStr(raw, 'brokerUrl', pickStr(raw, 'broker_url', '—'))),
+    transportSecurity:
+      typeof raw.tls === 'boolean'
+        ? raw.tls
+          ? 'TLS'
+          : 'TCP'
+        : pickStr(raw, 'transportSecurity', pickStr(raw, 'transport_security', '—')),
     certStatusText: pickStr(raw, 'certStatusText', '—'),
     clientId: pickStr(raw, 'clientId', pickStr(raw, 'client_id', '')),
     qos: (qosRaw === 0 || qosRaw === 1 || qosRaw === 2 ? qosRaw : 1) as ForwarderRecord['qos'],
     retained: pickBool(raw, 'retained', false),
-    topicTemplate: pickStr(raw, 'topicTemplate', pickStr(raw, 'topic_template', '')),
+    topicTemplate: pickStr(raw, 'topicTemplate', pickStr(raw, 'topic_prefix', pickStr(raw, 'topic_template', ''))),
     encoding: (encoding === 'json' ? 'json' : 'protobuf') as Encoding,
     status: pickStr(raw, 'status', 'disconnected') as ForwarderRecord['status'],
     connectedForText: pickStr(raw, 'connectedForText', '—'),

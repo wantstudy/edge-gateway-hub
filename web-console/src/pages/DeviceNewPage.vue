@@ -445,7 +445,7 @@ import {
   type ProtocolType,
   type DeviceDraft,
 } from '@/api/repo';
-import { API_MODE, apiRequest } from '@/api/client';
+import { API_MODE } from '@/api/client';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -1071,27 +1071,20 @@ async function runTest(): Promise<void> {
     return;
   }
 
-  const body: Record<string, unknown> = {
-    protocol: probeTarget.value.protocol,
-    address: probeTarget.value.address,
-    timeout_ms: Number((conn.timeout ?? '') || 1000),
-  };
-  if (probeTarget.value.slave) {
-    body.slave = probeTarget.value.slave;
-  }
-  if (probeRegister.value !== '—') {
-    body.register = probeRegister.value;
-  }
-
   try {
-    const raw = await apiRequest<Record<string, unknown>>('/api/devices/test', {
-      method: 'POST',
-      body: JSON.stringify(body),
+    // real：统一走 repo.actions.testDevice（已封装 POST /api/devices/test，
+    // 返回结构化 ProbeResult；后端只做 Modbus 全探测，其余协议返回 unsupported_protocol）。
+    const pr = await repo.actions.testDevice({
+      protocol: probeTarget.value.protocol || undefined,
+      address: probeTarget.value.address || undefined,
+      timeoutMs: Number((conn.timeout ?? '') || 1000),
+      slave: probeTarget.value.slave || undefined,
+      register: probeRegister.value !== '—' ? probeRegister.value : undefined,
     });
-    const ok = raw.ok === true;
-    const elapsed = typeof raw.elapsed_ms === 'string' ? raw.elapsed_ms : '';
-    const reason = typeof raw.reason === 'string' ? raw.reason : '';
-    const kind = typeof raw.error_kind === 'string' ? raw.error_kind : '';
+    const ok = pr.ok;
+    const elapsed = pr.elapsedMs;
+    const reason = pr.reason;
+    const kind = pr.errorKind;
 
     if (ok) {
       for (const step of steps) {
@@ -1101,12 +1094,11 @@ async function runTest(): Promise<void> {
         step.state = 'done';
         step.time = elapsed ? `${elapsed} ms` : '完成';
       }
-      steps[2].desc = typeof raw.register === 'string' ? `${raw.register} · sample_bytes ${String(raw.sample_bytes ?? '')}` : steps[2].desc;
       steps[3].state = 'idle';
       steps[3].time = '需人工核对';
       testResult.value = {
         ok: true,
-        text: `网关探测成功：连接 ${String(raw.endpoint ?? '')} 并读取 1 个保持寄存器（耗时 ${elapsed || '—'} ms）。这只说明「读得到」，不代表地址语义正确。`,
+        text: `网关探测成功（耗时 ${elapsed || '—'} ms）。这只说明「读得到」，不代表地址语义正确。`,
       };
     } else {
       steps[0].state = 'fail';
