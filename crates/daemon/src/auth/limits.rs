@@ -194,6 +194,8 @@ mod tests {
             server_name: None,
             alpn: Vec::new(),
             encoding: crate::config::OutletEncoding::Protobuf,
+            username: None,
+            password: None,
         });
         config
     }

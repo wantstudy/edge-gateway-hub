@@ -236,7 +236,7 @@ impl Default for GatewaySection {
 }
 
 /// `[[outlets]]` 北向出口（每路独立：broker / topic / qos / tls / 编码）。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct OutletConfig {
     /// 出口名（唯一键，日志与诊断用）。
     pub name: String,
@@ -279,6 +279,43 @@ pub struct OutletConfig {
     /// 该路出口的载荷编码（默认 protobuf）。
     #[serde(default)]
     pub encoding: OutletEncoding,
+    /// MQTT 认证用户名（**可选**；与 `password` 成对）。
+    ///
+    /// ⚠️ **明文存于 TOML 配置文件**——敏感凭据。日志 / 诊断导出 / 任何 `{:?}`
+    /// 打印都**不得**包含明文口令；本结构实现了自定义 `Debug`，口令恒被掩码为
+    /// `***`。与 `password` 同时配置时由
+    /// [`crate::north::runtime::endpoint_from_outlet`] 注入连接；仅 `password`
+    /// 无 `username` 时由 [`crate::north::mqtt::EndpointConfig::validate`] 拒绝。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// MQTT 认证口令（**可选**；与 `username` 成对）。
+    ///
+    /// ⚠️ **明文存于 TOML 配置文件**——与 `username` 同属敏感凭据，且**绝不**经
+    /// 日志 / 诊断 / 任何 `{:?}` 泄露（自定义 `Debug` 已掩码）。仅当 `username`
+    /// 一并配置时才被使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for OutletConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutletConfig")
+            .field("name", &self.name)
+            .field("broker", &self.broker)
+            .field("topic_prefix", &self.topic_prefix)
+            .field("qos", &self.qos)
+            .field("tls", &self.tls)
+            .field("ca_cert_path", &self.ca_cert_path)
+            .field("client_cert_path", &self.client_cert_path)
+            .field("client_key_path", &self.client_key_path)
+            .field("server_name", &self.server_name)
+            .field("alpn", &self.alpn)
+            .field("encoding", &self.encoding)
+            .field("username", &self.username)
+            // 口令永远掩码，绝不打印明文（安全红线）。
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 /// `[[points]]` 点位平铺行（设备级字段随行冗余，便于批量导入导出）。
@@ -1184,5 +1221,46 @@ alpn = ["mqtt"]
                 "unset `{absent}` must be omitted when serializing: {raw}"
             );
         }
+    }
+
+    /// task：北向 MQTT 凭证字段 `username`/`password` 可随 `[[outlets]]` 解析；
+    /// 同时验证「不带凭证的旧配置」仍可解析（向后兼容，新字段缺省为 `None`）。
+    #[test]
+    fn config_outlet_credentials_parse() {
+        let raw = r#"
+[[outlets]]
+name = "cred-1"
+broker = "mqtts://broker.local:8883"
+tls = true
+username = "gw-user"
+password = "s3cr3t-password"
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse credentialed outlet");
+        assert_eq!(config.outlets.len(), 1);
+        let outlet = &config.outlets[0];
+        assert_eq!(outlet.username.as_deref(), Some("gw-user"));
+        assert_eq!(outlet.password.as_deref(), Some("s3cr3t-password"));
+    }
+
+    /// task：未配置 `username`/`password` 的旧 `[[outlets]]` 仍可解析（向后兼容）；
+    /// 凭证字段缺省为 `None`，且序列化时被省略（旧 daemon 仍可读取新文件）。
+    #[test]
+    fn config_outlet_credentials_backward_compatible() {
+        let config =
+            GatewayConfig::parse("[[outlets]]\nname = \"legacy\"\nbroker = \"mqtt://h:1883\"\n")
+                .expect("parse legacy outlet without credentials");
+        let outlet = &config.outlets[0];
+        assert!(outlet.username.is_none());
+        assert!(outlet.password.is_none());
+
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !raw.contains("username"),
+            "unset `username` must be omitted when serializing: {raw}"
+        );
+        assert!(
+            !raw.contains("password"),
+            "unset `password` must be omitted when serializing: {raw}"
+        );
     }
 }

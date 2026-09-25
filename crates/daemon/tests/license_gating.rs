@@ -460,6 +460,8 @@ fn outlet_to(addr: SocketAddr) -> OutletConfig {
         server_name: None,
         alpn: Vec::new(),
         encoding: OutletEncoding::Protobuf,
+        username: None,
+        password: None,
     }
 }
 

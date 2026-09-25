@@ -210,6 +210,14 @@ pub fn endpoint_from_outlet(outlet: &OutletConfig) -> DaemonResult<EndpointConfi
         .with_topic_prefix(outlet.topic_prefix.clone())
         .with_encoding(outlet.encoding.into());
 
+    // 北向 MQTT 凭证支持（task）：仅当 `username` 与 `password` **同时**配置时才
+    // 注入。若只设置了其中之一，保持 `None`，交由 `EndpointConfig::validate`
+    // （`build_options`）既有校验在连接期拒绝「有口令无用户名」，绝不发送空凭证。
+    let endpoint = match (&outlet.username, &outlet.password) {
+        (Some(user), Some(pass)) => endpoint.with_credentials(user.clone(), pass.clone()),
+        _ => endpoint,
+    };
+
     if !tls_enabled {
         // 规则 5：非 TLS 出口若携带 TLS 字段 → 报错（不静默忽略安全配置）。
         let stray = [
@@ -820,7 +828,31 @@ mod tests {
             server_name: None,
             alpn: Vec::new(),
             encoding: OutletEncoding::Protobuf,
+            username: None,
+            password: None,
         }
+    }
+
+    /// task：北向凭证随 `[[outlets]]` 的 `username`/`password` 透传到 `EndpointConfig`
+    /// （transport 层既有 `set_credentials` 支持）。
+    #[test]
+    fn endpoint_from_outlet_propagates_credentials() {
+        let mut outlet = base_outlet("cred-1", "mqtt://127.0.0.1:1883");
+        outlet.username = Some("gw-user".to_string());
+        outlet.password = Some("s3cr3t-password".to_string());
+        let ep = endpoint_from_outlet(&outlet).expect("build endpoint");
+        assert_eq!(ep.username.as_deref(), Some("gw-user"));
+        assert_eq!(ep.password.as_deref(), Some("s3cr3t-password"));
+    }
+
+    /// task：无凭证出口构造的 `EndpointConfig` 不携带 `username`/`password`
+    /// （不会注入空凭证）；既有 builder 链其余字段保持原样。
+    #[test]
+    fn endpoint_from_outlet_without_credentials_is_none() {
+        let outlet = base_outlet("no-cred", "mqtt://127.0.0.1:1883");
+        let ep = endpoint_from_outlet(&outlet).expect("build endpoint");
+        assert!(ep.username.is_none(), "username must be None when unset");
+        assert!(ep.password.is_none(), "password must be None when unset");
     }
 
     /// 写一个占位 PEM 文件（仅用于「路径存在性」校验；内容由 `to_transport` 校验）。
