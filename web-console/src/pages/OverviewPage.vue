@@ -113,35 +113,34 @@
           >
             <g v-for="g in 4" :key="`grid-${g}`">
               <line
+                class="ov-grid-line"
                 :x1="0"
                 :y1="gridY(g - 1)"
                 :x2="CHART_W"
                 :y2="gridY(g - 1)"
-                stroke="#F2F3F5"
-                stroke-width="1"
               />
-              <text :x="4" :y="gridY(g - 1) - 4" font-size="9" fill="#86909C">{{ gridLabel(g - 1) }}</text>
+              <text class="ov-grid-text" :x="4" :y="gridY(g - 1) - 4">{{ gridLabel(g - 1) }}</text>
             </g>
 
-            <!-- 成功采集：面积 + 折线 -->
-            <path :d="successArea" fill="rgba(0,168,112,0.12)" stroke="none" />
-            <path :d="successLine" fill="none" stroke="#00A870" stroke-width="1.8" />
-            <!-- 补发：折线（同为「条/分钟」量纲，共用 Y 轴） -->
-            <path :d="replayLine" fill="none" stroke="#7A5AF8" stroke-width="1.4" stroke-dasharray="4 3" />
+            <!-- 成功采集：面积 + 折线（原型 :1399 主序列 = 强调青绿） -->
+            <path class="ov-area" :d="successArea" />
+            <path class="ov-line" :d="successLine" />
+            <!-- 补发：折线（同为「条/分钟」量纲，共用 Y 轴；原型 :1400 次序列 = 紫） -->
+            <path class="ov-line ov-line--alt" :d="replayLine" />
 
             <circle
               v-for="(pt, i) in successPoints"
               :key="`dot-${i}`"
+              class="ov-dot"
               :cx="pt.x"
               :cy="pt.y"
               r="2"
-              fill="#00A870"
             />
           </svg>
 
           <div class="ov-legend">
-            <span><i style="background: #00a870" />成功采集（条/分钟）</span>
-            <span><i style="background: #7a5af8" />补发（条/分钟）</span>
+            <span><i class="ov-legend__swatch ov-legend__swatch--ok" />成功采集（条/分钟）</span>
+            <span><i class="ov-legend__swatch ov-legend__swatch--alt" />补发（条/分钟）</span>
             <span class="wc-mono">峰值 {{ peakText }}</span>
           </div>
         </div>
@@ -279,7 +278,14 @@
             <span class="wc-tag" :class="stateTagClass(row.state)">{{ row.stateLabel }}</span>
           </template>
         </UiTable>
-        <UiPager :page="paged.page" :total="paged.total" :page-size="ALARM_PAGE_SIZE" @update:page="onAlarmPage" />
+        <UiPager
+          :page="paged.page"
+          :total="paged.total"
+          :page-size="ALARM_PAGE_SIZE"
+          numeric
+          jump
+          @update:page="onAlarmPage"
+        />
       </template>
     </section>
 
@@ -878,11 +884,38 @@ function go(name: string): void {
 </script>
 
 <style scoped>
-/* 采集吞吐图表：随容器拉伸，最小高度保证 1366×768 下仍可读 */
+/* 采集吞吐图表：随容器拉伸，最小高度保证 1366×768 下仍可读。
+   全部描边 / 填充取自 ui-kit token（SVG 表现属性不支持 var()，故统一下沉到类）。 */
 .ov-chart {
   width: 100%;
   height: 190px;
   display: block;
+}
+.ov-grid-line {
+  stroke: var(--divider);
+  stroke-width: 1;
+}
+.ov-grid-text {
+  font-size: 9px;
+  fill: var(--text-3);
+}
+.ov-area {
+  fill: var(--brand);
+  opacity: 0.12;
+  stroke: none;
+}
+.ov-line {
+  fill: none;
+  stroke: var(--brand);
+  stroke-width: 1.8;
+}
+.ov-line--alt {
+  stroke: var(--series-alt);
+  stroke-width: 1.4;
+  stroke-dasharray: 4 3;
+}
+.ov-dot {
+  fill: var(--brand);
 }
 .ov-legend {
   display: flex;
@@ -898,6 +931,12 @@ function go(name: string): void {
   border-radius: 2px;
   margin-right: 6px;
   vertical-align: middle;
+}
+.ov-legend__swatch--ok {
+  background: var(--brand);
+}
+.ov-legend__swatch--alt {
+  background: var(--series-alt);
 }
 .ov-meter {
   display: flex;

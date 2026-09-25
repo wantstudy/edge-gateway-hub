@@ -147,7 +147,7 @@
                     role="img"
                     :aria-label="`${row.name} 近 20 次采样的波动趋势`"
                   >
-                    <path :d="row.spark" :stroke="row.sparkColor" stroke-width="1.4" fill="none" />
+                    <path :d="row.spark" :style="{ stroke: row.sparkColor }" stroke-width="1.4" fill="none" />
                   </svg>
                 </td>
                 <td>
@@ -166,8 +166,12 @@
         <UiPager
           :page="pointPage"
           :total="filteredPoints.length"
-          :page-size="POINT_PAGE_SIZE"
+          :page-size="pointPageSize"
+          :sizes="POINT_PAGE_SIZES"
+          numeric
+          jump
           @update:page="onPointPage"
+          @update:page-size="onPointPageSize"
         />
       </template>
     </section>
@@ -214,18 +218,17 @@
                 :y="52 - bar.height"
                 :width="16"
                 :height="bar.height"
-                :fill="bar.color"
+                :style="{ fill: bar.color }"
                 rx="1.5"
               />
-              <text :x="16 + i * 22" :y="58" text-anchor="middle" font-size="5.4" fill="#86909C">
+              <text class="mn-bars__label" :x="16 + i * 22" :y="58" text-anchor="middle">
                 {{ bar.key }}
               </text>
               <text
+                class="mn-bars__value"
                 :x="16 + i * 22"
                 :y="48 - bar.height"
                 text-anchor="middle"
-                font-size="5.6"
-                fill="#1D2129"
                 font-weight="600"
               >
                 {{ bar.value }}
@@ -297,8 +300,9 @@ const IS_REAL = API_MODE === 'real';
 // 常量
 // ---------------------------------------------------------------------------
 
-/** 实时点位表每页条数（用 UiPager 单一口径）。 */
-const POINT_PAGE_SIZE = 8;
+/** 实时点位表每页条数（用 UiPager 单一口径；可经 sizes chip 切换，sizes 需可变数组）。 */
+const POINT_PAGE_SIZES: number[] = [8, 16, 32];
+const pointPageSize = ref<number>(POINT_PAGE_SIZES[0]);
 
 /** sparkline 保留的历史拍数。 */
 const HISTORY_LEN = 20;
@@ -306,13 +310,18 @@ const HISTORY_LEN = 20;
 /** 质量码展示顺序（固定，避免柱状图顺序漂移）。 */
 const QUALITY_ORDER: readonly PointRecord['quality'][] = ['Good', 'Uncertain', 'Bad', 'Timeout', 'CalcFailed'];
 
-/** 质量码 → 柱状图颜色（取自 ui-kit token 语义色，非自造配色）。 */
+/**
+ * 质量码 → 柱状图颜色（全部取自 ui-kit token / global.css 桥接变量，非自造色值）。
+ *
+ * SVG 表现属性不支持 `var()`，故这里只存放「变量名字符串」，由模板经
+ * `:style` 下发（见 `qualityBars` 与模板 `:style="{ fill: bar.color }"`）。
+ */
 const QUALITY_COLOR: Readonly<Record<string, string>> = Object.freeze({
-  Good: '#00A870',
-  Uncertain: '#FF7D00',
-  Bad: '#F53F3F',
-  Timeout: '#86909C',
-  CalcFailed: '#7A5AF8',
+  Good: 'var(--ok)',
+  Uncertain: 'var(--warn)',
+  Bad: 'var(--danger)',
+  Timeout: 'var(--unknown)',
+  CalcFailed: 'var(--series-alt)',
 });
 
 /** 设备连接状态列定义（分页口径：设备数固定 8 台，不设分页）。 */
@@ -754,13 +763,19 @@ function resetFilters(): void {
  * 后者每秒重算只做一次 `.map()`，前者（字符串比较 + slice）不参与每秒重算。
  */
 const staticRows = computed<readonly PointRecord[]>(() => {
-  const start = (pointPage.value - 1) * POINT_PAGE_SIZE;
-  return filteredPoints.value.slice(start, start + POINT_PAGE_SIZE);
+  const start = (pointPage.value - 1) * pointPageSize.value;
+  return filteredPoints.value.slice(start, start + pointPageSize.value);
 });
 
 /** 换页。 */
 function onPointPage(next: number): void {
   pointPage.value = next;
+}
+
+/** 换每页条数（回到第 1 页，避免停留在越界空页）。 */
+function onPointPageSize(next: number): void {
+  pointPageSize.value = next;
+  pointPage.value = 1;
 }
 
 /** 筛选条件变化时回到第 1 页（避免停留在空页）。 */
@@ -858,18 +873,18 @@ function qualityTagClass(quality: string): string {
   return 'wc-tag--info';
 }
 
-/** sparkline 描边色：质量异常统一转对应语义色以强化信号。 */
+/** sparkline 描边色：质量异常统一转对应语义色以强化信号（token 变量名，模板经 style 下发）。 */
 function sparkColorOf(quality: string): string {
   if (quality === 'Good') {
-    return '#00A870';
+    return 'var(--ok)';
   }
   if (quality === 'Uncertain') {
-    return '#FF7D00';
+    return 'var(--warn)';
   }
   if (quality === 'Bad' || quality === 'Timeout') {
-    return '#F53F3F';
+    return 'var(--danger)';
   }
-  return '#7A5AF8';
+  return 'var(--series-alt)';
 }
 
 /**
@@ -978,7 +993,7 @@ const qualityBars = computed<readonly QualityBar[]>(() => {
   const counts = QUALITY_ORDER.map((key) => ({
     key,
     value: allPoints.filter((p) => (runtimeQuality[p.id] ?? p.quality) === key).length,
-    color: QUALITY_COLOR[key] ?? '#86909C',
+    color: QUALITY_COLOR[key] ?? 'var(--unknown)',
   }));
   const max = Math.max(...counts.map((c) => c.value), 1);
   return counts.map((c) => ({ ...c, height: Math.max(2, (c.value / max) * 44) }));
@@ -1078,6 +1093,14 @@ function go(name: string): void {
   width: 100%;
   height: 160px;
   display: block;
+}
+.mn-bars__label {
+  font-size: 5.4px;
+  fill: var(--text-3);
+}
+.mn-bars__value {
+  font-size: 5.6px;
+  fill: var(--text-1);
 }
 .mn-table tr.is-abnormal > td:first-child {
   border-left: 3px solid var(--warn);
