@@ -177,6 +177,29 @@ fn heartbeat_signature_is_accepted_by_server_keyring() {
     assert_eq!(kid, "k-device-conformance");
 }
 
+/// 激活：daemon 侧 `req_sig`（设备私钥对 `activation_payload_hash`）→ 服务端
+/// `verify_activation_signature`（用请求自带公钥验签）必须验通；异钥伪造 / 篡改哈希必被拒。
+#[test]
+fn activation_signature_is_accepted_by_server_activation_verifier() {
+    let anchors = vec!["h0".to_string(), "h1".to_string(), "h2".to_string()];
+    let device_key = SigningKey::from_bytes(&TEST_ONLY_DEVICE_SEED);
+    let pubkey = B64.encode(device_key.verifying_key().to_bytes());
+    let hash = activation_payload_hash("ACT-CODE", "mid-1", &anchors, &pubkey, "n-1", TS);
+    let req_sig = sign(&device_key, &hash);
+    device_auth::verify_activation_signature(&pubkey, &hash, &req_sig)
+        .expect("server activation verifier must accept daemon req_sig");
+
+    // 异钥伪造（异钥公钥 + 异钥签名自洽，但签名对象是设备语义哈希 → 验签失败）。
+    let rogue = SigningKey::from_bytes(&TEST_ONLY_ROGUE_SEED);
+    let rogue_sig = sign(&rogue, &hash);
+    assert!(device_auth::verify_activation_signature(&pubkey, &hash, &rogue_sig).is_err());
+
+    // 篡改哈希 → 拒绝。
+    let mut tampered = hash;
+    tampered[0] ^= 0xFF;
+    assert!(device_auth::verify_activation_signature(&pubkey, &tampered, &req_sig).is_err());
+}
+
 /// 校验：daemon 侧算 hash + 签名 → 服务端验签返回 kid。
 #[test]
 fn verify_signature_is_accepted_by_server_keyring() {

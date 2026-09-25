@@ -42,6 +42,9 @@
 //! - `cursor` 为空用 `"none"`（而非省略字段）：保持签名字段数量恒定，避免"有无字段"
 //!   导致的域串长度差异掩盖空档攻击。
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::error::{LicenseError, LicenseResult};
@@ -245,11 +248,72 @@ pub fn verify_device_signature(
         .map_err(|e| LicenseError::verify_failed(e.to_string()))
 }
 
+/// 校验 `/activation` 请求签名（`req_sig`）。
+///
+/// # 为什么用「请求自带的公钥」验签
+///
+/// 激活是设备唯一自举端点：服务端此刻尚无该设备的可信公钥记录（心跳 / verify 用
+/// [`KeyRing`]，因为设备已激活过）。故首次校验只能用**请求自带的 `device_pubkey`**
+/// （STANDARD base64 的 Ed25519 32 字节公钥）验证 `req_sig` 对
+/// [`activation_payload_hash`]（业务语义确定性哈希，**非**序列化字节）的签名；
+/// 公钥与库中已钉定值的**一致性**判定在 service 层结合存储完成
+/// （`Store::get_device_pubkey`），本函数只做纯密码学校验与格式白名单。
+///
+/// # Errors
+/// 公钥 / 签名为空白、非 STANDARD base64、字节长度不符（公钥 ≠ 32 / 签名 ≠ 64）、
+/// 公钥不是合法 Ed25519 点、验签不通过 → [`LicenseError::ActivationSignatureInvalid`]
+/// （**绝不**回显输入，防探测）。
+pub fn verify_activation_signature(
+    device_pubkey_b64: &str,
+    payload_hash: &[u8; 32],
+    signature_b64: &str,
+) -> LicenseResult<()> {
+    if device_pubkey_b64.trim().is_empty() {
+        return Err(LicenseError::activation_signature_invalid(
+            "activation device pubkey is empty",
+        ));
+    }
+    let pubkey_bytes = B64.decode(device_pubkey_b64.trim()).map_err(|_| {
+        LicenseError::activation_signature_invalid("activation device pubkey is not valid base64")
+    })?;
+    let pubkey_arr: [u8; 32] = pubkey_bytes.as_slice().try_into().map_err(|_| {
+        LicenseError::activation_signature_invalid(
+            "activation device pubkey must be 32 bytes of ed25519",
+        )
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(&pubkey_arr).map_err(|_| {
+        LicenseError::activation_signature_invalid(
+            "activation device pubkey is not a valid ed25519 point",
+        )
+    })?;
+
+    if signature_b64.trim().is_empty() {
+        return Err(LicenseError::activation_signature_invalid(
+            "activation req_sig is empty",
+        ));
+    }
+    let sig_bytes = B64.decode(signature_b64.trim()).map_err(|_| {
+        LicenseError::activation_signature_invalid("activation req_sig is not valid base64")
+    })?;
+    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+        LicenseError::activation_signature_invalid(
+            "activation req_sig must be 64 bytes of ed25519 signature",
+        )
+    })?;
+    let signature = Signature::from_bytes(&sig_arr);
+    verifying_key
+        .verify(payload_hash, &signature)
+        .map_err(|_| {
+            LicenseError::activation_signature_invalid(
+                "activation req_sig does not verify against the device pubkey",
+            )
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
 
     /// 测试种子（**仅测试，禁止真实部署**）。
@@ -395,5 +459,49 @@ mod tests {
         let secret_like = "!!!not base64!!!";
         let err = verify_device_signature(&ring, &hash, secret_like).unwrap_err();
         assert!(!err.to_string().contains(secret_like));
+    }
+
+    /// `/activation` 请求验签：合法签名验通；异钥 / 篡改哈希 / 畸形公钥 / 畸形签名
+    /// 一律拒绝（`ActivationSignatureInvalid`），且错误信息不回显输入。
+    #[test]
+    fn verify_activation_signature_covers_pass_and_fail_paths() {
+        let key = SigningKey::from_bytes(&TEST_SEED);
+        let pubkey = B64.encode(key.verifying_key().to_bytes());
+        let hash = activation_payload_hash(
+            "ACT-CODE",
+            "mid-1",
+            &["a".to_string()],
+            &pubkey,
+            "n-1",
+            1_700_000_000,
+        );
+        let sig = B64.encode(key.sign(&hash).to_bytes());
+        assert!(verify_activation_signature(&pubkey, &hash, &sig).is_ok());
+
+        // 异钥伪造 → 拒绝。
+        let rogue = SigningKey::from_bytes(&[0x77u8; 32]);
+        let rogue_pubkey = B64.encode(rogue.verifying_key().to_bytes());
+        assert!(verify_activation_signature(&rogue_pubkey, &hash, &sig).is_err());
+        let rogue_sig = B64.encode(rogue.sign(&hash).to_bytes());
+        assert!(verify_activation_signature(&pubkey, &hash, &rogue_sig).is_err());
+
+        // 篡改哈希 → 拒绝。
+        let mut tampered = hash;
+        tampered[0] ^= 0xFF;
+        assert!(verify_activation_signature(&pubkey, &tampered, &sig).is_err());
+
+        // 畸形公钥 / 畸形签名（空、非 base64、长度不符）→ 拒绝且不 panic。
+        for bad_pubkey in ["", "   ", "!!!not b64!!!", &B64.encode([0u8; 31])] {
+            assert!(
+                verify_activation_signature(bad_pubkey, &hash, &sig).is_err(),
+                "malformed pubkey must be rejected: {bad_pubkey}"
+            );
+        }
+        for bad_sig in ["", "   ", "!!!not b64!!!", &B64.encode([0u8; 63])] {
+            assert!(
+                verify_activation_signature(&pubkey, &hash, bad_sig).is_err(),
+                "malformed req_sig must be rejected: {bad_sig}"
+            );
+        }
     }
 }

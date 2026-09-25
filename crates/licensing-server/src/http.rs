@@ -217,6 +217,10 @@ pub fn error_to_code(err: &LicenseError) -> &'static str {
         LicenseError::NonceReplay(_) => proto::codes::NONCE_REPLAY,
         // 字段白名单越界 → FIELD_WHITELIST_VIOLATION（422）。
         LicenseError::FieldWhitelistViolation(_) => proto::codes::FIELD_WHITELIST_VIOLATION,
+        // 激活请求验签失败 → ACTIVATION_SIGNATURE_INVALID（401；2026-09-25 主理人决策）。
+        LicenseError::ActivationSignatureInvalid(_) => proto::codes::ACTIVATION_SIGNATURE_INVALID,
+        // 激活公钥与钉定值不一致 → ACTIVATION_PUBKEY_MISMATCH（403；2026-09-25 主理人决策）。
+        LicenseError::ActivationPubkeyMismatch(_) => proto::codes::ACTIVATION_PUBKEY_MISMATCH,
         // 配额超限 → QUOTA_EXCEEDED（403）。
         LicenseError::QuotaExceeded(_) => proto::codes::QUOTA_EXCEEDED,
         // 存储层异常属内部错误：用未知业务码，让 `http_status` 兜底为 500，
@@ -245,6 +249,8 @@ mod tests {
     const TEST_ONLY_SEED: [u8; 32] = *b"iotdaq-test-seed-http-0000000001";
     /// **TEST_ONLY_** 异钥种子（伪造签名负例）。
     const TEST_ONLY_ROGUE_SEED: [u8; 32] = *b"iotdaq-rogue-seed-http-000000001";
+    /// **TEST_ONLY_** 设备密钥种子（激活请求 `req_sig` 签名；仅测试，禁止真实部署）。
+    const TEST_ONLY_DEVICE_SEED: [u8; 32] = *b"iotdaq-device-seed-http-00000001";
 
     /// 构造带内存库 + 已注册**已知测试密钥**的服务（测试专用）。
     fn build_service() -> SharedService {
@@ -289,9 +295,16 @@ mod tests {
         })
     }
 
-    /// 构造 `POST /activation` 请求体。
+    /// 构造 `POST /activation` 请求体（默认设备密钥，签名合法，nonce 唯一）。
     fn activate_body(code_value: &str, machine: &str) -> serde_json::Value {
-        activate_body_with_anchors(code_value, machine, &["a", "b", "c", "d", "e"])
+        let anchors = ["a", "b", "c", "d", "e"];
+        activate_body_full(
+            code_value,
+            machine,
+            &anchors.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            &TEST_ONLY_DEVICE_SEED,
+            now_unix_secs(),
+        )
     }
 
     /// 构造带**自定义锚点集**的 `POST /activation` 请求体（N-of-M 冲突检测测试用）。
@@ -300,14 +313,39 @@ mod tests {
         machine: &str,
         anchors: &[&str],
     ) -> serde_json::Value {
+        activate_body_full(
+            code_value,
+            machine,
+            &anchors.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            &TEST_ONLY_DEVICE_SEED,
+            now_unix_secs(),
+        )
+    }
+
+    /// 构造 `/activation` 请求体的完整形态：给定设备私钥种子与 `ts`，
+    /// `req_sig` = 设备私钥对 `activation_payload_hash` 的签名（与 daemon 侧
+    /// `auth::client::activate` 的构造逐字段同构），nonce 唯一。
+    fn activate_body_full(
+        code_value: &str,
+        machine: &str,
+        anchors: &[String],
+        seed: &[u8; 32],
+        ts: i64,
+    ) -> serde_json::Value {
+        let key = SigningKey::from_bytes(seed);
+        let pubkey = B64.encode(key.verifying_key().to_bytes());
+        let nonce = now_ns_id("n");
+        let hash = crate::device_auth::activation_payload_hash(
+            code_value, machine, anchors, &pubkey, &nonce, ts,
+        );
         json!({
             "activation_code": code_value,
             "machine_code": machine,
             "anchor_hashes": anchors,
-            "device_pubkey": "x",
-            "nonce": "n1",
-            "ts": now_unix_secs().to_string(),
-            "req_sig": "s"
+            "device_pubkey": pubkey,
+            "nonce": nonce,
+            "ts": ts.to_string(),
+            "req_sig": B64.encode(key.sign(&hash).to_bytes()),
         })
     }
 
@@ -549,6 +587,134 @@ mod tests {
             msg.contains("machine replacement"),
             "消息缺少可操作提示: {msg}"
         );
+    }
+
+    // ---------------- 激活鉴权（验签 / ts 窗口 / nonce 防重放） ----------------
+
+    /// 错签名（格式合法但验不过）→ 401 + `ACTIVATION_SIGNATURE_INVALID`。
+    #[tokio::test]
+    async fn http_activate_forged_signature_returns_401_activation_signature_invalid() {
+        let svc = build_service();
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-act-sig"),
+            &[],
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut body = activate_body(&code, "M1");
+        body["req_sig"] = json!(B64.encode([0u8; 64])); // 格式合法、验签必败
+        let (status, resp) = call_with(&svc, "POST", "/activation", body, &[]).await;
+        assert_eq!(status, StatusCode::from_u16(401).unwrap());
+        assert_eq!(resp["code"], "ACTIVATION_SIGNATURE_INVALID");
+    }
+
+    /// 已钉定公钥不一致（异钥设备同码重激活）→ 403 + `ACTIVATION_PUBKEY_MISMATCH`。
+    #[tokio::test]
+    async fn http_activate_pubkey_mismatch_returns_403_activation_pubkey_mismatch() {
+        let svc = build_service();
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-act-pk"),
+            &[],
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 首激：正常设备密钥 → 200，公钥被钉定。
+        let (s1, _) = call_with(&svc, "POST", "/activation", activate_body(&code, "M1"), &[]).await;
+        assert_eq!(s1, StatusCode::OK);
+
+        // 异钥设备（签名自洽但公钥不同）→ 403 ACTIVATION_PUBKEY_MISMATCH。
+        let anchors = [
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+        ];
+        let body = activate_body_full(
+            &code,
+            "M1",
+            &anchors,
+            &TEST_ONLY_ROGUE_SEED,
+            now_unix_secs(),
+        );
+        let (status, resp) = call_with(&svc, "POST", "/activation", body, &[]).await;
+        assert_eq!(status, StatusCode::from_u16(403).unwrap());
+        assert_eq!(resp["code"], "ACTIVATION_PUBKEY_MISMATCH");
+    }
+
+    /// 过期 ts（±5min 窗外，签名自洽）→ 401 + `TIMESTAMP_SKEW`。
+    #[tokio::test]
+    async fn http_activate_stale_ts_returns_401_timestamp_skew() {
+        let svc = build_service();
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-act-ts"),
+            &[],
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let anchors = [
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+        ];
+        let body = activate_body_full(
+            &code,
+            "M1",
+            &anchors,
+            &TEST_ONLY_DEVICE_SEED,
+            now_unix_secs() - 10_000,
+        );
+        let (status, resp) = call_with(&svc, "POST", "/activation", body, &[]).await;
+        assert_eq!(status, StatusCode::from_u16(401).unwrap());
+        assert_eq!(resp["code"], "TIMESTAMP_SKEW");
+    }
+
+    /// nonce 重放（同一请求体二次提交）→ 409 + `NONCE_REPLAY`。
+    #[tokio::test]
+    async fn http_activate_replayed_nonce_returns_409_nonce_replay() {
+        let svc = build_service();
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-act-replay"),
+            &[],
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let body = activate_body(&code, "M1");
+        let (s1, _) = call_with(&svc, "POST", "/activation", body.clone(), &[]).await;
+        assert_eq!(s1, StatusCode::OK);
+        let (status, resp) = call_with(&svc, "POST", "/activation", body, &[]).await;
+        assert_eq!(status, StatusCode::from_u16(409).unwrap());
+        assert_eq!(resp["code"], "NONCE_REPLAY");
     }
 
     // ---------------- revoke + reissue ----------------

@@ -31,6 +31,10 @@ pub const ERR_LICENSE_NONCE: u16 = 1110;
 pub const ERR_LICENSE_RECEIPT: u16 = 1120;
 /// 授权域错误码：**同码异机**（一机一码冲突检测，`docs/design/machine-fingerprint.md` §7 步骤 ③）。
 pub const ERR_LICENSE_BOUND_OTHER_DEVICE: u16 = 1130;
+/// 授权域错误码：激活请求验签失败（`req_sig` / `device_pubkey`，2026-09-25 主理人决策）。
+pub const ERR_LICENSE_ACTIVATION_SIG: u16 = 1140;
+/// 授权域错误码：激活请求设备公钥与库中钉定公钥不一致（2026-09-25 主理人决策）。
+pub const ERR_LICENSE_ACTIVATION_PUBKEY: u16 = 1150;
 
 /// licensing-server 主错误枚举。
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +138,22 @@ pub enum LicenseError {
     /// 对应业务码 `FIELD_WHITELIST_VIOLATION`（HTTP 422，设计 §1.3 / §1.4）。
     #[error("LicenseError: field whitelist violation: {0}")]
     FieldWhitelistViolation(String),
+
+    /// 激活请求验签失败（`req_sig` 与请求自带 `device_pubkey` 不匹配 / 格式非法）。
+    ///
+    /// 2026-09-25 主理人决策：`/activation` 开启请求验签，wire code
+    /// `ACTIVATION_SIGNATURE_INVALID`（HTTP **401**）。消息**绝不**回显签名 / 公钥原文
+    /// （错误会进日志与响应体，防探测）。
+    #[error("LicenseError: activation signature invalid: {0}")]
+    ActivationSignatureInvalid(String),
+
+    /// 激活请求设备公钥与库中已钉定公钥不一致（设备身份漂移 / 疑似激活码盗用）。
+    ///
+    /// 2026-09-25 主理人决策：设备首次激活成功时 first-write-wins 钉定公钥
+    /// （`device.device_pubkey`）；此后任何激活请求必须携带同一公钥。
+    /// wire code `ACTIVATION_PUBKEY_MISMATCH`（HTTP **403**）。
+    #[error("LicenseError: activation pubkey mismatch: {0}")]
+    ActivationPubkeyMismatch(String),
 }
 
 /// 预绑定冲突的细分种类。
@@ -237,6 +257,16 @@ impl LicenseError {
         LicenseError::FieldWhitelistViolation(message.into())
     }
 
+    /// 构造「激活请求验签失败」错误（HTTP 401，`ACTIVATION_SIGNATURE_INVALID`）。
+    pub fn activation_signature_invalid(message: impl Into<String>) -> Self {
+        LicenseError::ActivationSignatureInvalid(message.into())
+    }
+
+    /// 构造「激活公钥与钉定值不一致」错误（HTTP 403，`ACTIVATION_PUBKEY_MISMATCH`）。
+    pub fn activation_pubkey_mismatch(message: impl Into<String>) -> Self {
+        LicenseError::ActivationPubkeyMismatch(message.into())
+    }
+
     /// 错误码（u16，非零）。
     pub fn error_code(&self) -> u16 {
         match self {
@@ -254,6 +284,8 @@ impl LicenseError {
             LicenseError::TimestampSkew(_) => ERR_LICENSE_SKEW,
             LicenseError::NonceReplay(_) => ERR_LICENSE_NONCE,
             LicenseError::FieldWhitelistViolation(_) => ERR_LICENSE_RECEIPT,
+            LicenseError::ActivationSignatureInvalid(_) => ERR_LICENSE_ACTIVATION_SIG,
+            LicenseError::ActivationPubkeyMismatch(_) => ERR_LICENSE_ACTIVATION_PUBKEY,
         }
     }
 }
@@ -326,6 +358,14 @@ mod tests {
             (
                 LicenseError::code_bound_to_other_device(),
                 ERR_LICENSE_BOUND_OTHER_DEVICE,
+            ),
+            (
+                LicenseError::activation_signature_invalid("bad sig"),
+                ERR_LICENSE_ACTIVATION_SIG,
+            ),
+            (
+                LicenseError::activation_pubkey_mismatch("pubkey drift"),
+                ERR_LICENSE_ACTIVATION_PUBKEY,
             ),
         ];
         let mut seen = std::collections::HashSet::new();

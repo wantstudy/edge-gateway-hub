@@ -35,11 +35,21 @@ use crate::model::{
 ///
 /// 只对**已建库后**新增的列登记；`migrate` 会先查 `PRAGMA table_info`，缺列才执行 DDL，
 /// 因此对全新库（列已在 `CREATE TABLE` 中）与旧库都幂等。
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[(
-    "activation_code",
-    "prebind_machine_code",
-    "ALTER TABLE activation_code ADD COLUMN prebind_machine_code TEXT",
-)];
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "activation_code",
+        "prebind_machine_code",
+        "ALTER TABLE activation_code ADD COLUMN prebind_machine_code TEXT",
+    ),
+    (
+        // 2026-09-25 主理人决策：/activation 开启请求验签后，设备首次激活成功时把请求
+        // 自带公钥 first-write-wins 钉定到本列；此后激活请求公钥必须一致（可空 = 未钉定，
+        // 兼容历史设备，由下一次激活成功路径补钉定）。
+        "device",
+        "device_pubkey",
+        "ALTER TABLE device ADD COLUMN device_pubkey TEXT",
+    ),
+];
 
 /// 判断表中是否已存在某列（基于 `PRAGMA table_info`，不受 SQLite 版本差异影响）。
 fn column_exists(conn: &Connection, table: &str, column: &str) -> LicenseResult<bool> {
@@ -107,7 +117,8 @@ const SCHEMA: &[&str] = &[
         host_anchor_ref     TEXT,
         first_activation_at INTEGER,
         status              TEXT NOT NULL,
-        created_at          INTEGER NOT NULL
+        created_at          INTEGER NOT NULL,
+        device_pubkey       TEXT
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_device_tenant ON device(tenant_id)"#,
     r#"CREATE TABLE IF NOT EXISTS activation_code (
@@ -742,6 +753,43 @@ impl Store {
             params![device_id, status.as_str()],
         )?;
         Ok(())
+    }
+
+    /// 读取设备已钉定的激活公钥（2026-09-25 主理人决策）。
+    ///
+    /// 首次激活成功时由 [`Store::pin_device_pubkey_if_absent`] first-write-wins 写入；
+    /// 未钉定（历史设备 / 未激活）返回 `None`。
+    pub fn get_device_pubkey(&self, device_id: &str) -> LicenseResult<Option<String>> {
+        let conn = self.conn.lock();
+        // 显式匹配 `QueryReturnedNoRows`：设备不存在与「列值为 NULL（未钉定）」
+        // 都归一为 `None`（列类型可空，`row.get::<_, Option<String>>` 承接 NULL）。
+        match conn.query_row(
+            "SELECT device_pubkey FROM device WHERE device_id = ?1",
+            params![device_id],
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            Ok(pubkey) => Ok(pubkey),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 首写钉定设备激活公钥（2026-09-25 主理人决策）。
+    ///
+    /// `UPDATE ... WHERE device_pubkey IS NULL` 单语句仲裁（与防重放同一纪律：
+    /// **绝不做「先 SELECT 再 UPDATE」**），返回是否本次发生了写入；已钉定则不覆盖。
+    pub fn pin_device_pubkey_if_absent(
+        &self,
+        device_id: &str,
+        pubkey: &str,
+    ) -> LicenseResult<bool> {
+        let conn = self.conn.lock();
+        let affected = conn.execute(
+            "UPDATE device SET device_pubkey = ?1
+              WHERE device_id = ?2 AND device_pubkey IS NULL",
+            params![pubkey, device_id],
+        )?;
+        Ok(affected == 1)
     }
 
     // ================= activation_code =================
@@ -2552,6 +2600,46 @@ mod tests {
         assert!(store.get_nonce("n-old").expect("get").is_none());
         assert!(store.get_nonce("n-new").expect("get").is_some());
         assert_eq!(store.purge_expired_nonces(2_000).expect("again"), 0);
+    }
+
+    #[test]
+    fn device_pubkey_pin_is_first_write_wins() {
+        let (store, _) = fixture();
+        store
+            .insert_device(&sample_device("dev-1", "mc-1", DeviceStatus::Active))
+            .expect("device");
+
+        // 未钉定 → None。
+        assert_eq!(store.get_device_pubkey("dev-1").expect("get"), None);
+
+        // 首写钉定成功；再次钉定不覆盖。
+        assert!(
+            store
+                .pin_device_pubkey_if_absent("dev-1", "pk-A")
+                .expect("pin"),
+            "首次钉定必须返回 true"
+        );
+        assert_eq!(
+            store.get_device_pubkey("dev-1").expect("get").as_deref(),
+            Some("pk-A")
+        );
+        assert!(
+            !store
+                .pin_device_pubkey_if_absent("dev-1", "pk-B")
+                .expect("pin again"),
+            "重复钉定必须返回 false（first-write-wins）"
+        );
+        assert_eq!(
+            store.get_device_pubkey("dev-1").expect("get").as_deref(),
+            Some("pk-A"),
+            "已钉定公钥不得被覆盖"
+        );
+
+        // 不存在的设备 → 钉定无效果（affected == 0），读取为 None。
+        assert!(!store
+            .pin_device_pubkey_if_absent("dev-missing", "pk-X")
+            .expect("pin missing"));
+        assert_eq!(store.get_device_pubkey("dev-missing").expect("get"), None);
     }
 
     #[test]

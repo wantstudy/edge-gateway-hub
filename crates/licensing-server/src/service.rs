@@ -50,6 +50,9 @@ const HEARTBEAT_HOURS: i64 = 24;
 /// 心跳周期（秒）。
 const HEARTBEAT_SECS: i64 = HEARTBEAT_HOURS * 3_600;
 
+/// 激活 nonce 最大长度（daemon 侧为 uuid simple：32 hex；2026-09-25 主理人决策）。
+const MAX_NONCE_LEN: usize = 128;
+
 /// 时钟偏移窗口（±5min，设计 §0 / §1.2 / §1.3）。
 pub const CLOCK_SKEW_SECS: i64 = 300;
 
@@ -198,15 +201,35 @@ impl LicensingService {
     ///
     /// # 行为次序（对齐 `docs/design/machine-fingerprint.md` §7 与 `licensing-api.md` §1.1）
     ///
+    /// 0. **请求鉴权（2026-09-25 主理人决策，先于任何 DB 读取 / §7 判定 / 幂等短路 /
+    ///    状态变更，拒绝路径零 DB 写入）**：
+    ///    - `ts` 解析（非整数秒 → [`LicenseError::TimestampSkew`]）；
+    ///    - nonce 字段白名单（空白 / 超长 → [`LicenseError::FieldWhitelistViolation`]）；
+    ///    - **验签**：用请求自带设备公钥验证 `req_sig`
+    ///      （[`device_auth::verify_activation_signature`]，对业务语义确定性哈希签名，
+    ///      非 Protobuf / JSON 序列化字节）→ [`LicenseError::ActivationSignatureInvalid`]；
+    ///    - **±5min 时间窗**（与 A 档 `/verify` 一致，设计 §1.1）→
+    ///      [`LicenseError::TimestampSkew`]；
     /// 1. **取码 + 状态守卫（④）**：`revoked` / `reissued` 一律拒绝；
     /// 2. **有效期窗口**：`code.is_valid_at(now)` 不满足 → 拒绝；
     /// 3. **码已绑定（`status = bound`）** → [`Self::activate_against_binding`] 执行 §7 ①②③：
+    ///    - ⓪ 请求公钥与设备**已钉定公钥**一致性（不一致 →
+    ///      [`LicenseError::ActivationPubkeyMismatch`]，403）；
     ///    - ① `machine_code` 一致 → 同机（幂等恢复 / 重签租约）；
     ///    - ② 不一致但锚点命中 ≥4/5 → 同机（重装 / 漂移）→ 自动改绑 + 重签；
     ///    - ③ 命中 ≤3/5 → **异机** → [`LicenseError::CodeBoundToOtherDevice`]（403），无副作用。
     /// 4. **码未绑定（`issued`）**：
     ///    - **G1 预绑定匹配**（`None` = 任意机器）→ 不匹配 [`PrebindKind::ActivationMachineMismatch`]；
-    ///    - 解析 / 创建设备 → **原子绑定**（`bind_code_to_device`）→ 签发 Lease Token。
+    ///    - 解析 / 创建设备 → 公钥一致性 → **nonce 防重放认领**（全局 `nonce_cache`，
+    ///      TTL = 2×时钟窗；同 nonce 重放 → [`LicenseError::NonceReplay`]）→
+    ///    - **原子绑定**（`bind_code_to_device`）→ 钉定公钥 → 签发 Lease Token。
+    ///
+    /// # nonce / 公钥的副作用窗口（显式记录）
+    /// nonce 认领与公钥钉定只发生在**成功路径**（该路径的全部拒绝判定均已通过），
+    /// 紧邻首个状态变更之前；因此所有拒绝路径（未知码 / 状态守卫 / 预绑定 / §7③ /
+    /// 公钥不一致）对 `nonce_cache`、`audit_log`、`activation_code`、`lease` 均**零写入**。
+    /// 唯一例外是首激路径上 `resolve_or_create_device` 的设备行创建：它幂等且以
+    /// `machine_code` 唯一约束仲裁，重放方只会复用既有设备行，不产生孤儿状态。
     ///
     /// # 顺序说明（相对既有守卫的**唯一**调整）
     /// 预绑定校验从「取码后立即判定」**下沉到未绑定分支**：预绑定只约束「谁可**首次**
@@ -216,6 +239,31 @@ impl LicensingService {
     /// `t46_prebind_mismatch_still_rejected_as_activation_machine_mismatch`）。
     pub fn activate(&self, req: &ActivationRequest) -> LicenseResult<ActivationResponse> {
         let now = now_unix_secs();
+
+        // ============ 0) 请求鉴权（2026-09-25 主理人决策） ============
+        // 0a) ts 解析（JSON 路径 String → i64，大整数红线）。
+        let ts = Self::parse_ts(&req.ts)
+            .map_err(|_| LicenseError::timestamp_skew("activation ts must be integer seconds"))?;
+        // 0b) nonce 字段白名单（空白判空统一 trim；req_sig / device_pubkey 的格式校验
+        //     在验签内统一做，避免两处规则漂移）。
+        Self::validate_activation_nonce(&req.nonce)?;
+        // 0c) **验签**：用请求自带设备公钥验证 req_sig（签名对象为业务语义确定性哈希，
+        //     与心跳 / verify / 回执同一纪律——绝不签 Protobuf / JSON 序列化字节）。
+        let payload_hash = device_auth::activation_payload_hash(
+            req.activation_code.trim(),
+            &req.machine_code,
+            &req.anchor_hashes,
+            &req.device_pubkey,
+            &req.nonce,
+            ts,
+        );
+        device_auth::verify_activation_signature(&req.device_pubkey, &payload_hash, &req.req_sig)?;
+        // 0d) ±5min 时间窗（与 A 档 /verify 一致，设计 §1.1「401 TIMESTAMP_SKEW（±5min 外）」）。
+        if (now - ts).abs() > CLOCK_SKEW_SECS {
+            return Err(LicenseError::timestamp_skew(format!(
+                "activation ts {ts} outside ±{CLOCK_SKEW_SECS}s of server {now}"
+            )));
+        }
 
         let code_value = req.activation_code.trim();
         let code = self
@@ -268,6 +316,15 @@ impl LicensingService {
         let machine_code = req.machine_code.clone();
         let device =
             self.resolve_or_create_device(&tenant_id, &machine_code, &req.anchor_hashes, now)?;
+
+        // 公钥一致性：该机器已有设备记录（其他码激活过 / 并发首激）→ 请求公钥必须与
+        // 钉定值一致（纯读，无副作用）。
+        self.check_pinned_pubkey(&device, &req.device_pubkey)?;
+        // nonce 防重放认领（全局表；同 nonce → NonceReplay）——先于绑定（首个状态变更）。
+        self.claim_activation_nonce(req, &device.device_id, now)?;
+        // 钉定设备激活公钥（first-write-wins；幂等）。
+        self.store
+            .pin_device_pubkey_if_absent(&device.device_id, &req.device_pubkey)?;
 
         // 原子绑定：单条条件 UPDATE + rows_affected 判定，防并发双绑。
         self.store
@@ -859,6 +916,62 @@ impl LicensingService {
             .map_err(|_| LicenseError::KeyStateIllegal(format!("invalid timestamp: {value}")))
     }
 
+    /// nonce 字段白名单：非空白、长度 ≤ [`MAX_NONCE_LEN`]（daemon 侧为 uuid simple
+    /// 32 hex；上限留 4 倍余量，防超长串写库 / 撑爆 nonce_cache，2026-09-25 主理人决策）。
+    fn validate_activation_nonce(nonce: &str) -> LicenseResult<()> {
+        if nonce.trim().is_empty() {
+            return Err(LicenseError::field_whitelist_violation(
+                "activation nonce must not be empty",
+            ));
+        }
+        if nonce.len() > MAX_NONCE_LEN {
+            return Err(LicenseError::field_whitelist_violation(
+                "activation nonce exceeds the 128-byte limit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 校验请求设备公钥与库中**已钉定**公钥一致（只读，无副作用）。
+    ///
+    /// 「钉定」语义（2026-09-25 主理人决策）：设备首次激活成功时把请求公钥
+    /// first-write-wins 写入 `device.device_pubkey`（历史设备列为 NULL，不阻断，
+    /// 由成功路径补钉定）；此后任何激活请求（同码重激活 / 漂移改绑 / 换码同机）
+    /// 必须携带同一公钥，不一致 → [`LicenseError::ActivationPubkeyMismatch`]（403）。
+    fn check_pinned_pubkey(&self, device: &Device, req_pubkey: &str) -> LicenseResult<()> {
+        if let Some(pinned) = self.store.get_device_pubkey(&device.device_id)? {
+            if pinned != req_pubkey {
+                return Err(LicenseError::activation_pubkey_mismatch(
+                    "activation device pubkey does not match the pinned pubkey of this device",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 认领激活 nonce（全局防重放仲裁；同 nonce 二次提交 → [`LicenseError::NonceReplay`]）。
+    ///
+    /// - TTL 与心跳 / verify 一致（[`NONCE_TTL_SECS`] = 2×时钟窗，窗口内 nonce 不可复用）；
+    /// - 认领前顺带清理过期 nonce（`idx_nonce_expires` 索引，代价可控；
+    ///   参照库内既有清理写法 `Store::purge_expired_nonces`）；
+    /// - daemon 侧重试语义：激活失败重试会换新 nonce / ts，故同请求不做幂等保留；
+    /// - **仅在成功路径调用**（全部拒绝判定之后、首个状态变更之前），拒绝路径零写入。
+    fn claim_activation_nonce(
+        &self,
+        req: &ActivationRequest,
+        device_id: &str,
+        now: i64,
+    ) -> LicenseResult<()> {
+        self.store.purge_expired_nonces(now)?;
+        if !self
+            .store
+            .insert_nonce_if_absent(&req.nonce, device_id, now + NONCE_TTL_SECS)?
+        {
+            return Err(LicenseError::nonce_replay("activation nonce already used"));
+        }
+        Ok(())
+    }
+
     /// 解析心跳 `receipt_cursor` 的序号区间（String → `i64`）。
     ///
     /// 畸形（非整数）→ [`LicenseError::FieldWhitelistViolation`]（字段不合规，HTTP 422）。
@@ -1013,6 +1126,9 @@ impl LicensingService {
             ))
         })?;
 
+        // ⓪ 公钥钉定一致性（先于 §7 分支；纯读，无副作用；2026-09-25 主理人决策）。
+        self.check_pinned_pubkey(&device, &req.device_pubkey)?;
+
         // ① 上报 machine_code 与绑定记录一致 → 同机（幂等恢复 / 重签租约）。
         if req.machine_code == device.machine_code {
             return self.activate_same_machine(code, &device, req, now);
@@ -1051,6 +1167,12 @@ impl LicensingService {
         req: &ActivationRequest,
         now: i64,
     ) -> LicenseResult<ActivationResponse> {
+        // nonce 防重放 + 公钥钉定：幂等返回路径同样要求**新 nonce**（重放一律拒绝；
+        // daemon 重试会换新 nonce / ts，同请求不做幂等保留，2026-09-25 主理人决策）。
+        self.claim_activation_nonce(req, &device.device_id, now)?;
+        self.store
+            .pin_device_pubkey_if_absent(&device.device_id, &req.device_pubkey)?;
+
         if let Some(lease) = self.find_usable_lease(&device.device_id, &code.code_id, now)? {
             // 幂等：返回现存有效租约（同码同机重复激活，如凭证丢失重装）。
             let claims = Self::lease_claims(&lease, &device.machine_code);
@@ -1112,6 +1234,11 @@ impl LicensingService {
         now: i64,
     ) -> LicenseResult<ActivationResponse> {
         let new_machine_code = req.machine_code.clone();
+
+        // nonce 防重放 + 公钥钉定（改绑事务之前认领；重放 → NonceReplay，零状态变更）。
+        self.claim_activation_nonce(req, &device.device_id, now)?;
+        self.store
+            .pin_device_pubkey_if_absent(&device.device_id, &req.device_pubkey)?;
 
         let lease_id = now_ns_id("lease");
         let claims = LeaseClaims {
@@ -1314,6 +1441,14 @@ mod tests {
     const TEST_ONLY_SEED: [u8; 32] = *b"iotdaq-test-seed-service-0000001";
     /// **TEST_ONLY_** 独立异钥种子（用于「伪造签名必被拒」的负例）。
     const TEST_ONLY_ROGUE_SEED: [u8; 32] = *b"iotdaq-rogue-seed-service-000001";
+    /// **TEST_ONLY_** 设备密钥种子（激活请求 `req_sig` 的签名密钥；仅测试，禁止真实部署）。
+    const TEST_ONLY_DEVICE_SEED: [u8; 32] = *b"iotdaq-device-seed-service-00001";
+
+    /// 设备公钥（STANDARD base64，32 字节 Ed25519），由给定种子导出。
+    fn device_pubkey_b64(seed: &[u8; 32]) -> String {
+        let key = SigningKey::from_bytes(seed);
+        B64.encode(key.verifying_key().to_bytes())
+    }
 
     /// 构造带内存库 + 已知测试密钥的服务（测试专用）。
     ///
@@ -1380,33 +1515,55 @@ mod tests {
         }
     }
 
+    /// 构造一个**签名合法、nonce 全局唯一**的激活请求（默认设备密钥）。
     fn activate_req(code_value: &str, machine: &str) -> ActivationRequest {
-        ActivationRequest {
-            activation_code: code_value.to_string(),
-            machine_code: machine.to_string(),
-            anchor_hashes: vec!["a".to_string(); 5],
-            device_pubkey: "x".to_string(),
-            nonce: "n1".to_string(),
-            ts: now_unix_secs().to_string(),
-            req_sig: "s".to_string(),
-        }
+        let anchors: Vec<String> = vec!["a".to_string(); 5];
+        build_activation_req(code_value, machine, &anchors, &TEST_ONLY_DEVICE_SEED)
     }
 
-    /// 构造带**自定义锚点集**的激活请求（N-of-M 冲突检测测试用）。
+    /// 构造带**自定义锚点集**的激活请求（N-of-M 冲突检测测试用；默认设备密钥）。
     fn activate_req_with_anchors(
         code_value: &str,
         machine: &str,
         anchors: &[&str],
     ) -> ActivationRequest {
+        let owned: Vec<String> = anchors.iter().map(|s| (*s).to_string()).collect();
+        build_activation_req(code_value, machine, &owned, &TEST_ONLY_DEVICE_SEED)
+    }
+
+    /// 构造激活请求（给定设备密钥种子）：`req_sig` = 设备私钥对
+    /// `activation_payload_hash`（规范化语义哈希）的签名；nonce 取 `now_ns_id`（唯一）；
+    /// ts 取当前时钟。与 daemon 侧 `auth::client::activate` 的构造逐字段同构。
+    fn build_activation_req(
+        code_value: &str,
+        machine: &str,
+        anchors: &[String],
+        seed: &[u8; 32],
+    ) -> ActivationRequest {
+        let ts = now_unix_secs();
+        let key = SigningKey::from_bytes(seed);
+        let pubkey = B64.encode(key.verifying_key().to_bytes());
+        let nonce = now_ns_id("n");
+        let hash = crate::device_auth::activation_payload_hash(
+            code_value, machine, anchors, &pubkey, &nonce, ts,
+        );
         ActivationRequest {
             activation_code: code_value.to_string(),
             machine_code: machine.to_string(),
-            anchor_hashes: anchors.iter().map(|s| (*s).to_string()).collect(),
-            device_pubkey: "x".to_string(),
-            nonce: "n1".to_string(),
-            ts: now_unix_secs().to_string(),
-            req_sig: "s".to_string(),
+            anchor_hashes: anchors.to_vec(),
+            device_pubkey: pubkey,
+            nonce,
+            ts: ts.to_string(),
+            req_sig: B64.encode(key.sign(&hash).to_bytes()),
         }
+    }
+
+    /// 统计审计日志条数（副作用断言用）。
+    fn count_audit(svc: &LicensingService) -> usize {
+        svc.store()
+            .list_audit_logs(&AuditFilter::default(), 1, 1000)
+            .unwrap()
+            .len()
     }
 
     /// 按机器码取设备（断言必须存在）。
@@ -2526,5 +2683,345 @@ mod tests {
         let v = receipt_value("MID-0001", "lease-missing", 1, 10, "d", &sign_hash);
         let err = svc.audit_receipt(&v).unwrap_err();
         assert!(matches!(err, LicenseError::LeaseNotFound(_)), "{err:?}");
+    }
+
+    // ================= 激活鉴权（验签 / ts 窗口 / nonce 防重放） =================
+
+    /// 正例：合法 `req_sig` + 合法 nonce/ts → 激活成功；nonce 落防重放表、公钥被钉定。
+    #[test]
+    fn t_act_valid_request_activates_and_pins_pubkey_and_nonce() {
+        let svc = build_service();
+        let resp = svc.issue_codes(&issue_req("t-1", None, "act-ok")).unwrap();
+        let code = &resp.codes[0];
+        let req = activate_req(&code.code, "MID-A");
+        let act = svc.activate(&req).expect("activation must succeed");
+        assert!(!act.lease_token.is_empty());
+
+        // nonce 已入全局防重放表。
+        assert!(svc.store().get_nonce(&req.nonce).unwrap().is_some());
+        // 设备公钥已钉定。
+        let dev = device_of(&svc, "MID-A");
+        assert_eq!(
+            svc.store()
+                .get_device_pubkey(&dev.device_id)
+                .unwrap()
+                .as_deref(),
+            Some(req.device_pubkey.as_str())
+        );
+    }
+
+    /// 错签名（异钥伪造）→ `ActivationSignatureInvalid`（401），且**零副作用**：
+    /// 无设备、码未绑定、无审计、nonce 未入表。
+    #[test]
+    fn t_act_forged_signature_rejected_without_side_effects() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "act-forge"))
+            .unwrap();
+        let code = &resp.codes[0];
+
+        let ts = now_unix_secs();
+        let anchors: Vec<String> = vec!["a".to_string(); 5];
+        let nonce = now_ns_id("n");
+        let hash = crate::device_auth::activation_payload_hash(
+            &code.code,
+            "MID-A",
+            &anchors,
+            &device_pubkey_b64(&TEST_ONLY_DEVICE_SEED),
+            &nonce,
+            ts,
+        );
+        let req = ActivationRequest {
+            activation_code: code.code.clone(),
+            machine_code: "MID-A".to_string(),
+            anchor_hashes: anchors,
+            device_pubkey: device_pubkey_b64(&TEST_ONLY_DEVICE_SEED),
+            nonce,
+            ts: ts.to_string(),
+            // 异钥（rogue）签名：公钥声明为真设备，签名却是另一把私钥 → 必须验签失败。
+            req_sig: sign_hash_rogue(&hash),
+        };
+        // 审计基线：issue_codes 自身会写一条 issue 审计，拒绝路径不得再新增。
+        let audit_before = count_audit(&svc);
+        let err = svc.activate(&req).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::ActivationSignatureInvalid(_)),
+            "{err:?}"
+        );
+        assert_eq!(err.error_code(), crate::error::ERR_LICENSE_ACTIVATION_SIG);
+
+        // 零副作用断言。
+        assert_eq!(svc.store().count_devices(None).unwrap(), 0, "不得产生设备");
+        let stored = svc.store().get_code_by_value(&code.code).unwrap().unwrap();
+        assert_eq!(stored.status, CodeStatus::Issued, "码不得被绑定");
+        assert!(stored.bound_device_id.is_none());
+        assert!(svc.store().get_nonce(&req.nonce).unwrap().is_none());
+        assert_eq!(count_audit(&svc), audit_before, "拒绝路径不得写审计");
+    }
+
+    /// 已钉定公钥不一致（异钥设备同码重激活）→ `ActivationPubkeyMismatch`（403），零副作用。
+    #[test]
+    fn t_act_pubkey_mismatch_on_pinned_device_rejected_without_side_effects() {
+        let svc = build_service();
+        let resp = svc.issue_codes(&issue_req("t-1", None, "act-pk")).unwrap();
+        let code = &resp.codes[0];
+        let first = svc
+            .activate(&activate_req(&code.code, "MID-A"))
+            .expect("first activation ok");
+
+        // 异钥设备：签名自洽（rogue 私钥签 rogue 公钥），但公钥 ≠ 钉定值。
+        let rogue_req = build_activation_req(
+            &code.code,
+            "MID-A",
+            &vec!["a".to_string(); 5],
+            &TEST_ONLY_ROGUE_SEED,
+        );
+        let dev = device_of(&svc, "MID-A");
+        let audit_before = count_audit(&svc);
+        let leases_before = svc
+            .store()
+            .list_leases_by_device(&dev.device_id)
+            .unwrap()
+            .len();
+
+        let err = svc.activate(&rogue_req).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::ActivationPubkeyMismatch(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.error_code(),
+            crate::error::ERR_LICENSE_ACTIVATION_PUBKEY
+        );
+
+        // 零副作用：审计 / 租约 / 绑定均无新行，原租约仍有效。
+        assert_eq!(count_audit(&svc), audit_before, "拒绝路径不得写审计");
+        assert_eq!(
+            svc.store()
+                .list_leases_by_device(&dev.device_id)
+                .unwrap()
+                .len(),
+            leases_before
+        );
+        assert_eq!(
+            svc.store()
+                .get_lease(&first.lease_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            LeaseStatus::Active,
+            "不得停既有租约"
+        );
+        assert!(svc.store().get_nonce(&rogue_req.nonce).unwrap().is_none());
+    }
+
+    /// 过期 ts / 未来 ts（±5min 窗外，签名自洽）→ `TimestampSkew`，零副作用。
+    #[test]
+    fn t_act_stale_and_future_ts_rejected_without_side_effects() {
+        let svc = build_service();
+        let resp = svc.issue_codes(&issue_req("t-1", None, "act-ts")).unwrap();
+        let code = &resp.codes[0];
+        let count_audit_before = count_audit(&svc);
+
+        for offset in [-10_000i64, 10_000] {
+            let ts = now_unix_secs() + offset;
+            let anchors: Vec<String> = vec!["a".to_string(); 5];
+            let key = SigningKey::from_bytes(&TEST_ONLY_DEVICE_SEED);
+            let pubkey = B64.encode(key.verifying_key().to_bytes());
+            let nonce = now_ns_id("n");
+            let hash = crate::device_auth::activation_payload_hash(
+                &code.code, "MID-A", &anchors, &pubkey, &nonce, ts,
+            );
+            let req = ActivationRequest {
+                activation_code: code.code.clone(),
+                machine_code: "MID-A".to_string(),
+                anchor_hashes: anchors,
+                device_pubkey: pubkey,
+                nonce,
+                ts: ts.to_string(),
+                req_sig: B64.encode(key.sign(&hash).to_bytes()),
+            };
+            let err = svc.activate(&req).unwrap_err();
+            assert!(matches!(err, LicenseError::TimestampSkew(_)), "{err:?}");
+            assert!(svc.store().get_nonce(&req.nonce).unwrap().is_none());
+        }
+        assert_eq!(svc.store().count_devices(None).unwrap(), 0);
+        assert_eq!(
+            count_audit(&svc),
+            count_audit_before,
+            "拒绝路径不得新增审计"
+        );
+    }
+
+    /// nonce 重放（同 nonce 二次提交）→ `NonceReplay`（409），零副作用。
+    #[test]
+    fn t_act_nonce_replay_rejected_without_side_effects() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "act-replay"))
+            .unwrap();
+        let code = &resp.codes[0];
+
+        let mk = |nonce: &str| {
+            let ts = now_unix_secs();
+            let anchors: Vec<String> = vec!["a".to_string(); 5];
+            let key = SigningKey::from_bytes(&TEST_ONLY_DEVICE_SEED);
+            let pubkey = B64.encode(key.verifying_key().to_bytes());
+            let hash = crate::device_auth::activation_payload_hash(
+                &code.code, "MID-A", &anchors, &pubkey, nonce, ts,
+            );
+            ActivationRequest {
+                activation_code: code.code.clone(),
+                machine_code: "MID-A".to_string(),
+                anchor_hashes: anchors,
+                device_pubkey: pubkey,
+                nonce: nonce.to_string(),
+                ts: ts.to_string(),
+                req_sig: B64.encode(key.sign(&hash).to_bytes()),
+            }
+        };
+
+        let first = mk("n-replay-1");
+        svc.activate(&first).expect("first activation ok");
+        let dev = device_of(&svc, "MID-A");
+        let leases_before = svc
+            .store()
+            .list_leases_by_device(&dev.device_id)
+            .unwrap()
+            .len();
+        let audit_before = count_audit(&svc);
+
+        let err = svc.activate(&mk("n-replay-1")).unwrap_err();
+        assert!(matches!(err, LicenseError::NonceReplay(_)), "{err:?}");
+
+        // 零副作用：幂等返回路径也不得因重放追加租约 / 审计。
+        assert_eq!(
+            svc.store()
+                .list_leases_by_device(&dev.device_id)
+                .unwrap()
+                .len(),
+            leases_before
+        );
+        assert_eq!(count_audit(&svc), audit_before);
+    }
+
+    /// nonce 是**全局**防重放：另一张码复用已用 nonce → 同样 `NonceReplay`。
+    #[test]
+    fn t_act_nonce_is_global_across_codes() {
+        let svc = build_service();
+        let r1 = svc.issue_codes(&issue_req("t-1", None, "act-g1")).unwrap();
+        let r2 = svc.issue_codes(&issue_req("t-1", None, "act-g2")).unwrap();
+
+        let mk = |code_value: &str, nonce: &str| {
+            let ts = now_unix_secs();
+            let anchors: Vec<String> = vec!["a".to_string(); 5];
+            let key = SigningKey::from_bytes(&TEST_ONLY_DEVICE_SEED);
+            let pubkey = B64.encode(key.verifying_key().to_bytes());
+            let hash = crate::device_auth::activation_payload_hash(
+                code_value, "MID-A", &anchors, &pubkey, nonce, ts,
+            );
+            ActivationRequest {
+                activation_code: code_value.to_string(),
+                machine_code: "MID-A".to_string(),
+                anchor_hashes: anchors,
+                device_pubkey: pubkey,
+                nonce: nonce.to_string(),
+                ts: ts.to_string(),
+                req_sig: B64.encode(key.sign(&hash).to_bytes()),
+            }
+        };
+
+        svc.activate(&mk(&r1.codes[0].code, "n-global-1"))
+            .expect("first activation ok");
+        let err = svc
+            .activate(&mk(&r2.codes[0].code, "n-global-1"))
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::NonceReplay(_)), "{err:?}");
+
+        // 第二张码仍未绑定。
+        let stored = svc
+            .store()
+            .get_code_by_value(&r2.codes[0].code)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, CodeStatus::Issued);
+    }
+
+    /// 字段格式非法：空 / 超长 nonce，空 / 非 base64 / 错长 sig，畸形公钥 → 拒绝且零副作用。
+    #[test]
+    fn t_act_malformed_fields_rejected_without_side_effects() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", None, "act-malformed"))
+            .unwrap();
+        let code = &resp.codes[0];
+
+        let ts = now_unix_secs();
+        let pubkey = device_pubkey_b64(&TEST_ONLY_DEVICE_SEED);
+        let anchors: Vec<String> = vec!["a".to_string(); 5];
+        let audit_before = count_audit(&svc);
+        let mk = |nonce: String, sig: String, pk: String| ActivationRequest {
+            activation_code: code.code.clone(),
+            machine_code: "MID-A".to_string(),
+            anchor_hashes: anchors.clone(),
+            device_pubkey: pk,
+            nonce,
+            ts: ts.to_string(),
+            req_sig: sig,
+        };
+
+        // 空 / 全空白 nonce → FieldWhitelistViolation。
+        let err = svc
+            .activate(&mk("   ".to_string(), "x".to_string(), pubkey.clone()))
+            .unwrap_err();
+        assert!(
+            matches!(err, LicenseError::FieldWhitelistViolation(_)),
+            "{err:?}"
+        );
+        // 超长 nonce（>128 字节）→ FieldWhitelistViolation。
+        let err = svc
+            .activate(&mk("n".repeat(129), "x".to_string(), pubkey.clone()))
+            .unwrap_err();
+        assert!(
+            matches!(err, LicenseError::FieldWhitelistViolation(_)),
+            "{err:?}"
+        );
+        // 空 sig / 非 base64 sig / 长度非 64 sig → ActivationSignatureInvalid。
+        for bad_sig in [
+            String::new(),
+            "   ".to_string(),
+            "!!!not b64!!!".to_string(),
+            B64.encode([0u8; 63]),
+            B64.encode([0u8; 65]),
+        ] {
+            let err = svc
+                .activate(&mk(now_ns_id("n"), bad_sig, pubkey.clone()))
+                .unwrap_err();
+            assert!(
+                matches!(err, LicenseError::ActivationSignatureInvalid(_)),
+                "malformed sig must be rejected: {err:?}"
+            );
+        }
+        // 畸形公钥（非 base64 / 长度非 32）→ ActivationSignatureInvalid。
+        for bad_pk in [
+            "not-b64".to_string(),
+            B64.encode([0u8; 31]),
+            B64.encode([0u8; 33]),
+        ] {
+            let err = svc
+                .activate(&mk(now_ns_id("n"), "x".to_string(), bad_pk))
+                .unwrap_err();
+            assert!(
+                matches!(err, LicenseError::ActivationSignatureInvalid(_)),
+                "malformed pubkey must be rejected: {err:?}"
+            );
+        }
+
+        // 零副作用：无设备、码未绑定、无审计新增、无 nonce 行。
+        assert_eq!(svc.store().count_devices(None).unwrap(), 0);
+        assert_eq!(count_audit(&svc), audit_before, "拒绝路径不得新增审计");
+        let stored = svc.store().get_code_by_value(&code.code).unwrap().unwrap();
+        assert_eq!(stored.status, CodeStatus::Issued);
+        assert!(stored.bound_device_id.is_none());
     }
 }

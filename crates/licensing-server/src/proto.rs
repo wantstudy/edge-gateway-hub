@@ -702,6 +702,10 @@ pub mod codes {
     pub const TOKEN_EXPIRED: &str = "TOKEN_EXPIRED";
     /// 请求参数非法（400，通用兜底）。
     pub const BAD_REQUEST: &str = "BAD_REQUEST";
+    /// 激活请求验签失败（401；2026-09-25 主理人决策，SCREAMING_SNAKE 与既有 wire code 一致）。
+    pub const ACTIVATION_SIGNATURE_INVALID: &str = "ACTIVATION_SIGNATURE_INVALID";
+    /// 激活请求设备公钥与库中钉定公钥不一致（403；SCREAMING_SNAKE 与既有 wire code 一致）。
+    pub const ACTIVATION_PUBKEY_MISMATCH: &str = "ACTIVATION_PUBKEY_MISMATCH";
 }
 
 /// 业务码 → HTTP 状态码映射（设计 §0「HTTP 状态码 + 业务码双重表达」）。
@@ -718,12 +722,14 @@ pub fn http_status(code: &str) -> u16 {
         codes::TIMESTAMP_SKEW
         | codes::VERIFY_FAIL
         | codes::SESSION_EXPIRED
-        | codes::TOKEN_EXPIRED => 401,
+        | codes::TOKEN_EXPIRED
+        | codes::ACTIVATION_SIGNATURE_INVALID => 401,
         codes::CODE_REVOKED
         | codes::CODE_BOUND_TO_OTHER_DEVICE
         | codes::LEASE_REVOKED
         | codes::ADMIN_ONLY
-        | codes::QUOTA_EXCEEDED => 403,
+        | codes::QUOTA_EXCEEDED
+        | codes::ACTIVATION_PUBKEY_MISMATCH => 403,
         codes::LEASE_NOT_FOUND => 404,
         codes::CODE_REISSUED
         | codes::NONCE_REPLAY
