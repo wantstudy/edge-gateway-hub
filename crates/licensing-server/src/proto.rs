@@ -66,6 +66,12 @@ pub struct ActivationResponse {
     pub server_time: String,
     /// nonce 回显（与请求一致）。
     pub nonce: String,
+    /// 服务端响应签名公钥（base64；**TOFU 下发**，2026-09-25 主理人决策）。
+    ///
+    /// 设计 §1.1 未定义响应级 `sig` 的公钥分发方式；本字段让客户端在首次激活时
+    /// 拿到签名公钥并**钉定**（Trust-On-First-Use），后续心跳响应用钉定公钥验签。
+    /// 客户端侧镜像：`daemon/src/auth/client.rs` 的响应验签与钉定逻辑。
+    pub server_pubkey: String,
     /// 服务端响应签名（base64）。
     pub sig: String,
 }
@@ -976,10 +982,14 @@ mod tests {
             heartbeat_hours: 24,
             server_time: "1700000000".into(),
             nonce: "n".into(),
+            server_pubkey: "pk".into(),
             sig: "s".into(),
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert!(v["valid_until"].is_string(), "{v}");
         assert!(v["server_time"].is_string(), "{v}");
+        // TOFU：激活响应必须携带服务端公钥字段（2026-09-25 主理人决策）。
+        assert!(v["server_pubkey"].is_string(), "{v}");
+        assert!(v["sig"].is_string(), "{v}");
     }
 }

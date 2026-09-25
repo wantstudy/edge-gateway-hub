@@ -26,7 +26,8 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 
 use daemon::auth::client::{
-    LicenseState, LicenseTransport, LicensingClient, LicensingClientConfig,
+    render_response_signing_message, LicenseState, LicenseTransport, LicensingClient,
+    LicensingClientConfig, RESPONSE_SIG_DOMAIN_ACTIVATION, RESPONSE_SIG_DOMAIN_HEARTBEAT,
 };
 use daemon::auth::machine_id::{FingerprintKey, MachineIdentity, StaticAnchor};
 use daemon::auth::signing::{AuthSigner, LicenseGate, StaticKeyProvider};
@@ -134,20 +135,63 @@ fn build_lease_token(seed: &[u8; 32], kid: &str, mid: &str, verify_mode: &str) -
     )
 }
 
-/// 构造激活成功响应体。
-fn activate_ok(token: &str) -> serde_json::Value {
-    serde_json::json!({ "lease_token": token })
+/// **TEST_ONLY_** 服务端响应签名私钥种子（TOFU；**仅测试，禁止真实部署**）。
+const TEST_ONLY_SERVER_SEED: [u8; 32] = [0x6cu8; 32];
+
+/// 动态构造**带 TOFU 服务端签名**的激活成功响应
+/// （`server_pubkey` + `sig`；sig 域串 `activation|lease-0001|<请求 nonce>|<server_time>`，
+/// lease_id / tier / valid_until 与 `build_lease_token` 的默认租约一致）。
+fn signed_activation_ok(req: &serde_json::Value, token: &str) -> serde_json::Value {
+    let nonce = req
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let server_time = ISSUED_AT;
+    let message = render_response_signing_message(
+        RESPONSE_SIG_DOMAIN_ACTIVATION,
+        "lease-0001",
+        &nonce,
+        server_time,
+    );
+    let server_key = SigningKey::from_bytes(&TEST_ONLY_SERVER_SEED);
+    serde_json::json!({
+        "lease_id": "lease-0001",
+        "lease_token": token,
+        "verify_mode": "B",
+        "tier": "standard",
+        "valid_until": VALID_UNTIL.to_string(),
+        "heartbeat_hours": 24,
+        "server_time": server_time.to_string(),
+        "nonce": nonce,
+        "server_pubkey": B64.encode(server_key.verifying_key().to_bytes()),
+        "sig": B64.encode(server_key.sign(message.as_bytes()).to_bytes()),
+    })
 }
 
-/// 构造心跳成功响应体（服务端 `HeartbeatResponse` 形状，**不含新 Token**）。
-fn heartbeat_ok() -> serde_json::Value {
+/// 动态构造**带服务端签名**的心跳成功响应（sig 域串 `heartbeat|lease-0001|<nonce>|<ts>`；
+/// `server_time` / `valid_until` 与原 `heartbeat_ok` 一致）。
+fn signed_heartbeat_ok(req: &serde_json::Value) -> serde_json::Value {
+    let nonce = req
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let server_time = VALID_UNTIL - 86_400;
+    let message = render_response_signing_message(
+        RESPONSE_SIG_DOMAIN_HEARTBEAT,
+        "lease-0001",
+        &nonce,
+        server_time,
+    );
+    let server_key = SigningKey::from_bytes(&TEST_ONLY_SERVER_SEED);
     serde_json::json!({
-        "server_time": (VALID_UNTIL - 86_400).to_string(),
+        "server_time": server_time.to_string(),
         "next_deadline": VALID_UNTIL.to_string(),
         "valid_until": VALID_UNTIL.to_string(),
         "verify_mode": "B",
         "tier": "standard",
-        "sig": "server-response-sig",
+        "sig": B64.encode(server_key.sign(message.as_bytes()).to_bytes()),
     })
 }
 
@@ -156,8 +200,11 @@ fn heartbeat_ok() -> serde_json::Value {
 /// mock 动作。
 #[derive(Default)]
 enum MockAction {
-    /// 返回成功响应体。
-    Ok(serde_json::Value),
+    /// 激活成功：请求到达时动态构造**带 TOFU 服务端签名**的响应
+    /// （sig 绑定请求 nonce，无法离线预制）。
+    ActivationOk { token: String },
+    /// 心跳成功：请求到达时动态构造**带服务端签名**的响应。
+    HeartbeatOk,
     /// 返回网络错误（模拟断网）。
     NetFail,
     /// 未编程（默认）——按网络错误处理，避免误放行。
@@ -179,9 +226,14 @@ struct MockTransport {
 }
 
 impl MockTransport {
-    /// 编程：下一次请求返回给定响应体。
-    fn respond_with(&self, value: serde_json::Value) {
-        self.inner.lock().expect("mock lock").action = MockAction::Ok(value);
+    /// 编程：下一次激活请求返回**带 TOFU 服务端签名**的成功响应。
+    fn respond_with_activation(&self, token: String) {
+        self.inner.lock().expect("mock lock").action = MockAction::ActivationOk { token };
+    }
+
+    /// 编程：下一次心跳请求返回**带服务端签名**的成功响应。
+    fn respond_with_heartbeat(&self) {
+        self.inner.lock().expect("mock lock").action = MockAction::HeartbeatOk;
     }
 
     /// 编程：下一次请求返回网络错误（断网）。
@@ -204,7 +256,8 @@ impl LicenseTransport for MockTransport {
         let mut inner = self.inner.lock().expect("mock lock");
         inner.calls.push(url.to_string());
         match &inner.action {
-            MockAction::Ok(value) => Ok(value.clone()),
+            MockAction::ActivationOk { token } => Ok(signed_activation_ok(_body, token)),
+            MockAction::HeartbeatOk => Ok(signed_heartbeat_ok(_body)),
             MockAction::NetFail => Err(DaemonError::NetworkError("mock: link down".to_string())),
             MockAction::Unset => Err(DaemonError::NetworkError(
                 "mock: not programmed".to_string(),
@@ -394,7 +447,7 @@ async fn trial_expiry_degrades_after_three_days() {
 async fn activation_with_valid_token_licenses() {
     let fx = Fixture::new();
     let token = fx.token();
-    fx.mock.respond_with(activate_ok(&token));
+    fx.mock.respond_with_activation(token);
 
     let rt = fx.cloud();
     rt.step().await.expect("step ok");
@@ -422,7 +475,7 @@ async fn activation_with_valid_token_licenses() {
 async fn network_failure_after_license_enters_grace_and_still_forwards() {
     let fx = Fixture::new();
     let token = fx.token();
-    fx.mock.respond_with(activate_ok(&token));
+    fx.mock.respond_with_activation(token);
     let rt = fx.cloud();
     rt.step().await.expect("activate ok");
     assert!(matches!(rt.state(), LicenseState::Licensed { .. }));
@@ -457,7 +510,7 @@ async fn network_failure_after_license_enters_grace_and_still_forwards() {
 async fn grace_survives_six_days_and_degrades_by_eight() {
     let fx = Fixture::new();
     let token = fx.token();
-    fx.mock.respond_with(activate_ok(&token));
+    fx.mock.respond_with_activation(token);
     let rt = fx.cloud();
     rt.step().await.expect("activate ok"); // last_online = T0_MS
     assert!(matches!(rt.state(), LicenseState::Licensed { .. }));
@@ -497,7 +550,7 @@ async fn grace_survives_six_days_and_degrades_by_eight() {
 async fn recovery_within_grace_returns_to_licensed() {
     let fx = Fixture::new();
     let token = fx.token();
-    fx.mock.respond_with(activate_ok(&token));
+    fx.mock.respond_with_activation(token);
     let rt = fx.cloud();
     rt.step().await.expect("activate ok");
 
@@ -508,7 +561,7 @@ async fn recovery_within_grace_returns_to_licensed() {
     assert!(matches!(rt.state(), LicenseState::Grace { .. }));
 
     // 恢复联网 → 下一次心跳成功 → Licensed。
-    fx.mock.respond_with(heartbeat_ok());
+    fx.mock.respond_with_heartbeat();
     fx.advance(HEARTBEAT_SECS * 1000 + 1_000);
     rt.step().await.expect("step ok");
 

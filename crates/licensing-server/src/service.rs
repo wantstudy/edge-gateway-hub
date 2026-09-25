@@ -59,6 +59,39 @@ pub const CLOCK_SKEW_SECS: i64 = 300;
 /// nonce 缓存有效期（秒）：取时钟窗的两倍，保证「窗口内 nonce 不可复用」。
 pub const NONCE_TTL_SECS: i64 = CLOCK_SKEW_SECS * 2;
 
+// ---- 服务端响应签名契约（daemon 侧逐字节镜像，跨端一致性由契约测试锁定） ----
+//
+// 响应级 `sig` = 当前签发密钥对「域串」的 Ed25519 签名（STANDARD base64）。
+// 域串 = `{domain}|{lease_id}|{nonce}|{server_time}`：**业务语义确定性哈希域串**
+// （非序列化字节，符合「禁签 Protobuf 序列化字节」红线）；`server_time` 以十进制
+// 秒字符串渲染（大整数红线）。
+//
+// 公钥分发（**TOFU**，2026-09-25 主理人决策）：激活响应携带 `server_pubkey`
+// （当前签发密钥公钥，base64）；客户端验签激活响应后钉定该公钥，后续心跳响应
+// 一律用钉定公钥验签（异钥 / 缺签 / 篡改 → fail-closed）。
+
+/// 服务端响应签名域：`/activation` 响应（daemon 侧 `RESPONSE_SIG_DOMAIN_ACTIVATION`
+/// 逐字节一致）。
+pub const RESPONSE_SIG_DOMAIN_ACTIVATION: &str = "activation";
+
+/// 服务端响应签名域：`/heartbeat` 响应（daemon 侧 `RESPONSE_SIG_DOMAIN_HEARTBEAT`
+/// 逐字节一致）。
+pub const RESPONSE_SIG_DOMAIN_HEARTBEAT: &str = "heartbeat";
+
+/// 渲染服务端响应签名域串（**未哈希**；daemon 侧 `auth::client::render_response_signing_message`
+/// 逐字节一致）。
+///
+/// 格式：`{domain}|{lease_id}|{nonce}|{server_time}`。
+#[must_use]
+pub fn render_response_signing_message(
+    domain: &str,
+    lease_id: &str,
+    nonce: &str,
+    server_time: i64,
+) -> String {
+    format!("{domain}|{lease_id}|{nonce}|{server_time}")
+}
+
 /// 授权服务：聚合 [`Store`] 与 [`KeyRing`]，对外暴露激活码生命周期业务方法。
 ///
 /// 设计为「薄聚合」：所有 SQL 仍集中在 [`Store`]，所有签名集中在 [`KeyRing`] 与
@@ -359,8 +392,9 @@ impl LicensingService {
         self.store
             .update_device_status(&device.device_id, DeviceStatus::Active)?;
 
-        // 服务端响应签名（防篡改；密钥来自 keyring）。
+        // 服务端响应签名（防篡改；密钥来自 keyring）+ TOFU 公钥下发。
         let sig = self.sign_response(&lease_id, &req.nonce, now)?;
+        let server_pubkey = self.signing_pubkey_b64()?;
 
         self.audit(
             &tenant_id,
@@ -380,6 +414,7 @@ impl LicensingService {
             heartbeat_hours: HEARTBEAT_HOURS,
             server_time: now.to_string(),
             nonce: req.nonce.clone(),
+            server_pubkey,
             sig,
         })
     }
@@ -673,7 +708,12 @@ impl LicensingService {
 
         // 6) 响应签名 + 组装。
         let next_deadline = now + HEARTBEAT_SECS;
-        let sig = self.sign_server_response("heartbeat", &lease.lease_id, &req.nonce, now)?;
+        let sig = self.sign_server_response(
+            RESPONSE_SIG_DOMAIN_HEARTBEAT,
+            &lease.lease_id,
+            &req.nonce,
+            now,
+        )?;
         Ok(HeartbeatResponse {
             server_time: now.to_string(),
             next_deadline: next_deadline.to_string(),
@@ -1321,7 +1361,7 @@ impl LicensingService {
         }
     }
 
-    /// 组装激活响应：签发租约 Token（载荷取自既有租约，**确定性**）+ 服务端响应签名。
+    /// 组装激活响应：签发租约 Token（载荷取自既有租约，**确定性**）+ 服务端响应签名 + TOFU 公钥。
     fn activation_response(
         &self,
         lease: &Lease,
@@ -1330,6 +1370,7 @@ impl LicensingService {
         now: i64,
     ) -> LicenseResult<ActivationResponse> {
         let sig = self.sign_response(&lease.lease_id, &req.nonce, now)?;
+        let server_pubkey = self.signing_pubkey_b64()?;
         Ok(ActivationResponse {
             lease_id: lease.lease_id.clone(),
             lease_token: token.encode(),
@@ -1339,8 +1380,24 @@ impl LicensingService {
             heartbeat_hours: HEARTBEAT_HOURS,
             server_time: now.to_string(),
             nonce: req.nonce.clone(),
+            server_pubkey,
             sig,
         })
+    }
+
+    /// 当前**签发**密钥的公钥（STANDARD base64；激活响应 TOFU 下发用）。
+    ///
+    /// # Errors
+    /// 无可用签发密钥（`signing_kid` 为空 / 密钥环不一致）→ [`LicenseError::TokenInvalid`]。
+    fn signing_pubkey_b64(&self) -> LicenseResult<String> {
+        let kid = self
+            .keyring
+            .signing_kid()
+            .ok_or_else(|| LicenseError::TokenInvalid("no active signing key available".into()))?;
+        let entry = self.keyring.get(&kid).ok_or_else(|| {
+            LicenseError::TokenInvalid(format!("signing kid vanished from keyring: {kid}"))
+        })?;
+        Ok(entry.public_key_b64().to_string())
     }
 
     /// 服务端对激活响应的签名（防篡改；密钥来自密钥环）。
@@ -1350,12 +1407,13 @@ impl LicensingService {
         nonce: &str,
         server_time: i64,
     ) -> LicenseResult<String> {
-        self.sign_server_response("activation", lease_id, nonce, server_time)
+        self.sign_server_response(RESPONSE_SIG_DOMAIN_ACTIVATION, lease_id, nonce, server_time)
     }
 
     /// 通用服务端响应签名：`{domain}|{lease_id}|{nonce}|{server_time}`（密钥来自密钥环）。
     ///
-    /// 域前缀区分端点（`activation` / `heartbeat`），防止跨端点签名混用。
+    /// 域前缀区分端点（[`RESPONSE_SIG_DOMAIN_ACTIVATION`] / [`RESPONSE_SIG_DOMAIN_HEARTBEAT`]），
+    /// 防止跨端点签名混用；域串渲染统一走 [`render_response_signing_message`]（daemon 侧逐字节镜像）。
     fn sign_server_response(
         &self,
         domain: &str,
@@ -1363,7 +1421,7 @@ impl LicensingService {
         nonce: &str,
         server_time: i64,
     ) -> LicenseResult<String> {
-        let message = format!("{domain}|{lease_id}|{nonce}|{server_time}");
+        let message = render_response_signing_message(domain, lease_id, nonce, server_time);
         let (_kid, sig) = self.keyring.sign(message.as_bytes())?;
         Ok(sig)
     }

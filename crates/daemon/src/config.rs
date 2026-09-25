@@ -51,6 +51,16 @@ fn default_heartbeat_secs() -> u64 {
     86_400
 }
 
+/// 试用天数默认（3 天，计划 task 23；与 `auth::client::TRIAL_DAYS` 口径一致）。
+fn default_trial_days() -> u32 {
+    3
+}
+
+/// 离线宽限天数默认（7 天，计划 task 22；与 `auth::client::GRACE_DAYS` 口径一致）。
+fn default_grace_days() -> u32 {
+    7
+}
+
 /// 北向出口编码（每路出口独立可选；计划决议：protobuf 默认 / json 可选）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,14 +72,27 @@ pub enum OutletEncoding {
     Json,
 }
 
-/// 授权配置雏形（task 22-24 填充语义）。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// 授权配置（计划 task 22-24：激活码 / 试用 / 宽限 + 云服务端点）。
+///
+/// ⚠️ `activation_code` 是**敏感凭据**：
+/// - 本结构手写 [`std::fmt::Debug`]——激活码输出一律 `<redacted>`（**永不进日志**）；
+/// - `activation_code` 标注 `serde(skip_serializing)`——配置导出 / API 回显**绝不携带**；
+/// - 仓库与示例配置文件只允许**占位符**，真实激活码经环境变量 `IOTDAQ_ACTIVATION_CODE`
+///   或管理 UI 注入（装配方注入 [`crate::license::LicenseRuntimeConfig::activation_code`]）。
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LicensingSection {
     /// 云授权服务地址；None = 纯本地模式（C 档雏形）。
     pub cloud_url: Option<String>,
     /// 心跳间隔（秒；计划默认 24h）。
     pub heartbeat_interval_secs: u64,
+    /// 激活码（**敏感**；见结构体文档的脱敏纪律）。`None` = 未配置云端激活。
+    #[serde(skip_serializing)]
+    pub activation_code: Option<String>,
+    /// 试用天数（默认 3，与 `auth::client::TRIAL_DAYS` 口径一致；计划 task 23）。
+    pub trial_days: u32,
+    /// 离线宽限天数（默认 7，与 `auth::client::GRACE_DAYS` 口径一致；计划 task 22）。
+    pub grace_days: u32,
 }
 
 impl Default for LicensingSection {
@@ -77,7 +100,26 @@ impl Default for LicensingSection {
         Self {
             cloud_url: None,
             heartbeat_interval_secs: default_heartbeat_secs(),
+            activation_code: None,
+            trial_days: default_trial_days(),
+            grace_days: default_grace_days(),
         }
+    }
+}
+
+/// 手写 [`std::fmt::Debug`]：**激活码脱敏**（只暴露是否已配置，绝不输出原文）。
+impl std::fmt::Debug for LicensingSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LicensingSection")
+            .field("cloud_url", &self.cloud_url)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field(
+                "activation_code",
+                &self.activation_code.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trial_days", &self.trial_days)
+            .field("grace_days", &self.grace_days)
+            .finish()
     }
 }
 
@@ -593,6 +635,10 @@ data_dir = "data"
 [gateway.licensing]
 cloud_url = "https://licensing.example.com"
 heartbeat_interval_secs = 86400
+# ⚠️ 激活码是敏感凭据：此处只允许占位符；真实值经 env IOTDAQ_ACTIVATION_CODE 注入。
+activation_code = "IOTDAQ-0000-0000-0000-0000"
+trial_days = 3
+grace_days = 7
 
 [gateway.cache]
 sqlite_path = "cache.db"
@@ -632,6 +678,14 @@ frequency_ms = 100
             config.gateway.licensing.cloud_url.as_deref(),
             Some("https://licensing.example.com")
         );
+        // task 19 尾巴：授权配置字段补齐（激活码 / 试用 / 宽限）。
+        assert_eq!(
+            config.gateway.licensing.activation_code.as_deref(),
+            Some("IOTDAQ-0000-0000-0000-0000"),
+            "activation_code must be configurable (placeholder in examples)"
+        );
+        assert_eq!(config.gateway.licensing.trial_days, 3);
+        assert_eq!(config.gateway.licensing.grace_days, 7);
         assert_eq!(config.gateway.cache.retention_days, 7);
         assert!(config.gateway.security.web_auth_enabled);
 
@@ -662,6 +716,40 @@ frequency_ms = 100
         assert!(config.points.is_empty());
         // task 57：mgmt_auth 可选段缺省 = None（既有配置语义不变）。
         assert!(config.mgmt_auth.is_none(), "mgmt_auth must default to None");
+        // task 19 尾巴：授权配置新字段缺省（向后兼容：老配置文件不含这些键也能解析）。
+        let licensing = &config.gateway.licensing;
+        assert_eq!(licensing.activation_code, None);
+        assert_eq!(
+            licensing.trial_days, 3,
+            "trial_days default = 3 (TRIAL_DAYS)"
+        );
+        assert_eq!(
+            licensing.grace_days, 7,
+            "grace_days default = 7 (GRACE_DAYS)"
+        );
+    }
+
+    /// 激活码脱敏纪律（task 19 尾巴）：
+    /// 1. `Debug` 输出只含 `<redacted>`，**绝不**含激活码原文（防日志泄露）；
+    /// 2. `Serialize` 输出（配置导出 / API 回显）**不含** `activation_code` 键。
+    #[test]
+    fn activation_code_is_redacted_in_debug_and_serialize() {
+        let section = LicensingSection {
+            activation_code: Some("IOTDAQ-SECRETCODE-DO-NOT-LOG".to_string()),
+            ..LicensingSection::default()
+        };
+        let dbg = format!("{section:?}");
+        assert!(dbg.contains("<redacted>"), "Debug must redact: {dbg}");
+        assert!(
+            !dbg.contains("IOTDAQ-SECRETCODE"),
+            "Debug leaked activation code: {dbg}"
+        );
+
+        let json = serde_json::to_string(&section).expect("serialize licensing section");
+        assert!(
+            !json.contains("activation_code") && !json.contains("IOTDAQ-SECRETCODE"),
+            "Serialize leaked activation code: {json}"
+        );
     }
 
     /// QA: task 57 可选 `[mgmt_auth]` 段解析——users 数组逐行承接

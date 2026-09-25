@@ -13,6 +13,22 @@ gateway_id = "gw-local-dev"
 # data_dir 缺省 ./data（点位数据库/队列/遥测落盘位置），可按需覆盖：
 # data_dir = "./data"
 
+# ── 云端授权（task 22-24；本地页面测试可不配；不配 = 纯本地 C 档雏形）──
+# [gateway.licensing]
+# cloud_url = "https://licensing.example.com/v1"  # 云授权服务基址
+# heartbeat_interval_secs = 86400                 # 心跳间隔（秒，默认 24h）
+# trial_days = 3                                  # 试用天数（默认 3，计划 task 23）
+# grace_days = 7                                  # 离线宽限天数（默认 7，计划 task 22）
+# ⚠️ activation_code（敏感凭据）：
+#   - 下方只允许**占位符**；仓库 / 日志 / 配置导出**绝不允许出现真实激活码**；
+#   - Debug 输出已脱敏（<redacted>），serde 序列化不携带该字段；
+#   - 真实激活码经环境变量 IOTDAQ_ACTIVATION_CODE 或管理 UI 注入。
+# activation_code = "IOTDAQ-0000-0000-0000-0000"
+#
+# 服务端响应签名（TOFU，2026-09-25 主理人决策）：激活响应携带 server_pubkey 并被客户端
+# 钉定；心跳响应用钉定公钥验签——缺签 / 篡改 / 异钥一律 fail-closed（状态不推进）。
+# 契约细节见 docs/design/licensing-api.md §1.1/§1.2 与 daemon/auth/client.rs 模块注释。
+
 # ── 北向出口（本地页面测试可不配；留空数组即不转发）──
 # [[outlets]]
 # name = "line1_m1"                     # 对外标识，不暴露内部 id

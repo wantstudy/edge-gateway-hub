@@ -28,7 +28,8 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use daemon::auth::client::{
-    LicenseState, LicenseTransport, LicensingClient, LicensingClientConfig,
+    render_response_signing_message, LicenseState, LicenseTransport, LicensingClient,
+    LicensingClientConfig, RESPONSE_SIG_DOMAIN_ACTIVATION,
 };
 use daemon::auth::machine_id::{FingerprintKey, MachineIdentity, StaticAnchor};
 use daemon::auth::signing::{AuthSigner, LicenseGate, StaticKeyProvider};
@@ -46,6 +47,8 @@ use daemon::offline_queue::{OfflineQueue, QueueConfig, SystemClock};
 
 /// **TEST_ONLY_** 设备私钥种子（32 字节；禁止真实部署）。
 const TEST_ONLY_SEED: [u8; 32] = *b"iotdaq-license-gating-test-seed!";
+/// **TEST_ONLY_** 服务端响应签名私钥种子（TOFU；**仅测试，禁止真实部署**）。
+const TEST_ONLY_SERVER_SEED: [u8; 32] = [0x6bu8; 32];
 /// 测试指纹 HMAC key（派 mid 用，**仅测试**）。
 const TEST_ONLY_FP_KEY: &[u8] = b"TEST_ONLY_license_gating_fp_key";
 /// 租约失效时刻（UTC 秒，2100-01-01）。
@@ -139,16 +142,12 @@ fn build_lease_token(seed: &[u8; 32], kid: &str, mid: &str, verify_mode: &str) -
     )
 }
 
-/// 激活成功响应体。
-fn activate_ok(token: &str) -> serde_json::Value {
-    serde_json::json!({ "lease_token": token })
-}
-
 /// mock 动作。
 #[derive(Default)]
 enum MockAction {
-    /// 返回成功响应体。
-    Ok(serde_json::Value),
+    /// 激活成功：请求到达时**动态构造**带 TOFU 服务端签名的响应
+    /// （响应 `sig` 域串绑定请求 nonce，无法离线预制）。
+    ActivationOk { token: String },
     /// 网络错误（断网）。
     NetFail,
     /// 未编程（默认按网络错误处理，fail-closed）。
@@ -169,8 +168,10 @@ struct MockTransport {
 }
 
 impl MockTransport {
-    fn respond_with(&self, value: serde_json::Value) {
-        self.inner.lock().expect("mock lock").action = MockAction::Ok(value);
+    /// 编程：下一次激活请求返回**带 TOFU 服务端签名**的成功响应
+    /// （`server_pubkey` + `sig`，sig 域串 `activation|lease-0001|<nonce>|<server_time>`）。
+    fn respond_with_activation(&self, token: String) {
+        self.inner.lock().expect("mock lock").action = MockAction::ActivationOk { token };
     }
 
     fn fail_network(&self) {
@@ -187,7 +188,35 @@ impl LicenseTransport for MockTransport {
         let mut inner = self.inner.lock().expect("mock lock");
         inner.calls.push(url.to_string());
         match &inner.action {
-            MockAction::Ok(value) => Ok(value.clone()),
+            MockAction::ActivationOk { token } => {
+                // 动态构造 TOFU 签名的激活响应（服务端 `ActivationResponse` 形状，
+                // lease_id / tier / valid_until 与 `build_lease_token` 的默认租约一致）。
+                let nonce = _body
+                    .get("nonce")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let server_time = ISSUED_AT;
+                let message = render_response_signing_message(
+                    RESPONSE_SIG_DOMAIN_ACTIVATION,
+                    "lease-0001",
+                    &nonce,
+                    server_time,
+                );
+                let server_key = SigningKey::from_bytes(&TEST_ONLY_SERVER_SEED);
+                Ok(serde_json::json!({
+                    "lease_id": "lease-0001",
+                    "lease_token": token,
+                    "verify_mode": "B",
+                    "tier": "standard",
+                    "valid_until": VALID_UNTIL.to_string(),
+                    "heartbeat_hours": 24,
+                    "server_time": server_time.to_string(),
+                    "nonce": nonce,
+                    "server_pubkey": B64.encode(server_key.verifying_key().to_bytes()),
+                    "sig": B64.encode(server_key.sign(message.as_bytes()).to_bytes()),
+                }))
+            }
             MockAction::NetFail => Err(DaemonError::NetworkError("mock: link down".to_string())),
             MockAction::Unset => Err(DaemonError::NetworkError(
                 "mock: not programmed".to_string(),
@@ -638,7 +667,7 @@ async fn free_quota_rejects_fast_interval_when_degraded() {
 async fn license_transition_stops_and_resumes_real_forwarding() {
     let fx = Fixture::new();
     let token = fx.token();
-    fx.mock.respond_with(activate_ok(&token));
+    fx.mock.respond_with_activation(token.clone());
     let rt = Arc::new(fx.cloud());
     rt.step().await.expect("activate ok");
     assert!(matches!(rt.state(), LicenseState::Licensed { .. }));
@@ -685,7 +714,7 @@ async fn license_transition_stops_and_resumes_real_forwarding() {
     );
 
     // 恢复：重新联网 → 激活成功 → Licensed（Grace→Licensed / Degraded→Licensed 恢复路）。
-    fx.mock.respond_with(activate_ok(&token));
+    fx.mock.respond_with_activation(token);
     fx.advance(HEARTBEAT_SECS * 1000 + 1_000);
     rt.step().await.expect("step ok");
     assert!(

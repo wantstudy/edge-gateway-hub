@@ -17,6 +17,10 @@
 //!   推进量按 0 计（否则把时钟调回去就能无限续期）。
 //! - **本地验签用内置公钥集**：[`LicensingClient::verify_lease_locally`] 支持**多个 kid**
 //!   （kid 轮换时旧 Token 仍可验），未知 kid / 签名不符 / 已过期 / 结构错误一律 `Err`。
+//! - **服务端响应验签（TOFU）**：激活 / 心跳响应携带响应级 `sig`，客户端验签后才推进状态；
+//!   激活响应携带 `server_pubkey` 并被**钉定**（2026-09-25 主理人决策，见
+//!   [`RESPONSE_SIG_DOMAIN_ACTIVATION`] 注释），心跳响应用钉定公钥验签——
+//!   缺签 / 篡改 / 异钥一律 **fail-closed**（错误返回、状态不推进）。
 //! - **回执字段白名单**：[`LicensingClient::report_receipt`] 的请求体**只能有** 8 个字段
 //!   （`device_mid, lease_id, seq_from, seq_to, count, payload_digest, ts, sig`），
 //!   **绝不携带任何业务数值**。
@@ -116,6 +120,88 @@ pub const ACTIVATION_SEMANTIC_DOMAIN: &[u8] = b"iotdaq.activation.semantic.v1|";
 
 /// `receipt_cursor` 为空时在签名域中占位的字面量（与服务端 `CURSOR_NONE` 一致）。
 pub const CURSOR_NONE: &str = "none";
+
+// ---- 服务端响应签名契约（daemon 侧镜像，与 licensing-server 逐字节一致） ----
+//
+// ⚠️ 以下常量与函数是 `licensing-server/src/service.rs` 响应签名契约的**逐字节镜像**：
+// 激活 / 心跳响应携带响应级 `sig`（Ed25519，STANDARD base64），签名对象是
+// `{domain}|{lease_id}|{nonce}|{server_time}` 域串（业务语义确定性串，非序列化字节；
+// `server_time` 以十进制秒字符串渲染——大整数红线）。跨端一致性由
+// `tests/response_signature_conformance.rs` 锁定。
+//
+// **公钥分发 = TOFU（Trust-On-First-Use），2026-09-25 主理人决策**：设计文档
+// （`docs/design/licensing-api.md` §1.1/§1.2）未定义响应级 `sig` 的公钥来源；
+// 采用「激活响应携带 `server_pubkey` + 客户端钉定该公钥」方案：激活响应先经
+// 携带公钥验签（自洽），通过后钉定；后续心跳响应用钉定公钥验签——异钥 / 缺签 /
+// 篡改一律 **fail-closed**（错误返回、状态不推进）。
+
+/// 服务端响应签名域：`/activation` 响应（与服务端 `RESPONSE_SIG_DOMAIN_ACTIVATION`
+/// 逐字节一致）。
+pub const RESPONSE_SIG_DOMAIN_ACTIVATION: &str = "activation";
+
+/// 服务端响应签名域：`/heartbeat` 响应（与服务端 `RESPONSE_SIG_DOMAIN_HEARTBEAT`
+/// 逐字节一致）。
+pub const RESPONSE_SIG_DOMAIN_HEARTBEAT: &str = "heartbeat";
+
+/// 渲染服务端响应签名域串（**未哈希**；与服务端 `service::render_response_signing_message`
+/// 逐字节一致）。
+///
+/// 格式：`{domain}|{lease_id}|{nonce}|{server_time}`。
+#[must_use]
+pub fn render_response_signing_message(
+    domain: &str,
+    lease_id: &str,
+    nonce: &str,
+    server_time: i64,
+) -> String {
+    format!("{domain}|{lease_id}|{nonce}|{server_time}")
+}
+
+/// 解码 STANDARD base64 编码的 Ed25519 公钥（32 字节原始形式）。
+///
+/// # Errors
+/// base64 非法 / 长度 ≠ 32 / 非 Ed25519 曲线点 → [`DaemonError::SecurityError`]。
+fn decode_ed25519_public_key_b64(
+    public_key_b64: &str,
+    context: &str,
+) -> DaemonResult<VerifyingKey> {
+    let raw = B64.decode(public_key_b64.trim()).map_err(|e| {
+        DaemonError::SecurityError(format!("{context} public key is not valid base64: {e}"))
+    })?;
+    let bytes: [u8; ED25519_PUBLIC_KEY_LEN] = raw.as_slice().try_into().map_err(|_| {
+        DaemonError::SecurityError(format!(
+            "{context} public key length {} != {ED25519_PUBLIC_KEY_LEN}",
+            raw.len()
+        ))
+    })?;
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|e| DaemonError::SecurityError(format!("invalid {context} public key: {e}")))
+}
+
+/// 校验服务端响应签名（TOFU 公钥；域串双端逐字节一致，契约测试锁定）。
+///
+/// 校验链：公钥解码 → 域串重建 → Ed25519 验签。任一失败 → [`DaemonError::SecurityError`]。
+///
+/// # Errors
+/// 公钥非法 / 签名 base64 非法 / 验签不通过 → [`DaemonError::SecurityError`]。
+pub fn verify_server_response_signature(
+    server_pubkey_b64: &str,
+    domain: &str,
+    lease_id: &str,
+    nonce: &str,
+    server_time: i64,
+    signature_b64: &str,
+) -> DaemonResult<()> {
+    if server_pubkey_b64.trim().is_empty() {
+        return Err(DaemonError::SecurityError(
+            "server response signature verification requires a non-empty server public key"
+                .to_string(),
+        ));
+    }
+    let key = decode_ed25519_public_key_b64(server_pubkey_b64, "server response")?;
+    let message = render_response_signing_message(domain, lease_id, nonce, server_time);
+    verify_signature_b64(&key, message.as_bytes(), signature_b64, "server response")
+}
 
 /// `/heartbeat` 请求体的字段集合（恰好 5 个，镜像服务端 `HeartbeatRequest`）。
 pub const HEARTBEAT_FIELD_WHITELIST: [&str; 5] =
@@ -445,6 +531,13 @@ struct ClientInner {
     trial_active: bool,
     /// 最近一次心跳携带的回执游标（`(seq_from, seq_to)`）。
     last_cursor: Option<(i64, i64)>,
+    /// **TOFU 钉定**的服务端响应签名公钥（原始 32 字节；2026-09-25 主理人决策）。
+    ///
+    /// 激活响应携带 `server_pubkey`，客户端验签激活响应通过后在此钉定；
+    /// 后续心跳响应一律用钉定公钥验签（异钥 / 缺签 / 篡改 → fail-closed）。
+    /// 存原始字节而非 `VerifyingKey`：`[u8; 32]` 是 `Copy`，免去对 `Clone` 的依赖，
+    /// 使用时再重建（重建失败视为钉定密钥损坏，同样 fail-closed）。
+    pinned_server_key: Option<[u8; 32]>,
 }
 
 /// 云授权客户端。
@@ -494,6 +587,14 @@ impl fmt::Debug for LicensingClient {
             .field("base_url", &self.cfg.base_url)
             .field("machine_code", &self.machine_code)
             .field("kid_count", &self.public_keys.len())
+            .field(
+                "server_key_pinned",
+                &self
+                    .inner
+                    .lock()
+                    .map(|g| g.pinned_server_key.is_some())
+                    .unwrap_or(false),
+            )
             .field("state", &state)
             .finish()
     }
@@ -531,6 +632,7 @@ impl LicensingClient {
                 trial_anchor_secs: 0,
                 trial_active: false,
                 last_cursor: None,
+                pinned_server_key: None,
             }),
         }
     }
@@ -598,6 +700,17 @@ impl LicensingClient {
         self.public_keys.keys().cloned().collect()
     }
 
+    /// TOFU 钉定的服务端响应签名公钥（STANDARD base64；未钉定为 `None`）。
+    ///
+    /// 供诊断 / 测试；公钥本身是公开信息，不脱敏。
+    pub fn pinned_server_key_b64(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.pinned_server_key)
+            .map(|bytes| B64.encode(bytes))
+    }
+
     /// 端点配置（只读）。
     pub fn config(&self) -> &LicensingClientConfig {
         &self.cfg
@@ -639,7 +752,13 @@ impl LicensingClient {
     /// `{ activation_code, machine_code, anchor_hashes, device_pubkey, nonce, ts, req_sig }`
     /// （`ts` 为**字符串**，大整数红线）。`req_sig` = 对
     /// [`activation_payload_hash`] 的设备私钥 Ed25519 签名（服务端当前不验，但形状要对）。
-    /// 响应体须含 `lease_token` 字段（三段式串）。成功即本地验签 → 写入 `Licensed`。
+    /// 响应体须含 `lease_token` 字段（三段式串）。
+    ///
+    /// **响应签名校验（TOFU，2026-09-25 主理人决策）**：激活响应携带 `server_pubkey`
+    /// 与响应级 `sig`（域串 `activation|{lease_id}|{nonce}|{server_time}`）。客户端先校验
+    /// nonce 回显一致，再用携带公钥验签；通过后**钉定**该公钥（后续心跳响应验签用）。
+    /// **任一环节失败 → fail-closed**：返回 [`DaemonError::SecurityError`] / [`DaemonError::AuthError`]，
+    /// 状态**不推进**（保持 `Unlicensed`），绝不钉定未验证的公钥。
     ///
     /// `anchor_hashes` 取注入的逐锚点哈希集（`with_anchor_hashes`）：**缺失即 fail-closed**。
     ///
@@ -647,7 +766,8 @@ impl LicensingClient {
     /// - 激活码为空 / **未注入锚点哈希集** → `ConfigError`；
     /// - 网络失败 / 超时 → `NetworkError`；
     /// - 服务端拒绝 → `AuthError`；
-    /// - 响应缺 `lease_token` / 本地验签失败 → `AuthError` / `SecurityError`。
+    /// - 响应缺 `lease_token` / `server_pubkey` / `sig` / `nonce` 回显不符 → `AuthError` / `SecurityError`；
+    /// - 响应验签失败 / 本地验签失败 → `SecurityError`。
     pub async fn activate(&self, activation_code: &str) -> DaemonResult<LicenseState> {
         let code = activation_code.trim();
         if code.is_empty() {
@@ -718,6 +838,51 @@ impl LicensingClient {
                 )
             })?;
 
+        // ---- 响应签名校验（TOFU）：先于任何状态推进，失败即 fail-closed ----
+        let resp_lease_id = resp
+            .get("lease_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::AuthError("activate response is missing 'lease_id' field".to_string())
+            })?;
+        let server_time = require_secs_field(&resp, "server_time", "activation")?;
+        let server_pubkey = resp
+            .get("server_pubkey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::AuthError(
+                    "activate response is missing 'server_pubkey' field (TOFU server public key)"
+                        .to_string(),
+                )
+            })?;
+        let resp_sig = resp.get("sig").and_then(|v| v.as_str()).ok_or_else(|| {
+            DaemonError::AuthError("activate response is missing 'sig' field".to_string())
+        })?;
+        // nonce 回显必须与请求一致（防响应串扰；域串本身也绑定了请求 nonce）。
+        let echoed = resp.get("nonce").and_then(|v| v.as_str()).ok_or_else(|| {
+            DaemonError::AuthError("activate response is missing 'nonce' field".to_string())
+        })?;
+        if echoed != nonce {
+            return Err(DaemonError::SecurityError(
+                "activate response nonce does not match the request nonce".to_string(),
+            ));
+        }
+        verify_server_response_signature(
+            server_pubkey,
+            RESPONSE_SIG_DOMAIN_ACTIVATION,
+            resp_lease_id,
+            &nonce,
+            server_time,
+            resp_sig,
+        )?;
+
+        // 验签通过 → 钉定服务端公钥（TOFU）。重复激活以最新激活响应重新钉定
+        // （激活响应经携带公钥自洽验签；TOFU 的首信边界即首次激活，见模块注释）。
+        let pinned = decode_ed25519_public_key_b64(server_pubkey, "server response")?.to_bytes();
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.pinned_server_key = Some(pinned);
+        }
+
         let lease = self.verify_lease_locally(raw)?;
         self.set_state(LicenseState::Licensed {
             lease: lease.clone(),
@@ -736,11 +901,18 @@ impl LicensingClient {
     /// `{server_time, next_deadline, valid_until, verify_mode, tier, sig}`），
     /// 故本方法按 `valid_until` / `server_time` 更新状态，**不再要求响应携带 `lease_token`**。
     ///
+    /// **响应签名校验（TOFU 钉定公钥）**：心跳响应的 `sig` 域串为
+    /// `heartbeat|{lease_id}|{nonce}|{server_time}`，用**激活时钉定**的服务端公钥验签。
+    /// **验签失败（缺签 / 篡改 / 异钥）或未钉定 → fail-closed**：返回错误，
+    /// 状态机**不推进**（`valid_until` 不刷新、宽限基准不动、时钟校准不生效）——
+    /// 未经验证的服务端时间绝不可信。
+    ///
     /// **关键**：网络失败**不得**降级——错误直接返回给调用方；状态机只在
     /// **宽限期耗尽**时才降级。B 档断网时由调用方继续采集与转发，稍后补报。
     ///
     /// # Errors
-    /// 网络失败 / 超时 → `NetworkError`；服务端拒绝 / 响应缺字段 → `AuthError`；无租约 → `AuthError`。
+    /// 网络失败 / 超时 → `NetworkError`；服务端拒绝 / 响应缺字段 → `AuthError`；无租约 → `AuthError`；
+    /// 响应验签失败 / 未钉定服务端公钥 → `SecurityError`。
     pub async fn heartbeat(&self, cursor: Option<(i64, i64)>) -> DaemonResult<LicenseState> {
         let lease = self.active_lease().ok_or_else(|| {
             DaemonError::AuthError("heartbeat requires an activated lease".to_string())
@@ -768,6 +940,31 @@ impl LicensingClient {
         // 服务端权威时间与租约失效时刻（均为秒字符串）。
         let server_time = require_secs_field(&resp, "server_time", "heartbeat")?;
         let server_valid_until = require_secs_field(&resp, "valid_until", "heartbeat")?;
+
+        // ---- 响应签名校验（TOFU 钉定公钥）：先于任何状态推进，失败即 fail-closed ----
+        let pinned = self.inner.lock().ok().and_then(|g| g.pinned_server_key);
+        let pinned = pinned.ok_or_else(|| {
+            DaemonError::SecurityError(
+                "heartbeat response rejected: no server public key pinned \
+                 (activate first to pin the server key via TOFU)"
+                    .to_string(),
+            )
+        })?;
+        let pinned_key = VerifyingKey::from_bytes(&pinned).map_err(|e| {
+            DaemonError::SecurityError(format!(
+                "pinned server public key is no longer a valid Ed25519 point: {e}"
+            ))
+        })?;
+        let resp_sig = resp.get("sig").and_then(|v| v.as_str()).ok_or_else(|| {
+            DaemonError::AuthError("heartbeat response is missing 'sig' field".to_string())
+        })?;
+        let message = render_response_signing_message(
+            RESPONSE_SIG_DOMAIN_HEARTBEAT,
+            &lease.lease_id,
+            &nonce,
+            server_time,
+        );
+        verify_signature_b64(&pinned_key, message.as_bytes(), resp_sig, "server response")?;
 
         // 以服务端权威 `valid_until` 刷新本地租约有效期（服务端在激活时固定该值，心跳回显；
         // 若两者漂移，以服务端为准）。`raw` 原文保留不变（审计与再验签用）。
@@ -1613,24 +1810,39 @@ fn validate_claims(claims: &LeaseClaims) -> DaemonResult<()> {
     Ok(())
 }
 
-/// Ed25519 验签（原始 64 字节签名，STANDARD base64）。
+/// Ed25519 验签（原始 64 字节签名，STANDARD base64；Lease Token 场景包装）。
 ///
 /// # Errors
 /// base64 非法 / 签名长度 ≠ 64 / 验签不通过 → [`DaemonError::SecurityError`]。
 fn verify_ed25519(key: &VerifyingKey, message: &[u8], signature_b64: &str) -> DaemonResult<()> {
+    verify_signature_b64(key, message, signature_b64, "lease token")
+}
+
+/// 通用 Ed25519 验签（原始 64 字节签名，STANDARD base64）。
+///
+/// `context` 进入错误消息（如 `lease token` / `server response`），便于定位失败环节。
+///
+/// # Errors
+/// base64 非法 / 签名长度 ≠ 64 / 验签不通过 → [`DaemonError::SecurityError`]。
+fn verify_signature_b64(
+    key: &VerifyingKey,
+    message: &[u8],
+    signature_b64: &str,
+    context: &str,
+) -> DaemonResult<()> {
     use ed25519_dalek::Verifier as _;
     let sig_bytes = B64.decode(signature_b64.trim()).map_err(|e| {
-        DaemonError::SecurityError(format!("lease token signature is not valid base64: {e}"))
+        DaemonError::SecurityError(format!("{context} signature is not valid base64: {e}"))
     })?;
     let sig_array: [u8; ED25519_SIGNATURE_LEN] = sig_bytes.as_slice().try_into().map_err(|_| {
         DaemonError::SecurityError(format!(
-            "lease token signature length {} != {ED25519_SIGNATURE_LEN}",
+            "{context} signature length {} != {ED25519_SIGNATURE_LEN}",
             sig_bytes.len()
         ))
     })?;
     let signature = Signature::from_bytes(&sig_array);
     key.verify(message, &signature).map_err(|e| {
-        DaemonError::SecurityError(format!("lease token signature verification failed: {e}"))
+        DaemonError::SecurityError(format!("{context} signature verification failed: {e}"))
     })
 }
 
@@ -1809,20 +2021,110 @@ mod tests {
         )
     }
 
-    /// 构造激活成功响应（服务端 `ActivationResponse` 关键字段）。
-    fn activate_ok_response(token: &str) -> serde_json::Value {
-        serde_json::json!({ "lease_token": token })
+    // ---- 带服务端响应签名的测试响应构造（TOFU） ----
+
+    /// **test-only** 服务端 Ed25519 私钥种子（响应签名用；**仅测试，禁止真实部署**）。
+    const TEST_ONLY_SERVER_SEED: [u8; 32] = [0x5du8; 32];
+
+    /// TEST_ONLY 私钥种子 → 服务端公钥 STANDARD base64（激活响应 `server_pubkey` 字段）。
+    fn server_pubkey_b64(seed: [u8; 32]) -> String {
+        B64.encode(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
     }
 
-    /// 构造心跳成功响应（服务端 `HeartbeatResponse` 形状，**不含新 Token**）。
-    fn heartbeat_ok_response(server_time: i64, valid_until: i64) -> serde_json::Value {
+    /// 服务端响应签名（测试侧按契约域串现算；与 daemon 验签函数逐字节一致）。
+    fn sign_server_response(
+        seed: [u8; 32],
+        domain: &str,
+        lease_id: &str,
+        nonce: &str,
+        server_time: i64,
+    ) -> String {
+        let message = render_response_signing_message(domain, lease_id, nonce, server_time);
+        B64.encode(
+            SigningKey::from_bytes(&seed)
+                .sign(message.as_bytes())
+                .to_bytes(),
+        )
+    }
+
+    /// 构造**带服务端响应签名**的激活成功响应（TOFU：`server_pubkey` + `sig`）。
+    ///
+    /// `sig` 用 `seed` 私钥对 `activation|lease-0001|<请求 nonce>|<server_time>` 签名；
+    /// `pubkey_override` 模拟「sig 与公钥不同源」（错钥负例）；`omit` 剔除字段（缺签负例）。
+    /// `lease_id` / `tier` / `verify_mode` / `valid_until` 与 [`build_token`] 的默认租约一致。
+    #[allow(clippy::too_many_arguments)]
+    fn signed_activation_response(
+        req: &serde_json::Value,
+        token: &str,
+        seed: [u8; 32],
+        tamper_sig: bool,
+        pubkey_override: Option<String>,
+        omit: &[&str],
+    ) -> serde_json::Value {
+        let nonce = req
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let server_time = T0;
+        let mut sig = sign_server_response(
+            seed,
+            RESPONSE_SIG_DOMAIN_ACTIVATION,
+            "lease-0001",
+            &nonce,
+            server_time,
+        );
+        if tamper_sig {
+            // 篡改签名首字节（base64 安全，不影响解析）。
+            sig.replace_range(0..1, if sig.starts_with('A') { "B" } else { "A" });
+        }
+        let mut body = serde_json::json!({
+            "lease_id": "lease-0001",
+            "lease_token": token,
+            "verify_mode": "B",
+            "tier": "standard",
+            "valid_until": (T0 + 365 * SECS_PER_DAY).to_string(),
+            "heartbeat_hours": 24,
+            "server_time": server_time.to_string(),
+            "nonce": nonce,
+            "server_pubkey": pubkey_override.unwrap_or_else(|| server_pubkey_b64(seed)),
+            "sig": sig,
+        });
+        if let Some(obj) = body.as_object_mut() {
+            for key in omit {
+                obj.remove(*key);
+            }
+        }
+        body
+    }
+
+    /// 构造**带服务端响应签名**的心跳成功响应（`sig` 域串 `heartbeat|lease-0001|<nonce>|<ts>`）。
+    ///
+    /// `sig` 用 `seed` 私钥现算（`seed` ≠ 激活时钉定种子即「异钥」负例）。
+    fn signed_heartbeat_response(
+        req: &serde_json::Value,
+        seed: [u8; 32],
+        server_time: i64,
+        valid_until: i64,
+    ) -> serde_json::Value {
+        let nonce = req
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         serde_json::json!({
             "server_time": server_time.to_string(),
             "next_deadline": (server_time + 86_400).to_string(),
             "valid_until": valid_until.to_string(),
             "verify_mode": "B",
             "tier": "standard",
-            "sig": "server-response-sig",
+            "sig": sign_server_response(
+                seed,
+                RESPONSE_SIG_DOMAIN_HEARTBEAT,
+                "lease-0001",
+                &nonce,
+                server_time,
+            ),
         })
     }
 
@@ -1844,6 +2146,8 @@ mod tests {
     enum FakeAction {
         /// 返回成功响应体。
         Ok(serde_json::Value),
+        /// 返回**动态计算**的成功响应（请求到达时以请求体现算——响应签名需要请求 nonce）。
+        Dyn(DynResponder),
         /// 返回网络错误（模拟断网 / 超时）。
         NetFail(String),
         /// 返回服务端拒绝（AuthError）。
@@ -1858,10 +2162,57 @@ mod tests {
         Unset,
     }
 
+    /// 动态响应闭包：入参 `(url, request_body)`，返回响应体。
+    type DynResponder = Box<dyn Fn(&str, &serde_json::Value) -> serde_json::Value + Send>;
+
     impl FakeTransport {
         /// 编程：下一次请求返回给定响应体。
         fn respond_with(&self, value: serde_json::Value) {
             *self.action.lock().expect("fake action lock") = FakeAction::Ok(value);
+        }
+
+        /// 编程：下一次请求返回动态计算的响应（闭包入参：URL、请求体）。
+        fn respond_dyn(&self, f: DynResponder) {
+            *self.action.lock().expect("fake action lock") = FakeAction::Dyn(f);
+        }
+
+        /// 编程：下一次激活请求返回**带 TOFU 服务端签名**的成功响应（契约默认形状）。
+        fn respond_with_signed_activation(&self, token: &str, seed: [u8; 32]) {
+            self.respond_with_activation_variants(token, seed, false, None, &[]);
+        }
+
+        /// 编程：激活响应变体（负例：篡改 `sig` / `server_pubkey` 与签名不同源 / 剔除字段）。
+        fn respond_with_activation_variants(
+            &self,
+            token: &str,
+            seed: [u8; 32],
+            tamper_sig: bool,
+            pubkey_override: Option<String>,
+            omit: &'static [&'static str],
+        ) {
+            let token = token.to_string();
+            self.respond_dyn(Box::new(move |_url, req| {
+                signed_activation_response(
+                    req,
+                    &token,
+                    seed,
+                    tamper_sig,
+                    pubkey_override.clone(),
+                    omit,
+                )
+            }));
+        }
+
+        /// 编程：下一次心跳请求返回**带服务端签名**的成功响应（`seed` ≠ 钉定种子即异钥负例）。
+        fn respond_with_signed_heartbeat(
+            &self,
+            seed: [u8; 32],
+            server_time: i64,
+            valid_until: i64,
+        ) {
+            self.respond_dyn(Box::new(move |_url, req| {
+                signed_heartbeat_response(req, seed, server_time, valid_until)
+            }));
         }
 
         /// 编程：下一次 `/verify` 请求返回**回显请求 nonce** 的成功响应。
@@ -1900,6 +2251,7 @@ mod tests {
             *self.last_body.lock().expect("body lock") = Some(body.clone());
             match &*self.action.lock().expect("fake action lock") {
                 FakeAction::Ok(v) => Ok(v.clone()),
+                FakeAction::Dyn(f) => Ok(f(url, body)),
                 FakeAction::NetFail(m) => Err(DaemonError::NetworkError(m.clone())),
                 FakeAction::Reject(m) => Err(DaemonError::AuthError(m.clone())),
                 FakeAction::VerifyEcho { ok } => {
@@ -1927,7 +2279,7 @@ mod tests {
     async fn activate_success_returns_licensed() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
 
         let state = client
             .activate("ACT-CODE-1234")
@@ -1987,12 +2339,286 @@ mod tests {
         assert_eq!(err.error_code(), ERR_CONFIG);
     }
 
+    // ---- 服务端响应签名（TOFU）：正例 ----
+
+    /// TOFU 正例：合法签名的激活响应 → `Licensed`，且服务端公钥被钉定（后续心跳用）。
+    #[tokio::test]
+    async fn activate_success_pins_server_key() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
+
+        client
+            .activate("ACT-1")
+            .await
+            .expect("activation must succeed");
+        assert_eq!(client.current_state().name(), "Licensed");
+        // 钉定的公钥 == 激活响应携带的公钥（由同一把 TEST_ONLY 服务端私钥派生）。
+        assert_eq!(
+            client.pinned_server_key_b64().as_deref(),
+            Some(server_pubkey_b64(TEST_ONLY_SERVER_SEED).as_str()),
+            "activation response server_pubkey must be pinned (TOFU)"
+        );
+    }
+
+    /// 心跳正例：钉定公钥验签通过 → 状态推进（`valid_until` 以服务端权威值刷新）。
+    #[tokio::test]
+    async fn heartbeat_with_valid_server_signature_advances_state() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
+        client.activate("ACT-1").await.expect("activate ok");
+
+        // 服务端报出更长的有效期（比 Token 原值 +35 天）。
+        let extended = T0 + 400 * SECS_PER_DAY;
+        fake.respond_with_signed_heartbeat(TEST_ONLY_SERVER_SEED, T0, extended);
+        let state = client
+            .heartbeat(None)
+            .await
+            .expect("heartbeat must succeed");
+        match &state {
+            LicenseState::Licensed { lease } => {
+                assert_eq!(lease.valid_until, extended, "valid_until must be refreshed");
+            }
+            other => panic!("expected Licensed, got {other:?}"),
+        }
+        assert_eq!(client.current_state().name(), "Licensed");
+    }
+
+    // ---- 服务端响应签名（TOFU）：激活负例（fail-closed，状态不推进） ----
+
+    /// 激活响应 `sig` 被篡改 → SecurityError，状态保持 `Unlicensed`，**不钉定**任何公钥。
+    #[tokio::test]
+    async fn activate_tampered_response_sig_is_fail_closed() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_activation_variants(&token, TEST_ONLY_SERVER_SEED, true, None, &[]);
+
+        let err = client
+            .activate("ACT-1")
+            .await
+            .expect_err("tampered sig must fail");
+        assert_eq!(err.error_code(), ERR_SECURITY);
+        assert!(err.to_string().contains("server response"), "{err}");
+        assert_eq!(client.current_state(), LicenseState::Unlicensed);
+        assert!(
+            client.pinned_server_key_b64().is_none(),
+            "must not pin an unverified key"
+        );
+    }
+
+    /// 错钥负例：`sig` 用 A 签、`server_pubkey` 报 B → 验签失败，fail-closed。
+    #[tokio::test]
+    async fn activate_response_sig_with_mismatched_pubkey_is_rejected() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        let rogue_pubkey = server_pubkey_b64(TEST_ONLY_KEY_B);
+        fake.respond_with_activation_variants(
+            &token,
+            TEST_ONLY_SERVER_SEED,
+            false,
+            Some(rogue_pubkey),
+            &[],
+        );
+
+        let err = client
+            .activate("ACT-1")
+            .await
+            .expect_err("mismatched key must fail");
+        assert_eq!(err.error_code(), ERR_SECURITY);
+        assert_eq!(client.current_state(), LicenseState::Unlicensed);
+        assert!(client.pinned_server_key_b64().is_none());
+    }
+
+    /// 激活响应缺 `sig` → fail-closed（不 panic，状态不推进）。
+    #[tokio::test]
+    async fn activate_response_missing_sig_is_fail_closed() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_activation_variants(&token, TEST_ONLY_SERVER_SEED, false, None, &["sig"]);
+
+        let err = client
+            .activate("ACT-1")
+            .await
+            .expect_err("missing sig must fail");
+        assert_eq!(err.error_code(), ERR_AUTH);
+        assert!(err.to_string().contains("'sig'"), "{err}");
+        assert_eq!(client.current_state(), LicenseState::Unlicensed);
+    }
+
+    /// 激活响应缺 `server_pubkey` → fail-closed（TOFU 无公钥即无信任锚）。
+    #[tokio::test]
+    async fn activate_response_missing_server_pubkey_is_fail_closed() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_activation_variants(
+            &token,
+            TEST_ONLY_SERVER_SEED,
+            false,
+            None,
+            &["server_pubkey"],
+        );
+
+        let err = client
+            .activate("ACT-1")
+            .await
+            .expect_err("missing pubkey must fail");
+        assert_eq!(err.error_code(), ERR_AUTH);
+        assert!(err.to_string().contains("server_pubkey"), "{err}");
+        assert_eq!(client.current_state(), LicenseState::Unlicensed);
+    }
+
+    // ---- 服务端响应签名（TOFU）：心跳负例（fail-closed，状态不推进） ----
+
+    /// 心跳响应 `sig` 被篡改 → SecurityError，状态机**不推进**（`valid_until` 不刷新）。
+    #[tokio::test]
+    async fn heartbeat_tampered_response_sig_does_not_advance_state() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
+        client.activate("ACT-1").await.expect("activate ok");
+
+        // 异钥签名：服务端私钥换成 TEST_ONLY_KEY_B（≠ 激活时钉定的 TEST_ONLY_SERVER_SEED）。
+        fake.respond_with_signed_heartbeat(TEST_ONLY_KEY_B, T0, T0 + 400 * SECS_PER_DAY);
+        let err = client
+            .heartbeat(None)
+            .await
+            .expect_err("foreign-key heartbeat sig must fail");
+        assert_eq!(err.error_code(), ERR_SECURITY);
+        // 状态不推进：仍是 Licensed，但 `valid_until` 保持激活时的原值（未被刷新）。
+        match client.current_state() {
+            LicenseState::Licensed { lease } => {
+                assert_eq!(
+                    lease.valid_until,
+                    T0 + 365 * SECS_PER_DAY,
+                    "unverified heartbeat must NOT refresh valid_until"
+                );
+            }
+            other => panic!("expected Licensed, got {other:?}"),
+        }
+    }
+
+    /// 心跳响应缺 `sig` → AuthError，状态不推进。
+    #[tokio::test]
+    async fn heartbeat_missing_sig_is_fail_closed() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
+        client.activate("ACT-1").await.expect("activate ok");
+
+        // 用 Ok 动作给一个无 sig 的心跳响应（缺签负例）。
+        fake.respond_with(serde_json::json!({
+            "server_time": T0.to_string(),
+            "next_deadline": (T0 + 86_400).to_string(),
+            "valid_until": (T0 + 400 * SECS_PER_DAY).to_string(),
+            "verify_mode": "B",
+            "tier": "standard",
+        }));
+        let err = client
+            .heartbeat(None)
+            .await
+            .expect_err("missing sig must fail");
+        assert_eq!(err.error_code(), ERR_AUTH);
+        assert!(err.to_string().contains("'sig'"), "{err}");
+        match client.current_state() {
+            LicenseState::Licensed { lease } => {
+                assert_eq!(lease.valid_until, T0 + 365 * SECS_PER_DAY);
+            }
+            other => panic!("expected Licensed, got {other:?}"),
+        }
+    }
+
+    /// TOFU 钉定后：心跳响应签名用异钥（哪怕响应其余字段合法）→ 一律拒绝。
+    #[tokio::test]
+    async fn heartbeat_after_tofu_pinning_rejects_other_key() {
+        let (client, fake) = setup();
+        let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
+        client.activate("ACT-1").await.expect("activate ok");
+        assert!(client.pinned_server_key_b64().is_some());
+
+        // 第三把私钥签心跳响应。
+        let rogue_seed: [u8; 32] = [0x7eu8; 32];
+        fake.respond_with_signed_heartbeat(rogue_seed, T0, T0 + 400 * SECS_PER_DAY);
+        let err = client
+            .heartbeat(Some((1, 2)))
+            .await
+            .expect_err("rogue-key heartbeat must be rejected");
+        assert_eq!(err.error_code(), ERR_SECURITY);
+        assert!(err.to_string().contains("server response"), "{err}");
+        assert_eq!(client.current_state().name(), "Licensed", "state unchanged");
+    }
+
+    /// 独立函数级正例：`verify_server_response_signature` 对契约域串的合法签名放行。
+    #[test]
+    fn verify_server_response_signature_accepts_valid_sig() {
+        let sig = sign_server_response(
+            TEST_ONLY_SERVER_SEED,
+            RESPONSE_SIG_DOMAIN_HEARTBEAT,
+            "lease-0001",
+            "nonce-x",
+            T0,
+        );
+        verify_server_response_signature(
+            &server_pubkey_b64(TEST_ONLY_SERVER_SEED),
+            RESPONSE_SIG_DOMAIN_HEARTBEAT,
+            "lease-0001",
+            "nonce-x",
+            T0,
+            &sig,
+        )
+        .expect("valid server response signature must verify");
+    }
+
+    /// 独立函数级负例：篡改域串任一字段（lease_id / nonce / server_time）→ 拒绝。
+    #[test]
+    fn verify_server_response_signature_rejects_tampered_fields() {
+        let sig = sign_server_response(
+            TEST_ONLY_SERVER_SEED,
+            RESPONSE_SIG_DOMAIN_ACTIVATION,
+            "lease-0001",
+            "nonce-x",
+            T0,
+        );
+        let pubkey = server_pubkey_b64(TEST_ONLY_SERVER_SEED);
+        // lease_id 不同。
+        assert!(verify_server_response_signature(
+            &pubkey,
+            RESPONSE_SIG_DOMAIN_ACTIVATION,
+            "lease-0002",
+            "nonce-x",
+            T0,
+            &sig
+        )
+        .is_err());
+        // server_time 不同。
+        assert!(verify_server_response_signature(
+            &pubkey,
+            RESPONSE_SIG_DOMAIN_ACTIVATION,
+            "lease-0001",
+            "nonce-x",
+            T0 + 1,
+            &sig
+        )
+        .is_err());
+        // 跨域混用（heartbeat 的 sig 用于 activation）。
+        assert!(verify_server_response_signature(
+            &pubkey,
+            RESPONSE_SIG_DOMAIN_HEARTBEAT,
+            "lease-0001",
+            "nonce-x",
+            T0,
+            &sig
+        )
+        .is_err());
+    }
+
     /// 要求 5（端到端·心跳超时）：网络失败 → NetworkError，**状态不降级**。
     #[tokio::test]
     async fn heartbeat_timeout_does_not_downgrade() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
         assert_eq!(client.current_state().name(), "Licensed");
 
@@ -2016,7 +2642,7 @@ mod tests {
     async fn offline_heartbeats_keep_collecting_and_forwarding() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         // 断网：连续 3 天反复心跳失败 + tick。
@@ -2035,10 +2661,10 @@ mod tests {
     async fn heartbeat_with_cursor_sends_string_numbers() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
-        fake.respond_with(heartbeat_ok_response(T0, T0 + 365 * 86_400));
+        fake.respond_with_signed_heartbeat(TEST_ONLY_SERVER_SEED, T0, T0 + 365 * 86_400);
         client
             .heartbeat(Some((100, 9007199254740991)))
             .await
@@ -2064,7 +2690,7 @@ mod tests {
     async fn receipt_body_has_exactly_whitelisted_keys() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         fake.respond_with(serde_json::json!({ "ok": true }));
@@ -2108,7 +2734,7 @@ mod tests {
     async fn receipt_numbers_are_json_strings() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         fake.respond_with(serde_json::json!({ "ok": true }));
@@ -2148,7 +2774,7 @@ mod tests {
     async fn receipt_negative_count_is_rejected() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         let err = client
@@ -2167,7 +2793,7 @@ mod tests {
     async fn receipt_signature_verifies_against_its_public_key() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         fake.respond_with(serde_json::json!({ "ok": true }));
@@ -2225,7 +2851,7 @@ mod tests {
         let fake = Arc::new(FakeTransport::default());
         let client = client_with_fake_no_receipt_signer(&fake);
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         fake.respond_with(serde_json::json!({ "ok": true }));
@@ -2407,7 +3033,7 @@ mod tests {
         let (client, fake) = setup();
         // 租约很快过期（1 天后），触发进入 Grace。
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + SECS_PER_DAY);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         // 先推进到 1 天后 → 租约过期 → 进入 Grace（days_left = 7）。
@@ -2526,7 +3152,7 @@ mod tests {
     async fn clock_rollback_does_not_extend_grace() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + SECS_PER_DAY);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         // 进入 Grace 并推进 3 天。
@@ -2553,7 +3179,7 @@ mod tests {
     async fn successful_heartbeat_restores_licensed() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + SECS_PER_DAY);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         // 进入 Grace。
@@ -2561,7 +3187,11 @@ mod tests {
         assert_eq!(client.current_state().name(), "Grace");
 
         // 心跳成功（服务端回显更长的 valid_until）→ 回到 Licensed；**不要求响应含新 Token**。
-        fake.respond_with(heartbeat_ok_response(T0 + SECS_PER_DAY, T0 + 365 * 86_400));
+        fake.respond_with_signed_heartbeat(
+            TEST_ONLY_SERVER_SEED,
+            T0 + SECS_PER_DAY,
+            T0 + 365 * 86_400,
+        );
         let state = client.heartbeat(None).await.expect("heartbeat ok");
         assert_eq!(state.name(), "Licensed");
         assert_eq!(client.current_state().name(), "Licensed");
@@ -2580,7 +3210,7 @@ mod tests {
     async fn heartbeat_missing_server_fields_errors_and_keeps_state() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         // 心跳响应只有 server_time，缺 valid_until → AuthError。
@@ -2619,13 +3249,13 @@ mod tests {
 
         // 激活：闸门开放。
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
         assert!(LicenseGate::can_sign(&client));
 
         // 降级：闸门关闭。先用短有效期租约激活，再推进「过期 → 宽限 → 宽限耗尽」。
         let trial_token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + SECS_PER_DAY);
-        fake.respond_with(activate_ok_response(&trial_token));
+        fake.respond_with_signed_activation(&trial_token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-2").await.expect("activate ok");
         // 第 1 步：过期 → 进入 Grace。
         let state = client.tick(T0 + SECS_PER_DAY);
@@ -2642,7 +3272,7 @@ mod tests {
     async fn class_b_offline_still_collects_and_forwards() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         fake.fail_network("offline");
@@ -2908,10 +3538,10 @@ mod tests {
     async fn heartbeat_body_has_exactly_whitelisted_keys_and_valid_sig() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
-        fake.respond_with(heartbeat_ok_response(T0, T0 + 365 * 86_400));
+        fake.respond_with_signed_heartbeat(TEST_ONLY_SERVER_SEED, T0, T0 + 365 * 86_400);
         client
             .heartbeat(Some((1, 100)))
             .await
@@ -2957,10 +3587,10 @@ mod tests {
         let fake = Arc::new(FakeTransport::default());
         let client = client_with_fake_no_receipt_signer(&fake);
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
-        fake.respond_with(heartbeat_ok_response(T0, T0 + 365 * 86_400));
+        fake.respond_with_signed_heartbeat(TEST_ONLY_SERVER_SEED, T0, T0 + 365 * 86_400);
         client
             .heartbeat(None)
             .await
@@ -2979,7 +3609,7 @@ mod tests {
     async fn verify_ok_echoes_nonce_and_returns_ok() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "A", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         fake.respond_with_verify_echo(true);
@@ -3012,7 +3642,7 @@ mod tests {
     async fn verify_nonce_mismatch_is_security_error() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "A", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-1").await.expect("activate ok");
 
         fake.respond_with(serde_json::json!({
@@ -3038,7 +3668,7 @@ mod tests {
     async fn activation_body_has_exactly_whitelisted_keys() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-CODE").await.expect("activate ok");
 
         let body = fake.last_body().expect("body recorded");
@@ -3067,7 +3697,7 @@ mod tests {
     async fn activation_req_sig_verifies_and_pubkey_matches() {
         let (client, fake) = setup();
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-CODE").await.expect("activate ok");
 
         let body = fake.last_body().expect("body recorded");
@@ -3126,7 +3756,7 @@ mod tests {
             .expect("register kid-a");
 
         let token = build_token(TEST_ONLY_KEY_A, "kid-a", "B", T0, T0 + 365 * 86_400);
-        fake.respond_with(activate_ok_response(&token));
+        fake.respond_with_signed_activation(&token, TEST_ONLY_SERVER_SEED);
         client.activate("ACT-CODE").await.expect("activate ok");
 
         let body = fake.last_body().expect("body recorded");
