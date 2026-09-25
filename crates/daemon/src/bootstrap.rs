@@ -31,8 +31,9 @@
 //! 2. 看门狗重启 = **单次**调用 `watchdog_restart` 钩子（默认 no-op warn）：
 //!    V1 无法重建已被消费的 `RunningScheduler`，仅记录 + 钩子回调；
 //!    组件级真正的重启留待装配闭环任务。
-//! 3. 离线队列 flush 为钩子（默认 no-op + TODO）：bootstrap 只**消费**装配方注入的
-//!    `OfflineQueue`，不负责其创建（构造需要 db 路径与 gateway_id 装配决策）。
+//! 3. 离线队列 flush 为钩子（缺省仍 no-op warn）：bootstrap 只**消费**装配方注入的
+//!    `OfflineQueue`，不负责其创建（构造需要 db 路径与 gateway_id 装配决策）；
+//!    生产 bin 经 [`assemble_north_runtime`] + [`offline_flush_hook`] 接线。
 //! 4. `run()` 支持外部注入 [`DaemonShared`]（[`BootstrapBuilder::with_shared`]）：
 //!    管理 API（mgmt）与北向都需要在运行期持有同一句柄，故不能只在 run 结束时返回。
 //! 5. 北向出口的 **TLS/mTLS 在 V1 不可接线**（`[[outlets]]` 无证书字段且不得新增
@@ -51,11 +52,13 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
+use crate::backpressure::{audit_json, BackpressureAudit};
 use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig, ReloadGate};
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
 use crate::license::{LicenseRuntime, LicenseRuntimeConfig, LICENSE_RECOVERY_HINT};
 use crate::north::runtime::{NorthForwardGate, NorthRuntime, NorthRuntimeConfig};
+use crate::offline_queue::{OfflineQueue, QueueConfig, SystemClock, QUEUE_DB_FILE_NAME};
 use crate::ota::OtaBootDecision;
 use crate::scheduler::{GroupConfig, GroupScheduler, PollHandler, RunningScheduler};
 
@@ -893,6 +896,117 @@ impl std::fmt::Debug for DynPollHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynPollHandler").finish_non_exhaustive()
     }
+}
+
+// ---- 生产装配辅助：北向运行期 + 离线队列（queue.db 生产落盘接线） ----
+
+/// 生产形态的背压审计上报出口：把 [`BackpressureAudit`] 事件写入 tracing 日志。
+///
+/// 「异常类」（溢出拒绝 / 落盘降级不可用退回内存）记 `warn`，其余记 `info`；
+/// 细节以 [`audit_json`] 的 JSON 形式携带（大数字段已按字符串编码，可直接采集）。
+/// 实现遵守 `AuditSink` 约定：同步、快速、无阻塞（审计环本身有界，
+/// `AuditPump::dropped()` 可观测消费变慢）。
+pub struct LoggingAuditSink;
+
+impl crate::north::mqtt::AuditSink for LoggingAuditSink {
+    fn emit(&self, events: Vec<BackpressureAudit>) {
+        for event in events {
+            let payload = audit_json(&event);
+            match &event {
+                BackpressureAudit::OverflowRejected { .. }
+                | BackpressureAudit::SpillFailedAdmitted { .. } => {
+                    warn!(audit = %payload, "north backpressure audit: {payload}");
+                }
+                _ => {
+                    info!(audit = %payload, "north backpressure audit: {payload}");
+                }
+            }
+        }
+    }
+}
+
+/// 北向运行期生产装配产物（bin 主流程与集成测试共用同一装配路径）。
+pub struct NorthRuntimeAssembly {
+    /// 共享离线队列（落 `<data_dir>/queue.db`；发送降级与补发共用同一实例）。
+    ///
+    /// 停机 flush 钩子（[`offline_flush_hook`]）与测试断言也需要它，故一并交付。
+    pub queue: Arc<OfflineQueue>,
+    /// 北向运行期装配输入（经 [`BootstrapBuilder::with_north_runtime`] 注入）。
+    pub runtime_config: NorthRuntimeConfig,
+}
+
+/// 按 `[[outlets]]` 声明装配北向运行期输入（生产装配缺口的唯一接线点）。
+///
+/// - **未声明 `[[outlets]]`** → 返回 `None`：北向不启动、不创建 `queue.db`，
+///   行为与接线前完全一致（bootstrap 对该情形记 `info`）；
+/// - **已声明** → 打开 `<data_dir>/queue.db`（D-08：data_dir 已随
+///   `IOT_DAQ_DATA_DIR` 解析）并构造 [`NorthRuntimeConfig`]（默认 200ms 驱动拍）。
+///   授权闸门在 [`BootstrapBuilder::run`] ④ 统一从 [`LicenseRuntime`] /
+///   `AssemblyFailedGate` 挂载（判定始终在 Rust 侧网关，本函数不重复实现配额语义）。
+///
+/// # Errors
+/// `gateway_id` 为空或 [`OfflineQueue::open`] 失败（目录不可写 / SQLite 打开 /
+/// 迁移失败）→ 原样上抛。调用方（生产 bin）应 fail-fast：离线队列不可用意味着
+/// 「发送队列超限 → 落盘降级」失去落盘保证，静默放行会退化为有界内存溢出丢数据。
+pub fn assemble_north_runtime(
+    config: &GatewayConfig,
+) -> DaemonResult<Option<NorthRuntimeAssembly>> {
+    if config.outlets.is_empty() {
+        return Ok(None);
+    }
+    let queue_cfg = QueueConfig::new(
+        config.gateway.data_dir.join(QUEUE_DB_FILE_NAME),
+        config.gateway.gateway_id.as_str(),
+    )?;
+    let queue = Arc::new(OfflineQueue::open(queue_cfg, Arc::new(SystemClock::new()))?);
+    info!(
+        db_path = %queue.queue_db_path().display(),
+        gateway_id = queue.gateway_id(),
+        outlets = config.outlets.len(),
+        "bootstrap: offline queue opened for the north runtime (send-queue spill + replay)"
+    );
+    let runtime_config = NorthRuntimeConfig::new(
+        Arc::clone(&queue),
+        Arc::new(SystemClock::new()),
+        Arc::new(LoggingAuditSink),
+    );
+    Ok(Some(NorthRuntimeAssembly {
+        queue,
+        runtime_config,
+    }))
+}
+
+/// 停机 flush 钩子工厂：优雅停机步骤 2/3 把发送队列降级后的内存驻留强制
+/// flush 进 `queue.db`（补齐模块注释限制 3 的 TODO；进程内数据安全的收口）。
+///
+/// `OfflineQueue::flush` 是同步 API（走队列写线程），故在 `spawn_blocking` 内
+/// 执行，不阻塞异步运行时；失败只 `warn`（数据已回灌队列内存，不丢），
+/// 不中断停机序列。
+#[must_use]
+pub fn offline_flush_hook(queue: Arc<OfflineQueue>) -> StopHook {
+    Arc::new(move || {
+        let queue = Arc::clone(&queue);
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || queue.flush()).await;
+            match result {
+                Ok(Ok(rows)) if rows > 0 => {
+                    info!(rows, "bootstrap: offline queue flushed at shutdown");
+                }
+                Ok(Ok(_)) => {
+                    info!("bootstrap: offline queue empty at shutdown (nothing to flush)");
+                }
+                Ok(Err(err)) => warn!(
+                    error = %err,
+                    "bootstrap: [WARN] offline queue flush failed; in-memory batches were \
+                     restored into the queue and remain pending (no data dropped)"
+                ),
+                Err(err) => warn!(
+                    error = %err,
+                    "bootstrap: [WARN] offline queue flush blocking task failed to join"
+                ),
+            }
+        }) as HookFuture
+    })
 }
 
 /// 安全审计库装配（task 26 最小接线）：把 [`crate::audit::AuditLogger`] 挂载到

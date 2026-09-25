@@ -567,6 +567,25 @@ async fn main() -> ExitCode {
         &config.gateway.data_dir,
     );
 
+    // ②-d 北向运行期与离线队列生产装配（queue.db 生产落盘缺口补齐）：
+    //     - 声明了 [[outlets]] → 构造 OfflineQueue（<data_dir>/queue.db，D-08 同卷）
+    //       与 NorthRuntimeConfig 注入 bootstrap（驱动循环 / 授权闸门 / 补发 /
+    //       审计上报均由 bootstrap 既有装配路径统一完成）；
+    //     - 未声明 → 保持既有行为（北向不启动、不创建 queue.db）。
+    //     离线队列打开失败 fail-fast：降级落盘路径失去落盘保证，不能带病运行。
+    let north_assembly = match daemon::bootstrap::assemble_north_runtime(&config) {
+        Ok(assembly) => assembly,
+        Err(e) => {
+            eprintln!(
+                "[iot-daq-daemon] [ERROR] 离线队列初始化失败（{}），拒绝启动（fail-closed）：{e}",
+                data_dir
+                    .join(daemon::offline_queue::QUEUE_DB_FILE_NAME)
+                    .display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     // ③ 共享状态 + 管理面：与 bootstrap 共用同一 DaemonShared（状态/热重载/事件）。
     let shared = DaemonShared::default();
     shared.set_config(Arc::new(ConfigShared::new(config.clone())));
@@ -596,6 +615,13 @@ async fn main() -> ExitCode {
         .with_data_dir(data_dir);
     if let Some(handler) = poll_handler {
         builder = builder.with_poll_handler(handler);
+    }
+    // 北向运行期接线 + 停机离线队列 flush 钩子（见 ②-d）：未声明 [[outlets]] 时
+    // 保持既有行为——north runtime 不注入，bootstrap 记 info 说明。
+    if let Some(assembly) = north_assembly {
+        builder = builder
+            .with_north_runtime(assembly.runtime_config)
+            .with_offline_flusher(daemon::bootstrap::offline_flush_hook(assembly.queue));
     }
     match licensing_outcome {
         daemon::auth::assembly::AssemblyOutcome::Assembled(rt_cfg) => {
