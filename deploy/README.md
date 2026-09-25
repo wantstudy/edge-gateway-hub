@@ -324,7 +324,7 @@ logging:
 - 镜像**不可变**，OTA/升级只更新应用产物（task 35），不动镜像与宿主锚点。
 - 升级流程：厂商发布新 digest → 更新 `.env` 的 `IOT_DAQ_IMAGE`（digest）→ 新离线包 `build-offline-bundle` + `sign-and-verify --verify` → `docker compose up -d`（自动拉取新 digest）。
 - 回滚：将 `IOT_DAQ_IMAGE` 改回旧 digest（旧版本镜像保留可重建，supply-chain §3.3），重新 `up -d`。持久卷不变 → 授权/试用/租约/配置全部保持。
-- 升级失败：容器因入口校验（entrypoint.sh）拒绝启动 → 查 `docker compose logs`；**禁止**删指纹文件重生成绕过。
+- 升级失败：容器因入口校验（daemon `--preflight`，distroless 镜像内无 shell，校验由二进制承担）拒绝启动 → 查 `docker compose logs`；**禁止**删指纹文件重生成绕过。
 
 ---
 
@@ -345,7 +345,7 @@ logging:
 
 | 现象 | 原因 / 处置 |
 |------|------------|
-| 容器起不来，entrypoint 报「锚点 machine-id 与容器自身相同」 | 挂载落回容器内路径（陷阱 1）。改用随包 compose 或 `diagnose-anchors.sh` 定位（`entrypoint.sh` 错误码 21）。 |
+| 容器起不来，入口校验（daemon `--preflight`）报「锚点 machine-id 与容器自身相同」 | 挂载落回容器内路径（陷阱 1）。改用随包 compose 或 `diagnose-anchors.sh` 定位（shell 版 `entrypoint.sh` 对应错误码 21；容器内 `--preflight` 统一 exit 2，原因见日志）。 |
 | 容器起不来，报「持久卷不可写 / 缺失」 | 卷未挂载或 `:ro` / 属主不符（陷阱 2）。`mkdir -p` + `chown` 服务账户 + 确认 compose 保留 rw 挂载（错误码 30/31）。 |
 | 串口设备节点打不开（permission denied） | 当前用户不在 `dialout` 组，或 `group_add` 组名与节点组属主不符。`detect-serial.sh` 查属主；把服务账户加入对应组。 |
 | `cosign verify` 失败 | 镜像被篡改/来源不可信，或公钥与签名不匹配。整包作废，从厂商渠道重取；核对公钥指纹（R6）。 |
@@ -365,7 +365,7 @@ logging:
 | `deploy/base-images.lock.yaml` | **本手册新增**：基础镜像 tag ↔ digest 锁文件（digest 由 CI 渲染注入，禁手写） |
 | `deploy/scripts/render-dockerfile-digests.sh` | **本手册新增**：从 lock 渲染 Dockerfile 的 `FROM ...@sha256:` 行；digest 未锁定即 fail-closed |
 | `deploy/docker/docker-compose.yml` | 随包唯一事实源（digest 镜像、陷阱 1/2 固化、host 网络、资源限制） |
-| `deploy/docker/entrypoint.sh` | 宿主锚定 + 持久卷可写性前置校验（fail-fast） |
+| `deploy/docker/entrypoint.sh` | 宿主锚定 + 持久卷可写性前置校验（fail-fast）。**不拷入 distroless runtime 镜像**（D-15：无 shell 下不可执行，容器内校验由 daemon `--preflight` 承担）；仅用于原生部署 / 调试变体（cc/shell）/ 现场排障 |
 | `deploy/docker/config/gateway.default.toml` | 默认配置模板（占位值，无凭据） |
 | `deploy/.env.example` | 全部环境变量命名权威（含红线注释） |
 | `deploy/scripts/install.sh` | 宿主一键安装（指纹采集 + HMAC + 渲染 compose + up -d + 健康检查） |

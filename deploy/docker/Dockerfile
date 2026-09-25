@@ -165,13 +165,14 @@ COPY --from=builder --chown=65532:65532 /build/web-console-dist/ /srv/web-consol
 # ---- 默认配置模板（占位值，现场注入覆盖；不含任何真实凭据）----
 COPY --chown=65532:65532 deploy/docker/config/gateway.default.toml /etc/iot-daq/gateway.toml
 
-# ---- 入口脚本：做宿主锚定校验 + 持久卷可写性校验 ----
-# distroless static 无 /bin/sh，故 entrypoint 用二进制自身而非 shell 脚本。
-# 校验逻辑由 daemon 的 `--preflight` 子命令承担（见 deploy/README.md「入口契约」），
-# 与 deploy/docker/entrypoint.sh（shell 版，供调试/非 distroless 变体使用）语义一一对应。
-COPY --chown=65532:65532 deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-# 注意：distroless/static 无 shell，上面这行仅对 cc/shell 变体有意义；
-# 使用 static 变体时真正的 ENTRYPOINT 走二进制 --preflight，见下。
+# ---- 入口契约：宿主锚定 + 持久卷可写性校验由二进制自身承担 ----
+# distroless/static 无 shell，ENTRYPOINT 直接走 `iot-daq-daemon --preflight`
+# （校验逻辑见 crates/daemon/src/bin/iot-daq-daemon.rs，退出码 0/2，
+# 与 deploy/README.md「入口契约」及 deploy/docker/entrypoint.sh 语义一一对应）。
+# ★ D-15：runtime 阶段**有意不 COPY** deploy/docker/entrypoint.sh ——
+#   该 shell 脚本在无 shell 的 distroless/static 中不可执行，拷入即死重。
+#   它仅服务于：① deb/rpm + systemd 原生部署 ② 调试镜像（cc/shell 变体）
+#   ③ 现场排障手动执行（见其文件头注释与 deploy/README.md §12）。
 
 # ---- 镜像内绝不含（红线自证清单，persistence-layout §2）----
 #   ✗ 私钥 / HKDF 盐 / KMS 凭据

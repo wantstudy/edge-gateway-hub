@@ -7,6 +7,8 @@
 # 与 Dockerfile 的关系：
 #   生产镜像用 distroless/static（无 shell），ENTRYPOINT 走 `iot-daq-daemon --preflight`，
 #   语义与本脚本**一一对应**。
+#   ★ D-15：本脚本**不被 COPY 进** distroless runtime 镜像（无 shell 下不可执行，
+#     拷入即死重）；runtime 阶段的入口校验由 daemon `--preflight` 承担。
 #   本脚本用于：① deb/rpm + systemd 原生部署 ② 调试镜像（cc/shell 变体）
 #   ③ 现场排障时手动执行以定位锚定问题。
 #
