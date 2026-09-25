@@ -10,7 +10,7 @@
  *  · **mock 模式（默认）**：`repo` 即 mock-data 仓库本身（追加 `ops` 运维动作），
  *    完全不发网络请求。
  *  · **real 模式**：启动 / 登录后 `preloadRealData()` 并行拉取
- *    `/api/devices · /api/points · /api/outlets · /api/status · /api/events`
+ *    `/api/devices · /api/points（逐设备）· /api/outlets · /api/overview · /api/events`
  *    并缓存；读取型方法优先返回真实缓存，**任一接口失败 / 为空则回退 mock 数据**
  *    （任务约束「容差由 fallback 兜底」）；写操作（后端契约未含设备/点位写接口）
  *    落本地覆盖层（overlay），语义与 mock 一致，供本地端到端走通页面流程。
@@ -179,15 +179,20 @@ function mapDevice(raw: Record<string, unknown>, idx: number): DeviceRecord {
   };
 }
 
-/** `/api/points` 行 → PointRecord。 */
+/** `/api/points` 行 → PointRecord。
+ *
+ * 后端行形状（蛇形命名）：`{ device_id, point_id, protocol, address, frequency_ms }`。
+ * `id` 取后端 `point_id`（无则回退 `id` 字段）——这是实时遥测流（`/api/stream`）
+ * 逐点 key（`${device_id}/${point_id}`）的对齐锚点，**不可改名**。
+ */
 function mapPoint(raw: Record<string, unknown>, idx: number): PointRecord {
   const value = raw.value === null || raw.value === undefined ? null : pickNum(raw, 'value', 0);
   const quality = pickStr(raw, 'quality', 'Good') as PointRecord['quality'];
   return {
-    id: pickStr(raw, 'id', `pt-real-${idx}`),
+    id: pickStr(raw, 'id', pickStr(raw, 'point_id', `pt-real-${idx}`)),
     deviceId: pickStr(raw, 'deviceId', pickStr(raw, 'device_id', '')),
     deviceName: pickStr(raw, 'deviceName', pickStr(raw, 'device_name', '—')),
-    name: pickStr(raw, 'name', `点位-${idx + 1}`),
+    name: pickStr(raw, 'name', pickStr(raw, 'point_id', `点位-${idx + 1}`)),
     pointType: pickStr(raw, 'pointType', 'physical') as PointRecord['pointType'],
     address: pickStr(raw, 'address', '—'),
     dataType: pickStr(raw, 'dataType', pickStr(raw, 'data_type', 'float32')),
@@ -284,10 +289,35 @@ function mapEventAlarm(raw: Record<string, unknown>, idx: number): AlarmRecord |
   };
 }
 
-/** `/api/status` → GatewayInfo。
+/** epoch 秒 / 毫秒字符串 → `YYYY-MM-DD HH:mm:ss`（非纯时间戳则原样透传）。
  *
- *  大数红线：`totalForwardedRecords` 走 `pickStr` 字符串直通；
- *  其余均为小值业务计数，经 `pickNum` 安全转换（后端即使返回字符串也不丢精度）。
+ * `/api/overview` 的 `startedAt` 当前为 epoch 秒字符串（小值，远低于 2^53），
+ * 为对齐 mock 契约的展示格式做一次**无精度损失**的格式化；若后端未来直接
+ * 返回人类可读时间字符串，则不匹配纯数字形态、原样透传（宽容兼容）。
+ */
+function formatEpochText(value: string): string {
+  const trimmed = value.trim();
+  if (/^\d{10}$/.test(trimmed)) {
+    return formatDateTimeMs(Number(trimmed) * 1000);
+  }
+  if (/^\d{13}$/.test(trimmed)) {
+    return formatDateTimeMs(Number(trimmed));
+  }
+  return value;
+}
+
+/** 毫秒时间戳 → `YYYY-MM-DD HH:mm:ss`。 */
+function formatDateTimeMs(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** `/api/overview` → GatewayInfo。
+ *
+ * 大数红线：`totalForwardedRecords` 走 `pickStr` 字符串直通；
+ * 后端其余计数字段当前也以字符串返回（JSON 大数红线），均为小值业务计数，
+ * 经 `pickNum` 安全转换后再参与页面运算/格式化（无精度损失）。
  */
 function mapStatus(raw: Record<string, unknown>): GatewayInfo {
   const dflt = mockRepo.getGateway();
@@ -299,7 +329,7 @@ function mapStatus(raw: Record<string, unknown>): GatewayInfo {
     hostname: pickStr(raw, 'hostname', dflt.hostname),
     manageUrl: pickStr(raw, 'manageUrl', dflt.manageUrl),
     port: pickNum(raw, 'port', dflt.port),
-    startedAt: pickStr(raw, 'startedAt', dflt.startedAt),
+    startedAt: formatEpochText(pickStr(raw, 'startedAt', dflt.startedAt)),
     uptimeText: pickStr(raw, 'uptimeText', dflt.uptimeText),
     deviceCount: pickNum(raw, 'deviceCount', dflt.deviceCount),
     onlineCount: pickNum(raw, 'onlineCount', dflt.onlineCount),
@@ -328,12 +358,33 @@ async function fetchDevices(): Promise<void> {
   }
 }
 
-/** 拉取点位清单（可选 `device_id` 过滤；失败保持空缓存）。 */
-async function fetchPoints(deviceId: string): Promise<void> {
+/** 按设备拉取点位并并入总表（单设备失败只跳过自身，不影响其余设备）。 */
+async function fetchPointsOfDevice(deviceId: string, offset: number): Promise<PointRecord[]> {
+  const qs = `?device_id=${encodeURIComponent(deviceId)}`;
+  const raw = await apiRequest<unknown[]>(`/api/points${qs}`);
+  return Array.isArray(raw) ? raw.map((row, i) => mapPoint(asRecord(row), offset + i)) : [];
+}
+
+/**
+ * 拉取全量点位：`/api/points` 需按 `device_id` 过滤（缺省返回空数组），
+ * 因此对各设备（须先由 `fetchDevices()` 填充清单）**并行**拉取点位后合并。
+ */
+async function fetchAllPoints(): Promise<void> {
   try {
-    const qs = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
-    const raw = await apiRequest<unknown[]>(`/api/points${qs}`);
-    realCache.points = Array.isArray(raw) ? raw.map((row, i) => mapPoint(asRecord(row), i)) : [];
+    if (realCache.devices.length === 0) {
+      realCache.points = [];
+      return; // 设备清单为空 / 不可得：回退 mock 点位
+    }
+    const settled = await Promise.allSettled(
+      realCache.devices.map((d, i) => fetchPointsOfDevice(d.id, i * 1000)),
+    );
+    const merged: PointRecord[] = [];
+    for (const result of settled) {
+      if (result.status === 'fulfilled') {
+        merged.push(...result.value);
+      }
+    }
+    realCache.points = merged;
   } catch {
     realCache.points = [];
   }
@@ -349,10 +400,10 @@ async function fetchOutlets(): Promise<void> {
   }
 }
 
-/** 拉取网关状态。 */
-async function fetchStatus(): Promise<void> {
+/** 拉取网关信息（`GET /api/overview`，无需 token；real 模式网关信息唯一来源）。 */
+async function fetchOverview(): Promise<void> {
   try {
-    const raw = await apiRequest<Record<string, unknown>>('/api/status');
+    const raw = await apiRequest<Record<string, unknown>>('/api/overview');
     realCache.status = mapStatus(asRecord(raw));
   } catch {
     realCache.status = null;
@@ -382,7 +433,8 @@ function asRecord(value: unknown): Record<string, unknown> {
 /**
  * 预取真实数据（real 模式专用；mock 模式直接返回 false）。
  *
- * 五路请求 `allSettled` 并行：任一失败只影响自身缓存（回退 mock），不影响其余。
+ * 四路请求 `allSettled` 并行：任一失败只影响自身缓存（回退 mock），不影响其余。
+ * 点位在分组内按设备并行二次展开（`/api/points` 需逐设备过滤）。
  *
  * @returns 全部成功返回 true（仅供日志 / 调试，页面无需关心）
  */
@@ -390,7 +442,7 @@ export async function preloadRealData(): Promise<boolean> {
   if (API_MODE !== 'real') {
     return false;
   }
-  const results = await Promise.allSettled([fetchDevices(), fetchPoints(''), fetchOutlets(), fetchStatus(), fetchEvents()]);
+  const results = await Promise.allSettled([fetchDevicesAndPoints(), fetchOutlets(), fetchOverview(), fetchEvents()]);
   realCache.loaded = true;
   const okCount = results.filter((r) => r.status === 'fulfilled').length;
   if (okCount < results.length) {
@@ -398,6 +450,25 @@ export async function preloadRealData(): Promise<boolean> {
     console.warn(`[web-console] preloadRealData：${okCount}/${results.length} 接口成功，失败分组已回退 mock 数据`);
   }
   return okCount === results.length;
+}
+
+/** 设备清单 + 逐设备点位（先设备后点位，两段串行；组内各自容错）。 */
+async function fetchDevicesAndPoints(): Promise<void> {
+  await fetchDevices();
+  await fetchAllPoints();
+}
+
+/**
+ * 低频轮询网关信息（real 模式专用；OverviewPage 的 1s tick 每 5 拍触发一次）。
+ *
+ * 实时遥测帧（`/api/stream` 的 `LiveTelemetry`）只含逐点数值、不含累计计数器
+ * （`totalForwardedRecords` 等），因此网关级统计由本方法按 5s 节奏刷新。
+ */
+export async function refreshOverview(): Promise<void> {
+  if (API_MODE !== 'real') {
+    return;
+  }
+  await fetchOverview();
 }
 
 // ---------------------------------------------------------------------------

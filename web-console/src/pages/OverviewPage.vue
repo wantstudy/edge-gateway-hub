@@ -12,7 +12,8 @@
     硬性约定遵守情况：
       · 只用 ui-kit 组件（`StatCard` / `PageHeader` / `UiTable` / `UiPager` / `StatusTag` / `EmptyState`）；
       · 图表为内联 SVG，**未引入任何新图表库**；
-      · 实时数值 1s 节流渲染（`setInterval` + mock 推流），界面标注「演示数据」；
+      · 实时数值 1s 节流渲染（`setInterval`）；mock 模式为内嵌推流并标注「演示数据」，
+        real 模式读 `GET /api/overview`（5s 轮询）并标注「实时数据」；
       · 列表条数只有 UiPager 一个口径（表格 `footer` 不重复写「共 N 条」）；
       · 无解绑 / 重置试用 / revoke 任何入口。
   -->
@@ -22,7 +23,13 @@
     desc="本机网关运行全景：采集吞吐、设备健康、北向出口与授权状态。聚合数值按 1s 节流刷新，避免高频重绘打满浏览器。"
   >
     <template #actions>
-      <span class="wc-tag wc-tag--info" title="当前为内嵌演示数据源，未接入真实 WebSocket">演示数据</span>
+      <span
+        class="wc-tag"
+        :class="IS_REAL ? 'wc-tag--ok' : 'wc-tag--info'"
+        :title="IS_REAL ? '已接入网关真实接口：GET /api/overview（5s 轮询）' : '当前为内嵌演示数据源，未接入真实后端'"
+      >
+        {{ IS_REAL ? '实时数据' : '演示数据' }}
+      </span>
       <button type="button" class="wc-btn" @click="refreshAll">立即刷新</button>
     </template>
   </PageHeader>
@@ -278,9 +285,13 @@
 
     <p class="wc-note">
       <span class="wc-note__icon">ⓘ</span>
-      <span>
+      <span v-if="IS_REAL">
+        本页网关信息来自 <span class="wc-mono">GET /api/overview</span>（按 5s 轮询、1s 节流渲染）；
+        实时遥测通道为 <span class="wc-mono">GET /api/stream</span>（SSE）。授权状态一律由网关侧（Rust）判定，前端仅展示。
+      </span>
+      <span v-else>
         本页所有数值来自内嵌演示数据源并按 1s 节流刷新；真实环境由 <span class="wc-mono">GET /api/overview</span> 与
-        <span class="wc-mono">GET /api/stream</span>（WebSocket）提供。授权状态一律由网关侧（Rust）判定，前端仅展示。
+        <span class="wc-mono">GET /api/stream</span>（SSE）提供。授权状态一律由网关侧（Rust）判定，前端仅展示。
       </span>
     </p>
   </div>
@@ -309,16 +320,22 @@ import {
   type TableColumn,
 } from '@ui-kit';
 import {
+  API_MODE,
   repo,
+  refreshOverview,
   type AlarmLevel,
   type AlarmRecord,
   type AlarmState,
   type DeviceRecord,
   type ForwarderRecord,
+  type GatewayInfo,
 } from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
+const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -364,8 +381,17 @@ const alarmColumns: readonly TableColumn[] = [
 // 静态快照（来自 mock 聚合，非硬编码重复值）
 // ---------------------------------------------------------------------------
 
-/** 本机网关信息（`GET /api/overview` 镜像）。 */
-const gateway = repo.getGateway();
+/** 本机网关信息（`GET /api/overview` 镜像；real 模式随 tick 从 repo 缓存同步）。
+ *
+ * 用 `reactive` 包装：mock 模式为静态快照（行为不变）；real 模式由 `syncGateway()`
+ * 在每个节拍从 repo 缓存刷新（uptimeText / totalForwardedRecords 等随轮询演进）。
+ */
+const gateway = reactive<GatewayInfo>(repo.getGateway());
+
+/** 从 repo 缓存同步网关信息（real 模式节拍内调用；字段级覆盖保持响应式引用稳定）。 */
+function syncGateway(): void {
+  Object.assign(gateway, repo.getGateway());
+}
 
 /** 全量设备（用于 KPI 与设备健康排序）。 */
 const devices: DeviceRecord[] = repo.allDevices();
@@ -411,20 +437,46 @@ function jitter(base: number, range: number, min: number): number {
   return Math.max(min, base + (Math.random() * 2 - 1) * range);
 }
 
+/** real 模式节拍计数（用于 5 拍一次的低频轮询 `/api/overview`）。 */
+let realTickCount = 0;
+
+/** `/api/overview` 轮询间隔（节拍数）：5s 一次，计数器/水位类统计低频即可。 */
+const OVERVIEW_POLL_EVERY_TICKS = 5;
+
 /**
  * 单个节拍：更新 `live` 快照。
  *
  * 该函数由 1s 定时器调用 —— 这**就是**节流点：上游再怎么高频，
  * 组件每秒只重渲染一次。
+ *
+ * · mock 模式：围绕基准值抖动（演示行为，保持原样）；
+ * · real 模式：从 repo 缓存同步 `GET /api/overview` 结果（每 5 拍触发一次
+ *   低频轮询刷新缓存），后端未提供的本机指标（CPU / 内存 / 端到端延迟 /
+ *   离线队列深度）置 0，不伪造数值。
  */
 function tick(): void {
-  live.sampleRatePerSec = Math.round(jitter(gateway.sampleRatePerSec, 24, 1));
-  live.forwardRatePerSec = Math.round(jitter(gateway.forwardRatePerSec, 30, 0));
-  live.latencyMs = Math.round(jitter(86, 9, 12));
-  live.cpuPct = Number(jitter(18.4, 3.2, 1).toFixed(1));
-  live.memUsedMb = Math.round(jitter(412, 14, 128));
-  live.queueDepth = Math.round(jitter(1204, 60, 0));
-  live.onlineCount = Math.min(gateway.deviceCount, Math.max(0, Math.round(jitter(gateway.onlineCount, 0.6, 0))));
+  if (IS_REAL) {
+    if (realTickCount % OVERVIEW_POLL_EVERY_TICKS === 0) {
+      void refreshOverview();
+    }
+    realTickCount += 1;
+    syncGateway();
+    live.sampleRatePerSec = gateway.sampleRatePerSec;
+    live.forwardRatePerSec = gateway.forwardRatePerSec;
+    live.onlineCount = gateway.onlineCount;
+    live.latencyMs = 0;
+    live.cpuPct = 0;
+    live.memUsedMb = 0;
+    live.queueDepth = 0;
+  } else {
+    live.sampleRatePerSec = Math.round(jitter(gateway.sampleRatePerSec, 24, 1));
+    live.forwardRatePerSec = Math.round(jitter(gateway.forwardRatePerSec, 30, 0));
+    live.latencyMs = Math.round(jitter(86, 9, 12));
+    live.cpuPct = Number(jitter(18.4, 3.2, 1).toFixed(1));
+    live.memUsedMb = Math.round(jitter(412, 14, 128));
+    live.queueDepth = Math.round(jitter(1204, 60, 0));
+    live.onlineCount = Math.min(gateway.deviceCount, Math.max(0, Math.round(jitter(gateway.onlineCount, 0.6, 0))));
+  }
   lastTickAt.value = Date.now();
 }
 

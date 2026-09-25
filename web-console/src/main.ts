@@ -17,10 +17,13 @@ import '@arco-design/web-vue/dist/arco.css';
 // 应用级全局样式（布局骨架 + 少量覆盖）
 import './styles/global.css';
 
+import { watch } from 'vue';
 import App from './App.vue';
 import { router } from './router';
 import { API_MODE, getStoredToken } from './api/client';
 import { preloadRealData } from './api/repo';
+import { closeStream, connectStream, streamStatus } from './api/stream';
+import { session } from './store/session';
 
 const app = createApp(App);
 
@@ -36,6 +39,34 @@ app.use(router);
 async function bootstrap(): Promise<void> {
   if (API_MODE === 'real' && getStoredToken()) {
     await preloadRealData();
+  }
+  // real 模式：SSE 生命周期由登录态驱动（刷新 / 登录 / 登出三态全覆盖）；
+  // SSE 通道状态同步到顶栏连接指示（open→connected，connecting→degraded，
+  // unauthorized / idle→disconnected）。mock 模式不建连、不改连接指示。
+  if (API_MODE === 'real') {
+    watch(
+      () => session.state.loggedIn,
+      (loggedIn) => {
+        if (loggedIn && getStoredToken()) {
+          connectStream();
+        } else {
+          closeStream();
+        }
+      },
+      { immediate: true },
+    );
+    watch(
+      () => streamStatus.value,
+      (status) => {
+        if (status === 'open') {
+          session.setConnection('connected');
+        } else if (status === 'connecting') {
+          session.setConnection('degraded');
+        } else {
+          session.setConnection('disconnected');
+        }
+      },
+    );
   }
   app.mount('#app');
 }

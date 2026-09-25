@@ -104,6 +104,22 @@ export class ApiError extends Error {
 }
 
 /**
+ * 401 统一处置：清本地会话 → 通知监听者 → 跳登录页。
+ *
+ * HTTP 层（`apiRequest`）与 SSE 层（`stream.ts` 的 401 探测）共用同一语义，
+ * 保证 token 失效时两条通道的行为一致。
+ */
+export function handleUnauthorized(): void {
+  clearAuth();
+  for (const listener of [...unauthorizedListeners]) {
+    listener();
+  }
+  if (window.location.hash !== '#/login') {
+    window.location.hash = '#/login';
+  }
+}
+
+/**
  * 通用请求函数。
  *
  * @param path 以 `/api` 开头的同源路径（dev 下经 vite proxy 转发）
@@ -130,14 +146,8 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   }
 
   if (res.status === 401) {
-    // 登录失效：清本地会话 + 通知监听者 + 跳登录页
-    clearAuth();
-    for (const listener of [...unauthorizedListeners]) {
-      listener();
-    }
-    if (window.location.hash !== '#/login') {
-      window.location.hash = '#/login';
-    }
+    // 登录失效：清本地会话 + 通知监听者 + 跳登录页（与 SSE 层共用同一处置）
+    handleUnauthorized();
     throw new ApiError(401, '登录已失效，请重新登录');
   }
 

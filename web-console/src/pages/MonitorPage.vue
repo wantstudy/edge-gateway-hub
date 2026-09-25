@@ -21,7 +21,13 @@
     desc="实时数值按 1s 节流渲染；质量码与采集耗时逐点可见。超过 1s 未更新的行整行转灰，质量异常行左侧带竖条。"
   >
     <template #actions>
-      <span class="wc-tag wc-tag--info" title="当前为内嵌演示数据源，未接入真实 WebSocket">演示数据</span>
+      <span
+        class="wc-tag"
+        :class="IS_REAL ? 'wc-tag--ok' : 'wc-tag--info'"
+        :title="IS_REAL ? '已接入网关真实接口：GET /api/stream（SSE 实时遥测）' : '当前为内嵌演示数据源，未接入真实后端'"
+      >
+        {{ IS_REAL ? '实时数据' : '演示数据' }}
+      </span>
       <button type="button" class="wc-btn" @click="handleManualRefresh">立即刷新</button>
     </template>
   </PageHeader>
@@ -145,7 +151,7 @@
                   </svg>
                 </td>
                 <td>
-                  <span class="wc-tag" :class="row.qualityClass">{{ row.quality }}</span>
+                  <span class="wc-tag" :class="row.qualityClass" :title="row.qualityTitle">{{ row.quality }}</span>
                 </td>
                 <td>
                   <span class="wc-mono">{{ row.latencyMs }} ms</span>
@@ -251,11 +257,12 @@
 /**
  * @file MonitorPage.vue
  * @module web-console/pages/MonitorPage
- * @description 实时监控页。1s 节流 + mock 推流 + sparkline 波动可视化。
+ * @description 实时监控页。1s 节流 + mock 推流 / real 模式消费 `/api/stream` SSE + sparkline 波动可视化。
  *
  * ── 节流契约（本页最关键的硬约束）────────────────────────────────────────────
- * `setInterval(tick, 1000)` 就是节流点：上游推送频率无关紧要，`live` 快照与
- * `series` 历史每秒**至多**被写一次，Vue 因此每秒至多重渲染一次。
+ * `setInterval(tick, 1000)` 就是节流点：上游推送频率无关紧要（real 模式下 SSE 帧
+ * 只落 `pointSnapshots` 缓存、不触发渲染），`live` 快照与 `series` 历史每秒
+ * **至多**被写一次，Vue 因此每秒至多重渲染一次。
  * 「暂停」只清除定时器，不改变任何已渲染数据（冻结语义）。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
@@ -273,13 +280,18 @@ import {
   type TableColumn,
 } from '@ui-kit';
 import {
+  API_MODE,
   repo,
   type DeviceRecord,
   type PointRecord,
 } from '@/api/repo';
+import { pointSnapshots, snapshotKey, streamStatus, wireQualityToDataQuality, type StreamStatus } from '@/api/stream';
 import { session } from '../store/session';
 
 const router = useRouter();
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
+const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -326,6 +338,9 @@ const devices: DeviceRecord[] = repo.allDevices();
  *
  * 以 `point.id` 为键；初始化时用 mock 的 `value` 作为基线，并预填一段历史，
  * 使 sparkline 首帧即有形状（避免「空白 → 突变」）。
+ *
+ * real 模式追加字段：`tsRaw`（SSE 帧的纳秒字符串原文，透传展示）与
+ * `qualityCode`（后端质量码整数，悬浮提示用）；mock 模式恒为空 / null。
  */
 interface PointRuntime {
   /** 当前值（不可用为 null） */
@@ -338,6 +353,10 @@ interface PointRuntime {
   latencyMs: number;
   /** 最后更新时间（毫秒时间戳） */
   tsMs: number;
+  /** 最近一次流帧的纳秒时间戳原文（real 模式；mock 恒空串） */
+  tsRaw: string;
+  /** 最近一次流帧的质量码整数（real 模式；mock 恒 null） */
+  qualityCode: number | null;
 }
 
 /** 各点位运行时状态（响应式，但每秒只被写一次）。 */
@@ -408,6 +427,8 @@ function seed(): void {
       history,
       latencyMs: latencyOf(point),
       tsMs: point.stale ? nowMs - 187_000 : nowMs,
+      tsRaw: '',
+      qualityCode: null,
     };
   }
 }
@@ -478,11 +499,24 @@ function jitter(base: number, range: number, min: number): number {
 }
 
 /**
- * 单个节拍：更新全部点位当前值与历史。
+ * 单个节拍的调度入口（仍由 1s 定时器驱动 —— 即「1s 节流渲染」的实现）。
  *
- * 这是唯一的写入点，由 1s 定时器驱动 —— 即「1s 节流渲染」的实现。
+ * · mock 模式：内嵌推流抖动（演示行为，保持原样）；
+ * · real 模式：从 SSE 逐点快照表（`pointSnapshots`）读取最新值。
+ *   SSE 帧的到达频率与本函数无关 —— 快照表只被写不渲染，渲染仍每秒至多一次。
  */
 function tick(): void {
+  if (IS_REAL) {
+    tickReal();
+  } else {
+    tickMock();
+  }
+}
+
+/**
+ * mock 模式节拍：更新全部点位当前值与历史（内嵌演示推流，行为与原版一致）。
+ */
+function tickMock(): void {
   const nowMs = Date.now();
 
   for (const point of allPoints) {
@@ -531,6 +565,61 @@ function tick(): void {
   live.queueDepth = Math.round(jitter(1204, 40, 0));
 
   const good = allPoints.filter((p) => (runtimeQuality[p.id] ?? p.quality) === 'Good').length;
+  live.goodPct = Number(((good / Math.max(allPoints.length, 1)) * 100).toFixed(1));
+
+  lastTickMs.value = nowMs;
+  tickCount.value += 1;
+}
+
+/**
+ * real 模式节拍：消费 SSE 逐点快照（key = `${device_id}/${point_id}`）。
+ *
+ * · 快照存在 → 以流帧为准：值 / 质量（wire 枚举映射到前端 5 值枚举）/
+ *   纳秒 ts 原文透传；历史序列仅在取到数值时推进；
+ * · 快照不存在（该点尚无流数据）→ 保持基线值与 mock 配置质量，不伪造；
+ * · 采集耗时 / 离线队列：后端帧不含这些指标，置 0 / '—'，不伪造。
+ */
+function tickReal(): void {
+  const nowMs = Date.now();
+
+  let good = 0;
+  for (const point of allPoints) {
+    const state = series[point.id];
+    if (!state) {
+      continue;
+    }
+    const snap = pointSnapshots.get(snapshotKey(point.deviceId, point.id));
+    if (!snap) {
+      runtimeQuality[point.id] = point.quality;
+      continue;
+    }
+
+    const quality = wireQualityToDataQuality(snap.quality);
+    runtimeQuality[point.id] = quality;
+    const previous = state.value;
+    state.value = snap.value;
+    state.delta =
+      previous !== null && snap.value !== null ? Number((snap.value - previous).toFixed(2)) : 0;
+    state.latencyMs = 0;
+    state.tsMs = snap.receivedAtMs;
+    state.tsRaw = snap.ts;
+    state.qualityCode = snap.qualityCode;
+    if (snap.value !== null) {
+      state.history.push(snap.value);
+      if (state.history.length > HISTORY_LEN) {
+        state.history.shift();
+      }
+    }
+    if (quality === 'Good') {
+      good += 1;
+    }
+  }
+
+  // KPI 快照（同样每秒只写一次；采样数 = 已有流数据的点位数）
+  live.sampledPoints = pointSnapshots.size;
+  live.slowestMs = 0;
+  live.slowestDevice = '—';
+  live.queueDepth = 0;
   live.goodPct = Number(((good / Math.max(allPoints.length, 1)) * 100).toFixed(1));
 
   lastTickMs.value = nowMs;
@@ -586,8 +675,17 @@ const lastTickText = computed<string>(() => {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 });
 
-/** 顶栏连接态文案。 */
+/** 顶栏连接态文案（real 模式直读 SSE 通道状态；mock 模式保持原会话指示）。 */
 const connectionLabel = computed<string>(() => {
+  if (IS_REAL) {
+    const labels: Readonly<Record<StreamStatus, string>> = Object.freeze({
+      open: '实时通道已连接（SSE）',
+      connecting: '实时通道连接中…',
+      unauthorized: '实时通道未授权',
+      idle: '实时通道未连接',
+    });
+    return labels[streamStatus.value];
+  }
   const map: Record<string, string> = { connected: '实时通道已连接', degraded: '链路降级', disconnected: '实时通道已断开' };
   return map[session.state.connection] ?? '未知';
 });
@@ -711,6 +809,8 @@ interface PointRow {
   readonly quality: string;
   /** 质量标签色调类 */
   readonly qualityClass: string;
+  /** 质量码悬浮提示（real 模式含后端 quality_code；mock 为空） */
+  readonly qualityTitle: string;
   /** 采集耗时展示 */
   readonly latencyMs: string;
   /** 时间戳展示 */
@@ -822,6 +922,14 @@ const pagedRows = computed<readonly PointRow[]>(() => {
       classes.push('is-abnormal');
     }
 
+    // 时间戳：real 模式透传 SSE 帧的纳秒字符串原文（大数红线，绝不 parseInt）；
+    // mock 模式保持原有的秒级展示。
+    const tsRaw = state?.tsRaw ?? '';
+    const tsText =
+      IS_REAL && tsRaw ? tsRaw : stale ? `${ageSec.toFixed(0)}s 前（陈旧）` : (tsMs / 1000).toFixed(3);
+    const qualityCode = state?.qualityCode ?? null;
+    const qualityTitle = IS_REAL && qualityCode !== null ? `quality_code: ${qualityCode}` : '';
+
     return {
       id: point.id,
       targetKey: point.targetKey,
@@ -836,8 +944,9 @@ const pagedRows = computed<readonly PointRow[]>(() => {
       sparkColor: sparkColorOf(quality),
       quality,
       qualityClass: qualityTagClass(quality),
+      qualityTitle,
       latencyMs: String(latency),
-      tsText: stale ? `${ageSec.toFixed(0)}s 前（陈旧）` : (tsMs / 1000).toFixed(3),
+      tsText,
       rowClass: classes.join(' '),
     };
   });
