@@ -20,7 +20,13 @@
     desc="选中设备各点位的实时曲线，1s 节流刷新；顶部查询框切换设备。曲线窗口 55 秒 · 12 个采样点。"
   >
     <template #actions>
-      <span class="wc-tag wc-tag--info">演示数据</span>
+      <span
+        class="wc-tag"
+        :class="IS_REAL ? 'wc-tag--ok' : 'wc-tag--info'"
+        :title="IS_REAL ? '已接入网关真实接口：GET /api/stream（SSE 实时遥测）' : '当前为内嵌演示数据源，未接入真实后端'"
+      >
+        {{ IS_REAL ? '实时数据' : '演示数据' }}
+      </span>
       <button type="button" class="wc-btn" @click="togglePause">{{ paused ? '继续刷新' : '暂停刷新' }}</button>
     </template>
   </PageHeader>
@@ -49,9 +55,9 @@
             <i>{{ curDeviceMeta }}</i>
           </span>
           <span class="wc-spacer" />
-          <span class="wc-conn" :class="paused ? 'wc-conn--degraded' : 'wc-conn--connected'">
+          <span class="wc-conn" :class="streamConnClass">
             <span class="wc-conn__dot">●</span>
-            <span>{{ paused ? '已暂停' : '采集中' }} · 最后更新 {{ lastTickText }}</span>
+            <span>{{ streamConnLabel }} · 最后更新 {{ lastTickText }}</span>
           </span>
         </div>
       </div>
@@ -149,9 +155,19 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { EmptyState, PageHeader, StatCard, UiPager } from '@ui-kit';
-import { repo, type DeviceRecord, type PointRecord } from '@/api/repo';
+import {
+  API_MODE,
+  dataVersion,
+  repo,
+  type DeviceRecord,
+  type PointRecord,
+} from '@/api/repo';
+import { pointSnapshots, snapshotKey, streamStatus, wireQualityToDataQuality } from '@/api/stream';
 
 const router = useRouter();
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
+const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -179,19 +195,24 @@ const AREA_H = 34;
 // 数据源
 // ---------------------------------------------------------------------------
 
-/** 全量设备（查询框 datalist 的数据源）。 */
-const devices: DeviceRecord[] = repo.allDevices();
+/** 全量设备（查询框 datalist 的数据源；dataVersion 驱动原地刷新）。 */
+const devices = ref<DeviceRecord[]>(repo.allDevices());
 
 /** 当前设备 id（'' = 全部设备）。 */
-const liveDevice = ref<string>(devices.length > 0 ? devices[0].id : '');
+const liveDevice = ref<string>(devices.value.length > 0 ? devices.value[0].id : '');
 
 /** 查询框输入值（与 liveDevice 同步；未命中时回显当前设备）。 */
-const devKeyword = ref<string>(devices.length > 0 ? devices[0].name : ALL_DEVICES_LABEL);
+const devKeyword = ref<string>(devices.value.length > 0 ? devices.value[0].name : ALL_DEVICES_LABEL);
+
+/** 缓存填充后重读设备清单（避免预取晚于挂载时 datalist / onDevQuery 停留在空态）。 */
+function reloadDevices(): void {
+  devices.value = repo.allDevices();
+}
 
 /** datalist 选项：value = 设备名，hint = 协议 · 连接摘要。 */
 const deviceOptions = computed<readonly { value: string; label: string; hint: string }[]>(() => [
   { value: '', label: ALL_DEVICES_LABEL, hint: '全部设备的点位' },
-  ...devices.map((d) => ({
+  ...devices.value.map((d) => ({
     value: d.id,
     label: d.name,
     hint: `${d.protocolLabel} · ${d.connectionSummary}`,
@@ -200,7 +221,7 @@ const deviceOptions = computed<readonly { value: string; label: string; hint: st
 
 /** 当前设备（'' 时为 null）。 */
 const curDevice = computed<DeviceRecord | null>(() =>
-  liveDevice.value ? devices.find((d) => d.id === liveDevice.value) ?? null : null,
+  liveDevice.value ? devices.value.find((d) => d.id === liveDevice.value) ?? null : null,
 );
 
 /** 当前范围内的点位（静态，不随每秒变化）。 */
@@ -222,6 +243,10 @@ interface PointRuntime {
   /** 曲线窗口序列（12 点 / 55s） */
   window: number[];
   tsMs: number;
+  /** 采样时间戳（**纳秒字符串**，real 模式由 SSE 帧透传，绝不 parseInt） */
+  tsRaw: string;
+  /** 质量码整数（real 模式由 SSE 帧透传；缺失为 null） */
+  qualityCode: number | null;
 }
 
 const series = reactive<Record<string, PointRuntime>>({});
@@ -251,7 +276,7 @@ function decimalsOf(point: PointRecord): number {
   return dot < 0 ? 0 : Math.min(t.length - dot - 1, 2);
 }
 
-/** 以 mock 基线初始化运行时（含 12 点窗口序列，首帧即有形状）。 */
+/** 以基线初始化运行时（含 12 点窗口序列，首帧即有形状；real 模式不伪造历史）。 */
 function seed(): void {
   const nowMs = Date.now();
   for (const point of scopedPoints.value) {
@@ -259,19 +284,36 @@ function seed(): void {
     const base = point.value;
     const amp = amplitudeOf(point);
     const win: number[] = [];
-    if (base !== null) {
+    if (!IS_REAL && base !== null) {
+      // mock：首帧即填满 12 点窗口，保留既有演示形状
       for (let i = WINDOW_POINTS - 1; i >= 0; i -= 1) {
         win.push(
           Number((base + Math.sin(i / 3) * amp * 0.8 + (Math.random() * 2 - 1) * amp * 0.6).toFixed(decimalsOf(point))),
         );
       }
     }
-    series[point.id] = { value: base, delta: 0, window: win, tsMs: point.stale ? nowMs - 187_000 : nowMs };
+    series[point.id] = {
+      value: base,
+      delta: 0,
+      window: win,
+      tsMs: point.stale ? nowMs - 187_000 : nowMs,
+      tsRaw: '',
+      qualityCode: null,
+    };
   }
 }
 
-/** 1s 节拍（唯一写入点）。 */
+/** 1s 节拍（唯一写入点）：按模式分发。 */
 function tick(): void {
+  if (IS_REAL) {
+    tickReal();
+  } else {
+    tickMock();
+  }
+}
+
+/** mock 模式节拍（内嵌演示推流，行为与原版一致）。 */
+function tickMock(): void {
   const nowMs = Date.now();
   const sampleWindow = tickCount.value % WINDOW_STEP_TICKS === 0;
   for (const point of scopedPoints.value) {
@@ -301,6 +343,45 @@ function tick(): void {
   tickCount.value += 1;
 }
 
+/**
+ * real 模式节拍：消费 SSE 逐点快照（key = `${device_id}/${point_id}`）。
+ *
+ * · 快照存在 → 以流帧为准：值 / 质量（wire 枚举映射到前端 5 值枚举）/
+ *   纳秒 ts 原文透传；每 5 拍（窗口采样点）且取到数值时才推进曲线窗口；
+ * · 快照不存在（该点尚无流数据）→ 保持基线值与配置质量，不伪造；
+ * · 时间戳使用 `receivedAtMs`（客户端接收时刻）做陈旧判定，业务纳秒字符串
+ *   原样透传给 `tsRaw` 展示，绝不 `parseInt`（2^53 精度陷阱）。
+ */
+function tickReal(): void {
+  const nowMs = Date.now();
+  const sampleWindow = tickCount.value % WINDOW_STEP_TICKS === 0;
+  for (const point of scopedPoints.value) {
+    const state = series[point.id];
+    if (!state) continue;
+    const snap = pointSnapshots.get(snapshotKey(point.deviceId, point.id));
+    if (!snap) {
+      // 尚无流数据：保持基线值与配置质量，不伪造
+      runtimeQuality[point.id] = point.quality;
+      continue;
+    }
+    const quality = wireQualityToDataQuality(snap.quality);
+    runtimeQuality[point.id] = quality;
+    const previous = state.value;
+    state.value = snap.value;
+    state.delta = previous !== null && snap.value !== null ? Number((snap.value - previous).toFixed(2)) : 0;
+    state.tsMs = snap.receivedAtMs;
+    state.tsRaw = snap.ts; // 纳秒字符串透传，绝不 parseInt
+    state.qualityCode = snap.qualityCode;
+    // 仅每 5 拍入窗一次且取到数值 → 窗口跨度 55s
+    if (snap.value !== null && sampleWindow) {
+      state.window.push(snap.value);
+      if (state.window.length > WINDOW_POINTS) state.window.shift();
+    }
+  }
+  lastTickMs.value = nowMs;
+  tickCount.value += 1;
+}
+
 /** 刷新设备范围。 */
 function refreshScope(): void {
   scopedPoints.value = liveDevice.value ? repo.pointsOfDevice(liveDevice.value) : repo.allPoints();
@@ -312,6 +393,24 @@ const lastTickMs = ref(Date.now());
 const tickCount = ref(0);
 const paused = ref(false);
 let timer: ReturnType<typeof setInterval> | null = null;
+
+/** 顶栏连接指示：real 模式反映 SSE 通道状态，mock 模式恒「采集中」。 */
+const streamConnClass = computed<string>(() => {
+  if (paused.value) return 'wc-conn--degraded';
+  if (!IS_REAL) return 'wc-conn--connected';
+  const s = streamStatus.value;
+  if (s === 'open') return 'wc-conn--connected';
+  return 'wc-conn--degraded'; // connecting / idle / unauthorized → 链路降级
+});
+const streamConnLabel = computed<string>(() => {
+  if (paused.value) return '已暂停';
+  if (!IS_REAL) return '采集中';
+  const s = streamStatus.value;
+  if (s === 'open') return '实时流已连接';
+  if (s === 'connecting') return '实时流连接中…';
+  if (s === 'unauthorized') return '鉴权失效';
+  return '实时流未连接';
+});
 
 function startTimer(): void {
   if (timer === null) timer = setInterval(tick, 1000);
@@ -344,6 +443,12 @@ watch(liveDevice, () => {
   refreshScope();
 });
 
+/** 缓存填充完成（dataVersion 自增）→ 重读设备清单与点位范围，避免预取晚于挂载时停留空态。 */
+watch(dataVersion, () => {
+  reloadDevices();
+  refreshScope();
+});
+
 // ---------------------------------------------------------------------------
 // 设备查询框（原型 :1261-1276）
 // ---------------------------------------------------------------------------
@@ -356,7 +461,7 @@ function onDevQuery(): void {
     devKeyword.value = ALL_DEVICES_LABEL;
     return;
   }
-  const hit = devices.find((d) => d.name === kw);
+  const hit = devices.value.find((d) => d.name === kw);
   if (hit) {
     liveDevice.value = hit.id;
     devKeyword.value = hit.name;
@@ -405,7 +510,7 @@ const curDeviceProtocol = computed<string>(() => curDevice.value?.protocolLabel 
 const curDeviceStatus = computed<string>(() => curDevice.value?.status ?? 'multi');
 /** 连接状态副标题：最后采集时间。 */
 const connSub = computed<string>(() =>
-  curDevice.value ? `最后采集 ${curDevice.value.lastSampleAt}` : `${devices.length} 台设备的合计点位`,
+  curDevice.value ? `最后采集 ${curDevice.value.lastSampleAt}` : `${devices.value.length} 台设备的合计点位`,
 );
 
 // ---------------------------------------------------------------------------
@@ -491,6 +596,7 @@ const pagedRows = computed<readonly CardRow[]>(() => {
     const delta = state ? state.delta : 0;
     const win = state ? state.window : [];
     const tsMs = state ? state.tsMs : nowMs;
+    const tsRaw = state ? state.tsRaw : '';
     const ageSec = (nowMs - tsMs) / 1000;
     const stale = ageSec > 1.5;
     return {
@@ -505,7 +611,12 @@ const pagedRows = computed<readonly CardRow[]>(() => {
       line: linePathOf(win),
       quality,
       qualityClass: qualityTagClass(quality),
-      tsText: stale ? `${ageSec.toFixed(0)}s 前（陈旧）` : `${(tsMs / 1000).toFixed(3)}`,
+      tsText:
+        IS_REAL && tsRaw
+          ? tsRaw
+          : stale
+            ? `${ageSec.toFixed(0)}s 前（陈旧）`
+            : `${(tsMs / 1000).toFixed(3)}`,
       stale,
     };
   });

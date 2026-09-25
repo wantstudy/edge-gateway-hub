@@ -284,6 +284,7 @@ import {
 } from '@ui-kit';
 import {
   API_MODE,
+  dataVersion,
   repo,
   type DeviceRecord,
   type PointRecord,
@@ -341,6 +342,27 @@ const allPoints: PointRecord[] = repo.allPoints();
 
 /** 全部设备（连接状态表）。 */
 const devices: DeviceRecord[] = repo.allDevices();
+
+/**
+ * 缓存填充完成（dataVersion 自增）→ 原地刷新静态清单。
+ *
+ * 避免预取晚于挂载时实时表停留空态：real 模式下清单来自 `preloadRealData`
+ * 填好的 `realCache`（点位来自 `GET /api/points`、设备来自 `GET /api/devices`）；
+ * dataVersion 自增即表示缓存已就绪，此处原地刷新（保持数组引用 / 响应式不变）。
+ * 实时数值本身由 1s tick 从 SSE `pointSnapshots` 消费，不在此重读。
+ */
+watch(dataVersion, () => {
+  applyInto(allPoints, repo.allPoints());
+  applyInto(devices, repo.allDevices());
+  // 新到达的点位尚无运行时行 → 重播 seed（幂等；仅缓存就绪时触发一次）。
+  seed();
+});
+
+/** 把 source 内容覆盖写入 target（原地变更，保持 target 引用 / 响应式不变）。 */
+function applyInto<T>(target: T[], source: readonly T[]): void {
+  target.length = 0;
+  target.push(...source);
+}
 
 /**
  * 点位运行时状态：当前值 / 上一拍差值 / 历史序列 / 耗时 / 时间戳。

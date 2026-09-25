@@ -314,7 +314,7 @@
  * 「节流后的渲染节拍」：无论上游多快，Vue 的响应式更新每秒至多一次，
  * 保证 200 设备 × 100ms 场景下浏览器不被重绘打满（设计系统 §4.2 硬约束）。
  */
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   EmptyState,
@@ -327,6 +327,7 @@ import {
 } from '@ui-kit';
 import {
   API_MODE,
+  dataVersion,
   repo,
   refreshOverview,
   type AlarmLevel,
@@ -407,6 +408,26 @@ const forwarders: ForwarderRecord[] = repo.allForwarders();
 
 /** 全部告警（页面内分页）。 */
 const allAlarms: AlarmRecord[] = repo.allAlarms();
+
+/**
+ * 缓存填充完成（dataVersion 自增）→ 原地刷新静态快照。
+ *
+ * 避免预取晚于挂载时 KPI / 列表停留空态：real 模式下这些列表来自 `preloadRealData`
+ * 填好的 `realCache`（设备 / 出口 / 告警），其中告警来自 `GET /api/alerts`、
+ * 设备来自 `GET /api/devices`、出口来自 `GET /api/forwarders`；dataVersion 自增即
+ * 表示缓存已就绪，此处原地刷新（保持数组引用不变，沿用既有引用型用法）。
+ */
+watch(dataVersion, () => {
+  applyInto(devices, repo.allDevices());
+  applyInto(forwarders, repo.allForwarders());
+  applyInto(allAlarms, repo.allAlarms());
+});
+
+/** 把 source 内容覆盖写入 target（原地变更，保持 target 引用 / 响应式不变）。 */
+function applyInto<T>(target: T[], source: readonly T[]): void {
+  target.length = 0;
+  target.push(...source);
+}
 
 // ---------------------------------------------------------------------------
 // 1s 节流推流（模拟 WS）

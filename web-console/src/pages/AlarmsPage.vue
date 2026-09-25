@@ -383,7 +383,7 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { API_MODE, repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '@/api/repo';
+import { API_MODE, dataVersion, repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '@/api/repo';
 import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
 
@@ -516,6 +516,15 @@ async function loadAlarms(): Promise<void> {
 }
 
 onMounted(() => {
+  void loadAlarms();
+});
+
+/**
+ * 缓存填充完成（dataVersion 自增）→ 重读告警数据源。
+ * · mock：重读 `repo.allAlarms()`（避免预取晚于挂载时停留空态）；
+ * · real：重新请求 `GET /api/alerts`（后端告警引擎落地后自动生效，绝不回退 mock）。
+ */
+watch(dataVersion, () => {
   void loadAlarms();
 });
 
