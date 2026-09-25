@@ -88,6 +88,19 @@ pub enum OpsAction {
     PointUpdate,
     /// 点位删除（`DELETE /api/points/{device_id}/{point_id}`）。
     PointDelete,
+    // —— 页面级补齐端点（mgmt pages；写/探测动作含被拒均入审计环）——
+    /// 点位批量导入（`POST /api/points/import`）。
+    PointImport,
+    /// 配置回滚（`POST /api/settings/rollback`）。
+    SettingsRollback,
+    /// 设备连通性探测（`POST /api/devices/test`）。
+    DeviceTest,
+    /// 北向出口登记（`POST /api/forwarders`；诚实 501 占位动作）。
+    ForwarderCreate,
+    /// 北向出口连通性探测（`POST /api/forwarders/{id}/test`）。
+    ForwarderTest,
+    /// 告警规则写（`PUT /api/alerts/rules`；诚实 501 占位动作）。
+    AlarmRulesWrite,
 }
 
 impl OpsAction {
@@ -104,6 +117,12 @@ impl OpsAction {
             OpsAction::PointCreate => "point_create",
             OpsAction::PointUpdate => "point_update",
             OpsAction::PointDelete => "point_delete",
+            OpsAction::PointImport => "point_import",
+            OpsAction::SettingsRollback => "settings_rollback",
+            OpsAction::DeviceTest => "device_test",
+            OpsAction::ForwarderCreate => "forwarder_create",
+            OpsAction::ForwarderTest => "forwarder_test",
+            OpsAction::AlarmRulesWrite => "alarm_rules_write",
         }
     }
 }

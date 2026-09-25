@@ -63,12 +63,15 @@ use crate::driver::PointAddressParser;
 static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 取写锁（毒锁恢复语义，对齐项目「锁中毒不 panic」纪律）。
-fn write_guard() -> MutexGuard<'static, ()> {
+/// `pub(crate)`：页面级写端点（mgmt::pages 的导入 / 回滚）共用同一全进程写锁，
+/// 防跨模块并发写撕裂。
+pub(crate) fn write_guard() -> MutexGuard<'static, ()> {
     CONFIG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// 协议取值域（与 config.rs `PointConfig::protocol` 注释一致）。
-const PROTOCOLS: &[&str] = &[
+/// `pub(crate)`：点位批量导入（mgmt::pages）复用同一协议域，防两套取值漂移。
+pub(crate) const PROTOCOLS: &[&str] = &[
     "modbus-tcp",
     "modbus-rtu",
     "opcua",
@@ -82,13 +85,13 @@ const PROTOCOLS: &[&str] = &[
 /// endpoint / URL 语义，仅做非空校验（诚实限制，见模块注释）。
 const PARSER_PROTOCOLS: &[&str] = &["modbus-tcp", "modbus-rtu", "s7", "mc"];
 
-/// 计划指标：采集频率下限（毫秒）。
-const MIN_FREQUENCY_MS: u64 = 100;
+/// 计划指标：采集频率下限（毫秒）。`pub(crate)`：批量导入共用同一计划指标。
+pub(crate) const MIN_FREQUENCY_MS: u64 = 100;
 /// 新增点位的缺省采集频率（毫秒；与 config.rs `default_frequency_ms` 一致）。
-const DEFAULT_FREQUENCY_MS: u64 = 1000;
+pub(crate) const DEFAULT_FREQUENCY_MS: u64 = 1000;
 
 /// 落盘失败（审计结果字面量；accepted / denied / bad_request 之外的失败路径）。
-const OUTCOME_FAILED: &str = "failed";
+pub(crate) const OUTCOME_FAILED: &str = "failed";
 
 // ---- 审计 ----
 
@@ -97,7 +100,7 @@ const OUTCOME_FAILED: &str = "failed";
 /// task 26：内存环（remote_ops）之外同步落**持久安全审计**（防篡改哈希链）——
 /// 放行的配置写 = `config_change`，被拒 = `authz_failed`；持久写失败仅告警
 /// 不阻塞主流程（内存环仍是兜底轨迹）。
-fn audit(
+pub(crate) fn audit(
     state: &MgmtState,
     actor: &str,
     action: OpsAction,
@@ -126,7 +129,7 @@ fn audit(
 // ---- 响应辅助 ----
 
 /// 400 + 「字段 + 原因 + 允许值」错误体（对齐点位批量导入错误口径）。
-fn validation_error(field: &str, reason: &str, allowed: &str) -> Response {
+pub(crate) fn validation_error(field: &str, reason: &str, allowed: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({
@@ -140,7 +143,7 @@ fn validation_error(field: &str, reason: &str, allowed: &str) -> Response {
 }
 
 /// 404 + JSON 错误体。
-fn not_found(message: &str) -> Response {
+pub(crate) fn not_found(message: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "not_found", "message": message })),
@@ -149,7 +152,7 @@ fn not_found(message: &str) -> Response {
 }
 
 /// 500 + JSON 错误体（落盘失败等内部错误；message 只含原因，不泄露路径细节以外内容）。
-fn internal(message: &str) -> Response {
+pub(crate) fn internal(message: &str) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": "internal", "message": message })),
@@ -303,7 +306,7 @@ struct PointUpdateBody {
 // ---- 配置辅助 ----
 
 /// 设备是否存在（登记段或点位聚合任一命中）。
-fn device_exists(config: &crate::config::GatewayConfig, device_id: &str) -> bool {
+pub(crate) fn device_exists(config: &crate::config::GatewayConfig, device_id: &str) -> bool {
     config.devices.iter().any(|d| d.device_id == device_id)
         || config.points.iter().any(|p| p.device_id == device_id)
 }

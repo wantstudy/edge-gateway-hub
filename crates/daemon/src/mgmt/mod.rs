@@ -40,6 +40,9 @@
 pub mod audit_api;
 pub mod auth_jwt;
 pub mod auth_login;
+// 页面级补齐（web-console real 模式页面契约：点表导入导出 / 配置回滚 /
+// 设备与出口连通性探测 / 规则告警诚实空态 / 授权状态快照）。
+pub mod pages;
 pub mod rbac;
 
 pub mod remote_ops;
@@ -424,6 +427,36 @@ pub fn router(state: MgmtState) -> Router {
             axum::routing::put(writeapi::point_update).delete(writeapi::point_delete),
         )
         .route("/api/outlets", get(outlets))
+        // 页面级补齐（mgmt::pages）：点表导入导出 / 配置回滚 / 连通性探测 /
+        // 规则告警诚实空态 / 北向出口别名与探测 / 授权状态。
+        .route("/api/points/export", get(pages::points_export))
+        .route(
+            "/api/points/import",
+            axum::routing::post(pages::points_import),
+        )
+        .route(
+            "/api/settings/rollback",
+            axum::routing::post(pages::settings_rollback),
+        )
+        .route("/api/devices/test", axum::routing::post(pages::device_test))
+        .route(
+            "/api/forwarders",
+            get(pages::forwarders_list).post(pages::forwarder_create),
+        )
+        .route(
+            "/api/forwarders/:id/test",
+            axum::routing::post(pages::forwarder_test),
+        )
+        .route("/api/rules", get(pages::rules_list))
+        .route("/api/alerts", get(pages::alerts_list))
+        .route(
+            "/api/alerts/rules",
+            axum::routing::put(pages::alerts_rules_put),
+        )
+        .route("/api/license/status", get(pages::license_status))
+        // mock 契约「审计日志 ↔ GET /api/logs」：复用 remote_ops::logs handler
+        //（handler 自带 AuthedRole + ensure(ops.logs_read) 二次校验，自守卫）。
+        .route("/api/logs", get(remote_ops::logs))
         .route("/api/events", get(events))
         // task 52：实时遥测流（SSE；Bearer token 鉴权，与 mgmt 其余端点同判定语义）。
         .route("/api/stream", get(stream))
@@ -620,6 +653,9 @@ async fn outlets(State(state): State<MgmtState>) -> Json<Value> {
                 crate::config::OutletEncoding::Json => "json",
             };
             json!({
+                // id = 出口名（config 唯一键；前端 ForwarderRecord 的 id 锚点，
+                // 与 GET /api/forwarders 同口径）。
+                "id": outlet.name,
                 "name": outlet.name,
                 "target": outlet.broker,
                 "topic_prefix": outlet.topic_prefix,
