@@ -11,6 +11,10 @@ authors.workspace = true
 # task 3 机器码指纹：多源锚点 + N-of-M + HMAC-SHA256（纯 Rust 栈）。
 hmac = "0.12"
 sha2 = "0.10"
+# task 34 敏感配置加密：AES-256-GCM（纯 Rust / 已在依赖图内——rustls 的 crypto provider
+# 就是 ring，Cargo.lock 已锁定 0.17.14，登记为直接依赖**零新增下载**）。
+# 禁止换成 aws-lc-rs（cmake/NASM C 构建，违反纯 Rust 依赖栈红线）。
+ring = "0.17"
 hex = "0.4"
 thiserror = "2"
 

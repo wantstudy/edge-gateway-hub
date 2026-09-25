@@ -570,6 +570,7 @@ dependencies = [
  "notify",
  "prost",
  "protocol-proto",
+ "ring",
  "rumqttc",
  "rusqlite",
  "rustls",

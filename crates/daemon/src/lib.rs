@@ -22,6 +22,9 @@ pub mod backpressure;
 pub mod bootstrap;
 pub mod codec;
 pub mod config;
+/// task 34 敏感配置加密（AES-256-GCM + HKDF(机器码)，fail-closed）。
+/// 模块本身仅提供加解密原语；接入 config 加载/落盘路径见 config.rs 后续集成任务。
+pub mod config_crypto;
 /// 数据面接线（D-14 修复）：南向采集样本 → 管线变换 → 北向投递。
 pub mod dataplane;
 pub mod driver;
