@@ -111,7 +111,7 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, TENANT_NAMES } from '../api/repo';
+import { repo, TENANT_NAMES, API_MODE } from '../api/repo';
 
 const router = useRouter();
 
@@ -149,11 +149,16 @@ const paged = computed(() =>
   }),
 );
 
-/** 筛选选项。 */
-const tenantOptions: readonly SelectOption[] = [
-  { value: '', label: '全部租户' },
-  ...TENANT_NAMES.map((t) => ({ value: t, label: t })),
-];
+/** 筛选选项。real 模式租户选项来自 GET /admin/tenants（后端租户 ID），mock 用演示租户名。 */
+const tenantOptions = computed<readonly SelectOption[]>(() => {
+  if (API_MODE !== 'real') {
+    return [{ value: '', label: '全部租户' }, ...TENANT_NAMES.map((t) => ({ value: t, label: t }))];
+  }
+  return [
+    { value: '', label: '全部租户' },
+    ...repo.allTenants().map((t) => ({ value: t.id, label: t.name && t.name !== t.id ? `${t.name}（${t.id}）` : t.id })),
+  ];
+});
 const deployOptions: readonly SelectOption[] = [
   { value: '', label: '全部形态' },
   { value: 'native', label: 'native' },

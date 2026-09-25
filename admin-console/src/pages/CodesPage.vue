@@ -408,7 +408,7 @@ const paged = computed(() =>
   }),
 );
 
-/** 筛选下拉选项。 */
+/** 筛选下拉选项。real 模式租户选项来自 GET /admin/tenants（后端租户 ID），mock 用演示租户名。 */
 const statusOptions: readonly SelectOption[] = [
   { value: '', label: '全部状态' },
   { value: 'issued', label: '已发放' },
@@ -416,10 +416,15 @@ const statusOptions: readonly SelectOption[] = [
   { value: 'revoked', label: '已废弃' },
   { value: 'reissued', label: '已重发' },
 ];
-const tenantOptions: readonly SelectOption[] = [
-  { value: '', label: '全部租户' },
-  ...TENANT_NAMES.map((t) => ({ value: t, label: t })),
-];
+const tenantOptions = computed<readonly SelectOption[]>(() => {
+  if (!isReal) {
+    return [{ value: '', label: '全部租户' }, ...TENANT_NAMES.map((t) => ({ value: t, label: t }))];
+  }
+  return [
+    { value: '', label: '全部租户' },
+    ...repo.allTenants().map((t) => ({ value: t.id, label: t.name && t.name !== t.id ? `${t.name}（${t.id}）` : t.id })),
+  ];
+});
 const tierOptions: readonly SelectOption[] = [
   { value: '', label: '全部 tier' },
   ...TIER_NAMES.map((t) => ({ value: t, label: t })),

@@ -10,14 +10,23 @@
  *  · **mock 模式（默认）**：`repo` 即 mock-data 仓库的 async 适配包装，完全不发
  *    网络请求，逐行为零回归。
  *  · **real 模式**（后端真实契约 = crates/licensing-server/src/http.rs）：
- *      - 已接通：`POST /admin/codes/issue`（发放）、`POST /admin/codes/:id/revoke`
- *        （废弃）、`POST /admin/codes/:id/reissue`（重发）——发放/重发响应回填
- *        会话级码缓存，列表 / 详情 / 溯源随缓存联动；
- *      - 端点缺失（设备 / 租户 / 审计 / 密钥 / 账号 / 工单 / 码列表等）：读取型
- *        方法返回**诚实的空结果**（绝不回退假数据），写入型方法返回 false 并把
- *        「后端缺口」写入全局提示横幅（`adminNotices`），做到清晰报错。
- *  · **大数红线**：uint64 / unix 秒时间戳一律 `string` 直通（`pickStr`），
- *    仅小值业务计数经 `pickNum`；日期 ↔ UTC 秒换算集中在 `dateToUtcSecs`。
+ *      - 登录鉴权：`POST /admin/auth/login` → `{token, role}`（client.ts 注入
+ *        `Authorization: Bearer` / `X-Tenant-Id` / `X-Actor-Id`，401 统一跳登录）；
+ *      - 已接通 GET 查询端点：`/admin/overview`、`/admin/codes`（分页 + 状态过滤）、
+ *        `/admin/codes/:code_id`（详情 + 时间线 + 溯源链）、`/admin/tenants`、
+ *        `/admin/devices`、`/admin/receipts/anomalies`、`/admin/keys`、
+ *        `/admin/audit/logs`——preload 阶段并行拉取进 **reactive 缓存**，
+ *        页面层同步读取（与 mock 同一接口形状），缓存更新即驱动视图刷新；
+ *      - 已接通写端点：`POST /admin/codes/issue`（发放）、
+ *        `POST /admin/codes/:id/revoke`（废弃）、`POST /admin/codes/:id/reissue`
+ *        （重发）——废弃的 `confirm_tail8` 由详情端点的完整码值自动计算；
+ *      - 后端确实没有的端点（租户策略写、换机工单、账号、密钥轮换、异常处置）：
+ *        读取型方法返回**诚实的空结果**（绝不回退假数据），写入型方法返回 false
+ *        并把「后端缺口」写入全局提示横幅（`adminNotices`），做到清晰报错；
+ *        后端未提供的数据维度以 `'—'` 展示，绝不编造。
+ *  · **大数红线**：uint64 / unix 秒时间戳一律 `string` 原文透传（`pickStr`），
+ *    **绝不 parseInt / Number()**——纳秒 / 毫秒时间戳、计数器原文显示；
+ *    总览聚合的计数契约本身即 String（`OverviewResponse` 全 String）。
  *  · **不改 mock-data.ts 本身**（它是契约与 fallback）。
  */
 import { reactive } from 'vue';
@@ -28,9 +37,11 @@ import {
   type CodeQuery,
   type CodeRecord,
   type CodeStatus,
+  type DeployMode,
   type DeviceRecord,
   type Grade,
   type LifecycleAction,
+  type LifecycleNode,
   type Paged,
   type ReceiptAnomaly,
   type SigningKey,
@@ -107,8 +118,8 @@ function pickStr(src: Record<string, unknown>, key: string, dflt: string): strin
   return dflt;
 }
 
-// （宽容取值当前仅用到 pickStr：后端已接通端点的整数字段均按契约以字符串透传，
-//  大数红线——绝不 parseFloat；后续接通列表端点需要数值映射时再按需补充。）
+// （大数红线：后端已接通端点的计数 / 时间戳 / 序号字段均按契约以 **String** 透传，
+//  原文显示，绝不 parseInt / Number() 运算。）
 
 /** 把 unknown 收敛为 Record（数组 / 非对象回空对象）。 */
 function asRecord(value: unknown): Record<string, unknown> {
@@ -142,25 +153,31 @@ function tail8Of(code: string): string {
 // 统一仓库接口（读：同步缓存视图；写：async——real 模式必须等后端确认）
 // ===========================================================================
 
-/** 总览聚合形状（mock-data `repo.overview()` 返回值的结构化镜像）。 */
+/**
+ * 总览聚合形状（mock-data `repo.overview()` 返回值的结构化镜像）。
+ *
+ * real 模式下后端契约（`OverviewResponse`）**全部计数为 String**（大数红线），
+ * 故计数维度统一 `string` 原文透传（后端未提供的维度为 `'—'`）；
+ * `tenantDelta` 为纯前端展示增量（非后端计数器），保持 number。
+ */
 export interface OverviewStats {
-  tenantCount: number;
-  licensedDevices: number;
-  trialDevices: number;
-  onlineDevices: number;
-  offlineDevices: number;
-  receiptOk: number;
-  receiptGap: number;
-  receiptMissing: number;
-  receiptBadSig: number;
-  pendingTransfers: number;
-  pendingAnomalies: number;
+  tenantCount: string;
+  licensedDevices: string;
+  trialDevices: string;
+  onlineDevices: string;
+  offlineDevices: string;
+  receiptOk: string;
+  receiptGap: string;
+  receiptMissing: string;
+  receiptBadSig: string;
+  pendingTransfers: string;
+  pendingAnomalies: string;
   currentKid: string;
-  kidRetireInDays: number;
-  legacyClientCount: number;
+  kidRetireInDays: string;
+  legacyClientCount: string;
   tenantDelta: number;
-  newActivationsThisMonth: number;
-  expiringIn7Days: number;
+  newActivationsThisMonth: string;
+  expiringIn7Days: string;
 }
 
 /** 换机工单处理结果（与 mock-data `repo.processTransfer` 同形）。 */
@@ -269,10 +286,35 @@ export interface AdminRepo {
 // mock 模式适配器：mockRepo + async 包装（行为逐行零回归）
 // ===========================================================================
 
+/** mock 总览数值 → 契约形状（计数 String 化，展示结果与原值逐字一致）。 */
+function mockOverviewToContract(): OverviewStats {
+  const o = mockRepo.overview();
+  return {
+    tenantCount: String(o.tenantCount),
+    licensedDevices: String(o.licensedDevices),
+    trialDevices: String(o.trialDevices),
+    onlineDevices: String(o.onlineDevices),
+    offlineDevices: String(o.offlineDevices),
+    receiptOk: String(o.receiptOk),
+    receiptGap: String(o.receiptGap),
+    receiptMissing: String(o.receiptMissing),
+    receiptBadSig: String(o.receiptBadSig),
+    pendingTransfers: String(o.pendingTransfers),
+    pendingAnomalies: String(o.pendingAnomalies),
+    currentKid: o.currentKid,
+    kidRetireInDays: String(o.kidRetireInDays),
+    legacyClientCount: String(o.legacyClientCount),
+    tenantDelta: o.tenantDelta,
+    newActivationsThisMonth: String(o.newActivationsThisMonth),
+    expiringIn7Days: String(o.expiringIn7Days),
+  };
+}
+
 /** mock 仓库的 async 适配包装（读方法直通，写方法 Promise.resolve）。 */
 function buildMockRepo(): AdminRepo {
   return {
     ...mockRepo,
+    overview: mockOverviewToContract,
     issueCode: (input) => Promise.resolve(mockRepo.issueCode(input)),
     revokeCode: (input) => Promise.resolve(mockRepo.revokeCode(input)),
     reissueCode: (input) => Promise.resolve(mockRepo.reissueCode(input)),
@@ -289,8 +331,16 @@ function buildMockRepo(): AdminRepo {
 }
 
 // ===========================================================================
-// real 模式仓库：已接通 3 个真实写端点；其余端点缺失 → 诚实空态 + 缺口提示
+// real 模式仓库：全部 GET 查询端点 + 3 个写端点接通；缺失端点 → 诚实空态 + 缺口提示
 // ===========================================================================
+
+/** 后端通用分页信封（`PagedResponse` 前端镜像；total/page/page_size 契约即 String）。 */
+interface PagedEnvelope {
+  items: unknown[];
+  total: string;
+  page: string;
+  page_size: string;
+}
 
 /** real 模式响应行 → IssuedCode 前端镜像（宽容取值）。 */
 interface IssuedCodeView {
@@ -315,60 +365,483 @@ function parseIssuedRow(raw: unknown, idx: number): IssuedCodeView {
   };
 }
 
-/** 码缓存条目 → 页面 CodeRecord（含时间线）。 */
-function buildCodeRecord(view: IssuedCodeView, ctx: {
-  tenantId: string;
-  tier: string;
-  validFrom: string;
-  validUntil: string;
-  note: string;
-  actor: string;
-  action: LifecycleAction;
-  tone: 'ok' | 'warn';
-}): CodeRecord {
-  const stamp = nowText();
-  const detailParts: string[] = [];
-  if (view.prebind) {
-    detailParts.push(`预绑定机器码 ${view.prebind}`);
+// ---------------------------------------------------------------------------
+// real 模式 reactive 缓存（preload 拉取 → 页面同步读 → 更新自动驱动视图）
+// ---------------------------------------------------------------------------
+
+/** real 模式码缓存（列表端点回填掩码值；详情端点回填完整码值 + 时间线）。 */
+const realCodes = reactive<CodeRecord[]>([]);
+
+/** real 模式设备缓存（GET /admin/devices）。 */
+const realDevices = reactive<DeviceRecord[]>([]);
+
+/** real 模式租户缓存（GET /admin/tenants）。 */
+const realTenants = reactive<TenantRecord[]>([]);
+
+/** real 模式回执异常缓存（GET /admin/receipts/anomalies）。 */
+const realAnomalies = reactive<ReceiptAnomaly[]>([]);
+
+/** real 模式签名密钥缓存（GET /admin/keys）。 */
+const realKeys = reactive<SigningKey[]>([]);
+
+/** real 模式审计日志缓存（GET /admin/audit/logs）。 */
+const realAuditLogs = reactive<AuditEntry[]>([]);
+
+/** real 模式总览聚合（GET /admin/overview；计数契约 String，未提供维度 '—'）。 */
+const realStats = reactive<OverviewStats>({
+  tenantCount: '—',
+  licensedDevices: '—',
+  trialDevices: '—',
+  onlineDevices: '—',
+  offlineDevices: '—',
+  receiptOk: '—',
+  receiptGap: '—',
+  receiptMissing: '—',
+  receiptBadSig: '—',
+  pendingTransfers: '—',
+  pendingAnomalies: '—',
+  currentKid: '—',
+  kidRetireInDays: '—',
+  legacyClientCount: '—',
+  tenantDelta: 0,
+  newActivationsThisMonth: '—',
+  expiringIn7Days: '—',
+});
+
+/** 单次拉取的分页上限（管理台数据量级；超出提示截断）。 */
+const FETCH_CAP = 500;
+/** 每页拉取条数（后端上限 200）。 */
+const FETCH_PAGE_SIZE = 200;
+
+/**
+ * 分页拉取全部列表（`items.length < page_size` 即止，绝不 Number(total) 比较）。
+ *
+ * @returns 拉取到的条目（可能因 cap 截断）
+ */
+async function fetchAllPaged(
+  path: string,
+  query: Record<string, string>,
+  buildItem: (raw: Record<string, unknown>, idx: number) => unknown,
+): Promise<unknown[]> {
+  const out: unknown[] = [];
+  for (let page = 1; page <= Math.ceil(FETCH_CAP / FETCH_PAGE_SIZE); page += 1) {
+    const data = await adminRequest<PagedEnvelope>(path, {
+      method: 'GET',
+      query: { ...query, page: String(page), page_size: String(FETCH_PAGE_SIZE) },
+    });
+    const items = data && Array.isArray(data.items) ? data.items : [];
+    for (const [idx, item] of items.entries()) {
+      out.push(buildItem(asRecord(item), out.length + idx));
+    }
+    if (items.length < FETCH_PAGE_SIZE || out.length >= FETCH_CAP) {
+      break;
+    }
   }
-  if (ctx.note) {
-    detailParts.push(ctx.note);
-  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 后端行 → 页面记录映射（时间戳 / 计数一律 String 原文透传）
+// ---------------------------------------------------------------------------
+
+/** 码列表行（CodeSummary）→ 页面 CodeRecord（码值为掩码；完整码值经详情端点回填）。 */
+function buildCodeRecordFromSummary(raw: Record<string, unknown>): CodeRecord {
+  const boundDevice = raw.bound_device_id;
   return {
-    id: view.codeId,
-    code: view.code,
-    status: view.status as CodeStatus,
-    tenant: ctx.tenantId,
-    tier: ctx.tier,
-    validFrom: ctx.validFrom,
-    validUntil: ctx.validUntil,
+    id: pickStr(raw, 'code_id', ''),
+    code: pickStr(raw, 'code_masked', ''),
+    status: pickStr(raw, 'status', 'issued') as CodeStatus,
+    tenant: pickStr(raw, 'tenant_id', ''),
+    tier: pickStr(raw, 'tier', ''),
+    validFrom: '',
+    validUntil: pickStr(raw, 'valid_until', ''),
     orderId: '—',
-    createdAt: stamp,
-    boundDeviceSummary: null,
+    createdAt: pickStr(raw, 'created_at', ''),
+    boundDeviceSummary: typeof boundDevice === 'string' && boundDevice !== '' ? boundDevice : null,
     boundDeviceName: null,
-    prebindMachineCode: view.prebind,
-    reissuedFrom: view.reissuedFrom,
+    prebindMachineCode: null,
+    reissuedFrom: null,
     reissuedTo: null,
-    timeline: [
-      {
-        time: stamp,
-        action: ctx.action,
-        tone: ctx.tone,
-        operator: ctx.actor,
-        ...(view.reissuedFrom ? { target: `源码 ${view.reissuedFrom}` } : {}),
-        detail: detailParts.join(' · ') || '—',
-      },
-    ],
-    receiptContinuity: '尚未激活，无回执',
-    note: ctx.note,
+    timeline: [],
+    receiptContinuity: '—',
+    note: '',
   };
 }
 
-/** real 模式会话级码缓存（后端未提供码列表端点——缺口 #3，故由写响应回填）。 */
-const realCodes: CodeRecord[] = [];
+/** 后端时间线动作 → 前端 LifecycleAction + 色调（未知动作诚实降级）。 */
+function mapTimelineAction(action: string): { action: LifecycleAction; tone: LifecycleNode['tone'] } {
+  switch (action) {
+    case 'issue':
+      return { action: '发放', tone: 'ok' };
+    case 'bind':
+      return { action: '绑定设备', tone: 'ok' };
+    case 'revoke':
+      return { action: '废弃', tone: 'danger' };
+    case 'reissue':
+      return { action: '重发', tone: 'warn' };
+    default:
+      return { action: '再次绑定', tone: 'unknown' };
+  }
+}
 
-/** real 模式 preload 汇总提示（每次会话只提示一次）。 */
-let preloadNoticeShown = false;
+/** 码详情行（CodeDetail）→ 页面 CodeRecord。 */
+function buildCodeRecordFromDetail(raw: Record<string, unknown>): CodeRecord {
+  const timelineRaw = Array.isArray(raw.timeline) ? raw.timeline : [];
+  const chainRaw = Array.isArray(raw.reissued_chain) ? raw.reissued_chain : [];
+  const boundDevice = raw.bound_device_id;
+  const status = pickStr(raw, 'status', 'issued');
+  const timeline: LifecycleNode[] = timelineRaw.map((entry) => {
+    const t = asRecord(entry);
+    const mapped = mapTimelineAction(pickStr(t, 'action', ''));
+    return {
+      time: pickStr(t, 'at', ''),
+      action: mapped.action,
+      tone: mapped.tone,
+      operator: pickStr(t, 'actor', ''),
+      detail: pickStr(t, 'detail', ''),
+    };
+  });
+  return {
+    id: pickStr(raw, 'code_id', ''),
+    code: pickStr(raw, 'code', ''),
+    status: status as CodeStatus,
+    tenant: pickStr(raw, 'tenant_id', ''),
+    tier: pickStr(raw, 'tier', ''),
+    validFrom: pickStr(raw, 'valid_from', ''),
+    validUntil: pickStr(raw, 'valid_until', ''),
+    orderId: '—',
+    createdAt: timeline.length > 0 ? timeline[0].time : '',
+    boundDeviceSummary: typeof boundDevice === 'string' && boundDevice !== '' ? boundDevice : null,
+    boundDeviceName: null,
+    prebindMachineCode: null,
+    reissuedFrom: typeof chainRaw[0] === 'string' && chainRaw[0] !== '' ? chainRaw[0] : null,
+    reissuedTo: null,
+    timeline,
+    receiptContinuity: status === 'revoked' ? '废弃后停止回执' : '—',
+    note: pickStr(raw, 'revoked_reason', '') || '',
+  };
+}
+
+/** 把列表 / 详情 / 写响应得到的码记录并入缓存（已有记录的完整码值不会被掩码覆盖）。 */
+function upsertCodeRecord(record: CodeRecord): void {
+  if (!record.id) {
+    return;
+  }
+  const existing = realCodes.find((c) => c.id === record.id);
+  if (!existing) {
+    realCodes.push(record);
+    return;
+  }
+  if (record.code) {
+    existing.code = record.code;
+  }
+  existing.status = record.status;
+  existing.tenant = record.tenant || existing.tenant;
+  existing.tier = record.tier || existing.tier;
+  if (record.validFrom) {
+    existing.validFrom = record.validFrom;
+  }
+  if (record.validUntil) {
+    existing.validUntil = record.validUntil;
+  }
+  if (record.createdAt) {
+    existing.createdAt = record.createdAt;
+  }
+  if (record.boundDeviceSummary !== null) {
+    existing.boundDeviceSummary = record.boundDeviceSummary;
+  }
+  if (record.reissuedFrom !== null) {
+    existing.reissuedFrom = record.reissuedFrom;
+  }
+  if (record.timeline.length > 0) {
+    existing.timeline = record.timeline;
+  }
+  if (record.receiptContinuity !== '—') {
+    existing.receiptContinuity = record.receiptContinuity;
+  }
+  if (record.note) {
+    existing.note = record.note;
+  }
+}
+
+/** 设备行（DeviceListItem）→ 页面 DeviceRecord。 */
+function buildDeviceRecord(raw: Record<string, unknown>): DeviceRecord {
+  // 后端设备行仅下发掩码机器码（machine_code_masked），无设备名 / tier / 档位字段——
+  // 未提供维度以 '—' / 未知档位诚实展示，绝不编造。
+  const gapSummary = pickStr(raw, 'receipt_gap_summary', '');
+  const gapMatch = /gap=(\d+)/.exec(gapSummary);
+  const lease = pickStr(raw, 'lease_status', '');
+  const imageDigest = raw.image_digest;
+  return {
+    id: pickStr(raw, 'device_id', ''),
+    tenant: pickStr(raw, 'tenant_id', ''),
+    name: pickStr(raw, 'device_id', ''),
+    machineCode: pickStr(raw, 'machine_code_masked', ''),
+    machineSummary: pickStr(raw, 'machine_code_masked', ''),
+    tier: '—',
+    deployMode: (pickStr(raw, 'deploy_mode', 'native') === 'docker' ? 'docker' : 'native') as DeployMode,
+    imageDigest: typeof imageDigest === 'string' && imageDigest !== '' ? imageDigest : null,
+    grade: '—' as Grade,
+    licenseStatus: lease || 'inactive',
+    lastHeartbeatAt: pickStr(raw, 'last_heartbeat_at', ''),
+    receiptStatus: lease ? (gapMatch ? 'receipt_gap' : 'receipt_ok') : 'receipt_na',
+    gapCount: gapMatch ? Number(gapMatch[1]) : 0,
+    boundCodeId: null,
+    boundCodeMasked: null,
+    clientVersion: '—',
+    firstActivatedAt: '',
+    anomalyNote: '',
+  };
+}
+
+/** 租户行（TenantItem）→ 页面 TenantRecord（后端未提供维度诚实 '—'）。 */
+function buildTenantRecord(raw: Record<string, unknown>): TenantRecord {
+  const verifyMode = pickStr(raw, 'verify_mode_default', '—');
+  return {
+    id: pickStr(raw, 'tenant_id', ''),
+    name: pickStr(raw, 'name', ''),
+    deviceCount: 0,
+    licensedCount: 0,
+    defaultGrade: (verifyMode === 'A' || verifyMode === 'B' || verifyMode === 'C' ? verifyMode : '—') as Grade,
+    defaultTier: '—',
+    heartbeatInterval: '—',
+    offlineGrace: '—',
+    receiptRequired: false,
+    contact: pickStr(raw, 'contact', ''),
+    enabled: true,
+  };
+}
+
+/** 回执告警行（ReceiptAnomalyItem）→ 页面 ReceiptAnomaly。 */
+function buildAnomalyRecord(raw: Record<string, unknown>): ReceiptAnomaly {
+  const kind = pickStr(raw, 'kind', '');
+  const typeMap: Record<string, string> = {
+    gap: 'receipt_gap',
+    overlap: 'receipt_rollback',
+    missing: 'receipt_missing',
+  };
+  const seqFrom = pickStr(raw, 'seq_from', '');
+  const seqTo = pickStr(raw, 'seq_to', '');
+  return {
+    id: pickStr(raw, 'id', ''),
+    deviceSummary: pickStr(raw, 'device_mid', ''),
+    tenant: '—',
+    type: typeMap[kind] ?? kind,
+    detail:
+      `${pickStr(raw, 'detail', '')}` +
+      (seqFrom ? `（区间 ${seqFrom} → ${seqTo}，前沿 ${pickStr(raw, 'last_seq_to', '')}）` : ''),
+    firstSeen: pickStr(raw, 'created_at', ''),
+    count: 1,
+    disposition: 'pending_check',
+    verified: false,
+    note: '',
+  };
+}
+
+/** 签名密钥行（SigningKeyItem）→ 页面 SigningKey。 */
+function buildSigningKeyRecord(raw: Record<string, unknown>): SigningKey {
+  const statusMap: Record<string, string> = {
+    active: 'key_active',
+    retiring: 'key_retiring',
+    retired: 'key_retired',
+  };
+  const status = pickStr(raw, 'status', '');
+  const retiredAt = raw.retired_at;
+  const publicKey = pickStr(raw, 'public_key', '');
+  return {
+    kid: pickStr(raw, 'kid', ''),
+    algorithm: '—',
+    status: statusMap[status] ?? status,
+    activatedAt: pickStr(raw, 'enabled_at', ''),
+    retiredAt: typeof retiredAt === 'string' && retiredAt !== '' ? retiredAt : '—',
+    plannedRetireAt: '—',
+    usage: '—',
+    fingerprint: publicKey ? `${publicKey.slice(0, 12)}…` : '—',
+  };
+}
+
+/** 审计日志行（AuditLogItem）→ 页面 AuditEntry。 */
+function buildAuditRecord(raw: Record<string, unknown>, idx: number): AuditEntry {
+  const actor = pickStr(raw, 'actor', '');
+  const entity = pickStr(raw, 'entity', '');
+  const colonAt = entity.indexOf(':');
+  const entityType = colonAt >= 0 ? entity.slice(0, colonAt) : entity;
+  const entityId = colonAt >= 0 ? entity.slice(colonAt + 1) : entity;
+  const labelMap: Record<string, string> = {
+    activation_code: '激活码',
+    tenant: '租户',
+    device: '设备',
+    receipt_anomaly: '回执异常',
+    transfer_ticket: '换机工单',
+    signing_key: '签名密钥',
+    admin_user: '管理员账号',
+  };
+  return {
+    id: `log-real-${idx}`,
+    ts: pickStr(raw, 'ts', ''),
+    actor,
+    actorType: actor.includes(':') ? actor.slice(0, actor.indexOf(':')) : actor,
+    action: pickStr(raw, 'action', ''),
+    entityType,
+    entityId,
+    entityLabel: labelMap[entityType] ?? entityType,
+    detail: pickStr(raw, 'detail', ''),
+    ip: pickStr(raw, 'ip', ''),
+    result: '—',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// real 模式拉取动作（preload 并行执行；各失败独立提示，不互相阻断）
+// ---------------------------------------------------------------------------
+
+/** 拉取总览聚合（GET /admin/overview；计数 String 原文透传）。 */
+async function fetchOverview(): Promise<void> {
+  try {
+    const data = asRecord(await adminRequest<unknown>('/admin/overview', { method: 'GET' }));
+    const anomalous = pickStr(data, 'receipts_anomalous', '—');
+    realStats.tenantCount = pickStr(data, 'tenants', '—');
+    realStats.licensedDevices = pickStr(data, 'codes_bound', '—');
+    realStats.receiptGap = anomalous;
+    realStats.pendingAnomalies = anomalous;
+    const activeKid = data.active_kid;
+    realStats.currentKid = typeof activeKid === 'string' && activeKid !== '' ? activeKid : '—';
+  } catch (cause) {
+    pushNoticeOnce('load-overview', 'warn', `总览加载失败：${describeCause(cause)}`);
+  }
+}
+
+/** 拉取激活码列表（GET /admin/codes；并入缓存，保留会话内发放的完整码值）。 */
+async function fetchCodes(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/codes', {}, buildCodeRecordFromSummary);
+    for (const raw of rows) {
+      const record = raw as CodeRecord;
+      const existing = realCodes.find((c) => c.id === record.id);
+      if (existing) {
+        // 已有记录（会话内发放的完整码值 / 详情回填）优先，仅同步服务端状态
+        existing.status = record.status;
+        existing.tenant = record.tenant || existing.tenant;
+        existing.tier = record.tier || existing.tier;
+        if (record.validUntil) {
+          existing.validUntil = record.validUntil;
+        }
+        if (record.createdAt) {
+          existing.createdAt = record.createdAt;
+        }
+        if (record.boundDeviceSummary !== null) {
+          existing.boundDeviceSummary = record.boundDeviceSummary;
+        }
+      } else {
+        realCodes.push(record);
+      }
+    }
+    if (rows.length >= FETCH_CAP) {
+      pushNoticeOnce('codes-truncated', 'warn', `激活码数量较多，列表仅加载前 ${FETCH_CAP} 条（可用筛选缩小范围）。`);
+    }
+  } catch (cause) {
+    pushNoticeOnce('load-codes', 'warn', `激活码列表加载失败：${describeCause(cause)}`);
+  }
+}
+
+/** 拉取设备列表（GET /admin/devices）。 */
+async function fetchDevices(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/devices', {}, buildDeviceRecord);
+    realDevices.splice(0, realDevices.length, ...(rows as DeviceRecord[]));
+    if (rows.length >= FETCH_CAP) {
+      pushNoticeOnce('devices-truncated', 'warn', `设备数量较多，列表仅加载前 ${FETCH_CAP} 条。`);
+    }
+  } catch (cause) {
+    pushNoticeOnce('load-devices', 'warn', `设备列表加载失败：${describeCause(cause)}`);
+  }
+}
+
+/** 拉取租户列表（GET /admin/tenants）。 */
+async function fetchTenants(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/tenants', {}, buildTenantRecord);
+    realTenants.splice(0, realTenants.length, ...(rows as TenantRecord[]));
+  } catch (cause) {
+    pushNoticeOnce('load-tenants', 'warn', `租户列表加载失败：${describeCause(cause)}`);
+  }
+}
+
+/** 拉取回执异常（GET /admin/receipts/anomalies）。 */
+async function fetchAnomalies(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/receipts/anomalies', {}, buildAnomalyRecord);
+    realAnomalies.splice(0, realAnomalies.length, ...(rows as ReceiptAnomaly[]));
+  } catch (cause) {
+    pushNoticeOnce('load-anomalies', 'warn', `回执异常加载失败：${describeCause(cause)}`);
+  }
+}
+
+/** 拉取签名密钥（GET /admin/keys）。 */
+async function fetchKeys(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/keys', {}, buildSigningKeyRecord);
+    realKeys.splice(0, realKeys.length, ...(rows as SigningKey[]));
+  } catch (cause) {
+    pushNoticeOnce('load-keys', 'warn', `签名密钥加载失败：${describeCause(cause)}`);
+  }
+}
+
+/** 拉取审计日志（GET /admin/audit/logs）。 */
+async function fetchAudit(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/audit/logs', {}, buildAuditRecord);
+    realAuditLogs.splice(0, realAuditLogs.length, ...(rows as AuditEntry[]));
+    if (rows.length >= FETCH_CAP) {
+      pushNoticeOnce('audit-truncated', 'warn', `审计日志较多，仅加载最近 ${FETCH_CAP} 条（可用筛选缩小范围）。`);
+    }
+  } catch (cause) {
+    pushNoticeOnce('load-audit', 'warn', `审计日志加载失败：${describeCause(cause)}`);
+  }
+}
+
+/**
+ * 拉取单个激活码详情（GET /admin/codes/:code_id）：
+ * 回填完整码值、有效期、时间线与溯源链（祖先码详情一并回填，上限 5 层）。
+ *
+ * @returns 是否成功（失败已推横幅）
+ */
+export async function fetchCodeDetail(id: string): Promise<boolean> {
+  if (API_MODE !== 'real' || !id) {
+    return false;
+  }
+  try {
+    const data = asRecord(await adminRequest<unknown>(`/admin/codes/${encodeURIComponent(id)}`, { method: 'GET' }));
+    upsertCodeRecord(buildCodeRecordFromDetail(data));
+    const chainRaw = Array.isArray(data.reissued_chain) ? data.reissued_chain : [];
+    for (const ancestor of chainRaw.slice(0, 5)) {
+      if (typeof ancestor === 'string' && ancestor !== '' && !realCodes.some((c) => c.id === ancestor)) {
+        try {
+          const anc = asRecord(
+            await adminRequest<unknown>(`/admin/codes/${encodeURIComponent(ancestor)}`, { method: 'GET' }),
+          );
+          upsertCodeRecord(buildCodeRecordFromDetail(anc));
+        } catch {
+          /* 祖先详情失败不阻断主详情展示 */
+        }
+      }
+    }
+    return true;
+  } catch (cause) {
+    pushNoticeOnce(`code-detail-${id}`, 'warn', `激活码详情加载失败：${describeCause(cause)}`);
+    return false;
+  }
+}
+
+/** 把 ApiError / 未知异常收敛为一句话（供横幅）。 */
+function describeCause(cause: unknown): string {
+  if (cause instanceof ApiError) {
+    const trace = cause.traceId ? `，trace_id=${cause.traceId}` : '';
+    const biz = cause.businessCode !== 'UNKNOWN' ? `［${cause.businessCode}］` : '';
+    return `${cause.message}${biz}${trace}`;
+  }
+  return cause instanceof Error ? cause.message : String(cause);
+}
 
 /** real 模式仓库。 */
 function buildRealRepo(): AdminRepo {
@@ -388,26 +861,39 @@ function buildRealRepo(): AdminRepo {
     return realCodes.find((c) => c.id === id) ?? null;
   }
 
-  /** 把 ApiError 转成横幅提示并返回 false。 */
+  /** 把 ApiError 转成横幅提示并返回 false（412 CONFIRM_MISMATCH 给可解释错误）。 */
   function reportFailure(prefix: string, cause: unknown): boolean {
-    if (cause instanceof ApiError) {
-      const trace = cause.traceId ? `，trace_id=${cause.traceId}` : '';
-      const biz = cause.businessCode !== 'UNKNOWN' ? `［${cause.businessCode}］` : '';
-      pushNotice('error', `${prefix}失败：${cause.message}${biz}${trace}`);
-    } else {
-      pushNotice('error', `${prefix}失败：${cause instanceof Error ? cause.message : String(cause)}`);
+    if (cause instanceof ApiError && cause.businessCode === 'CONFIRM_MISMATCH') {
+      pushNotice(
+        'error',
+        `${prefix}失败：确认串与激活码末 8 位不符（CONFIRM_MISMATCH）。确认串由系统按码值去分隔符后的末 8 位自动计算，请刷新列表后重试；若仍失败请联系系统管理员核对码值。`,
+      );
+      return false;
     }
+    pushNotice('error', `${prefix}失败：${describeCause(cause)}`);
     return false;
   }
 
+  /** 确保目标码具备完整码值与租户归属（列表仅掩码，confirm_tail8 需详情端点回填）。 */
+  async function ensureFullCode(id: string): Promise<CodeRecord | null> {
+    const cached = findCached(id);
+    if (cached && cached.tenant && cached.code && !cached.code.includes('*')) {
+      return cached;
+    }
+    const ok = await fetchCodeDetail(id);
+    if (!ok) {
+      return null;
+    }
+    const refreshed = findCached(id);
+    if (!refreshed || !refreshed.tenant || !refreshed.code || refreshed.code.includes('*')) {
+      return null;
+    }
+    return refreshed;
+  }
+
   return {
-    // ---------- 激活码（列表 / 详情来自会话级缓存；写直连后端） ----------
+    // ---------- 激活码（列表来自 GET /admin/codes 缓存；写直连后端） ----------
     queryCodes(query: CodeQuery): Paged<CodeRecord> {
-      pushNoticeOnce(
-        'gap-codes-list',
-        'warn',
-        '后端缺口 #3：未提供 GET /admin/codes 码列表端点——当前仅展示本会话内经「发放 / 重发」产生的码。',
-      );
       const kw = query.keyword.trim().toLowerCase();
       const filtered = effectiveCodes().filter((c) => {
         if (query.status && c.status !== query.status) {
@@ -453,19 +939,49 @@ function buildRealRepo(): AdminRepo {
           },
         });
         const rows = Array.isArray(data?.codes) ? data.codes : [];
-        const created = rows.map((row, i) =>
-          buildCodeRecord(parseIssuedRow(row, i), {
-            tenantId: input.tenant,
+        const stamp = nowText();
+        const created: CodeRecord[] = rows.map((row, i) => {
+          const view = parseIssuedRow(row, i);
+          const detailParts: string[] = [];
+          if (view.prebind) {
+            detailParts.push(`预绑定机器码 ${view.prebind}`);
+          }
+          if (input.note) {
+            detailParts.push(input.note);
+          }
+          return {
+            id: view.codeId,
+            code: view.code,
+            status: view.status as CodeStatus,
+            tenant: input.tenant,
             tier: input.tier,
             validFrom: input.validFrom,
             validUntil: input.validUntil,
+            orderId: '—',
+            createdAt: stamp,
+            boundDeviceSummary: null,
+            boundDeviceName: null,
+            prebindMachineCode: view.prebind,
+            reissuedFrom: view.reissuedFrom,
+            reissuedTo: null,
+            timeline: [
+              {
+                time: stamp,
+                action: '发放' as LifecycleAction,
+                tone: 'ok' as const,
+                operator: input.actor,
+                ...(view.reissuedFrom ? { target: `源码 ${view.reissuedFrom}` } : {}),
+                detail: detailParts.join(' · ') || '—',
+              },
+            ],
+            receiptContinuity: '尚未激活，无回执',
             note: input.note,
-            actor: input.actor,
-            action: '发放',
-            tone: 'ok',
-          }),
-        );
-        realCodes.push(...created);
+          };
+        });
+        for (const record of created) {
+          upsertCodeRecord(JSON.parse(JSON.stringify(record)) as CodeRecord);
+        }
+        void fetchOverview();
         return JSON.parse(JSON.stringify(created)) as CodeRecord[];
       } catch (cause) {
         reportFailure('发放激活码', cause);
@@ -474,12 +990,15 @@ function buildRealRepo(): AdminRepo {
     },
 
     async revokeCode(input): Promise<boolean> {
-      const target = findCached(input.id);
+      // 契约前置拦截：note ≥ 10 字（后端 400），前端先拦并解释
+      if (input.note.trim().length < 10) {
+        pushNotice('error', '废弃失败：补充说明需 ≥10 字（后端契约），请补充操作原因的具体细节。');
+        return false;
+      }
+      // confirm_tail8 需要完整码值：列表只有掩码，经详情端点回填（租户归属同源）
+      const target = await ensureFullCode(input.id);
       if (!target) {
-        pushNotice(
-          'error',
-          '废弃失败：该激活码不在本会话缓存中（后端未提供码列表端点，无法确定其租户归属）。',
-        );
+        pushNotice('error', '废弃失败：无法获取该激活码的完整码值与租户归属（详情端点不可用）。');
         return false;
       }
       try {
@@ -487,8 +1006,8 @@ function buildRealRepo(): AdminRepo {
           headers: { 'X-Tenant-Id': target.tenant },
           body: {
             reason: input.reason,
-            // 契约要求 note ≥ 10 字符；不足时以原因补足（后端当前未强制，前端先对齐契约）
-            note: input.note.trim().length >= 10 ? input.note : `${input.note}（原因：${input.reason}）`,
+            note: input.note.trim(),
+            // 契约：confirm_tail8 = 激活码去分隔符后的末 8 位（自动计算，绝不让用户手算）
             confirm_tail8: tail8Of(target.code),
             second_approver: null,
           },
@@ -503,6 +1022,8 @@ function buildRealRepo(): AdminRepo {
           reason: input.reason,
           detail: `补充说明：${input.note}`,
         });
+        void fetchCodes();
+        void fetchOverview();
         return true;
       } catch (cause) {
         return reportFailure('废弃激活码', cause);
@@ -510,12 +1031,9 @@ function buildRealRepo(): AdminRepo {
     },
 
     async reissueCode(input): Promise<CodeRecord | null> {
-      const source = findCached(input.sourceId);
+      const source = await ensureFullCode(input.sourceId);
       if (!source) {
-        pushNotice(
-          'error',
-          '重发失败：源激活码不在本会话缓存中（后端未提供码列表端点，无法确定其租户归属）。',
-        );
+        pushNotice('error', '重发失败：无法获取源激活码的租户归属（详情端点不可用）。');
         return null;
       }
       const inheritTier = input.inheritTier === source.tier;
@@ -539,28 +1057,49 @@ function buildRealRepo(): AdminRepo {
           },
         );
         const view = parseIssuedRow(asRecord(data?.new_code), 0);
-        const created = buildCodeRecord(view, {
-          tenantId: source.tenant,
+        const stamp = nowText();
+        const created: CodeRecord = {
+          id: view.codeId,
+          code: view.code,
+          status: view.status as CodeStatus,
+          tenant: source.tenant,
           tier: input.inheritTier,
-          validFrom: nowText().slice(0, 10),
+          validFrom: stamp.slice(0, 10),
           validUntil: input.inheritValidUntil,
+          orderId: '—',
+          createdAt: stamp,
+          boundDeviceSummary: null,
+          boundDeviceName: null,
+          prebindMachineCode: view.prebind,
+          reissuedFrom: source.id,
+          reissuedTo: null,
+          timeline: [
+            {
+              time: stamp,
+              action: '重发',
+              tone: 'warn',
+              target: `源码 ${source.id}`,
+              operator: input.actor,
+              detail: `继承 tier ${input.inheritTier} · 有效期至 ${input.inheritValidUntil}`,
+            },
+          ],
+          receiptContinuity: '尚未激活，无回执',
           note: input.note,
-          actor: input.actor,
-          action: '重发',
-          tone: 'warn',
-        });
+        };
         // 后端语义：原码 status → reissued（禁止再废弃 / 再重发），并建立溯源链
         source.status = 'reissued';
         source.reissuedTo = created.id;
         source.timeline.push({
-          time: nowText(),
+          time: stamp,
           action: '重发',
           tone: 'warn',
           target: `新码 ${created.id}`,
           operator: input.actor,
           detail: `继承 tier ${input.inheritTier} · 有效期至 ${input.inheritValidUntil}`,
         });
-        realCodes.push(created);
+        upsertCodeRecord(JSON.parse(JSON.stringify(created)) as CodeRecord);
+        void fetchCodes();
+        void fetchOverview();
         return JSON.parse(JSON.stringify(created)) as CodeRecord;
       } catch (cause) {
         reportFailure('重发激活码', cause);
@@ -568,19 +1107,36 @@ function buildRealRepo(): AdminRepo {
       }
     },
 
-    // ---------- 设备（缺口 #4：GET /admin/devices） ----------
+    // ---------- 设备（GET /admin/devices 已接通） ----------
     queryDevices(query: { tenant: string; deployMode: string; licenseStatus: string; keyword: string; page: number; pageSize: number }): Paged<DeviceRecord> {
-      void query;
-      pushNoticeOnce('gap-devices', 'warn', '后端缺口 #4：未提供 GET /admin/devices 设备列表端点——设备页无真实数据可显示。');
-      return { items: [], total: 0, page: query.page };
+      const kw = query.keyword.trim().toLowerCase();
+      const filtered = (JSON.parse(JSON.stringify(realDevices)) as DeviceRecord[]).filter((d) => {
+        if (query.tenant && d.tenant !== query.tenant) {
+          return false;
+        }
+        if (query.deployMode && d.deployMode !== query.deployMode) {
+          return false;
+        }
+        if (query.licenseStatus && d.licenseStatus !== query.licenseStatus) {
+          return false;
+        }
+        if (kw) {
+          const haystack = `${d.machineCode} ${d.machineSummary} ${d.name} ${d.tenant}`.toLowerCase();
+          if (!haystack.includes(kw)) {
+            return false;
+          }
+        }
+        return true;
+      });
+      return paginate(filtered, query.page, query.pageSize);
     },
 
-    getDevice(_id: string): DeviceRecord | null {
-      return null;
+    getDevice(id: string): DeviceRecord | null {
+      return (JSON.parse(JSON.stringify(realDevices)) as DeviceRecord[]).find((d) => d.id === id) ?? null;
     },
 
     allDevices(): DeviceRecord[] {
-      return [];
+      return JSON.parse(JSON.stringify(realDevices)) as DeviceRecord[];
     },
 
     markDeviceAnomaly(_input: { id: string; note: string; actor: string }): Promise<boolean> {
@@ -588,14 +1144,13 @@ function buildRealRepo(): AdminRepo {
       return Promise.resolve(false);
     },
 
-    // ---------- 租户（缺口 #2：GET /admin/tenants + 策略写端点） ----------
+    // ---------- 租户（GET /admin/tenants 已接通；策略写端点缺失） ----------
     allTenants(): TenantRecord[] {
-      pushNoticeOnce('gap-tenants', 'warn', '后端缺口 #2：未提供租户列表 / 策略显著端点——租户页无真实数据可显示。');
-      return [];
+      return JSON.parse(JSON.stringify(realTenants)) as TenantRecord[];
     },
 
-    getTenant(_id: string): TenantRecord | null {
-      return null;
+    getTenant(id: string): TenantRecord | null {
+      return (JSON.parse(JSON.stringify(realTenants)) as TenantRecord[]).find((t) => t.id === id) ?? null;
     },
 
     updateTenant(_input: {
@@ -617,10 +1172,9 @@ function buildRealRepo(): AdminRepo {
       return Promise.resolve(false);
     },
 
-    // ---------- 回执异常（缺口 #5：GET /admin/receipts/anomalies） ----------
+    // ---------- 回执异常（GET /admin/receipts/anomalies 已接通；处置写端点缺失） ----------
     allAnomalies(): ReceiptAnomaly[] {
-      pushNoticeOnce('gap-anomalies', 'warn', '后端缺口 #5：未提供回执异常查询端点——回执异常页无真实数据可显示。');
-      return [];
+      return JSON.parse(JSON.stringify(realAnomalies)) as ReceiptAnomaly[];
     },
 
     resolveAnomaly(_input: { id: string; note: string; verified: boolean; actor: string }): Promise<boolean> {
@@ -628,7 +1182,7 @@ function buildRealRepo(): AdminRepo {
       return Promise.resolve(false);
     },
 
-    // ---------- 换机工单（缺口 #6：工单实体后端不存在；可用废弃+重发替代） ----------
+    // ---------- 换机工单（工单实体后端不存在；可用废弃+重发替代） ----------
     allTransfers(): TransferTicket[] {
       pushNoticeOnce(
         'gap-transfers',
@@ -639,7 +1193,7 @@ function buildRealRepo(): AdminRepo {
     },
 
     async processTransfer(input): Promise<ProcessTransferResult> {
-      // real 模式没有工单实体：若源码在本会话缓存中，则退化为「废弃 + 重发」组合
+      // real 模式没有工单实体：若源码在缓存中，则退化为「废弃 + 重发」组合
       const source = findCached(input.ticketId);
       if (!source) {
         pushNoticeOnce(
@@ -672,10 +1226,9 @@ function buildRealRepo(): AdminRepo {
         : { ok: false, ticket: null, newCode: null, message: '重发失败（见上方提示）' };
     },
 
-    // ---------- 密钥（缺口 #7：GET /admin/keys + 轮换写端点） ----------
+    // ---------- 密钥（GET /admin/keys 已接通；轮换写端点缺失） ----------
     allKeys(): SigningKey[] {
-      pushNoticeOnce('gap-keys', 'warn', '后端缺口 #7：未提供签名密钥列表端点——密钥页无真实数据可显示。');
-      return [];
+      return JSON.parse(JSON.stringify(realKeys)) as SigningKey[];
     },
 
     rotateKey(_input: { newKid: string; actor: string }): Promise<boolean> {
@@ -688,11 +1241,24 @@ function buildRealRepo(): AdminRepo {
       return Promise.resolve(false);
     },
 
-    // ---------- 审计（缺口 #8：GET /admin/audit/logs） ----------
+    // ---------- 审计（GET /admin/audit/logs 已接通） ----------
     queryAudit(query: { actorType: string; action: string; entityType: string; entityId: string; page: number; pageSize: number }): Paged<AuditEntry> {
-      void query;
-      pushNoticeOnce('gap-audit', 'warn', '后端缺口 #8：未提供 GET /admin/audit/logs 审计查询端点——审计页无真实数据可显示。');
-      return { items: [], total: 0, page: 1 };
+      const filtered = (JSON.parse(JSON.stringify(realAuditLogs)) as AuditEntry[]).filter((log) => {
+        if (query.actorType && log.actorType !== query.actorType) {
+          return false;
+        }
+        if (query.action && !log.action.includes(query.action)) {
+          return false;
+        }
+        if (query.entityType && log.entityType !== query.entityType) {
+          return false;
+        }
+        if (query.entityId && !log.entityId.includes(query.entityId)) {
+          return false;
+        }
+        return true;
+      });
+      return paginate(filtered, query.page, query.pageSize);
     },
 
     async logReveal(_input: { entityId: string; actor: string }): Promise<void> {
@@ -700,7 +1266,7 @@ function buildRealRepo(): AdminRepo {
       // 说明：揭示动作本身仍受页面权限门控；服务端审计待缺口补齐后接入。
     },
 
-    // ---------- 账号（缺口 #9：管理员账号体系整体缺失，含登录/RBAC） ----------
+    // ---------- 账号（后端无管理员账号列表端点） ----------
     allUsers(): AdminUser[] {
       pushNoticeOnce('gap-users', 'warn', '后端缺口 #9：未提供管理员账号列表端点——账号页无真实数据可显示。');
       return [];
@@ -711,34 +1277,9 @@ function buildRealRepo(): AdminRepo {
       return Promise.resolve(false);
     },
 
-    // ---------- 总览（由会话级真实缓存聚合；端点缺失维度为诚实 0 值） ----------
+    // ---------- 总览（GET /admin/overview 已接通；计数 String 原文透传） ----------
     overview(): OverviewStats {
-      pushNoticeOnce(
-        'gap-overview',
-        'warn',
-        '后端缺口 #10：未提供总览聚合端点——总览页各维度为会话内真实缓存的聚合（未覆盖维度显示 0）。',
-      );
-      const tenantSet = new Set(realCodes.map((c) => c.tenant));
-      const issued = realCodes.filter((c) => c.status === 'issued').length;
-      return {
-        tenantCount: tenantSet.size,
-        licensedDevices: 0,
-        trialDevices: 0,
-        onlineDevices: 0,
-        offlineDevices: 0,
-        receiptOk: 0,
-        receiptGap: 0,
-        receiptMissing: 0,
-        receiptBadSig: 0,
-        pendingTransfers: 0,
-        pendingAnomalies: 0,
-        currentKid: '—',
-        kidRetireInDays: 0,
-        legacyClientCount: 0,
-        tenantDelta: 0,
-        newActivationsThisMonth: issued,
-        expiringIn7Days: 0,
-      };
+      return realStats;
     },
   };
 }
@@ -747,30 +1288,29 @@ function buildRealRepo(): AdminRepo {
 // preload（登录成功后调用一次；P0 教训：必须有总超时护栏）
 // ===========================================================================
 
+/** preload 是否已启动（防重复并发拉取）。 */
+let preloadStarted = false;
+
 /**
  * 预取真实数据（real 模式专用；mock 模式直接返回 false）。
  *
- * 后端当前**没有任何 GET 型管理端点**（全部 7 个端点均为 POST 写操作），
- * 因此 preload 阶段无可拉取的列表数据——这里仅推送一次缺口汇总提示并立即返回。
- * 保留该入口 + 超时护栏骨架，待后端补齐列表端点后在此并行预取。
+ * 并行拉取全部 GET 查询端点进 reactive 缓存（overview / codes / devices /
+ * tenants / anomalies / keys / audit）；单端点失败独立提示、不互相阻断。
+ * 总超时护栏 10s（超时后缓存保持部分结果，页面空态给出重试路径）。
  *
- * @returns real 模式返回 true（已进入降级就绪态）；mock 模式返回 false
+ * @returns real 模式返回 true（已进入加载态）；mock 模式返回 false
  */
 export async function preloadRealData(): Promise<boolean> {
   if (API_MODE !== 'real') {
     return false;
   }
-  if (!preloadNoticeShown) {
-    preloadNoticeShown = true;
-    pushNotice(
-      'warn',
-      'real 模式联调说明：licensing-server 当前仅提供「发放 / 废弃 / 重发激活码」3 个管理端点（均无鉴权），其余页面因端点缺失显示为空，详见后端缺口清单。',
-    );
+  if (preloadStarted) {
+    return true;
   }
-  // 超时护栏骨架：未来预取请求统一经 Promise.race 包裹，绝不无限等待
+  preloadStarted = true;
   const TIMEOUT_MS = 10_000;
   await Promise.race([
-    Promise.resolve(),
+    Promise.allSettled([fetchOverview(), fetchCodes(), fetchDevices(), fetchTenants(), fetchAnomalies(), fetchKeys(), fetchAudit()]),
     new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), TIMEOUT_MS)),
   ]);
   return true;

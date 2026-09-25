@@ -19,6 +19,11 @@ import './styles/global.css';
 
 import App from './App.vue';
 import { router } from './router';
+import { API_MODE } from './api/client';
+import { session } from './store/session';
+
+// real 模式启动时恢复持久化会话（token 有效性由首个后端请求的 401 统一裁决）
+session.restore(API_MODE === 'real');
 
 const app = createApp(App);
 

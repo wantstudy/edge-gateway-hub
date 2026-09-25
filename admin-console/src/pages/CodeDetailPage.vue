@@ -195,7 +195,7 @@
  * @module admin-console/pages/CodeDetailPage
  * @description 激活码详情页。
  */
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
   PageHeader,
@@ -211,7 +211,7 @@ import {
   can,
   type TimelineNode,
 } from '@ui-kit';
-import { repo, REVOKE_REASONS, DEFAULT_ACTOR } from '../api/repo';
+import { repo, fetchCodeDetail, API_MODE, REVOKE_REASONS, DEFAULT_ACTOR } from '../api/repo';
 import { session } from '../store/session';
 
 const route = useRoute();
@@ -226,6 +226,20 @@ const code = computed(() => {
   void reloadKey.value;
   return repo.getCode(codeId.value);
 });
+
+// real 模式：详情端点（GET /admin/codes/:code_id）回填完整码值 / 时间线 / 溯源链。
+// 列表缓存中只有掩码码值，进入详情页时必须拉取详情（mock 模式直接用内存记录）。
+watch(
+  codeId,
+  async (id) => {
+    if (API_MODE !== 'real' || !id) {
+      return;
+    }
+    await fetchCodeDetail(id);
+    reloadKey.value += 1;
+  },
+  { immediate: true },
+);
 
 /** 权限。 */
 const canReveal = computed(() => can(session.state.role, 'code.reveal'));
