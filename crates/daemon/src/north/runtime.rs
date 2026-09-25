@@ -138,9 +138,26 @@ fn parse_port(text: &str) -> DaemonResult<u16> {
 /// 5. TLS 字段（`ca_cert_path` / `client_cert_path` / `client_key_path` /
 ///    `server_name` / `alpn`）存在但 TLS 未启用 → 报错（防止「配了 CA 却忘开
 ///    TLS」被静默当作明文出口）。
-/// 6. `server_name` 作为 SNI 覆盖：当前传输层（rumqttc）以 broker host 派生
-///    服务端名，**无法**透传独立 SNI——若 `server_name` 与 broker host 不一致则
-///    报错（不静默忽略安全相关配置），一致时视为无操作。
+/// 6. `server_name` 作为 SNI 覆盖：**受 rumqttc 0.25.1 限制无法透传**，与 broker
+///    host 不一致则报错（不静默忽略安全相关配置），一致时视为无操作。
+///    源码证据（rumqttc 0.25.1）：
+///    - `src/eventloop.rs:420-423`：`Transport::Tls` 分支调用
+///      `tls::tls_connect(&options.broker_addr, ...)`——TLS 服务端名硬绑
+///      `MqttOptions.broker_addr`；
+///    - `src/tls.rs:176`：`ServerName::try_from(addr)`，该名字**同时**决定
+///      TLS SNI 与证书名校验（`connector.connect(domain, tcp)`），函数无
+///      server-name 参数；
+///    - `src/lib.rs:457` 起的 `MqttOptions` 与 `NetworkOptions`（lib.rs:396）
+///      均无 SNI / DNS 覆盖字段（全部 `set_*` 亦然）；
+///    - `TlsConfiguration::Rustls(Arc<ClientConfig>)`（tls.rs:131）只携带
+///      rustls `ClientConfig`，而 rustls 的握手服务端名是
+///      `ClientConnection::new` 的参数，`ClientConfig` 层面无覆盖 API；
+///    - 替代路径均不可用：proxy feature 的 TLS 跳仍取 broker_addr 且本项目
+///      未启用该 feature（Cargo.lock 无 async-http-proxy，离线不可新增依赖）；
+///      native-tls 非 pure Rust；fork / vendor 改源被红线禁止。
+///
+///    因此「连接地址与证书名不同（DNS 别名 / 负载均衡）」的唯一安全用法是：
+///    直接把 `broker` 配成证书 SAN 里的名字（此时 `server_name` 留空或同名）。
 /// 7. 非 TLS 出口（`mqtt://` 且 `tls = false`）行为与既往完全一致。
 ///
 /// # Errors
@@ -264,13 +281,18 @@ fn build_tls_config(outlet: &OutletConfig, broker_host: &str) -> DaemonResult<Tl
         ensure_cert_file_exists(outlet, "client_key_path", path)?;
     }
 
-    // 规则 6：SNI 覆盖当前无法透传 → 与 broker host 不一致即报错（不静默忽略）。
+    // 规则 6：SNI 覆盖受 rumqttc 0.25.1 限制无法透传——`ServerName` 硬绑
+    // `MqttOptions.broker_addr`（eventloop.rs:420-423 → tls.rs:176，同时决定
+    // SNI 与证书名校验；`MqttOptions` / `NetworkOptions` / `ClientConfig` 均无
+    // 覆盖点）。与 broker host 不一致即报错（fail-closed，不静默忽略）；
+    // 一致时无操作（broker_addr 即服务端名）。
     if let Some(sni) = non_empty(outlet.server_name.as_deref()) {
         if !sni.eq_ignore_ascii_case(broker_host) {
             return Err(config_err(format!(
                 "outlet `{}`: `server_name` = `{sni}` differs from broker host `{broker_host}`; \
-                 an independent SNI override is not supported by the MQTT transport in V1 — \
-                 set `broker` host to the certificate's server name instead",
+                 the MQTT transport (rumqttc 0.25.1) derives the TLS server name from the \
+                 broker address and exposes no SNI override, so an independent `server_name` \
+                 cannot be honored — set `broker` to the certificate's server name instead",
                 outlet.name
             )));
         }
@@ -893,7 +915,10 @@ mod tests {
         assert!(msg.contains("ca_cert_path"), "msg={msg}");
     }
 
-    /// 规则 6：`server_name` 与 broker host 不一致 → 报错（不静默忽略 SNI 覆盖）。
+    /// 规则 6（反例）：`server_name` 与 broker host 不一致 → 报错（不静默忽略）。
+    ///
+    /// 背景（task 20）：rumqttc 0.25.1 把 TLS `ServerName` 硬绑 `broker_addr`
+    /// （eventloop.rs:420-423 → tls.rs:176），`server_name` 无透传通道 → fail-closed。
     #[test]
     fn tls_server_name_mismatch_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -905,6 +930,22 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("north-sni"), "msg={msg}");
         assert!(msg.contains("server_name"), "msg={msg}");
+    }
+
+    /// 规则 6（正例）：`server_name` 与 broker host 一致（大小写不敏感）→ 接受，
+    /// 且该出口确实挂上了 TLS（语义：broker_addr 即服务端名，`server_name` 无操作）。
+    #[test]
+    fn tls_server_name_matching_host_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(dir.path(), "ca.crt");
+        let mut outlet = base_outlet("north-sni-ok", "mqtts://Broker.Local:8883");
+        outlet.ca_cert_path = Some(ca);
+        outlet.server_name = Some("broker.local".to_string());
+        let endpoint = endpoint_from_outlet(&outlet).expect("same-name SNI must be accepted");
+        assert!(
+            endpoint.tls.is_some(),
+            "TLS must still be attached to the endpoint"
+        );
     }
 
     /// 正例：完整 mTLS（ca + client_cert + client_key）→ 成功，且 `TlsConfig`

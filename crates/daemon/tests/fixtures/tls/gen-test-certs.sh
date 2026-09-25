@@ -13,6 +13,8 @@
 #   client.crt / client.key            —— 合法客户端证书（mTLS 正例）
 #   rogue-ca.crt / rogue-ca.key        —— 无关的「另一张」自签 CA（反例）
 #   rogue-client.crt / rogue-client.key —— 由 rogue-ca 签发（mTLS 反例：不受信）
+#   sni-server.crt / sni-server.key    —— SNI 证据证书（SAN 仅 DNS:broker.local，
+#                                         无 IP SAN；task 20 专用，见下方第 5 节）
 #
 # 幂等：重复执行会覆盖全部生成物（先清理 *.srl / 中间 CSR）。
 #
@@ -28,7 +30,8 @@ rm -f ca.crt ca.key ca.srl \
       server.crt server.key server.csr server.ext \
       client.crt client.key client.csr client.ext \
       rogue-ca.crt rogue-ca.key rogue-ca.srl \
-      rogue-client.crt rogue-client.key rogue-client.csr rogue-client.ext
+      rogue-client.crt rogue-client.key rogue-client.csr rogue-client.ext \
+      sni-server.crt sni-server.key sni-server.csr sni-server.ext
 
 # ── 1. 测试根 CA（自签，CA:TRUE）────────────────────────────────────────────
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
@@ -86,8 +89,27 @@ EOF
 openssl x509 -req -in rogue-client.csr -CA rogue-ca.crt -CAkey rogue-ca.key \
   -CAcreateserial -out rogue-client.crt -days "$DAYS" -extfile rogue-client.ext
 
+# ── 5. SNI 证据证书（SAN 仅 DNS:broker.local，**无 IP SAN**；serverAuth）────
+# task 20 用途：证明「TCP 连 IP / SNI+校验名用 DNS 名」在 rustls 机制层可行，
+# 而 rumqttc 0.25.1 把 ServerName 焊死为 broker_addr（无法分离），因此北向
+# server_name 只能 fail-closed。注意其必须由上面的 ca.crt 签发（依赖执行顺序）。
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout sni-server.key -out sni-server.csr -nodes \
+  -subj "/CN=broker.local"
+
+cat > sni-server.ext <<'EOF'
+basicConstraints=CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:broker.local
+EOF
+
+openssl x509 -req -in sni-server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out sni-server.crt -days "$DAYS" -extfile sni-server.ext
+
 # ── 清理中间产物（保留最终 PEM）─────────────────────────────────────────────
 rm -f ca.srl server.csr server.ext client.csr client.ext \
-      rogue-ca.srl rogue-client.csr rogue-client.ext
+      rogue-ca.srl rogue-client.csr rogue-client.ext \
+      sni-server.csr sni-server.ext
 
 echo "TEST_ONLY test certificates generated in: $DIR"

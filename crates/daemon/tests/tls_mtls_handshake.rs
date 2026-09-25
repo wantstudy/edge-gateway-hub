@@ -19,6 +19,13 @@
 //! - (b) 不带客户端证书 → 握手被拒；
 //! - (c) 由另一张自签 CA 签发的 client 证书 → 握手被拒；
 //! - (d) 错误 SNI / 服务端名不在 SAN 内 → 握手被拒（证明不忽略证书验证错误）。
+//! - (e) TCP 连 IP、SNI/校验名用 DNS 名（证书 SAN 仅 `DNS:broker.local`）→
+//!   握手成功——证明 rustls 机制层支持「连接地址与服务端名分离」；
+//! - (f) 同一张 DNS-only 证书、服务端名用 IP（`127.0.0.1`）→ 握手被拒——
+//!   证明 rumqttc 0.25.1 把 `ServerName` 硬绑 `broker_addr`（eventloop.rs:420-423
+//!   → tls.rs:176）时，IP 直连 DNS-only 证书必然失败：北向 `server_name`
+//!   （task 20）无透传通道，`endpoint_from_outlet` 规则 6 fail-closed 是
+//!   传输层约束下的唯一安全行为，而非实现偷懒。
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -85,6 +92,16 @@ fn server_config() -> Arc<ServerConfig> {
         .with_client_cert_verifier(verifier)
         .with_single_cert(read_certs("server.crt"), read_key("server.key"))
         .expect("server config");
+    Arc::new(config)
+}
+
+/// 服务端配置（SNI 证据用）：指定证书对、**不要求**客户端证书
+/// （SNI / 服务端名与 mTLS 无关，避免无关变量）。
+fn server_config_without_client_auth(cert: &str, key: &str) -> Arc<ServerConfig> {
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(read_certs(cert), read_key(key))
+        .expect("server config (no client auth)");
     Arc::new(config)
 }
 
@@ -302,5 +319,76 @@ async fn tls_handshake_rejected_with_wrong_server_name() {
         "server name outside the certificate SAN must be rejected, got Ok"
     );
     // 服务端不对 SNI 做校验：其失败与否不断言，仅确保任务收口（不残留）。
+    let _ = timeout(IO_TIMEOUT, server.handle).await;
+}
+
+/// (e) **rustls 机制层支持「连接地址与服务端名分离」**：TCP 连 `127.0.0.1`（IP），
+/// SNI + 证书校验名用 DNS 名 `broker.local`（证书 `sni-server.crt` 的 SAN 仅有
+/// `DNS:broker.local`）→ 握手成功。
+///
+/// 这是 task 20 的关键对照：北向 `server_name` 透传「在 rustls 层是可行的」，
+/// 不可行完全源于 rumqttc 0.25.1 把 `ServerName` 焊死为 `broker_addr`
+/// （`src/eventloop.rs:420-423` → `src/tls.rs:176`），且 `MqttOptions` /
+/// `NetworkOptions` / `ClientConfig` 均无覆盖点。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sni_name_separation_works_at_rustls_layer() {
+    install_provider();
+    let server = spawn_server(server_config_without_client_auth(
+        "sni-server.crt",
+        "sni-server.key",
+    ))
+    .await;
+    let client = client_config_without_cert("ca.crt");
+
+    // 连接地址 = server.addr（127.0.0.1:<ephemeral>，IP）；服务端名 = DNS 名。
+    let outcome = timeout(
+        IO_TIMEOUT,
+        client_roundtrip(client, server.addr, server_name("broker.local")),
+    )
+    .await
+    .expect("client must not hang");
+    assert!(
+        outcome.is_ok(),
+        "rustls must accept a DNS server name while connecting via IP, got: {outcome:?}"
+    );
+
+    let server_outcome = timeout(IO_TIMEOUT, server.handle)
+        .await
+        .expect("server must not hang")
+        .expect("server task join");
+    assert!(
+        server_outcome.is_ok(),
+        "server side must complete: {server_outcome:?}"
+    );
+}
+
+/// (f) **rumqttc 硬绑行为的必然结果**：同一张 DNS-only 证书（SAN 仅
+/// `DNS:broker.local`），服务端名用 IP `127.0.0.1` → 握手被拒（无 IP SAN）。
+///
+/// rumqttc 0.25.1 的 TLS 路径恒以 `broker_addr` 构造 `ServerName`（IP 直连即
+/// IP ServerName），因此「连接地址 = IP / 证书名 = DNS 别名」的场景在 rumqttc
+/// 下**必然失败**——`endpoint_from_outlet` 规则 6 对不一致的 `server_name`
+/// fail-closed 与传输层行为一致，不存在「配了就能透传」的静默幻觉。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_only_cert_rejected_when_server_name_is_ip() {
+    install_provider();
+    let server = spawn_server(server_config_without_client_auth(
+        "sni-server.crt",
+        "sni-server.key",
+    ))
+    .await;
+    let client = client_config_without_cert("ca.crt");
+
+    let outcome = timeout(
+        IO_TIMEOUT,
+        client_roundtrip(client, server.addr, server_name("127.0.0.1")),
+    )
+    .await
+    .expect("client must not hang");
+    assert!(
+        outcome.is_err(),
+        "IP server name against a DNS-only SAN must be rejected, got Ok"
+    );
+    // 服务端在 CertificateVerify 前失败即收线：仅确保任务收口（不残留）。
     let _ = timeout(IO_TIMEOUT, server.handle).await;
 }

@@ -9,3 +9,5 @@
 # （父目录未被排除，故负向规则生效）。
 !*.key
 !*.crt
+# openssl -CAserial 副产物，非交付物
+*.srl
