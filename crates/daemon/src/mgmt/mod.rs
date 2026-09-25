@@ -52,7 +52,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRef, FromRequestParts, Path as AxumPath, Query, Request, State};
 use axum::http::{header, StatusCode};
@@ -67,6 +67,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::bootstrap::{DaemonShared, LifecycleState};
 use crate::config::GatewayConfig;
+use crate::dataplane::LiveTelemetry;
 
 /// 事件历史环容量（断线重连回放窗口；超出按环形淘汰）。
 pub const EVENT_HISTORY_CAPACITY: usize = 256;
@@ -408,6 +409,8 @@ pub fn router(state: MgmtState) -> Router {
         // 与 install.sh 的健康判据统一走 `/healthz`，两个路径共享同一 handler。
         .route("/healthz", get(health))
         .route("/api/status", get(status))
+        // task 52：网关信息快照（对齐前端 GatewayInfo；读接口保持开放，与 /api/status 同口径）。
+        .route("/api/overview", get(overview))
         // 读接口形状不变；写接口（writeapi）自带 AuthedRole extractor（401）
         // + ensure()（403）+ 审计，不经过 ops_guard（动作映射仅覆盖 /api/ops/*）。
         .route("/api/devices", get(devices).post(writeapi::device_create))
@@ -422,6 +425,8 @@ pub fn router(state: MgmtState) -> Router {
         )
         .route("/api/outlets", get(outlets))
         .route("/api/events", get(events))
+        // task 52：实时遥测流（SSE；Bearer token 鉴权，与 mgmt 其余端点同判定语义）。
+        .route("/api/stream", get(stream))
         .route("/api/auth/login", axum::routing::post(auth_login::login))
         .route("/api/auth/whoami", get(auth_login::whoami))
         // task 26：安全审计远程拉取（只读；handler 自带 AuthedRole extractor +
@@ -625,6 +630,184 @@ async fn outlets(State(state): State<MgmtState>) -> Json<Value> {
         })
         .collect();
     Json(Value::Array(rows))
+}
+
+// ---- task 52：网关信息快照 + 实时遥测流 ----
+
+/// GET /api/overview → 网关信息 + 配置聚合 + 最近状态快照（对齐前端 GatewayInfo）。
+///
+/// 字段名采用前端 `GatewayInfo` 的 camelCase 契约；大数（纳秒 / 计数 / 字节）一律
+/// 字符串编码（JSON 大数红线）。daemon 未实时聚合的字段（`onlineCount` / 速率 /
+/// 队列水位）给出「最佳估计」并标注——待后续接入真实设备在线探测 / 采样窗口后收敛。
+///
+/// 读接口保持开放（与 `/api/status` 同口径；task 52 实时通道鉴权只在 `/api/stream`）。
+async fn overview(State(state): State<MgmtState>) -> Response {
+    let daemon = state.daemon();
+    let config = state.config();
+    let uptime_secs = daemon.uptime_secs();
+    let device_count = config
+        .points
+        .iter()
+        .map(|p| p.device_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let point_count = config.points.len();
+    let running = daemon.state() == LifecycleState::Running;
+    // 最佳估计：运行态下配置的设备视为在线；非运行态记为 0。
+    let online_count = if running { device_count } else { 0 };
+    let total_forwarded = daemon
+        .north_runtime()
+        .map_or(0u64, |rt| rt.stats().admitted);
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let started_at = now_epoch.saturating_sub(uptime_secs);
+    let hostname = hostname_or_unknown();
+    Json(json!({
+        "name": config.gateway.gateway_id,
+        "machineCode": hostname,
+        "deployMode": "edge",
+        "version": env!("CARGO_PKG_VERSION"),
+        "hostname": hostname,
+        "manageUrl": "",
+        "port": "0",
+        "startedAt": started_at.to_string(),
+        "uptimeText": format_uptime(uptime_secs),
+        "deviceCount": device_count.to_string(),
+        "onlineCount": online_count.to_string(),
+        "pointCount": point_count.to_string(),
+        "failedPointCount": "0",
+        "sampleRatePerSec": "0",
+        "forwardRatePerSec": "0",
+        "queueUsedGb": "0",
+        "queueCapacityGb": "0",
+        "queueDrainDays": "0",
+        "totalForwardedRecords": total_forwarded.to_string(),
+    }))
+    .into_response()
+}
+
+/// 把秒数格式化为人类可读 uptime 文本（`Xd Yh Zm` / `Xh Ym Zs` / …）。
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let secs = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m {secs}s")
+    } else if mins > 0 {
+        format!("{mins}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// 取本机主机名（跨平台 best-effort；取不到回退 `unknown`）。
+fn hostname_or_unknown() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// GET /api/stream → 实时遥测流（SSE，`text/event-stream`）。
+///
+/// task 52 鉴权：Bearer token 取自 `Authorization: Bearer` 头，**或** `?token=`
+/// 查询参数（与 mgmt 其余端点同一判定语义，复用 `rbac::AuthedRole` extractor）；
+/// 无效 / 缺失 token 一律 401。鉴权通过后订阅 [`DaemonShared`] 的实时遥测广播，
+/// 逐帧以 `event: telemetry` 的 SSE 帧推送（帧形状复用北向 `JsonEncoder` 信封，
+/// `value` 已解码为 JSON 数值）。心跳由 `KeepAlive`（15s）承担。
+async fn stream(State(state): State<MgmtState>, req: Request) -> Response {
+    // 鉴权：优先 Authorization 头；缺省时回退 ?token= 查询参数。
+    let (mut parts, _body) = req.into_parts();
+    if parts.headers.get(header::AUTHORIZATION).is_none() {
+        if let Some(token) = query_token(&parts.uri) {
+            if let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
+                parts.headers.insert(header::AUTHORIZATION, value);
+            }
+        }
+    }
+    if let Err(rejection) = rbac::AuthedRole::from_request_parts(&mut parts, &state).await {
+        return rejection.into_response();
+    }
+
+    // 订阅实时遥测广播并包装为 SSE 流。
+    //
+    // broadcast→mpsc 桥接：tokio 的 broadcast 无 `poll_recv`（那是 mpsc 的 API），
+    // 为与既有 `MgmtEventStream` 的 mpsc 驱动模式对齐，每个 SSE 订阅者起一个桥接
+    // task：broadcast 帧转入有界 mpsc（Lagged 丢弃中间帧、Closed 结束流），SSE 流
+    // 侧用 `mpsc::Receiver::poll_recv` 驱动。广播扇出语义（多订阅者互不阻塞）不变。
+    let mut live_rx = state.daemon().subscribe_live();
+    let (frame_tx, frame_rx) = mpsc::channel::<LiveTelemetry>(16);
+    tokio::spawn(async move {
+        loop {
+            match live_rx.recv().await {
+                Ok(live) => {
+                    if frame_tx.send(live).await.is_err() {
+                        break; // SSE 订阅者已断开，桥接退出
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!(
+                        skipped,
+                        "live stream: subscriber lagged; dropping intermediate frames"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break, // daemon 关停
+            }
+        }
+    });
+    let stream = LiveTelemetryStream { rx: frame_rx };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+/// 从请求 URI 查询串取出 `token` 参数（`?token=<jwt>`）。
+fn query_token(uri: &axum::http::Uri) -> Option<String> {
+    let query = uri.query()?;
+    for pair in query.split('&') {
+        // 无 '=' 的裸参数跳过，不影响后续 token 解析。
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key == "token" {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// `/api/stream` 的 SSE 事件流：包装实时遥测桥接通道（broadcast→mpsc）的接收端。
+///
+/// `mpsc::Receiver::poll_recv` 是 tokio 公开的同步轮询 API，与
+/// `futures_core::Stream` 单向对接（Item 恒为 `Ok`，错误经由流结束表达）；
+/// Lagged / Closed 语义由上游桥接 task 处理（见 `/api/stream` handler 注释）。
+struct LiveTelemetryStream {
+    rx: mpsc::Receiver<LiveTelemetry>,
+}
+
+impl Stream for LiveTelemetryStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(live)) => {
+                    let data = match serde_json::to_string(&live) {
+                        Ok(data) => data,
+                        Err(_) => continue, // 序列化失败跳过该帧，不中断流。
+                    };
+                    return Poll::Ready(Some(Ok(Event::default().event("telemetry").data(data))));
+                }
+                // 桥接 task 已退出（订阅者断开 / daemon 关停）→ 结束流。
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 // ---- 实时事件通道（SSE：历史回放 + broadcast/watch 三源合流） ----
@@ -991,6 +1174,125 @@ frequency_ms = 500
         let value: Value = serde_json::from_str(&body).expect("json body");
         assert_eq!(value["status"], "ok");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    // ---- task 52：/api/overview 快照 + /api/stream 实时遥测流 ----
+
+    /// 签发测试 Bearer token（对齐 writeapi 测试装配口径）。
+    fn bearer_token_52(state: &MgmtState) -> String {
+        let now = crate::mgmt::auth_jwt::now_unix_secs();
+        let claims = crate::mgmt::auth_jwt::Claims {
+            sub: "ops-admin".to_string(),
+            role: crate::mgmt::rbac::Role::System,
+            exp: now + 600,
+            iat: now,
+            nbf: None,
+            jti: "test-jti-52".to_string(),
+        };
+        crate::mgmt::auth_jwt::sign(&claims, state.auth().key()).expect("sign test token")
+    }
+
+    /// QA Happy（task 52）：`/api/overview` → 200，GatewayInfo camelCase 字段齐备，
+    /// 大数计数一律字符串编码（JSON 大数红线）。
+    #[tokio::test]
+    async fn overview_returns_gateway_info() {
+        let port = spawn_server(test_state()).await;
+        let (status, _, body) = http_get(port, "/api/overview").await;
+        assert_eq!(status, 200);
+        let value: Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(value["name"], "gw-test");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["deviceCount"], "1", "configured distinct devices");
+        assert_eq!(value["pointCount"], "2", "configured points");
+        assert!(
+            value["startedAt"].is_string() && value["totalForwardedRecords"].is_string(),
+            "big numbers must be string-encoded (大数红线)"
+        );
+    }
+
+    /// QA（task 52 鉴权）：`/api/stream` 无 token → 401（与 mgmt 其余端点同判定语义）。
+    #[tokio::test]
+    async fn stream_requires_bearer_token() {
+        let port = spawn_server(test_state()).await;
+        let (status, _, _) = http_get(port, "/api/stream").await;
+        assert_eq!(status, 401, "missing token must be rejected");
+    }
+
+    /// QA Happy（task 52 主链路）：授权订阅者经 SSE 收到实时遥测帧——
+    /// `?token=` 查询参数回退路径 + `event: telemetry` 帧 + value 已解码为数值。
+    #[tokio::test]
+    async fn stream_pushes_live_frame_to_authorized_subscriber() {
+        let config = Arc::new(GatewayConfig::parse(TEST_TOML).expect("parse"));
+        let daemon = DaemonShared::new();
+        daemon.set_config(Arc::new(crate::config::ConfigShared::new(
+            (*config).clone(),
+        )));
+        // 先取广播发送端再移交共享态（不依赖 DaemonShared 是否 Clone）。
+        let live_tx = daemon.live_sender();
+        let state = MgmtState::new(daemon, config);
+        let token = bearer_token_52(&state);
+        let port = spawn_server(state).await;
+
+        // 连接 SSE（走 ?token= 回退路径），写入请求但不读至 EOF（SSE 流不会结束）。
+        let mut sock = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let request = format!(
+            "GET /api/stream?token={token} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        sock.write_all(request.as_bytes()).await.expect("write");
+        sock.flush().await.expect("flush");
+
+        // 等待 SSE 订阅者 attach（handler 完成鉴权并 subscribe），再向广播注入一帧。
+        let frame = LiveTelemetry {
+            enc: "json".to_string(),
+            points: vec![crate::dataplane::LivePoint {
+                device_id: "dev-01".to_string(),
+                point_id: "p_temp".to_string(),
+                value: Value::from(12.5f64),
+                unit: String::new(),
+                ts: "1700000000000000000".to_string(),
+                quality: "GOOD".to_string(),
+                quality_code: Value::from(1),
+            }],
+            ts: "1700000000000000000".to_string(),
+            gateway_id: "gw-test".to_string(),
+            auth: None,
+        };
+        let mut attached = false;
+        for _ in 0..200 {
+            if live_tx.send(frame.clone()).is_ok() {
+                attached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(attached, "SSE subscriber must have attached before send");
+
+        // 增量读取直至出现第一帧 telemetry，断言帧形状（value 已解码为数值）。
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(3), sock.read(&mut chunk))
+                .await
+                .expect("read timed out")
+                .expect("read");
+            assert!(n > 0, "stream closed before telemetry frame");
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            if text.contains("event: telemetry") {
+                assert!(
+                    text.contains("\"device_id\":\"dev-01\""),
+                    "frame carries device_id: {text}"
+                );
+                assert!(text.contains("12.5"), "value decoded to number: {text}");
+                assert!(
+                    text.contains("\"ts\":\"1700000000000000000\""),
+                    "ts string (大数红线): {text}"
+                );
+                break;
+            }
+        }
     }
 
     /// QA 红线: /api/status 全部整数语义字段必须为字符串编码（uptime / 纳秒 / 计数）。

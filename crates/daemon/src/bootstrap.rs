@@ -48,13 +48,13 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::backpressure::{audit_json, BackpressureAudit};
 use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig, ReloadGate};
-use crate::dataplane::NorthDataPlane;
+use crate::dataplane::{LiveTelemetry, NorthDataPlane};
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
 use crate::license::{LicenseRuntime, LicenseRuntimeConfig, LICENSE_RECOVERY_HINT};
@@ -74,6 +74,8 @@ pub const DEFAULT_WATCHDOG_TICK: Duration = Duration::from_secs(15);
 pub const DEFAULT_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(45);
 /// 配置热重载版本号轮询间隔（`ConfigShared` 是拉模型，bootstrap 负责转发为事件）。
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// 实时遥测广播通道容量（管理面 `/api/stream` 订阅者各自积压上限；超限按 Lagged 丢弃）。
+const LIVE_CHANNEL_CAPACITY: usize = 256;
 
 // ---- 生命周期状态 ----
 
@@ -138,6 +140,8 @@ struct DaemonSharedInner {
     license_assembly_error: RwLock<Option<String>>,
     /// 安全审计记录器（task 26 最小接线；`None` = 未挂载，mgmt 审计端点 503）。
     audit: RwLock<Option<Arc<crate::audit::AuditLogger>>>,
+    /// 实时遥测广播（task 52）：解码后逐点遥测扇出给管理面 `/api/stream` 订阅者。
+    live_tx: broadcast::Sender<LiveTelemetry>,
 }
 
 /// daemon 全局共享状态：生命周期 / 心跳 / 配置快照（task 51）。
@@ -154,6 +158,7 @@ impl DaemonShared {
         let (state_tx, _) = watch::channel(LifecycleState::Starting);
         let (reload_tx, _) = watch::channel(0u64);
         let (shutdown_tx, _) = watch::channel(false);
+        let (live_tx, _) = broadcast::channel(LIVE_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(DaemonSharedInner {
                 state_tx,
@@ -167,6 +172,7 @@ impl DaemonShared {
                 license: RwLock::new(None),
                 license_assembly_error: RwLock::new(None),
                 audit: RwLock::new(None),
+                live_tx,
             }),
         }
     }
@@ -360,6 +366,16 @@ impl DaemonShared {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// 订阅实时遥测广播（task 52；管理面 `/api/stream` 消费）。
+    pub fn subscribe_live(&self) -> broadcast::Receiver<LiveTelemetry> {
+        self.inner.live_tx.subscribe()
+    }
+
+    /// 取得实时遥测广播发送端克隆（数据面注入点用；[`NorthDataPlane::new`] 注入）。
+    pub fn live_sender(&self) -> broadcast::Sender<LiveTelemetry> {
+        self.inner.live_tx.clone()
     }
 }
 
@@ -741,10 +757,13 @@ impl BootstrapBuilder {
         //     编码投递 [`NorthRuntime::submit`]（背压 / 补发 / 审计复用既有机制）。
         //     北向运行期在 ④ 才创建 → 晚绑定 attach；就绪前样本照常采集。
         let groups = build_groups(&config_shared.snapshot());
-        let data_plane: Option<Arc<NorthDataPlane>> = self
-            .poll_handler
-            .take()
-            .map(|inner| Arc::new(NorthDataPlane::new(inner, &config_shared.snapshot())));
+        let data_plane: Option<Arc<NorthDataPlane>> = self.poll_handler.take().map(|inner| {
+            Arc::new(NorthDataPlane::new(
+                inner,
+                &config_shared.snapshot(),
+                shared.live_sender(),
+            ))
+        });
         let running_scheduler = match &data_plane {
             Some(plane) if !groups.is_empty() => {
                 match GroupScheduler::new(

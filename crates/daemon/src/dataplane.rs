@@ -43,13 +43,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock, PoisonError};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use protocol_proto::TelemetryBatch;
+use serde::Serialize;
+use serde_json::Value;
+use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use crate::backpressure::{AuditLog, PushOutcome};
 use crate::config::GatewayConfig;
 use crate::error::DaemonResult;
-use crate::north::encoder::{encoder_for, sample_to_data_point, BatchEncoder};
+use crate::north::encoder::{encoder_for, sample_to_data_point, BatchEncoder, JsonEncoder};
 use crate::north::runtime::NorthRuntime;
 use crate::offline_queue::{Clock, SystemClock};
 use crate::pipeline::{
@@ -118,6 +122,10 @@ pub struct NorthDataPlane {
     clock: Arc<dyn Clock>,
     /// 原子计数器。
     counters: DataPlaneCounters,
+    /// 实时遥测广播（task 52）：解码后逐点遥测扇出给管理面 `/api/stream` 订阅者。
+    ///
+    /// 仅 `Err`/`None` 丢弃、不 panic（broadcast 无订阅者 / 编码异常均为正常路径）。
+    live_tx: broadcast::Sender<LiveTelemetry>,
 }
 
 /// 原子计数器组（内部可变、快照只读）。
@@ -156,8 +164,14 @@ impl NorthDataPlane {
     ///   采集与调度完全不受影响，只是不做北向变换；
     /// - 出口泳道按 `[[outlets]]` 全量构建（编码按该路 `encoding`；北向启动期
     ///   被拒绝的出口在 [`Self::attach`] 时剔除）。
+    ///
+    /// `live_tx` 为管理面实时遥测广播发送端（[`DaemonShared::live_sender`] 注入）。
     #[must_use]
-    pub fn new(inner: Arc<dyn PollHandler>, config: &GatewayConfig) -> Self {
+    pub fn new(
+        inner: Arc<dyn PollHandler>,
+        config: &GatewayConfig,
+        live_tx: broadcast::Sender<LiveTelemetry>,
+    ) -> Self {
         let gateway_id = config.gateway.gateway_id.clone();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
@@ -209,6 +223,7 @@ impl NorthDataPlane {
             gateway_id,
             clock,
             counters: DataPlaneCounters::default(),
+            live_tx,
         }
     }
 
@@ -324,6 +339,14 @@ impl NorthDataPlane {
             auth: None, // 签名块由既有北向签名链路负责，数据面不重复实现。
         };
 
+        // 实时遥测扇出（task 52）：把解码后逐点遥测广播给管理面 `/api/stream`
+        // 订阅者。复用 `JsonEncoder` 字段名、把 `value` 解码为 JSON 数值；
+        // 仅 `Err`/`None` 丢弃、不 panic（broadcast 无订阅者 / 编码异常均为正常路径，
+        // 不影响北向投递）。
+        if let Some(live) = LiveTelemetry::from_batch(&batch) {
+            let _ = self.live_tx.send(live);
+        }
+
         let lanes = lock_or_recover(&self.lanes);
         for lane in lanes.iter() {
             let payload = match lane.encoder.encode_batch(&batch) {
@@ -372,6 +395,124 @@ impl NorthDataPlane {
     }
 }
 
+// ---- task 52：实时遥测帧（管理面 `/api/stream` 广播载荷） ----
+
+/// 单点实时遥测（与北向 JSON 信封同构，但 `value` 已解码为 JSON 数值以便前端直显）。
+#[derive(Debug, Clone, Serialize)]
+pub struct LivePoint {
+    /// 设备标识（北向 schema 必填）。
+    pub device_id: String,
+    /// 点位标识。
+    pub point_id: String,
+    /// 解码后的数值（f64 小端解码为 JSON number；非有限浮点为 `null`）。
+    pub value: Value,
+    /// 单位（工程单位字符串，可能为空）。
+    pub unit: String,
+    /// 采集时刻（纳秒，**字符串编码**，大数红线）。
+    pub ts: String,
+    /// 质量码英文枚举名（北向契约：`GOOD` / `UNCERTAIN` / `BAD` / …）。
+    pub quality: String,
+    /// 质量码整数值（JSON number；范围安全，走数值）。
+    pub quality_code: Value,
+}
+
+/// 实时遥测帧（task 52）：与北向 `JsonEncoder` 信封同构（字段名 / 结构一致），
+/// 仅 `value` 由 `{t:"f64le",b64}` 解码为 JSON 数值。
+///
+/// 作为 `broadcast` 广播项（要求 `Clone`）；管理面 `/api/stream` 直接序列化本类型
+/// 为 SSE `data:` 帧，前端仪表盘无需再做 f64le 解码。
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveTelemetry {
+    /// 编码标识（恒 `"json"`）。
+    pub enc: String,
+    /// 本批次点位数组（已解码数值）。
+    pub points: Vec<LivePoint>,
+    /// 批次时间戳（纳秒，**字符串编码**，大数红线）。
+    pub ts: String,
+    /// 网关标识。
+    pub gateway_id: String,
+    /// 签名块（北向无签名时为 `null`）。
+    pub auth: Option<Value>,
+}
+
+impl LiveTelemetry {
+    /// 由北向 [`TelemetryBatch`] 构造实时帧（复用 `JsonEncoder` 字段名）。
+    ///
+    /// 失败（编码 / JSON 解析异常）返回 `None`——调用方（数据面热路径）仅丢弃该帧、
+    /// 不 panic、不影响北向投递。
+    #[must_use]
+    pub fn from_batch(batch: &TelemetryBatch) -> Option<Self> {
+        let encoded = JsonEncoder.encode_batch(batch).ok()?;
+        let root: Value = serde_json::from_slice(&encoded).ok()?;
+        let points: Vec<LivePoint> = root
+            .get("points")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|point| LivePoint {
+                        device_id: str_field(point, "device_id"),
+                        point_id: str_field(point, "point_id"),
+                        value: decode_value(point),
+                        unit: str_field(point, "unit"),
+                        ts: str_field(point, "ts"),
+                        quality: str_field(point, "quality"),
+                        quality_code: point.get("quality_code").cloned().unwrap_or(Value::Null),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(LiveTelemetry {
+            enc: root
+                .get("enc")
+                .and_then(Value::as_str)
+                .unwrap_or("json")
+                .to_string(),
+            points,
+            ts: str_field(&root, "ts"),
+            gateway_id: str_field(&root, "gateway_id"),
+            auth: root.get("auth").cloned(),
+        })
+    }
+}
+
+/// 取 `Value` 对象字符串字段（缺省空串）。
+fn str_field(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 把北向 `value` 字段（`{t:"f64le",b64}` 或 `null`/数值）解码为 JSON 数值。
+///
+/// - 8 字节 f64le → 解码为 JSON number（前端直接展示）；
+/// - 非有限浮点（`value:null`）→ 保留 `null`；
+/// - 其余（已是数值 / blob）→ 原样保留。
+fn decode_value(point: &Value) -> Value {
+    match point.get("value") {
+        Some(Value::Object(_)) => {
+            let Some(b64) = point
+                .get("value")
+                .and_then(|v| v.get("b64"))
+                .and_then(Value::as_str)
+            else {
+                return Value::Null;
+            };
+            match base64::engine::general_purpose::STANDARD.decode(b64) {
+                Ok(bytes) if bytes.len() == 8 => {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&bytes);
+                    Value::from(f64::from_le_bytes(arr))
+                }
+                _ => Value::Null,
+            }
+        }
+        Some(other) => other.clone(),
+        None => Value::Null,
+    }
+}
+
 #[async_trait]
 impl PollHandler for NorthDataPlane {
     async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>> {
@@ -396,6 +537,7 @@ mod tests {
     use crate::offline_queue::{OfflineQueue, QueueConfig};
 
     use std::time::Duration;
+    use tokio::sync::broadcast;
 
     /// 测试内层 handler：每次返回 `n` 个值 = 12.5 的样本。
     struct FakeInner {
@@ -475,7 +617,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime = start_runtime(dir.path());
         let config = config_with("mqtt://127.0.0.1:1883", "protobuf");
-        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config);
+        let (live_tx, mut live_rx) = broadcast::channel(16);
+        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config, live_tx);
         assert!(!plane.is_attached());
         plane.attach(Arc::clone(&runtime));
         assert!(plane.is_attached());
@@ -503,6 +646,23 @@ mod tests {
         assert_eq!(batch.points[0].point_id, "p1");
         let value = f64::from_le_bytes(batch.points[0].value.as_slice().try_into().expect("8B"));
         assert!((value - 12.5).abs() < 1e-9, "decoded value must be 12.5");
+
+        // 实时遥测广播（task 52）：解码后逐点遥测扇出给 /api/stream 订阅者。
+        let live = live_rx
+            .try_recv()
+            .expect("live telemetry frame must be broadcast");
+        assert_eq!(live.points.len(), 1, "one point in the frame");
+        assert_eq!(live.points[0].device_id, "dev-01");
+        assert_eq!(live.points[0].point_id, "p1");
+        assert!(
+            (live.points[0].value.as_f64().expect("value is number") - 12.5).abs() < 1e-9,
+            "value decoded from f64le"
+        );
+        assert!(
+            !live.points[0].ts.is_empty() && live.points[0].ts.bytes().all(|b| b.is_ascii_digit()),
+            "ts must be string-encoded nanos (大数红线)"
+        );
+        assert_eq!(live.points[0].quality, "GOOD", "north quality contract");
     }
 
     /// 北向运行期未 attach（启动竞态窗口）：样本照常返回、不投递、不 panic。
@@ -511,7 +671,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime = start_runtime(dir.path());
         let config = config_with("mqtt://127.0.0.1:1883", "protobuf");
-        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config);
+        let (live_tx, _) = broadcast::channel(8);
+        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config, live_tx);
 
         let samples = plane
             .poll("dev-01", &["p1".to_string()])
@@ -537,7 +698,8 @@ mod tests {
         )
         .expect("parse");
         assert!(config.outlets.is_empty());
-        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config);
+        let (live_tx, _) = broadcast::channel(8);
+        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config, live_tx);
         let samples = plane
             .poll("dev-01", &["p1".to_string()])
             .await
@@ -578,7 +740,12 @@ mod tests {
             .with_tick(Duration::from_millis(50)),
             shutdown_rx,
         ));
-        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config_with("x", "json"));
+        let (live_tx, _) = broadcast::channel(8);
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config_with("x", "json"),
+            live_tx,
+        );
         plane.attach(Arc::clone(&runtime));
         plane
             .poll("dev-01", &["p1".to_string()])
@@ -625,9 +792,11 @@ mod tests {
         ));
         assert_eq!(runtime.outlet_count(), 0, "outlet rejected at startup");
 
+        let (live_tx, _) = broadcast::channel(8);
         let plane = NorthDataPlane::new(
             Arc::new(FakeInner { n: 1 }),
             &config_with("mqtts://127.0.0.1:8883", "protobuf"),
+            live_tx,
         );
         plane.attach(Arc::clone(&runtime));
         let samples = plane
@@ -639,5 +808,44 @@ mod tests {
         assert_eq!(stats.forward_cycles, 1);
         assert_eq!(stats.admitted, 0, "detached lane submits nothing");
         assert_eq!(stats.encode_errors, 0, "no per-cycle error spam");
+    }
+
+    /// QA（task 52）：`LiveTelemetry` 序列化——字段名与北向信封一致、`value` 解码为
+    /// 数值、大数 `ts` 走字符串、非有限浮点 `value` 为 `null`。
+    #[test]
+    fn live_telemetry_serialization_matches_envelope() {
+        let batch = TelemetryBatch {
+            points: vec![protocol_proto::DataPoint {
+                device_id: "dev-01".to_string(),
+                point_id: "p1".to_string(),
+                value: 12.5f64.to_le_bytes().to_vec(),
+                unit: "degC".to_string(),
+                ts: 1_700_000_000_000_000_000i64,
+                quality: protocol_proto::Quality::Good as i32,
+            }],
+            ts: 1_700_000_000_000_000_000i64,
+            gateway_id: "gw-test".to_string(),
+            auth: None,
+        };
+        let live = LiveTelemetry::from_batch(&batch).expect("live frame");
+        let json = serde_json::to_string(&live).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(value["enc"], "json");
+        assert_eq!(value["gateway_id"], "gw-test");
+        assert_eq!(value["points"][0]["device_id"], "dev-01");
+        assert_eq!(value["points"][0]["point_id"], "p1");
+        assert!(
+            (value["points"][0]["value"].as_f64().expect("value number") - 12.5).abs() < 1e-9,
+            "value must be decoded number"
+        );
+        assert!(
+            value["points"][0]["ts"].is_string(),
+            "ts must be string (大数红线)"
+        );
+        assert_eq!(
+            value["points"][0]["quality"], "GOOD",
+            "north quality contract"
+        );
+        assert_eq!(value["auth"], serde_json::Value::Null);
     }
 }
