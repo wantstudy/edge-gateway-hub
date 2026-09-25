@@ -33,6 +33,17 @@ pub const FREE_NORTH_FORWARD: bool = false;
 /// 免费版是否允许 OTA（task 24 契约常量：不允许）。
 pub const FREE_OTA_ALLOWED: bool = false;
 
+/// 免费版允许的南向协议判定：仅 Modbus（`modbus-tcp` / `modbus-rtu`，
+/// 大小写不敏感、容忍首尾空白）。免费版配额闸门（`LicenseRuntime::enforce_free_limits`）
+/// 与策略测试共用本判定，避免口径漂移。
+#[must_use]
+pub fn is_free_edition_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol.trim().to_ascii_lowercase().as_str(),
+        "modbus-tcp" | "modbus-rtu"
+    )
+}
+
 /// 免费基础版限制参数集（常量聚合视图，供调用方展示 / 文案使用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreeEditionLimits {
@@ -326,6 +337,23 @@ mod tests {
     fn empty_config_has_no_violations() {
         let config = GatewayConfig::default();
         assert!(validate(&config, false).is_empty());
+    }
+
+    /// QA：免费版协议判定 —— modbus-tcp / modbus-rtu 放行（大小写与空白容忍），
+    /// 其余协议（opcua / s7 / mc / http / mqtt / 空串）一律拒绝。
+    #[test]
+    fn free_edition_protocol_only_modbus() {
+        assert!(is_free_edition_protocol("modbus-tcp"));
+        assert!(is_free_edition_protocol("modbus-rtu"));
+        assert!(is_free_edition_protocol(" MODBUS-TCP "));
+        assert!(is_free_edition_protocol("Modbus-RTU"));
+        assert!(!is_free_edition_protocol("opcua"));
+        assert!(!is_free_edition_protocol("s7"));
+        assert!(!is_free_edition_protocol("mc"));
+        assert!(!is_free_edition_protocol("http"));
+        assert!(!is_free_edition_protocol("mqtt"));
+        assert!(!is_free_edition_protocol(""));
+        assert!(!is_free_edition_protocol("modbus"));
     }
 
     /// QA：判定顺序稳定 —— 相同配置多次校验结果逐项一致。

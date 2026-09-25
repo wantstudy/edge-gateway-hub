@@ -51,11 +51,11 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig};
+use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig, ReloadGate};
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
 use crate::license::{LicenseRuntime, LicenseRuntimeConfig};
-use crate::north::runtime::{NorthRuntime, NorthRuntimeConfig};
+use crate::north::runtime::{NorthForwardGate, NorthRuntime, NorthRuntimeConfig};
 use crate::ota::OtaBootDecision;
 use crate::scheduler::{GroupConfig, GroupScheduler, PollHandler, RunningScheduler};
 
@@ -526,13 +526,67 @@ impl BootstrapBuilder {
         }
 
         // ①-b OTA 启动判定（task 35 接线）：commit / 回滚结果写审计日志；
-        // 回滚发生时显式 [WARN] 并记录原因（宽限期内未确认启动健康）。
+        //      回滚发生时显式 [WARN] 并记录原因（宽限期内未确认启动健康）。
         run_ota_boot_check(&self.ota_boot_check).await;
 
+        // ①-c 授权运行期（**提前到配置 / 北向之前**）：北向转发门控与免费版配额
+        //     闸门都需要授权状态真相源（[`LicenseRuntime`]），故先构造并步进一次
+        //     确定初始状态（Trial / Licensed / Degraded）；随后 step 循环照常由
+        //     [`LicenseRuntime::spawn`] 驱动。未注入时跳过（行为与既往一致）。
+        let license_runtime: Option<Arc<LicenseRuntime>> = match self.license.take() {
+            Some(cfg) => {
+                let runtime = Arc::new(LicenseRuntime::new(cfg));
+                // 装配期步进一次：启动阶段（试用判定）+ 激活恢复 + 心跳/倒计时，
+                // 让后续的配额闸门读到真实初始状态而非占位 Unlicensed。
+                if let Err(err) = runtime.step().await {
+                    warn!(error = %err, "bootstrap: license runtime initial step failed");
+                }
+                shared.set_license_runtime(Arc::clone(&runtime));
+                // 常驻 step 循环（首个 tick 立即触发；停机序列经 shutdown() 收口）。
+                let _driver = Arc::clone(&runtime).spawn();
+                info!("bootstrap: license runtime started");
+                Some(runtime)
+            }
+            None => {
+                info!("bootstrap: license runtime not injected (no licensing orchestration)");
+                None
+            }
+        };
+
         // ② 配置热重载：初始加载失败直接返回错误（绝不静默空配置）。
-        let (reloader, config_shared) = ConfigHotReloader::spawn(&self.config_path)?;
+        //     热重载准入闸门（免费版配额，fail-closed）：Degraded 期间设备数 /
+        //     协议 / 采集间隔超限的重载一律拒绝（保留旧快照 + warn 可解释）。
+        let (reloader, config_shared) = match &license_runtime {
+            Some(license) => {
+                let gate: ReloadGate = {
+                    let license = Arc::clone(license);
+                    Arc::new(move |config: &GatewayConfig| {
+                        license
+                            .enforce_free_limits(config)
+                            .map_err(|err| err.to_string())
+                    })
+                };
+                ConfigHotReloader::spawn_with_gate(&self.config_path, Some(gate))?
+            }
+            None => ConfigHotReloader::spawn(&self.config_path)?,
+        };
         shared.set_config(config_shared.clone());
         shared.notify_config_reload(config_shared.version());
+
+        // ②-b 免费版配额闸门（**启动装配期**，fail-closed）：Degraded（免费版）
+        //     状态下配置超额（设备数 > 8 / 非 Modbus / 间隔 < 1s）→ 拒绝启动，
+        //     错误含字段名 / 标识值与恢复路径。闸门通过后 reloader 继续服务热重载。
+        if let Some(license) = &license_runtime {
+            if let Err(err) = license.enforce_free_limits(&config_shared.snapshot()) {
+                reloader.stop();
+                error!(
+                    error = %err,
+                    "bootstrap: [ERROR] config rejected by free-edition quota gate; \
+                     aborting startup"
+                );
+                return Err(err);
+            }
+        }
 
         // 转发任务：ConfigShared 是拉模型，这里轮询版本号并转发为共享态事件。
         let reload_task = tokio::spawn(forward_config_reload(
@@ -586,7 +640,12 @@ impl BootstrapBuilder {
         // 中止全部驱动任务。**未注入**时按是否声明 `[[outlets]]` 记 error/info
         // （绝不静默放过已声明的出口）。
         match self.north.take() {
-            Some(cfg) => {
+            Some(mut cfg) => {
+                // 北向转发授权闸门：把授权状态真相源接到每个出口的驱动任务
+                //（Degraded / Unlicensed ⇒ 跳过发送；恢复后下一拍自动继续）。
+                if let Some(license) = &license_runtime {
+                    cfg.set_gate(Arc::clone(license) as Arc<dyn NorthForwardGate>);
+                }
                 let snapshot = config_shared.snapshot();
                 let runtime = Arc::new(NorthRuntime::start(
                     snapshot.gateway.gateway_id.as_str(),
@@ -631,22 +690,9 @@ impl BootstrapBuilder {
             }
         }
 
-        // ④-b 授权运行期接线（task 22/23/24）：注入 `LicenseRuntimeConfig` 后构造
-        //     [`LicenseRuntime`]、启动其 `step` 循环并把句柄挂到
-        //     [`DaemonShared::license_runtime`]；停机步骤通知该循环退出。
-        //     **未注入**时跳过（库 / 纯 UI 场景行为不变，`license_runtime()` 保持 `None`）。
-        match self.license.take() {
-            Some(cfg) => {
-                let runtime = Arc::new(LicenseRuntime::new(cfg));
-                // 驱动任务自行在后台跑；句柄经 DaemonShared 共享给采集侧 / mgmt。
-                let _driver = runtime.clone().spawn();
-                shared.set_license_runtime(runtime);
-                info!("bootstrap: license runtime started");
-            }
-            None => {
-                info!("bootstrap: license runtime not injected (no licensing orchestration)");
-            }
-        }
+        // ④-b 授权运行期已在 ①-c 接线（见上）：构造、装配期步进、句柄挂载均在
+        //     北向之前完成（北向门控与配额闸门依赖授权状态真相源）。此处仅保留
+        //     north_starter 扩展钩子。
 
         shared.set_state(LifecycleState::Running);
         info!("bootstrap: daemon running");
@@ -1792,6 +1838,129 @@ frequency_ms = 3000
             shared.license_runtime().is_none(),
             "no injection → no license runtime"
         );
+        shared.request_shutdown();
+        let result = handle.await.expect("run task joins").expect("run ok");
+        assert_eq!(result.state(), LifecycleState::Stopped);
+    }
+
+    // ---- 免费版配额闸门（启动装配期，task 22/23/24 门控接线） ----
+
+    /// 构造 N 台 modbus 设备（间隔合规）+ 一个北向出口的测试配置。
+    fn write_device_config(dir: &tempfile::TempDir, device_count: usize) -> PathBuf {
+        let mut toml = String::from(
+            "[gateway]\ngateway_id = \"gw-quota\"\n\n[[outlets]]\nname = \"north-1\"\n\
+             broker = \"mqtt://127.0.0.1:1883\"\n\n",
+        );
+        for i in 0..device_count {
+            toml.push_str(&format!(
+                "[[points]]\ndevice_id = \"dev-{i:02}\"\npoint_id = \"p1\"\n\
+                 protocol = \"modbus-tcp\"\naddress = \"127.0.0.1:502\"\n\
+                 frequency_ms = 1000\n\n"
+            ));
+        }
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).expect("write config");
+        path
+    }
+
+    /// 制造 Degraded 初始状态：在 `data_dir` 路径上放一个**文件**，试用标记
+    /// 无法落盘 → fail-closed 降级（不 panic）。
+    fn block_data_dir(dir: &tempfile::TempDir) -> PathBuf {
+        let data_file = dir.path().join("data");
+        std::fs::write(&data_file, b"not a directory").expect("write blocker file");
+        data_file
+    }
+
+    /// QA 闸门（装配期拒绝）：Degraded + 9 台设备（超免费配额）→ run 返回
+    /// `ConfigError`，消息含实际数 / 恢复路径（fail-closed、可解释）。
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_degraded_rejects_over_quota_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = write_device_config(&dir, 9);
+        let data_dir = block_data_dir(&dir);
+
+        let shared = DaemonShared::new();
+        let shared_probe = shared.clone();
+        let builder = BootstrapBuilder::new(config_path)
+            .with_shared(shared)
+            .without_signal_handlers()
+            .with_license_runtime(LicenseRuntimeConfig::new(
+                bootstrap_test_license_client(),
+                data_dir,
+            ));
+
+        // 装配期即拒绝：不会进入 Running（await 直接拿到 Err）。
+        let err = builder
+            .run()
+            .await
+            .expect_err("over-quota must be rejected");
+        assert_eq!(err.error_code(), crate::error::ERR_CONFIG, "ConfigError 域");
+        let msg = err.to_string();
+        assert!(msg.contains("free-edition"), "reason prefix: {msg}");
+        assert!(msg.contains('9'), "actual device count: {msg}");
+        assert!(msg.contains("device_id"), "field name: {msg}");
+        assert!(
+            msg.contains("activate"),
+            "recovery path must be included: {msg}"
+        );
+
+        // 收口：步进循环优雅退出（不残留到下一个测试）。
+        if let Some(rt) = shared_probe.license_runtime() {
+            rt.shutdown();
+        }
+    }
+
+    /// QA 闸门（降级 ≠ 停用）：Degraded + 合规配置（1 台 / 1000ms / modbus）
+    /// → 照常 Running、本地采集调度器在跑；北向出口被授权门控接管
+    ///（`gated_cycles` 增长 = 跳过发送语义生效），停机正常。
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_degraded_compliant_config_runs_and_gates_north() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = write_device_config(&dir, 1);
+        let data_dir = block_data_dir(&dir);
+
+        let shared = DaemonShared::new();
+        let queue = temp_queue(&dir);
+        let builder = BootstrapBuilder::new(config_path)
+            .with_shared(shared.clone())
+            .without_signal_handlers()
+            .with_license_runtime(LicenseRuntimeConfig::new(
+                bootstrap_test_license_client(),
+                data_dir,
+            ))
+            .with_north_runtime(NorthRuntimeConfig::new(
+                queue,
+                Arc::new(crate::offline_queue::SystemClock),
+                Arc::new(CountingAuditSink::default()),
+            ));
+
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
+
+        // 初始状态为 Degraded（fail-closed），但 daemon 照常运行（降级 ≠ 停用）。
+        let license = shared
+            .license_runtime()
+            .expect("license runtime must be wired");
+        assert_eq!(license.state().name(), "Degraded");
+        assert!(license.state().allows_local_capture());
+
+        // 北向门控生效：gated_cycles 增长（出口在运行、发送被跳过）。
+        let north = shared.north_runtime().expect("north runtime must be wired");
+        let mut gated = 0u64;
+        for _ in 0..200 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+            gated = north.stats().gated_cycles;
+            if gated > 0 {
+                break;
+            }
+        }
+        assert!(gated > 0, "north driver must be gated while degraded");
+
         shared.request_shutdown();
         let result = handle.await.expect("run task joins").expect("run ok");
         assert_eq!(result.state(), LifecycleState::Stopped);

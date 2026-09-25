@@ -57,9 +57,11 @@ use tracing::{info, warn};
 
 use crate::auth::client::{LicenseState, LicensingClient, GRACE_DAYS};
 use crate::auth::clock::{LastSeenLoader, LastSeenSaver, TrustedClock};
-use crate::auth::limits::FreeEditionLimits;
+use crate::auth::limits::{self, FreeEditionLimits, LimitViolation};
 use crate::auth::trial::{self, HmacKey, TrialMarker, TrialVerdict};
-use crate::error::DaemonResult;
+use crate::config::GatewayConfig;
+use crate::error::{DaemonError, DaemonResult};
+use crate::north::runtime::NorthForwardGate;
 
 // ---- 常量（集中声明，避免散落魔法数字） ----
 
@@ -68,6 +70,11 @@ pub const TRIAL_MARKER_FILE: &str = "trial.marker";
 
 /// 默认心跳周期（秒，24h）；与 `config::LicensingSection::heartbeat_interval_secs` 默认一致。
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 86_400;
+
+/// 降级 / 门控提示（**恢复路径**）：设备端界面与日志据此向运维展示「如何恢复」。
+pub const LICENSE_RECOVERY_HINT: &str =
+    "northbound forwarding and full quotas resume automatically after license \
+     activation or connectivity recovery";
 
 /// 默认编排器检查周期（秒）。
 pub const DEFAULT_TICK: Duration = Duration::from_secs(30);
@@ -269,6 +276,37 @@ impl LicenseRuntime {
     #[must_use]
     pub fn limits(&self) -> FreeEditionLimits {
         FreeEditionLimits::new()
+    }
+
+    /// **免费版配额闸门**（fail-closed、可解释）：仅 [`LicenseState::Degraded`]
+    /// （免费基础版）状态下对配置生效；其余状态（试用享受完整配额）恒放行。
+    ///
+    /// 检查项（聚合**全部**违规后一次性报错，不短路）：
+    /// - 设备数 > 8（`[[points]].device_id` 去重）；
+    /// - 采集间隔 < 1s（`[[points]].frequency_ms`，逐设备取最小值）；
+    /// - 非 Modbus 协议（`[[points]].protocol`；免费版仅 `modbus-tcp` / `modbus-rtu`）。
+    ///
+    /// 北向转发**不**在此拒绝：降级 ≠ 停用，出口由北向驱动任务按「跳过发送」
+    /// 语义门控（见 [`NorthForwardGate`] 实现）；声明了 `[[outlets]]` 仅记 warn。
+    ///
+    /// 错误消息含字段名 / 标识值与恢复路径（`LICENSE_RECOVERY_HINT`），
+    /// 调用方（bootstrap 装配期 / 配置热重载 / mgmt 写路径）原样向上传播。
+    ///
+    /// # Errors
+    /// `Degraded` 且存在配额违规 → [`DaemonError::ConfigError`]（聚合消息）。
+    pub fn enforce_free_limits(&self, config: &GatewayConfig) -> DaemonResult<()> {
+        if !matches!(self.state(), LicenseState::Degraded { .. }) {
+            return Ok(());
+        }
+        let problems = free_quota_problems(config);
+        if problems.is_empty() {
+            return Ok(());
+        }
+        Err(DaemonError::ConfigError(format!(
+            "free-edition quota exceeded (license degraded): {} — reduce the config to \
+             free-edition limits or activate a license; {LICENSE_RECOVERY_HINT}",
+            problems.join("; ")
+        )))
     }
 
     /// 试用标记文件路径（`data_dir/trial.marker`；宿主持久卷，红线 #13）。
@@ -687,6 +725,85 @@ fn next_reason(state: &LicenseState) -> Option<&str> {
     }
 }
 
+/// 免费版配额违规清单（聚合、不短路；纯函数便于单测）。
+///
+/// 「是否处于免费版（Degraded）」由调用方（[`LicenseRuntime::enforce_free_limits`]）判定；
+/// 本函数只做策略计算：设备数 / 采集间隔复用 [`limits::validate`] 的既有口径，
+/// 协议限制用 [`limits::is_free_edition_protocol`] 逐点位检查。
+fn free_quota_problems(config: &GatewayConfig) -> Vec<String> {
+    let limits = FreeEditionLimits::new();
+    let mut problems: Vec<String> = Vec::new();
+
+    // ① 设备数 + 采集间隔（复用既有聚合校验器；licensed=false ⇒ 免费口径）。
+    for violation in limits::validate(config, false) {
+        match violation {
+            LimitViolation::TooManyDevices { count } => problems.push(format!(
+                "devices: {count} distinct device_id values in [[points]] exceed the \
+                 free-edition limit of {}",
+                limits.max_devices
+            )),
+            LimitViolation::IntervalTooFast {
+                device_id,
+                interval_ms,
+            } => problems.push(format!(
+                "frequency: device `{device_id}` has min [[points]].frequency_ms = \
+                 {interval_ms}ms, below the free-edition floor of {}ms",
+                limits.min_poll_interval_ms
+            )),
+            // 北向转发不在此拒绝（降级 ≠ 停用：北向由驱动任务按「跳过发送」门控），
+            // 只在日志中提醒免费版设备声明了 [[outlets]]。
+            LimitViolation::NorthEnabled => {
+                warn!(
+                    "license gating: free edition declares [[outlets]]; northbound \
+                     forwarding stays suspended until activation ({LICENSE_RECOVERY_HINT})"
+                );
+            }
+            // 预留变体（GatewayConfig 暂无 OTA 字段，当前不可达）；接入后自动生效。
+            LimitViolation::OtaEnabled => {
+                problems.push("ota: OTA is not allowed in the free edition".to_string())
+            }
+        }
+    }
+
+    // ② 协议：免费版仅 Modbus（逐点位上报，含点位 / 设备标识与字段名）。
+    for point in &config.points {
+        if !limits::is_free_edition_protocol(&point.protocol) {
+            problems.push(format!(
+                "protocol: point `{}` on device `{}` sets [[points]].protocol = `{}`; \
+                 the free edition only allows modbus-tcp / modbus-rtu",
+                point.point_id, point.device_id, point.protocol
+            ));
+        }
+    }
+
+    problems
+}
+
+/// 北向转发授权闸门实现：把 [`LicenseRuntime`] 的状态判据接到北向驱动任务。
+///
+/// - `Trial` / `Licensed` / `Grace` → 放行；
+/// - `Unlicensed`（尚未完成启动步进）/ `Degraded` → 拒绝，`deny_reason` 携带
+///   Degraded 原因与恢复路径（驱动任务按节流节奏写入 warn 日志）。
+impl NorthForwardGate for LicenseRuntime {
+    fn north_forward_allowed(&self) -> bool {
+        self.north_forward_allowed()
+    }
+
+    fn deny_reason(&self) -> Option<String> {
+        match self.state() {
+            LicenseState::Degraded { reason } => Some(format!(
+                "license degraded: {reason}; northbound forwarding is suspended, \
+                 local capture continues ({LICENSE_RECOVERY_HINT})"
+            )),
+            LicenseState::Unlicensed => Some(format!(
+                "license not yet established; northbound forwarding is suspended \
+                 ({LICENSE_RECOVERY_HINT})"
+            )),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,5 +897,84 @@ mod tests {
         );
         // 超过 7 天 ⇒ 负数。
         assert!(LicenseRuntime::grace_days_left(anchor, anchor + 8 * MS_PER_DAY) < 0);
+    }
+
+    // ---- 免费版配额闸门（纯策略函数） ----
+
+    /// 构造 N 台设备（每台 1 点位、指定协议 / 间隔）的配置。
+    fn quota_config(device_count: usize, protocol: &str, frequency_ms: u64) -> GatewayConfig {
+        let points = (0..device_count)
+            .map(|i| crate::config::PointConfig {
+                device_id: format!("dev-{i:03}"),
+                point_id: format!("p_{i:03}"),
+                protocol: protocol.to_string(),
+                address: format!("192.168.1.{i}:502"),
+                frequency_ms,
+            })
+            .collect();
+        GatewayConfig {
+            gateway: crate::config::GatewaySection::default(),
+            outlets: Vec::new(),
+            points,
+            devices: Vec::new(),
+            mgmt_auth: None,
+        }
+    }
+
+    /// QA：设备数边界 —— 8 台放行（零违规）；9 台违规且消息含实际数与上限。
+    #[test]
+    fn free_quota_device_boundary() {
+        assert!(free_quota_problems(&quota_config(8, "modbus-tcp", 1_000)).is_empty());
+        let problems = free_quota_problems(&quota_config(9, "modbus-tcp", 1_000));
+        assert_eq!(problems.len(), 1, "9 台仅设备数违规: {problems:?}");
+        assert!(problems[0].contains("9"), "actual count: {}", problems[0]);
+        assert!(problems[0].contains('8'), "limit: {}", problems[0]);
+        assert!(
+            problems[0].contains("device_id"),
+            "field name: {}",
+            problems[0]
+        );
+    }
+
+    /// QA：协议 —— 非 Modbus 逐点位上报；Modbus 两种写法（含大小写）放行。
+    #[test]
+    fn free_quota_protocol_scan() {
+        let problems = free_quota_problems(&quota_config(1, "opcua", 1_000));
+        assert_eq!(problems.len(), 1, "opcua 违规: {problems:?}");
+        assert!(problems[0].contains("protocol"), "{}", problems[0]);
+        assert!(problems[0].contains("opcua"), "{}", problems[0]);
+        assert!(problems[0].contains("modbus"), "{}", problems[0]);
+
+        assert!(free_quota_problems(&quota_config(1, "modbus-rtu", 1_000)).is_empty());
+        assert!(free_quota_problems(&quota_config(1, "MODBUS-TCP", 1_000)).is_empty());
+    }
+
+    /// QA：间隔边界 —— 999ms 违规（含字段名与数值）；1000ms 放行。
+    #[test]
+    fn free_quota_interval_boundary() {
+        let problems = free_quota_problems(&quota_config(1, "modbus-tcp", 999));
+        assert_eq!(problems.len(), 1, "999ms 违规: {problems:?}");
+        assert!(problems[0].contains("frequency_ms"), "{}", problems[0]);
+        assert!(problems[0].contains("999"), "{}", problems[0]);
+        assert!(free_quota_problems(&quota_config(1, "modbus-tcp", 1_000)).is_empty());
+    }
+
+    /// QA：聚合不短路 —— 超额设备 + 非 Modbus + 快间隔同时上报。
+    #[test]
+    fn free_quota_aggregates_all_problems() {
+        let mut config = quota_config(10, "modbus-tcp", 2_000);
+        config.points.push(crate::config::PointConfig {
+            device_id: "dev-000".to_string(),
+            point_id: "p_fast".to_string(),
+            protocol: "s7".to_string(),
+            address: "10.0.0.1:102".to_string(),
+            frequency_ms: 100,
+        });
+        let problems = free_quota_problems(&config);
+        assert_eq!(
+            problems.len(),
+            3,
+            "1 超额 + 1 协议 + 1 快间隔: {problems:?}"
+        );
     }
 }

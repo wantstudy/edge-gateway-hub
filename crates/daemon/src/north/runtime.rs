@@ -51,6 +51,23 @@ use crate::offline_queue::{Clock, OfflineQueue};
 /// 同时保证 PUBACK 回收与补发推进的延迟远小于采集周期。
 pub const DEFAULT_NORTH_TICK: Duration = Duration::from_millis(200);
 
+/// 门控 warn 日志节流：被授权门控拒绝时，每隔这么多拍重复一次 warn
+/// （首拍必打；200ms tick 下约每 30s 提醒一次，含 Degraded 原因与恢复路径）。
+const GATED_WARN_EVERY_CYCLES: u64 = 150;
+
+/// 北向转发授权闸门（fail-closed 判据注入点；由 `LicenseRuntime` 实现）。
+///
+/// 驱动任务每拍先问 [`Self::north_forward_allowed`]：不允许时**跳过本轮发送**
+/// （发送队列照常受理采集侧入队，超限自然落盘降级；本地采集与连接维护不受影响），
+/// 并按节流节奏把 [`Self::deny_reason`]（Degraded 原因 + 恢复路径）写入 warn 日志。
+/// 状态恢复（Grace→Licensed / 激活成功）后下一拍自动恢复转发。
+pub trait NorthForwardGate: Send + Sync {
+    /// 当前是否允许北向转发（单拍判据；经 `watch` 读取授权状态，跃迁即生效）。
+    fn north_forward_allowed(&self) -> bool;
+    /// 不可转发时的可读原因（含降级原因与恢复路径）；允许转发时返回 `None`。
+    fn deny_reason(&self) -> Option<String>;
+}
+
 /// 取锁并在中毒时取回内部数据（**绝不 panic**）。
 fn lock_or_recover<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
@@ -310,6 +327,9 @@ pub struct NorthRuntimeConfig {
     pub audit_sink: Arc<dyn AuditSink>,
     /// 驱动轮询周期。
     pub tick: Duration,
+    /// 北向转发授权闸门（`None` = 恒放行，保持未接线授权时的既有行为；
+    /// bootstrap 在装配期把 `LicenseRuntime` 注入进来）。
+    gate: Option<Arc<dyn NorthForwardGate>>,
 }
 
 impl NorthRuntimeConfig {
@@ -325,6 +345,7 @@ impl NorthRuntimeConfig {
             clock,
             audit_sink,
             tick: DEFAULT_NORTH_TICK,
+            gate: None,
         }
     }
 
@@ -334,6 +355,18 @@ impl NorthRuntimeConfig {
         self.tick = tick;
         self
     }
+
+    /// 注入北向转发授权闸门（builder 风格）。
+    #[must_use]
+    pub fn with_gate(mut self, gate: Arc<dyn NorthForwardGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// 注入北向转发授权闸门（bootstrap 持有 `Option<NorthRuntimeConfig>` 时的原地写法）。
+    pub fn set_gate(&mut self, gate: Arc<dyn NorthForwardGate>) {
+        self.gate = Some(gate);
+    }
 }
 
 impl std::fmt::Debug for NorthRuntimeConfig {
@@ -342,6 +375,7 @@ impl std::fmt::Debug for NorthRuntimeConfig {
             .field("queue_db", &self.queue.queue_db_path())
             .field("gateway_id", &self.queue.gateway_id())
             .field("tick", &self.tick)
+            .field("gate", &self.gate.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -367,6 +401,10 @@ pub struct NorthRuntimeStats {
     pub pump_errors: u64,
     /// 补发成功条数。
     pub replayed: u64,
+    /// 因授权门控（`NorthForwardGate` 拒绝）被跳过发送的驱动拍数。
+    ///
+    /// > 0 = 授权门控生效中（Degraded / Unlicensed）；恢复后停止增长。
+    pub gated_cycles: u64,
     /// 发送队列入内存条数（各出口合计）。
     pub admitted: u64,
     /// 发送队列落盘降级条数。
@@ -389,6 +427,7 @@ struct Counters {
     pumps: AtomicU64,
     pump_errors: AtomicU64,
     replayed: AtomicU64,
+    gated_cycles: AtomicU64,
 }
 
 impl Counters {
@@ -468,7 +507,22 @@ impl NorthRuntime {
                     continue;
                 }
             };
-            let client = match MqttClient::new(endpoint) {
+            // 每个出口一个审计环（有界）；发送 / 补发 / 消费闸门三者共享，
+            // 形成「超限落盘 → 幂等补发 → 审计统一上报」的闭环。
+            let audit_log = Arc::new(crate::backpressure::AuditLog::default());
+            let outlet = Arc::new(NorthOutlet::with_audit_log(
+                gateway_id.to_string(),
+                Arc::clone(&cfg.queue),
+                Arc::clone(&cfg.clock),
+                audit_log,
+                Arc::clone(&cfg.audit_sink),
+            ));
+            // ⚠ 背压接线缺口修复：`MqttClient` 必须挂载同一 [`NorthOutlet`]，
+            // 否则驱动任务的 `pump`（pump_send / pump_replay）拿不到发送队列，
+            // 出口将永远不发报文（发送队列只进不出）。此前缺这一步，
+            // 由授权门控恢复转发的集成测试暴露。
+            let client = match MqttClient::new(endpoint).map(|c| c.with_outlet(Arc::clone(&outlet)))
+            {
                 Ok(client) => client,
                 Err(err) => {
                     Counters::bump(&counters.skipped);
@@ -480,16 +534,6 @@ impl NorthRuntime {
                     continue;
                 }
             };
-            // 每个出口一个审计环（有界）；发送 / 补发 / 消费闸门三者共享，
-            // 形成「超限落盘 → 幂等补发 → 审计统一上报」的闭环。
-            let audit_log = Arc::new(crate::backpressure::AuditLog::default());
-            let outlet = Arc::new(NorthOutlet::with_audit_log(
-                gateway_id.to_string(),
-                Arc::clone(&cfg.queue),
-                Arc::clone(&cfg.clock),
-                audit_log,
-                Arc::clone(&cfg.audit_sink),
-            ));
             let task = spawn_driver(
                 outlet_cfg.name.clone(),
                 outlet_cfg.topic_prefix.clone(),
@@ -498,6 +542,7 @@ impl NorthRuntime {
                 Arc::clone(&counters),
                 shutdown.clone(),
                 cfg.tick,
+                cfg.gate.clone(),
             );
             by_name.insert(outlet_cfg.name.clone(), started.len());
             started.push(OutletRuntime {
@@ -570,6 +615,7 @@ impl NorthRuntime {
             pumps: Counters::get(&self.counters.pumps),
             pump_errors: Counters::get(&self.counters.pump_errors),
             replayed: Counters::get(&self.counters.replayed),
+            gated_cycles: Counters::get(&self.counters.gated_cycles),
             ..NorthRuntimeStats::default()
         };
         for entry in &self.outlets {
@@ -614,7 +660,11 @@ impl std::fmt::Debug for NorthRuntime {
     }
 }
 
-/// 单个出口的驱动任务：每拍「推进事件循环 → 一轮泵」。
+/// 单个出口的驱动任务：每拍「授权门控 → 推进事件循环 → 一轮泵」。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "装配期一次性接线签名；参数均为独立所有权/句柄，聚合只会增加间接层"
+)]
 fn spawn_driver(
     name: String,
     topic_prefix: String,
@@ -623,6 +673,7 @@ fn spawn_driver(
     counters: Arc<Counters>,
     mut shutdown: watch::Receiver<bool>,
     tick: Duration,
+    gate: Option<Arc<dyn NorthForwardGate>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // 驱动任务独占该客户端（无其它持有者），按值持有并只用 `&mut self` 方法：
@@ -633,6 +684,9 @@ fn spawn_driver(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // interval 首拍立即完成，先消费掉再进循环。
         ticker.tick().await;
+        // 门控观测：上一拍是否被拒（用于跃迁日志：拒绝首拍 warn / 恢复首拍 info）。
+        let mut last_allowed = true;
+        let mut denied_cycles: u64 = 0;
         loop {
             if *shutdown.borrow_and_update() {
                 break;
@@ -643,8 +697,42 @@ fn spawn_driver(
             }
             Counters::bump(&counters.poll_cycles);
 
+            // ⓪ 授权门控（fail-closed，可解释）：Degraded / Unlicensed ⇒ 跳过本轮
+            //    发送。发送队列照常受理采集侧入队（超限自然落盘降级），本地采集与
+            //    连接维护不受影响；判据经 `watch` 读授权状态，跃迁下一拍即生效。
+            let allowed = gate.as_ref().is_none_or(|g| g.north_forward_allowed());
+            if !allowed {
+                Counters::bump(&counters.gated_cycles);
+                denied_cycles = denied_cycles.saturating_add(1);
+                // 节流：进入门控首拍必打（上一拍还是放行），之后每
+                // GATED_WARN_EVERY_CYCLES 拍提醒一次（含 Degraded 原因与恢复路径）。
+                if last_allowed || denied_cycles % GATED_WARN_EVERY_CYCLES == 1 {
+                    let reason = gate
+                        .as_ref()
+                        .and_then(|g| g.deny_reason())
+                        .unwrap_or_else(|| "license gate denied northbound forwarding".to_string());
+                    warn!(
+                        outlet = %name,
+                        reason = %reason,
+                        "north driver: northbound forwarding suspended by license gate; \
+                         local capture continues, queued batches wait in the send queue"
+                    );
+                }
+                last_allowed = false;
+            } else {
+                if !last_allowed {
+                    info!(
+                        outlet = %name,
+                        "north driver: license recovered; northbound forwarding resumed"
+                    );
+                }
+                last_allowed = true;
+                denied_cycles = 0;
+            }
+
             // ① 推进事件循环：PUBACK/PUBCOMP → 回收发送队列在途窗口；
             //    出错 → 按退避重试（继续 poll 即自动重连）。
+            //    门控期间照常推进（维持连接），只是不发送。
             match client.poll_event().await {
                 Ok(_) => Counters::bump(&counters.polls_ok),
                 Err(err) => {
@@ -657,6 +745,10 @@ fn spawn_driver(
                     client.backoff().await;
                     continue;
                 }
+            }
+            if !allowed {
+                // 门控生效：跳过发送轮（发送 / 补发 / 审计），下一拍重新判定。
+                continue;
             }
             // ② 发送一轮 + 补发一轮 + 审计取走上报。
             match client.pump(&topic_prefix).await {
@@ -880,5 +972,152 @@ mod tests {
         outlet.ca_cert_path = Some(ca);
         let endpoint = endpoint_from_outlet(&outlet).expect("accepted");
         assert!(endpoint.tls.is_some());
+    }
+
+    // ---- 授权门控（NorthForwardGate 接入驱动任务） ----
+
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// 可翻转的测试闸门：拒绝理由固定（含恢复路径语义）。
+    struct FlipGate {
+        allowed: AtomicBool,
+    }
+
+    impl FlipGate {
+        fn denied() -> Self {
+            Self {
+                allowed: AtomicBool::new(false),
+            }
+        }
+
+        fn allow(&self) {
+            self.allowed.store(true, AtomicOrdering::SeqCst);
+        }
+    }
+
+    impl NorthForwardGate for FlipGate {
+        fn north_forward_allowed(&self) -> bool {
+            self.allowed.load(AtomicOrdering::SeqCst)
+        }
+
+        fn deny_reason(&self) -> Option<String> {
+            if self.allowed.load(AtomicOrdering::SeqCst) {
+                None
+            } else {
+                Some("license degraded: test; local capture continues".to_string())
+            }
+        }
+    }
+
+    /// 在临时目录打开一个真实 [`OfflineQueue`]。
+    fn gate_test_queue(dir: &Path) -> Arc<OfflineQueue> {
+        let cfg = crate::offline_queue::QueueConfig::new(dir.join("queue.db"), "gw-gate")
+            .expect("queue cfg");
+        Arc::new(
+            OfflineQueue::open(cfg, Arc::new(crate::offline_queue::SystemClock))
+                .expect("open queue"),
+        )
+    }
+
+    /// 丢弃型审计出口（门控测试不关心审计内容）。
+    struct DropSink;
+
+    impl crate::north::mqtt::AuditSink for DropSink {
+        fn emit(&self, _events: Vec<crate::backpressure::BackpressureAudit>) {}
+    }
+
+    /// 构造单出口（指向不可达 broker）+ 指定闸门的运行期与停机信号。
+    fn gated_runtime(
+        dir: &Path,
+        gate: Option<Arc<dyn NorthForwardGate>>,
+    ) -> (NorthRuntime, tokio::sync::watch::Sender<bool>) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut cfg = NorthRuntimeConfig::new(
+            gate_test_queue(dir),
+            Arc::new(crate::offline_queue::SystemClock),
+            Arc::new(DropSink),
+        )
+        .with_tick(Duration::from_millis(20));
+        if let Some(gate) = gate {
+            cfg.set_gate(gate);
+        }
+        let outlet = base_outlet("north-gated", "mqtt://127.0.0.1:1883");
+        (
+            NorthRuntime::start("gw-gate", &[outlet], cfg, shutdown_rx),
+            shutdown_tx,
+        )
+    }
+
+    /// QA：闸门拒绝期间 —— 驱动拍计入 `gated_cycles`、pump 恒不执行；
+    /// 恢复放行后 `gated_cycles` 停止增长（状态跃迁下一拍生效，跳过发送语义）。
+    #[tokio::test(start_paused = true)]
+    async fn gate_denial_skips_pump_and_resume_stops_gating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gate = Arc::new(FlipGate::denied());
+        let (runtime, shutdown_tx) = gated_runtime(
+            dir.path(),
+            Some(Arc::clone(&gate) as Arc<dyn NorthForwardGate>),
+        );
+
+        // 采集侧入队在门控期间照常受理（降级 ≠ 停用）。
+        assert!(matches!(
+            runtime.submit("north-gated", 1, vec![1, 2, 3]),
+            Ok(PushOutcome::Admitted)
+        ));
+
+        // 推进虚拟时间直到多个驱动拍被门控（poll 失败触发指数退避 1s/2s/4s…，
+        // 驱动拍稀疏出现，故按谓词推进而非固定拍数）。
+        let mut gated_cycles = 0u64;
+        for _ in 0..400 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+            gated_cycles = runtime.stats().gated_cycles;
+            if gated_cycles >= 5 {
+                break;
+            }
+        }
+        let stats = runtime.stats();
+        assert!(
+            gated_cycles >= 5,
+            "denied cycles must be counted: {stats:?}"
+        );
+        assert_eq!(stats.pumps, 0, "pump must be skipped while gated");
+
+        // 恢复放行：gated_cycles 停止增长。
+        gate.allow();
+        let frozen = runtime.stats().gated_cycles;
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            runtime.stats().gated_cycles,
+            frozen,
+            "allowed cycles must not count as gated"
+        );
+
+        shutdown_tx.send_replace(true);
+    }
+
+    /// QA：未注入闸门 = 恒放行（未接线授权时行为与既往完全一致，
+    /// `gated_cycles` 恒 0，pump 正常进入）。
+    #[tokio::test(start_paused = true)]
+    async fn absent_gate_defaults_to_allow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (runtime, shutdown_tx) = gated_runtime(dir.path(), None);
+
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.stats().gated_cycles, 0, "no gate ⇒ no gating ever");
+        assert_eq!(
+            runtime.stats().pumps,
+            0,
+            "poll fails against unreachable broker so pump path never completes; \
+             the assertion here is gated_cycles == 0"
+        );
+
+        shutdown_tx.send_replace(true);
     }
 }

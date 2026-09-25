@@ -336,6 +336,26 @@ fn persist(
     device_id: &str,
     point_id: Option<&str>,
 ) -> Response {
+    // 授权配额闸门（免费版 fail-closed，可解释）：Degraded 期间设备数 / 协议 /
+    // 采集间隔超限的管理面写操作一律拒绝（400），与启动装配期 / 热重载同口径。
+    if let Some(license) = state.daemon().license_runtime() {
+        if let Err(err) = license.enforce_free_limits(&new_config) {
+            audit(
+                state,
+                actor,
+                action,
+                false,
+                OUTCOME_BAD_REQUEST,
+                &format!("{detail}: rejected by free-edition quota gate: {err}"),
+            );
+            return validation_error(
+                "config",
+                &format!("free-edition quota rejected: {err}"),
+                "free edition: ≤8 devices, modbus-tcp/modbus-rtu only, \
+                 frequency_ms ≥ 1000 (activate a license to lift the limits)",
+            );
+        }
+    }
     let Some(path) = state.config_path() else {
         audit(
             state,

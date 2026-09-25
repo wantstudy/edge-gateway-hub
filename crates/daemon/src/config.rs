@@ -414,6 +414,13 @@ impl ConfigShared {
     }
 }
 
+/// 热重载准入闸门（授权配额门控的注入点）：对**解析成功**的候选配置做终检，
+/// `Err(reason)` = 拒绝本次重载（保留旧快照、版本号不变、`warn!` 记录原因）。
+///
+/// bootstrap 用 `LicenseRuntime::enforce_free_limits` 充当本闸门——免费版（Degraded）
+/// 期间，设备数 / 协议 / 采集间隔超限的热重载一律拒绝（fail-closed，可解释）。
+pub type ReloadGate = Arc<dyn Fn(&GatewayConfig) -> Result<(), String> + Send + Sync>;
+
 /// 配置文件热重载器（notify + 防抖 + 后台线程）。
 ///
 /// 生命周期：`spawn` 后台线程消费文件事件 → 防抖窗口静默后整文件重解析 →
@@ -428,11 +435,25 @@ pub struct ConfigHotReloader {
 }
 
 impl ConfigHotReloader {
-    /// 加载初始配置、启动监听与后台重载线程。
+    /// 加载初始配置、启动监听与后台重载线程（无准入闸门）。
     ///
     /// # Errors
     /// 初始加载失败或 watcher 初始化失败时返回 [`DaemonError`]（此时未产生后台线程）。
     pub fn spawn(path: impl Into<PathBuf>) -> DaemonResult<(Self, Arc<ConfigShared>)> {
+        Self::spawn_with_gate(path, None)
+    }
+
+    /// 加载初始配置、启动监听与后台重载线程，并注入热重载准入闸门。
+    ///
+    /// 每次文件重载解析成功后先过闸门（[`ReloadGate`]）；被拒则保留旧快照
+    /// （版本号不变）并 `warn!` 拒绝原因——免费版配额在运行期热加载同样 fail-closed。
+    ///
+    /// # Errors
+    /// 初始加载失败或 watcher 初始化失败时返回 [`DaemonError`]（此时未产生后台线程）。
+    pub fn spawn_with_gate(
+        path: impl Into<PathBuf>,
+        gate: Option<ReloadGate>,
+    ) -> DaemonResult<(Self, Arc<ConfigShared>)> {
         let path: PathBuf = path.into();
         // 初始加载失败直接返回错误：调用方据此走安全模式（task 55），绝不静默空配置。
         let initial = GatewayConfig::load(&path)?;
@@ -467,7 +488,7 @@ impl ConfigHotReloader {
         let handle = std::thread::Builder::new()
             .name("config-hot-reload".to_string())
             .spawn(move || {
-                reload_loop(thread_path, thread_shared, thread_stop, event_rx);
+                reload_loop(thread_path, thread_shared, thread_stop, event_rx, gate);
             })
             .map_err(|e| DaemonError::ConfigError(format!("spawn reload thread: {e}")))?;
 
@@ -499,12 +520,13 @@ impl Drop for ConfigHotReloader {
     }
 }
 
-/// 防抖重载主循环：静默窗口后整文件重解析。
+/// 防抖重载主循环：静默窗口后整文件重解析；解析成功先过准入闸门再替换快照。
 fn reload_loop(
     path: PathBuf,
     shared: Arc<ConfigShared>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     event_rx: std::sync::mpsc::Receiver<()>,
+    gate: Option<ReloadGate>,
 ) {
     let mut pending = false;
     let mut last_event: Option<Instant> = None;
@@ -526,6 +548,19 @@ fn reload_loop(
             last_event = None;
             match GatewayConfig::load(&path) {
                 Ok(config) => {
+                    // 准入闸门（授权配额，fail-closed）：被拒则保留旧快照，
+                    // 版本号不变，原因可解释（含恢复路径），绝不 panic。
+                    if let Some(gate) = &gate {
+                        if let Err(reason) = gate(&config) {
+                            tracing::warn!(
+                                reason = %reason,
+                                path = %path.display(),
+                                "config hot-reload rejected by license quota gate; \
+                                 keeping previous config"
+                            );
+                            continue;
+                        }
+                    }
                     let version = shared.store(config);
                     tracing::info!(
                         version,
@@ -731,6 +766,78 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         assert_eq!(
             snapshot.points[0].frequency_ms, 100,
             "previous config must survive"
+        );
+        drop(reloader);
+    }
+
+    /// QA: 热重载准入闸门（授权配额，fail-closed）—— 闸门拒绝期间版本号不变、
+    /// 旧快照保留；闸门放行后（同一文件再触发一次事件）重载成功、版本号递增。
+    #[test]
+    fn hot_reload_gate_rejects_then_accepts_on_recovery() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXAMPLE_TOML).expect("seed");
+
+        // 模拟「免费版（Degraded）→ 激活恢复」的闸门状态翻转。
+        let degraded = Arc::new(AtomicBool::new(true));
+        let gate: ReloadGate = {
+            let degraded = Arc::clone(&degraded);
+            Arc::new(move |_config| {
+                if degraded.load(AtomicOrdering::SeqCst) {
+                    Err(
+                        "free-edition quota exceeded (license degraded): devices: 9 > 8 — \
+                         activate a license to lift the limits"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(())
+                }
+            })
+        };
+
+        let (reloader, shared) =
+            ConfigHotReloader::spawn_with_gate(&path, Some(gate)).expect("spawn with gate");
+        let version_before = shared.version();
+
+        // 闸门拒绝：合法 TOML 但被闸门否决 → 版本号不变、旧快照保留。
+        std::fs::write(
+            &path,
+            EXAMPLE_TOML.replace("frequency_ms = 100", "frequency_ms = 250"),
+        )
+        .expect("write candidate");
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            shared.version(),
+            version_before,
+            "gate-rejected reload must not bump version"
+        );
+        assert_eq!(
+            shared.snapshot().points[0].frequency_ms,
+            100,
+            "previous config must survive gate rejection"
+        );
+
+        // 授权恢复（Degraded → Licensed）后再次触发文件事件 → 同一候选配置过闸。
+        degraded.store(false, AtomicOrdering::SeqCst);
+        std::fs::write(
+            &path,
+            EXAMPLE_TOML.replace("frequency_ms = 100", "frequency_ms = 250"),
+        )
+        .expect("rewrite candidate");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.version() == version_before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            shared.version() > version_before,
+            "gate-accepted reload must bump version"
+        );
+        assert_eq!(
+            shared.snapshot().points[0].frequency_ms,
+            250,
+            "new config must be visible after gate acceptance"
         );
         drop(reloader);
     }
