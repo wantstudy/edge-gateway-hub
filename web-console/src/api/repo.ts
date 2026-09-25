@@ -786,27 +786,26 @@ export async function refreshOverview(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 生效视图（真实缓存 + 覆盖层合成；缓存为空时回退 mock 数据）
+// 生效视图（真实缓存 + 覆盖层合成）。
+// 诚实空态红线（D-01 + 2026-09-25 真机验收 FAIL 修复）：real 模式缓存为空
+// 即空态（拉取失败原因见 realCache.notices.*），**绝不回退 mock 演示数据**。
 // ---------------------------------------------------------------------------
 
-/** 生效设备清单。 */
+/** 生效设备清单（real 空缓存 = 诚实空态，不回退 mock）。 */
 function effectiveDevices(): DeviceRecord[] {
-  const base = realCache.devices.length > 0 ? realCache.devices : mockRepo.allDevices();
-  const kept = base.filter((d) => !overlay.deletedDeviceIds.has(d.id));
+  const kept = realCache.devices.filter((d) => !overlay.deletedDeviceIds.has(d.id));
   return [...overlay.newDevices, ...kept];
 }
 
-/** 生效点位清单。 */
+/** 生效点位清单（real 空缓存 = 诚实空态，不回退 mock）。 */
 function effectivePoints(): PointRecord[] {
-  const base = realCache.points.length > 0 ? realCache.points : mockRepo.allPoints();
-  const kept = base.filter((p) => !overlay.deletedPointIds.has(p.id));
+  const kept = realCache.points.filter((p) => !overlay.deletedPointIds.has(p.id));
   return [...overlay.newPoints, ...kept];
 }
 
-/** 生效北向出口清单（含编码覆盖）。 */
+/** 生效北向出口清单（含编码覆盖；real 空缓存 = 诚实空态，不回退 mock）。 */
 function effectiveOutlets(): ForwarderRecord[] {
-  const base = realCache.outlets.length > 0 ? realCache.outlets : mockRepo.allForwarders();
-  return base.map((f) => {
+  return realCache.outlets.map((f) => {
     const enc = overlay.outletEncoding.get(f.id);
     return enc ? { ...f, encoding: enc } : f;
   });
@@ -830,13 +829,9 @@ function effectiveAlarms(): AlarmRecord[] {
   });
 }
 
-/** 生效审计清单（本地覆盖层在前 + `GET /api/audit` 真实条目）。 */
+/** 生效审计清单（本地覆盖层在前 + `GET /api/audit` 真实条目；空缓存 = 诚实空态，不回退 mock）。 */
 function effectiveAudit(): AuditEntry[] {
-  const base =
-    realCache.events.length > 0
-      ? realCache.events
-      : mockRepo.queryAudit({ actorType: '', action: '', entityType: '', result: '', page: 1, pageSize: 100000 }).items;
-  return [...overlay.localAudit, ...base];
+  return [...overlay.localAudit, ...realCache.events];
 }
 
 /** 生效转发规则清单（real 模式取 `GET /api/rules`，后端无规则引擎 → 诚实空态）。 */
