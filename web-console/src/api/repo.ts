@@ -519,8 +519,32 @@ function formatDateTimeMs(ms: number): string {
  * 后端其余计数字段当前也以字符串返回（JSON 大数红线），均为小值业务计数，
  * 经 `pickNum` 安全转换后再参与页面运算/格式化（无精度损失）。
  */
+/** real 模式诚实空网关（`getGateway` 空缓存 / `mapStatus` 缺字段兜底）——绝不掺 mock 演示值。
+ * 真机验收取证：mock 默认曾致侧栏恒显 v1.0.0(build a91f3c2)，而 daemon 实际为 0.1.0。 */
+const HONEST_EMPTY_GATEWAY: GatewayInfo = {
+  name: '—',
+  machineCode: '—',
+  deployMode: '—',
+  version: '—',
+  hostname: '—',
+  manageUrl: '—',
+  port: 0,
+  startedAt: '—',
+  uptimeText: '—',
+  deviceCount: 0,
+  onlineCount: 0,
+  pointCount: 0,
+  failedPointCount: 0,
+  sampleRatePerSec: 0,
+  forwardRatePerSec: 0,
+  queueUsedGb: 0,
+  queueCapacityGb: 0,
+  queueDrainDays: 0,
+  totalForwardedRecords: '0',
+};
+
 function mapStatus(raw: Record<string, unknown>): GatewayInfo {
-  const dflt = mockRepo.getGateway();
+  const dflt = HONEST_EMPTY_GATEWAY;
   return {
     name: pickStr(raw, 'name', dflt.name),
     machineCode: pickStr(raw, 'machineCode', dflt.machineCode),
@@ -938,7 +962,9 @@ function buildRealRepo(): typeof mockRepo {
 
     // ---------- 网关信息 ----------
     getGateway(): GatewayInfo {
-      return realCache.status ?? mockRepo.getGateway();
+      // 诚实空态（真机验收取证修复）：real 缓存未就绪时返回诚实空值，
+      // 绝不回退 mock 演示网关（曾致侧栏版本号恒显 mock 指纹 v1.0.0/a91f3c2）。
+      return realCache.status ?? HONEST_EMPTY_GATEWAY;
     },
 
     // ---------- 设备（读） ----------

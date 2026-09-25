@@ -167,7 +167,7 @@
  * @module web-console/App
  * @description 应用外壳与全局导航（16 页，5 分组）。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
   ROLES,
@@ -179,7 +179,7 @@ import {
   type Role,
 } from './store/session';
 import { API_MODE } from './api/client';
-import { repo } from './api/repo';
+import { repo, dataVersion } from './api/repo';
 
 const route = useRoute();
 const router = useRouter();
@@ -187,14 +187,20 @@ const router = useRouter();
 /** 顶栏头像字符。 */
 const initial = accountInitial;
 
-/** 侧栏页脚版本号（取网关实际版本，real 模式来自 GET /api/overview）。 */
-const appVersion = repo.getGateway().version;
+/** 侧栏页脚版本号（real 模式随 dataVersion 响应式刷新；挂载早于 preload 时显示诚实空值，绝不定格 mock）。 */
+const appVersion = ref<string>(repo.getGateway().version);
+watch(dataVersion, () => {
+  appVersion.value = repo.getGateway().version;
+});
 
 /** 当前是否为登录页（登录页不渲染应用外壳）。 */
 const isLoginRoute = computed<boolean>(() => route.name === 'login');
 
-/** 顶栏网关名（本机标识）。 */
-const gatewayName = '线1-网关-01';
+/** 顶栏网关名（real 取 GET /api/overview 的 name，随 dataVersion 刷新；不再写死演示名）。 */
+const gatewayName = ref<string>(repo.getGateway().name);
+watch(dataVersion, () => {
+  gatewayName.value = repo.getGateway().name;
+});
 
 /** 导航项定义（id 与路由 name 一致）。 */
 interface NavItem {
