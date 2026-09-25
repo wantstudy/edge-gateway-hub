@@ -374,8 +374,9 @@ fn parse_import_request(
 /// 页面级配置落盘：license 配额闸门 → 写前备份 + 原子落盘 → 热快照即时替换 →
 /// 审计（内存环 + 持久链）。调用方须已持有 [`writeapi::write_guard`] 并完成
 /// 全部校验；管理事件由调用方按语义自行发布。
+/// `pub(crate)`：settings 写端点（mgmt::settings）复用同一落盘链路。
 #[allow(clippy::result_large_err)]
-fn persist_config(
+pub(crate) fn persist_config(
     state: &MgmtState,
     new_config: GatewayConfig,
     actor: &str,

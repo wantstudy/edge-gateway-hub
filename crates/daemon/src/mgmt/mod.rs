@@ -46,6 +46,8 @@ pub mod pages;
 pub mod rbac;
 
 pub mod remote_ops;
+// 设置页真实落盘（GET/PUT /api/settings + 备份清单；web-console 设置页联调缺口补齐）。
+pub mod settings;
 pub mod writeapi;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -399,6 +401,7 @@ pub fn router(state: MgmtState) -> Router {
     // 本子路由已注册路由）。
     let ops = Router::new()
         .route("/api/ops/restart", axum::routing::post(remote_ops::restart))
+        .route("/api/ops/stop", axum::routing::post(remote_ops::stop))
         .route(
             "/api/ops/collectors",
             axum::routing::post(remote_ops::collectors),
@@ -438,6 +441,13 @@ pub fn router(state: MgmtState) -> Router {
             "/api/settings/rollback",
             axum::routing::post(pages::settings_rollback),
         )
+        // 设置页真实落盘（mgmt::settings）：读视图开放；写走 device.write +
+        // writeapi 落盘范式（写前备份 + 热重载 + 审计）。
+        .route(
+            "/api/settings",
+            get(settings::get_settings).put(settings::put_settings),
+        )
+        .route("/api/settings/backups", get(settings::list_backups))
         .route("/api/devices/test", axum::routing::post(pages::device_test))
         .route(
             "/api/forwarders",
@@ -495,6 +505,7 @@ async fn ops_guard(State(state): State<MgmtState>, req: Request, next: Next) -> 
     // ① 动作映射（未知组合透传给路由器，由其产生 404/405）。
     let action: &str = match (parts.method.as_str(), parts.uri.path()) {
         ("POST", "/api/ops/restart") => "restart",
+        ("POST", "/api/ops/stop") => "stop",
         ("POST", "/api/ops/collectors") => "collectors_pause",
         ("GET", "/api/ops/logs") => "logs_read",
         _ => "",
@@ -513,6 +524,7 @@ async fn ops_guard(State(state): State<MgmtState>, req: Request, next: Next) -> 
     if let Err(rejection) = authed.ensure(permission) {
         let action_enum = match action {
             "restart" => remote_ops::OpsAction::Restart,
+            "stop" => remote_ops::OpsAction::Stop,
             "collectors_pause" => remote_ops::OpsAction::CollectorsPause,
             _ => remote_ops::OpsAction::LogsRead,
         };

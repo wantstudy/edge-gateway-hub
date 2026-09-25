@@ -101,6 +101,10 @@ pub enum OpsAction {
     ForwarderTest,
     /// 告警规则写（`PUT /api/alerts/rules`；诚实 501 占位动作）。
     AlarmRulesWrite,
+    /// 设置持久化写（`PUT /api/settings`；mgmt settings 页面真实落盘）。
+    SettingsWrite,
+    /// 远程停机（`POST /api/ops/stop`；优雅停机，不承诺拉起——比 restart 更保守）。
+    Stop,
 }
 
 impl OpsAction {
@@ -123,6 +127,8 @@ impl OpsAction {
             OpsAction::ForwarderCreate => "forwarder_create",
             OpsAction::ForwarderTest => "forwarder_test",
             OpsAction::AlarmRulesWrite => "alarm_rules_write",
+            OpsAction::SettingsWrite => "settings_write",
+            OpsAction::Stop => "stop",
         }
     }
 }
@@ -628,6 +634,111 @@ pub async fn restart(State(state): State<MgmtState>, authed: AuthedRole, body: B
         "accepted": true,
         "mode": "graceful",
         "note": "shutdown requested via DaemonShared::request_shutdown; the supervisor / service manager (Windows service, systemd) is responsible for relaunching the daemon",
+    }))
+    .into_response()
+}
+
+/// POST /api/ops/stop → 请求优雅停机（**不承诺拉起**，契约与 restart 对齐）。
+///
+/// ## 安全停机裁决（为何可实现而非 501）
+/// 既有 [`crate::bootstrap::DaemonShared::request_shutdown`] 的语义是**置位
+/// shutdown watch 标志后立即返回**：主循环在下一轮 tick 才消费该标志执行优雅
+/// 停机（先完成在途工作）。因此 handler 可以**先构造并送达 HTTP 响应、再置位
+/// 停机标志**，响应不会因进程先死而丢失——与 `/api/ops/restart` 同一已验证的
+/// 机制（见该端点测试 `restart_accepted_triggers_graceful_shutdown`），故本端点
+/// 可安全实现，无须诚实 501。
+///
+/// 与 restart 的差异：stop **不假设任何拉起方**（响应 `note` 明确说明进程将
+/// 退出、是否拉起由 Supervisor / 服务管理器自行决定），restart 的语义是
+/// 「停机后由 Supervisor 拉起」。审计动作字面量独立为 `stop`（便于区分运维
+/// 意图），权限与 restart 共享 `ops.restart`（仅 system）。
+pub async fn stop(State(state): State<MgmtState>, authed: AuthedRole, body: Bytes) -> Response {
+    let runtime = runtime_for(&state);
+
+    let req: RestartBody = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => {
+            runtime.record_audit(
+                "<unknown>",
+                OpsAction::Stop,
+                false,
+                OUTCOME_BAD_REQUEST,
+                &format!("malformed json body: {err}"),
+            );
+            return bad_request(
+                "bad_request",
+                "body must be a JSON object {actor, confirm, reason}",
+            );
+        }
+    };
+
+    if req.actor.trim().is_empty() {
+        runtime.record_audit(
+            "<missing>",
+            OpsAction::Stop,
+            false,
+            OUTCOME_BAD_REQUEST,
+            "actor is required",
+        );
+        return bad_request("bad_request", "actor is required");
+    }
+
+    if let Err(rejection) = ensure_action(&authed, OpsAction::Stop) {
+        runtime.record_audit(
+            &req.actor,
+            OpsAction::Stop,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return forbidden("stop denied by authorizer");
+    }
+
+    // 二次确认：与 restart 同契约（confirm 必须回显当前 gateway_id）。
+    let gateway_id = state.daemon().config_snapshot().gateway.gateway_id.clone();
+    if req.confirm.trim().is_empty() {
+        runtime.record_audit(
+            &req.actor,
+            OpsAction::Stop,
+            true,
+            OUTCOME_BAD_REQUEST,
+            "confirm missing (echo gateway id required)",
+        );
+        return bad_request(
+            "confirm_required",
+            &format!("confirm must echo the gateway id {gateway_id:?}"),
+        );
+    }
+    if req.confirm != gateway_id {
+        runtime.record_audit(
+            &req.actor,
+            OpsAction::Stop,
+            true,
+            OUTCOME_BAD_REQUEST,
+            "confirm mismatch",
+        );
+        return bad_request(
+            "confirm_mismatch",
+            &format!("confirm does not match gateway id {gateway_id:?}"),
+        );
+    }
+
+    state.daemon().request_shutdown();
+    runtime.record_audit(
+        &req.actor,
+        OpsAction::Stop,
+        true,
+        OUTCOME_ACCEPTED,
+        &format!("graceful stop requested; reason={:?}", req.reason),
+    );
+    tracing::info!(
+        actor = %req.actor,
+        "remote_ops: graceful stop requested via /api/ops/stop"
+    );
+    Json(json!({
+        "accepted": true,
+        "mode": "graceful_stop",
+        "note": "graceful shutdown requested via DaemonShared::request_shutdown; the daemon will exit after in-flight work completes — relaunching (if desired) is the supervisor / service manager's decision",
     }))
     .into_response()
 }
@@ -1404,6 +1515,145 @@ frequency_ms = 100
             http_post_bearer(port, "/api/ops/restart", r#"{"confirm":"gw-test"}"#, &token).await;
         assert_eq!(status, 400);
         assert!(!state.daemon().shutdown_requested());
+    }
+
+    // ---- stop ----
+
+    /// QA Happy: system 角色 + confirm 匹配 → 200 {accepted, mode:
+    /// graceful_stop}；shutdown watch 观测到停机请求（先响应后停机的安全机制
+    /// 与 restart 同源）；审计动作字面量 = stop（accepted）。
+    #[tokio::test]
+    async fn stop_accepted_triggers_graceful_shutdown() {
+        let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
+        let shutdown_rx = state.daemon().subscribe_shutdown();
+        assert!(!*shutdown_rx.borrow());
+        let port = spawn_server(state.clone()).await;
+
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/ops/stop",
+            r#"{"actor":"ops-admin","confirm":"gw-test","reason":"decommission"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["accepted"], true);
+        assert_eq!(value["mode"], "graceful_stop");
+        let note = value["note"].as_str().expect("note string");
+        assert!(
+            note.contains("supervisor"),
+            "note must state relaunch is the supervisor's decision: {note}"
+        );
+
+        for _ in 0..100 {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            *shutdown_rx.borrow(),
+            "shutdown watch must observe stop request"
+        );
+
+        let audit = ops_runtime(&state).audit_snapshot();
+        let accepted = audit
+            .iter()
+            .find(|e| e.action == "stop" && e.allowed && e.outcome == OUTCOME_ACCEPTED)
+            .expect("accepted stop audit entry");
+        assert_eq!(accepted.actor, "ops-admin");
+        assert!(accepted.reason.contains("decommission"));
+    }
+
+    /// QA: confirm 不匹配 / 缺失 → 400（与 restart 同一二次确认契约），
+    /// 且不触发停机。
+    #[tokio::test]
+    async fn stop_confirm_validation_is_400() {
+        let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // 缺 confirm。
+        let (status, _, body) =
+            http_post_bearer(port, "/api/ops/stop", r#"{"actor":"ops-admin"}"#, &token).await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "confirm_required");
+
+        // confirm 与 gateway_id 不匹配。
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/ops/stop",
+            r#"{"actor":"ops-admin","confirm":"gw-wrong"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "confirm_mismatch");
+
+        assert!(!state.daemon().shutdown_requested(), "must NOT shutdown");
+        assert!(ops_runtime(&state)
+            .audit_snapshot()
+            .iter()
+            .all(|e| e.outcome == OUTCOME_BAD_REQUEST));
+    }
+
+    /// QA 安全: ops 角色（不持 ops.restart——stop 共享该权限）→ 403 + 审计，
+    /// 不触发停机。
+    #[tokio::test]
+    async fn stop_denied_for_role_without_permission_is_403() {
+        let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/ops/stop",
+            r#"{"actor":"ops-admin","confirm":"gw-test"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+        assert!(!state.daemon().shutdown_requested(), "must NOT shutdown");
+        let audit = ops_runtime(&state).audit_snapshot();
+        assert!(audit.iter().any(|e| e.action == "stop" && !e.allowed));
+    }
+
+    /// QA Error: 恶意 JSON / 缺 actor → 400 + 审计，不 panic、不停机。
+    #[tokio::test]
+    async fn stop_bad_requests_are_400_and_audited() {
+        let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, _, _) = http_post_bearer(port, "/api/ops/stop", "not-json{{{", &token).await;
+        assert_eq!(status, 400);
+        let (status, _, _) =
+            http_post_bearer(port, "/api/ops/stop", r#"{"confirm":"gw-test"}"#, &token).await;
+        assert_eq!(status, 400, "missing actor must be 400");
+
+        assert!(!state.daemon().shutdown_requested());
+        assert_eq!(
+            ops_runtime(&state)
+                .audit_snapshot()
+                .iter()
+                .filter(|e| e.action == "stop" && e.outcome == OUTCOME_BAD_REQUEST)
+                .count(),
+            2,
+            "both bad requests audited"
+        );
+    }
+
+    /// QA: GET /api/ops/stop → 405（路径已注册、方法不匹配；守卫对未映射组合透传）。
+    #[tokio::test]
+    async fn stop_route_is_registered() {
+        let state = make_state(Arc::new(AllowAllOpsAuthorizer), None);
+        let port = spawn_server(state).await;
+        let (status, _, _) = http_get(port, "/api/ops/stop").await;
+        assert_eq!(status, 405, "POST-only route must be registered");
     }
 
     // ---- collectors ----

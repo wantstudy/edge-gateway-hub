@@ -242,7 +242,9 @@ pub fn authorize(role: Role, permission: Permission) -> bool {
 /// 端点零改动（对齐 remote_ops.rs 注释中的接线点约定）。
 pub fn permission_for_ops_action(action: &str) -> Option<Permission> {
     match action {
-        "restart" => Some(Permission::OpsRestart),
+        // stop 与 restart 同为「优雅停机请求」级高危动作：共享 ops.restart 权限
+        //（仅 system 可授）；停机不承诺拉起，语义上比重启更保守。
+        "restart" | "stop" => Some(Permission::OpsRestart),
         "collectors_pause" | "collectors_resume" => Some(Permission::OpsCollectors),
         "logs_read" => Some(Permission::OpsLogsRead),
         _ => None,

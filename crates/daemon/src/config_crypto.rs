@@ -224,10 +224,14 @@ impl ConfigEncryptor {
     /// - 密钥错误（跨机器）或数据被篡改 → [`ConfigCryptoError::DecryptFailed`]。
     pub fn open(&self, blob: &[u8]) -> Result<Vec<u8>, ConfigCryptoError> {
         if blob.len() < MIN_ENVELOPE_LEN {
-            return Err(ConfigCryptoError::BadEnvelope { reason: "truncated" });
+            return Err(ConfigCryptoError::BadEnvelope {
+                reason: "truncated",
+            });
         }
         if blob[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC {
-            return Err(ConfigCryptoError::BadEnvelope { reason: "bad magic" });
+            return Err(ConfigCryptoError::BadEnvelope {
+                reason: "bad magic",
+            });
         }
         let version = blob[ENVELOPE_MAGIC.len()];
         if version != ENVELOPE_VERSION {
@@ -528,7 +532,9 @@ mod tests {
         let key_b = derive_config_key(TEST_ONLY_MACHINE_B, &TEST_ONLY_SALT).expect("key b");
         assert_ne!(key_a, key_b, "different machine → different key");
 
-        let blob = enc_a.seal(TEST_ONLY_PASSWORD.as_bytes()).expect("seal on A");
+        let blob = enc_a
+            .seal(TEST_ONLY_PASSWORD.as_bytes())
+            .expect("seal on A");
         let err = enc_b.open(&blob).expect_err("must fail on machine B");
         assert!(
             matches!(err, ConfigCryptoError::DecryptFailed),
@@ -607,7 +613,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ConfigCryptoError::BadEnvelope { reason: "truncated" }
+                ConfigCryptoError::BadEnvelope {
+                    reason: "truncated"
+                }
             ),
             "got {err:?}"
         );
@@ -616,7 +624,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ConfigCryptoError::BadEnvelope { reason: "truncated" }
+                ConfigCryptoError::BadEnvelope {
+                    reason: "truncated"
+                }
             ),
             "got {err:?}"
         );
@@ -627,7 +637,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ConfigCryptoError::BadEnvelope { reason: "bad magic" }
+                ConfigCryptoError::BadEnvelope {
+                    reason: "bad magic"
+                }
             ),
             "got {err:?}"
         );
@@ -643,7 +655,10 @@ mod tests {
         // 头部被认证：改 nonce 区同样失败（AAD 绑定）。
         let mut bad_nonce = blob.clone();
         bad_nonce[ENVELOPE_MAGIC.len() + 1] ^= 0xff;
-        assert!(enc.open(&bad_nonce).is_err(), "nonce is authenticated via AAD");
+        assert!(
+            enc.open(&bad_nonce).is_err(),
+            "nonce is authenticated via AAD"
+        );
     }
 
     /// QA 旧明文迁移路径: 无 `enc:v1:` 前缀 → `LegacyPlaintext`（明确报错，
