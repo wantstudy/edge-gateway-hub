@@ -40,6 +40,7 @@ use tracing::{info, warn};
 
 use crate::backpressure::AcquisitionGovernor;
 use crate::error::{DaemonError, DaemonResult};
+use crate::pipeline::RawSample;
 
 // ---- 配置 ----
 
@@ -135,13 +136,16 @@ impl GroupConfig {
 /// 组内批量轮询动作（一次调用 = 该组一轮采集）。
 ///
 /// 实现方（通常是「驱动适配器」）负责把整组 `point_ids` 合并为尽量少的南向请求；
-/// 返回值为本轮成功采集的样本数。
+/// 返回本轮成功采集的**样本**（D-14 数据面接线：样本按点位一一对应，含解码后
+/// 数值 / 质量码 / 时间戳），调度器只取 `len()` 记统计——样本本身由
+/// [`crate::dataplane::NorthDataPlane`] 消费（管线变换 → 北向投递）。
 #[async_trait]
 pub trait PollHandler: Send + Sync {
-    /// 执行 `group` 的一轮批量采集，返回成功采集的样本数。
+    /// 执行 `group` 的一轮批量采集，返回成功采集的样本。
     ///
-    /// 返回 `Err` 时调度器记录错误统计并继续下一拍，**不会**终止该组调度。
-    async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<usize>;
+    /// 返回 `Err` 时调度器记录错误统计并继续下一拍，**不会**终止该组调度
+    /// （错误 = 整组无样本；个别点位解码失败由实现方跳过并告警，不整体失败）。
+    async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>>;
 }
 
 // ---- 运行时统计 ----
@@ -323,7 +327,7 @@ async fn execute_poll<H: PollHandler>(
     stats: &GroupStats,
 ) -> DaemonResult<usize> {
     let future = handler.poll(&config.name, &config.point_ids);
-    let outcome = match config.poll_timeout {
+    let polled: DaemonResult<Vec<RawSample>> = match config.poll_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, future).await {
             Ok(result) => result,
             Err(_) => Err(DaemonError::ProtocolError(format!(
@@ -335,14 +339,15 @@ async fn execute_poll<H: PollHandler>(
         None => future.await,
     };
 
-    match &outcome {
-        Ok(samples) => stats.record_success(*samples),
+    match &polled {
+        Ok(samples) => stats.record_success(samples.len()),
         Err(err) => {
             warn!("scheduler: group {} poll failed: {err}", config.name);
             stats.record_failure(&err.to_string());
         }
     }
-    outcome
+    // 统计口径维持「样本数」；样本本体已由数据面（NorthDataPlane）消费。
+    polled.map(|samples| samples.len())
 }
 
 impl<H: PollHandler + 'static> GroupScheduler<H> {
@@ -575,13 +580,13 @@ mod tests {
 
     #[async_trait]
     impl PollHandler for FakeHandler {
-        async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<usize> {
+        async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>> {
             if let Ok(mut guard) = self.batches.lock() {
                 guard.push((group.to_string(), point_ids.to_vec()));
             }
             if let Some(delay) = self.hanging.get(group) {
                 tokio::time::sleep(*delay).await;
-                return Ok(point_ids.len());
+                return Ok(fake_samples(point_ids));
             }
             if self.failing.contains(group) {
                 return Err(DaemonError::ProtocolError(format!(
@@ -591,8 +596,21 @@ mod tests {
             if let Some(counter) = self.polls.get(group) {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(point_ids.len())
+            Ok(fake_samples(point_ids))
         }
+    }
+
+    /// 构造 `point_ids.len()` 个直通假样本（每点位值 = 1.0）。
+    fn fake_samples(point_ids: &[String]) -> Vec<RawSample> {
+        point_ids
+            .iter()
+            .map(|point_id| RawSample {
+                source_id: point_id.clone(),
+                value: 1.0,
+                quality: protocol_proto::Quality::Good,
+                device_ts_ns: None,
+            })
+            .collect()
     }
 
     /// 组配置快捷构造。

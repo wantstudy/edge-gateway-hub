@@ -22,6 +22,8 @@ pub mod backpressure;
 pub mod bootstrap;
 pub mod codec;
 pub mod config;
+/// 数据面接线（D-14 修复）：南向采集样本 → 管线变换 → 北向投递。
+pub mod dataplane;
 pub mod driver;
 pub mod error;
 pub mod formula;

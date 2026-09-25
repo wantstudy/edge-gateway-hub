@@ -10,12 +10,13 @@
 //!
 //! # 职责边界
 //! - **做**：按配置点位表把 `poll(group, point_ids)` 翻译为「该设备一次南向驱动
-//!   批量读」（惰性建连 + 断线自愈走 [`crate::driver::Reconnector`]）；返回成功
-//!   采集样本数供调度器统计。
-//! - **不做**：北向转发 / 离线队列（bootstrap 的 north 装配链路负责）；授权 /
-//!   降级状态的采集限制（Degraded 档位配额闸门在
-//!   `LicenseRuntime::enforce_free_limits` 与热重载准入闸门——本模块不重复实现、
-//!   也绝不绕过）。
+//!   批量读」（惰性建连 + 断线自愈走 [`crate::driver::Reconnector`]）；把回读的
+//!   寄存器字节解码为带质量码 / 时间戳的样本（D-14 数据面接线：`poll` 返回
+//!   **样本**而非计数，供 [`crate::dataplane::NorthDataPlane`] 消费）。
+//! - **不做**：北向转发 / 离线队列（`dataplane` + bootstrap 的 north 装配链路
+//!   负责）；公式求值（pipeline / formula 负责）；授权 / 降级状态的采集限制
+//!   （Degraded 档位配额闸门在 `LicenseRuntime::enforce_free_limits` 与热重载
+//!   准入闸门——本模块不重复实现、也绝不绕过）。
 //!
 //! # V1 限制（随代码注释，勿静默扩面）
 //! - 支持协议：`modbus-tcp` / `modbus-rtu`（RTU-over-TCP；从站号固定默认 0xFF，
@@ -31,12 +32,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use protocol_proto::Quality;
 use tracing::warn;
 
+use crate::codec::{DecodeSpec, ValueDecoder};
 use crate::config::GatewayConfig;
 use crate::driver::modbus::{ModbusConfig, ModbusDriver, ModbusFraming};
 use crate::driver::{Driver, PointAddressParser, ReadPoint, Reconnector};
 use crate::error::{DaemonError, DaemonResult};
+use crate::pipeline::RawSample;
 use crate::scheduler::PollHandler;
 
 /// Modbus 单次请求超时（与 `ModbusConfig::default` 一致；显式声明便于运维口径统一）。
@@ -168,12 +172,12 @@ impl DevicePollHandler {
 
 #[async_trait]
 impl PollHandler for DevicePollHandler {
-    async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<usize> {
+    async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>> {
         let plan = self.devices.get(group).ok_or_else(|| {
             DaemonError::ConfigError(format!("southbound poll: unknown device group {group:?}"))
         })?;
         if plan.point_ids.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // 惰性建连（连接表只在取/插时短持锁；读期间按设备锁串行，组间并行）。
@@ -182,7 +186,9 @@ impl PollHandler for DevicePollHandler {
 
         // 组内批量读：一次驱动请求承载全部可读点位（PollHandler 契约）。
         // 未知点位 / 不可解析为南向地址的点位跳过并告警（不整体失败）。
+        // 记录点位标识与请求的下标对应关系，回读后逐一解码。
         let mut read_points: Vec<ReadPoint> = Vec::with_capacity(point_ids.len());
+        let mut read_ids: Vec<String> = Vec::with_capacity(point_ids.len());
         for point_id in point_ids {
             if !plan.point_ids.contains(point_id) {
                 warn!(
@@ -193,7 +199,10 @@ impl PollHandler for DevicePollHandler {
                 continue;
             }
             match PointAddressParser::parse(point_id) {
-                Ok(address) => read_points.push(ReadPoint { address, count: 1 }),
+                Ok(address) => {
+                    read_points.push(ReadPoint { address, count: 1 });
+                    read_ids.push(point_id.clone());
+                }
                 Err(err) => warn!(
                     group = %group,
                     point_id = %point_id,
@@ -203,10 +212,34 @@ impl PollHandler for DevicePollHandler {
             }
         }
         if read_points.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let samples = driver.read(&read_points).await?;
-        Ok(samples.len())
+
+        // 字节 → 数值解码（D-14）：保持寄存器负载按缺省解码规格（uint16 / ABCD
+        // 大端，与驱动 `to_be_bytes` 装载一致）解码为工程量值；成功读到的样本
+        // 质量码 = GOOD（读取失败时整个 `read` 报错，无部分结果语义）；
+        // 设备不提供时间戳 → `device_ts_ns = None`（统一由采集时刻承载）。
+        // 单个点位解码失败只跳过该点（结构性配置错误须可观测，不静默吞值）。
+        let decoder = ValueDecoder::new(DecodeSpec::default())?;
+        let mut out: Vec<RawSample> = Vec::with_capacity(samples.len());
+        for (sample, point_id) in samples.into_iter().zip(read_ids) {
+            match decoder.decode(&sample.value) {
+                Ok(decoded) => out.push(RawSample {
+                    source_id: point_id,
+                    value: decoded.scaled,
+                    quality: Quality::Good,
+                    device_ts_ns: None,
+                }),
+                Err(err) => warn!(
+                    group = %group,
+                    point_id = %point_id,
+                    error = %err,
+                    "southbound poll: sample decode failed; point skipped"
+                ),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -342,7 +375,6 @@ mod tests {
         assert!(matches!(err, DaemonError::ConfigError(_)), "{err:?}");
         assert!(err.to_string().contains("no-such-device"), "{err}");
     }
-
     /// 未接线协议 → ConfigError 且消息点明 V1 支持面（绝不猜测意图）。
     #[tokio::test]
     async fn poll_unsupported_protocol_is_config_error() {
@@ -364,7 +396,8 @@ mod tests {
     }
 
     /// 真实链路：经调度器 `poll_group` 对 mock 从站发起 FC03 批量读 → 样本数 1，
-    /// 从站收到 `ReadHoldingRegisters(0, 1)`。
+    /// 从站收到 `ReadHoldingRegisters(0, 1)`；直连 `poll` 断言样本携带解码值
+    /// （寄存器 0x1234 → 4660.0，uint16 / 大端）与 GOOD 质量码（D-14：poll 产样本）。
     #[tokio::test]
     async fn handler_reads_mock_modbus_server_via_scheduler() {
         let state = Arc::new(Mutex::new(MockInner {
@@ -377,19 +410,34 @@ mod tests {
         let config =
             GatewayConfig::parse(&one_point_toml(addr, "modbus-tcp", "40001")).expect("parse");
         let handler = DevicePollHandler::from_config(&config);
+
+        // 直连 poll：样本本体携带解码值与质量码（不只是计数）。
+        let raw = handler
+            .poll("dev-01", &["40001".to_string()])
+            .await
+            .expect("poll");
+        assert_eq!(raw.len(), 1, "one decoded sample");
+        let first = &raw[0];
+        assert_eq!(first.source_id, "40001");
+        assert!((first.value - 4660.0).abs() < 1e-9, "0x1234 → 4660.0");
+        assert_eq!(first.quality, Quality::Good);
+        assert_eq!(
+            first.device_ts_ns, None,
+            "modbus carries no device timestamp"
+        );
+
         let group = GroupConfig::new("dev-01", Duration::from_secs(1), vec!["40001".to_string()])
             .expect("group");
         let scheduler = GroupScheduler::new(handler, vec![group]).expect("scheduler");
-
         let samples = scheduler.poll_group("dev-01").await.expect("poll");
         assert_eq!(samples, 1, "one readable point → one sample");
         assert_eq!(
-            state.lock().expect("mock state").requests,
-            vec![Request::ReadHoldingRegisters(0, 1)],
+            state.lock().expect("mock state").requests.first(),
+            Some(&Request::ReadHoldingRegisters(0, 1)),
             "mock slave saw FC03 addr=0 count=1"
         );
 
-        // 连接复用：第二轮不再新建连接。
+        // 连接复用：直连 poll 已建连，调度器路径不再新建连接。
         scheduler.poll_group("dev-01").await.expect("poll 2");
         assert_eq!(
             connections.load(Ordering::SeqCst),
@@ -412,7 +460,7 @@ mod tests {
             .poll("dev-01", &["p_temp".to_string()])
             .await
             .expect("poll must not fail");
-        assert_eq!(samples, 0, "unparseable point skipped → zero samples");
+        assert_eq!(samples.len(), 0, "unparseable point skipped → zero samples");
     }
 
     // ---- 生产 bootstrap 路径接线证明（D-12 核心：摘掉接线即失败） ----

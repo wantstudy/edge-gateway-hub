@@ -54,12 +54,14 @@ use tracing::{error, info, warn};
 
 use crate::backpressure::{audit_json, BackpressureAudit};
 use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig, ReloadGate};
+use crate::dataplane::NorthDataPlane;
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
 use crate::license::{LicenseRuntime, LicenseRuntimeConfig, LICENSE_RECOVERY_HINT};
 use crate::north::runtime::{NorthForwardGate, NorthRuntime, NorthRuntimeConfig};
 use crate::offline_queue::{OfflineQueue, QueueConfig, SystemClock, QUEUE_DB_FILE_NAME};
 use crate::ota::OtaBootDecision;
+use crate::pipeline::RawSample;
 use crate::scheduler::{GroupConfig, GroupScheduler, PollHandler, RunningScheduler};
 
 // ---- 默认常量 ----
@@ -734,12 +736,20 @@ impl BootstrapBuilder {
         ));
 
         // ③ 调度器：组按配置点位表推导（一组一设备，周期 = 该设备最小采集频率）。
+        //     数据面接线（D-14 修复）：采集动作包裹 [`NorthDataPlane`]——poll 取回
+        //     样本后经管线变换（质量码归一 / 换算 / 死区 / 公式周期屏障）按出口
+        //     编码投递 [`NorthRuntime::submit`]（背压 / 补发 / 审计复用既有机制）。
+        //     北向运行期在 ④ 才创建 → 晚绑定 attach；就绪前样本照常采集。
         let groups = build_groups(&config_shared.snapshot());
-        let running_scheduler = match &self.poll_handler {
-            Some(handler) if !groups.is_empty() => {
+        let data_plane: Option<Arc<NorthDataPlane>> = self
+            .poll_handler
+            .take()
+            .map(|inner| Arc::new(NorthDataPlane::new(inner, &config_shared.snapshot())));
+        let running_scheduler = match &data_plane {
+            Some(plane) if !groups.is_empty() => {
                 match GroupScheduler::new(
                     DynPollHandler {
-                        inner: handler.clone(),
+                        inner: Arc::clone(plane) as Arc<dyn PollHandler>,
                     },
                     groups,
                 ) {
@@ -815,6 +825,10 @@ impl BootstrapBuilder {
                     names = ?runtime.outlet_names(),
                     "bootstrap: north runtime started"
                 );
+                // 数据面接线收口（D-14）：北向运行期就绪，采集侧桥接开始投递。
+                if let Some(plane) = &data_plane {
+                    plane.attach(Arc::clone(&runtime));
+                }
                 shared.set_north_runtime(runtime);
             }
             None => {
@@ -887,7 +901,7 @@ struct DynPollHandler {
 
 #[async_trait]
 impl PollHandler for DynPollHandler {
-    async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<usize> {
+    async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>> {
         self.inner.poll(group, point_ids).await
     }
 }
