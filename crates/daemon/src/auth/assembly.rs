@@ -61,6 +61,11 @@ use crate::license::LicenseRuntimeConfig;
 /// 指纹 HMAC key 的环境变量（部署期注入；缺失 → 装配 fail-closed）。
 pub const FINGERPRINT_KEY_ENV: &str = "IOT_DAQ_FINGERPRINT_KEY";
 
+/// 指纹 HMAC key 的 **secret 文件路径**环境变量（D-03 修复：随包 compose 经
+/// secret 文件注入 `IOT_DAQ_FINGERPRINT_KEY_FILE=/run/secrets/...`；解析顺序
+/// 为 env [`FINGERPRINT_KEY_ENV`] 优先，其次读本变量指向的文件）。
+pub const FINGERPRINT_KEY_FILE_ENV: &str = "IOT_DAQ_FINGERPRINT_KEY_FILE";
+
 /// 激活码回退环境变量（config 缺省时使用；与 `license.rs` 文档口径一致）。
 pub const ACTIVATION_CODE_ENV: &str = "IOTDAQ_ACTIVATION_CODE";
 
@@ -178,14 +183,15 @@ pub fn assemble(input: AssemblyInput<'_>) -> AssemblyOutcome {
     // ① 指纹 HMAC key（注入优先；缺失 → fail-closed，错误只引用变量名）。
     let fingerprint_key = match input.fingerprint_key {
         Some(key) => key,
-        None => match FingerprintKey::from_env(FINGERPRINT_KEY_ENV) {
+        None => match resolve_fingerprint_key() {
             Ok(key) => key,
             Err(err) => {
                 return AssemblyOutcome::Failed(format!(
                     "machine fingerprint key unavailable ({err}); license assembly cannot \
                      proceed and northbound stays closed. Recovery: deploy \
-                     {FINGERPRINT_KEY_ENV} and restart; local capture is unaffected — \
-                     northbound resumes automatically after a successful activation"
+                     {FINGERPRINT_KEY_ENV} (or {FINGERPRINT_KEY_FILE_ENV} pointing at a \
+                     secret file) and restart; local capture is unaffected — northbound \
+                     resumes automatically after a successful activation"
                 ))
             }
         },
@@ -331,6 +337,50 @@ pub fn assemble(input: AssemblyInput<'_>) -> AssemblyOutcome {
 #[must_use]
 pub fn default_device_key_path(data_dir: &Path) -> PathBuf {
     data_dir.join(DEVICE_KEY_SUBDIR).join(DEVICE_KEY_FILE)
+}
+
+/// 从原始文本解析指纹 HMAC key（trim 后非空；空 / 纯空白 → `Err`）。
+fn fingerprint_key_from_raw(raw: Option<String>) -> Result<FingerprintKey, String> {
+    let raw = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match raw {
+        Some(value) => FingerprintKey::from_bytes(value.into_bytes())
+            .map_err(|err| format!("fingerprint key payload invalid: {err}")),
+        None => Err("fingerprint key source is unset or blank".to_string()),
+    }
+}
+
+/// 从 secret 文件解析指纹 HMAC key（读取全文、trim 尾部换行等空白后判空——
+/// 注意用 `trim().is_empty()` 判空，不要 `is_empty()` 裸判）。
+///
+/// 文件缺失 / 不可读 / 空白 → `Err`；错误消息只含路径，**绝不包含 key 值**。
+fn fingerprint_key_from_file(path: &Path) -> Result<FingerprintKey, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("fingerprint key file {} unreadable: {err}", path.display()))?;
+    fingerprint_key_from_raw(Some(text))
+        .map_err(|_| format!("fingerprint key file {} is empty or blank", path.display()))
+}
+
+/// 解析指纹 HMAC key（部署契约，D-03 修复）：env [`FINGERPRINT_KEY_ENV`] 优先；
+/// env 缺失（或为空白）时回退读 [`FINGERPRINT_KEY_FILE_ENV`] 指向的 secret 文件；
+/// 两者皆无 → `Err`（fail-closed，与既往语义一致）。
+fn resolve_fingerprint_key() -> Result<FingerprintKey, String> {
+    match std::env::var(FINGERPRINT_KEY_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => fingerprint_key_from_raw(Some(raw)),
+        _ => {
+            let path = std::env::var(FINGERPRINT_KEY_FILE_ENV)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    format!(
+                        "neither {FINGERPRINT_KEY_ENV} nor {FINGERPRINT_KEY_FILE_ENV} is \
+                         configured"
+                    )
+                })?;
+            fingerprint_key_from_file(&path)
+        }
+    }
 }
 
 /// 解析 Lease 公钥集文本：`kid1=BASE64,kid2=BASE64`（分隔符 `,` / `;`；非法项跳过并告警）。
@@ -1338,6 +1388,94 @@ mod tests {
             rt_cfg.data_dir, data_dir,
             "trial marker dir must come from gateway.data_dir"
         );
+    }
+
+    // ---- 指纹 key 解析三分支（D-03 修复）：env 优先 / secret 文件回退 / 皆无 fail-closed ----
+
+    /// 纯解析分支：原始文本 trim 后非空才有效；空白 / 缺失拒绝。
+    #[test]
+    fn fingerprint_key_from_raw_trims_and_rejects_blank() {
+        assert!(fingerprint_key_from_raw(Some("deployed-key".to_string())).is_ok());
+        assert!(
+            fingerprint_key_from_raw(Some("  deployed-key \n".to_string())).is_ok(),
+            "surrounding whitespace must be trimmed"
+        );
+        assert!(fingerprint_key_from_raw(Some(String::new())).is_err());
+        assert!(fingerprint_key_from_raw(Some("   ".to_string())).is_err());
+        assert!(fingerprint_key_from_raw(None).is_err());
+    }
+
+    /// secret 文件分支：缺失 / 空白文件拒绝；带尾随换行的合法内容解析成功。
+    #[test]
+    fn fingerprint_key_from_file_covers_missing_blank_and_valid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let missing = dir.path().join("missing-key-file");
+        let err = fingerprint_key_from_file(&missing).expect_err("missing file must fail");
+        assert!(
+            err.contains("unreadable"),
+            "error must explain the failure mode: {err}"
+        );
+        // 绝不把 key 值写进错误消息（文件内容不可预期，消息只含路径）。
+        assert!(
+            !err.contains("TEST_SECRET"),
+            "error must never echo file content: {err}"
+        );
+
+        let blank = dir.path().join("blank-key-file");
+        std::fs::write(&blank, b"\n \n").expect("write blank file");
+        let err = fingerprint_key_from_file(&blank).expect_err("blank file must fail");
+        assert!(err.contains("empty or blank"), "{err}");
+
+        let valid = dir.path().join("key-file");
+        std::fs::write(&valid, b"file-provided-key\n").expect("write key file");
+        assert!(
+            fingerprint_key_from_file(&valid).is_ok(),
+            "valid content (with trailing newline) must resolve"
+        );
+    }
+
+    /// 装配级三分支回归（env 优先 / 文件回退 / 两者皆无 fail-closed）。
+    ///
+    /// CI 不应设置这两个变量；若已被环境占用则跳过（避免污染并行测试）。
+    #[test]
+    fn resolve_fingerprint_key_prefers_env_then_file_then_fails_closed() {
+        if std::env::var(FINGERPRINT_KEY_ENV).is_ok()
+            || std::env::var(FINGERPRINT_KEY_FILE_ENV).is_ok()
+        {
+            return;
+        }
+
+        // 两者皆无 → Err 且错误提示两个变量名（恢复路径）。
+        let err = resolve_fingerprint_key().expect_err("both unset must fail");
+        assert!(
+            err.contains(FINGERPRINT_KEY_ENV) && err.contains(FINGERPRINT_KEY_FILE_ENV),
+            "error must name both deployment variables: {err}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 文件回退：env 缺失 + secret 文件合法 → Ok。
+        let key_file = dir.path().join("fp-key");
+        std::fs::write(&key_file, b"file-provided-key\n").expect("write key file");
+        std::env::set_var(FINGERPRINT_KEY_FILE_ENV, &key_file);
+        assert!(
+            resolve_fingerprint_key().is_ok(),
+            "file fallback must succeed when env is unset"
+        );
+
+        // env 优先：env 存在而文件指针指向缺失路径 → 仍 Ok（env 赢，不读文件）。
+        let missing_file = dir.path().join("missing-file");
+        std::env::set_var(FINGERPRINT_KEY_FILE_ENV, &missing_file);
+        std::env::set_var(FINGERPRINT_KEY_ENV, "env-provided-key");
+        assert!(
+            resolve_fingerprint_key().is_ok(),
+            "env must take precedence over the file branch"
+        );
+
+        // 收尾：清理进程环境（不残留到其它测试）。
+        std::env::remove_var(FINGERPRINT_KEY_ENV);
+        std::env::remove_var(FINGERPRINT_KEY_FILE_ENV);
     }
 
     /// lease 公钥集解析：合法项保留、非法项逐个跳过（不整体失败）。

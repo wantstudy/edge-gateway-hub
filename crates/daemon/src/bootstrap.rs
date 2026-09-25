@@ -441,6 +441,9 @@ pub struct BootstrapBuilder {
     license_assembly_failed: Option<String>,
     /// 安全审计记录器（task 26；`None` = run 内按默认路径 audit.db 自建）。
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
+    /// 数据根目录（task-61 D-08：audit.db 随 data_dir 落宿主持久卷；
+    /// `None` = 维持「配置同目录 audit.db」的既有口径）。
+    data_dir: Option<PathBuf>,
 }
 
 impl BootstrapBuilder {
@@ -463,6 +466,7 @@ impl BootstrapBuilder {
             license: None,
             license_assembly_failed: None,
             audit_logger: None,
+            data_dir: None,
         }
     }
 
@@ -470,6 +474,17 @@ impl BootstrapBuilder {
     /// 未注入则 run 内按「配置同目录 audit.db」自建）。
     pub fn with_audit_logger(mut self, logger: Arc<crate::audit::AuditLogger>) -> Self {
         self.audit_logger = Some(logger);
+        self
+    }
+
+    /// 注入数据根目录（task-61 验收 D-08 修复）：审计库随之落到
+    /// `<data_dir>/audit.db`（与设备签名密钥 / 试用标记同一持久卷）。
+    ///
+    /// 未注入时保持既有行为（配置同目录 audit.db）。生产 bin 传
+    /// `config.gateway.data_dir`（缺省随 env `IOT_DAQ_DATA_DIR` 解析）。
+    #[must_use]
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
         self
     }
 
@@ -606,6 +621,7 @@ impl BootstrapBuilder {
         mount_audit_logger(
             &shared,
             &self.config_path,
+            self.data_dir.as_deref(),
             self.audit_logger.take(),
             audit_machine_code.as_deref(),
         );
@@ -882,13 +898,15 @@ impl std::fmt::Debug for DynPollHandler {
 /// 安全审计库装配（task 26 最小接线）：把 [`crate::audit::AuditLogger`] 挂载到
 /// [`DaemonShared`]，供 mgmt 审计端点与配置写 / 登录事件消费。
 ///
-/// 装配顺序：外部注入优先（测试 / 嵌入式）；否则按「配置同目录 `audit.db`」
-/// 自建，IKM 由 [`crate::audit::resolve_audit_ikm`] 解析（env 部署密钥 → 授权
+/// 装配顺序：外部注入优先（测试 / 嵌入式）；否则按
+/// **`data_dir`（D-08：持久卷根）→ 回退「配置同目录」** 解析 `audit.db` 路径，
+/// IKM 由 [`crate::audit::resolve_audit_ikm`] 解析（env 部署密钥 → 授权
 /// 机器码 → 无 → 盐自派生降级）。共享态已挂载时跳过（幂等）；开库失败只记
 /// `error!` 不阻断启动（fail-safe：审计缺失可观测，采集数据面不受影响）。
 fn mount_audit_logger(
     shared: &DaemonShared,
     config_path: &Path,
+    data_dir: Option<&Path>,
     injected: Option<Arc<crate::audit::AuditLogger>>,
     machine_code: Option<&str>,
 ) {
@@ -900,11 +918,20 @@ fn mount_audit_logger(
         info!("bootstrap: audit logger mounted (injected)");
         return;
     }
-    let dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let db_path = dir.join(crate::audit::AUDIT_DB_FILE_NAME);
+    let db_path = match data_dir {
+        Some(data_dir) => {
+            // 数据根可能尚未创建（本地首跑）：尽力创建；失败交由 open 报错（fail-safe）。
+            let _ = std::fs::create_dir_all(data_dir);
+            data_dir.join(crate::audit::AUDIT_DB_FILE_NAME)
+        }
+        None => {
+            let dir = config_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            dir.join(crate::audit::AUDIT_DB_FILE_NAME)
+        }
+    };
     let ikm = crate::audit::resolve_audit_ikm(machine_code);
     match crate::audit::AuditLogger::open(&db_path, ikm.as_deref()) {
         Ok(logger) => {
@@ -1592,6 +1619,35 @@ frequency_ms = 500
         assert_eq!(shared.last_heartbeat_ns(), 1_000, "must keep the max");
         shared.touch_heartbeat(2_000);
         assert_eq!(shared.last_heartbeat_ns(), 2_000);
+    }
+
+    /// QA（D-08）：注入 data_dir 后 audit.db 落到 `<data_dir>/audit.db`（与设备
+    /// 签名密钥 / 试用标记同一持久卷），而非配置同目录。
+    #[tokio::test(start_paused = true)]
+    async fn audit_db_lands_in_injected_data_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join("var-lib-iot-daq");
+        let shared = DaemonShared::new();
+
+        let builder = BootstrapBuilder::new(write_test_config(&dir))
+            .with_shared(shared.clone())
+            .without_signal_handlers()
+            .with_data_dir(&data_dir);
+
+        let handle = wait_for_state(
+            tokio::spawn(builder.run()),
+            &shared,
+            LifecycleState::Running,
+        )
+        .await;
+
+        assert!(
+            data_dir.join(crate::audit::AUDIT_DB_FILE_NAME).is_file(),
+            "audit.db must be created under the injected data_dir"
+        );
+
+        shared.request_shutdown();
+        handle.await.expect("run task joins").expect("run ok");
     }
 
     /// QA: build_groups 一组一设备、周期取设备最小采集频率、点位去重保序。

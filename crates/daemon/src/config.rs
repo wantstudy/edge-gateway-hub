@@ -31,8 +31,26 @@ fn default_gateway_id() -> String {
     "gw-unset".to_string()
 }
 
+/// 数据根目录环境变量（task-61 验收 D-08 修复）：容器部署注入
+/// `IOT_DAQ_DATA_DIR`（宿主持久卷挂载点）。修复前只有 preflight 读它，运行期
+/// `gateway.data_dir` 默认相对路径 `data`（相对 WORKDIR = 容器 tmpfs）——
+/// `docker rm && docker run` 即重置设备密钥 / 试用，正中陷阱 2。
+pub const DATA_DIR_ENV: &str = "IOT_DAQ_DATA_DIR";
+
+/// 本地开发默认数据根（相对 WORKDIR 的 `data`；容器形态必须经 env 或显式配置覆盖）。
+const LOCAL_DEFAULT_DATA_DIR: &str = "data";
+
+/// `data_dir` 缺省解析（纯函数，单测注入）：env 存在且非空白（`trim().is_empty()`
+/// 判空，勿裸 `is_empty()`）→ 用 env 值；否则维持本地开发默认相对 `data`。
+fn data_dir_from_env(env_value: Option<String>) -> PathBuf {
+    env_value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from(LOCAL_DEFAULT_DATA_DIR), PathBuf::from)
+}
+
 fn default_data_dir() -> PathBuf {
-    PathBuf::from("data")
+    data_dir_from_env(std::env::var(DATA_DIR_ENV).ok())
 }
 
 fn default_topic_prefix() -> String {
@@ -792,6 +810,100 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         let err = GatewayConfig::parse("[gateway\ngateway_id = ").expect_err("must fail");
         assert!(matches!(err, DaemonError::ConfigError(_)));
         assert_eq!(err.error_code(), crate::error::ERR_CONFIG);
+    }
+
+    // ---- D-08：data_dir 缺省随 env `IOT_DAQ_DATA_DIR` 落持久卷 ----
+
+    /// data_dir 缺省解析（纯函数）：env 存在且非空白 → env 值；否则本地默认相对 `data`。
+    #[test]
+    fn data_dir_env_resolution_covers_all_branches() {
+        assert_eq!(
+            data_dir_from_env(None),
+            PathBuf::from("data"),
+            "unset → local default"
+        );
+        assert_eq!(
+            data_dir_from_env(Some(String::new())),
+            PathBuf::from("data"),
+            "empty → local default"
+        );
+        assert_eq!(
+            data_dir_from_env(Some("   ".to_string())),
+            PathBuf::from("data"),
+            "blank → local default"
+        );
+        assert_eq!(
+            data_dir_from_env(Some("/var/lib/iot-daq".to_string())),
+            PathBuf::from("/var/lib/iot-daq"),
+            "env value wins"
+        );
+        assert_eq!(
+            data_dir_from_env(Some(" /var/lib/iot-daq \n".to_string())),
+            PathBuf::from("/var/lib/iot-daq"),
+            "surrounding whitespace trimmed"
+        );
+    }
+
+    /// 集成回归：env 注入后，空 TOML（data_dir 键缺省 → serde default）解析出的
+    /// `gateway.data_dir` 指向 env 值——设备密钥 / 审计库 / 试用标记随之落持久卷。
+    /// CI 不应设置该变量；被占用时跳过（避免污染并行测试）。
+    #[test]
+    fn data_dir_env_wins_over_local_default_in_parsed_config() {
+        if std::env::var(DATA_DIR_ENV).is_ok() {
+            return;
+        }
+        std::env::set_var(DATA_DIR_ENV, "/var/lib/iot-daq");
+        let config = GatewayConfig::parse("").expect("empty toml defaults");
+        std::env::remove_var(DATA_DIR_ENV);
+        assert_eq!(
+            config.gateway.data_dir,
+            PathBuf::from("/var/lib/iot-daq"),
+            "env-injected data_dir must flow into the parsed config"
+        );
+    }
+
+    // ---- D-07：随镜像分发的默认配置模板逐行 schema 对齐 ----
+
+    /// 默认配置模板（deploy/docker/config/gateway.default.toml）必须整体落在
+    /// `GatewayConfig` schema 内：解析成功 + 关键字段符合预期 + 无惰性未知段。
+    /// （D-07 修复前模板的 [storage]/[fingerprint]/[license]/[logging]/[integrity]/
+    /// [serial] 段全部被 serde 静默忽略。）
+    #[test]
+    fn default_template_parses_within_schema() {
+        const TEMPLATE: &str = include_str!("../../../deploy/docker/config/gateway.default.toml");
+        let config =
+            GatewayConfig::parse(TEMPLATE).expect("deploy template must parse into GatewayConfig");
+
+        assert_eq!(config.gateway.gateway_id, "gw-unset");
+        assert_eq!(
+            config.gateway.data_dir,
+            PathBuf::from("/var/lib/iot-daq"),
+            "container data_dir must point at the persistent volume mount"
+        );
+
+        // 授权段：字段名与 schema 一致；模板不内置激活码（真实值经 env 注入，
+        // 占位符也绝不默认启用——未配置 = NotConfigured，保持既有行为）。
+        let licensing = &config.gateway.licensing;
+        assert_eq!(licensing.cloud_url.as_deref(), Some(""));
+        assert_eq!(licensing.heartbeat_interval_secs, 86_400);
+        assert_eq!(
+            licensing.activation_code, None,
+            "template must not enable cloud activation by default"
+        );
+        assert_eq!(licensing.trial_days, 3);
+        assert_eq!(licensing.grace_days, 7);
+
+        // 缓存 / 安全段在 [gateway] 命名空间内。
+        assert_eq!(config.gateway.cache.sqlite_path, "cache.db");
+        assert_eq!(config.gateway.cache.max_size_mb, 512);
+        assert_eq!(config.gateway.cache.retention_days, 7);
+        assert!(config.gateway.security.web_auth_enabled);
+
+        // 模板不含任何出口 / 点位 / 设备登记 / 凭证实例（注释示例不入 schema）。
+        assert!(config.outlets.is_empty());
+        assert!(config.points.is_empty());
+        assert!(config.devices.is_empty());
+        assert!(config.mgmt_auth.is_none());
     }
 
     /// QA: 从文件加载示例配置。

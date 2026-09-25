@@ -37,6 +37,8 @@ pub mod pipeline;
 pub mod platform;
 pub mod rules;
 pub mod scheduler;
+/// 南向采集装配（生产 `PollHandler`，bootstrap 生产路径接线，D-12 修复）。
+pub mod southbound;
 pub mod telemetry_store;
 
 /// 便捷再导出：`daemon::modbus` ≡ `daemon::driver::modbus`（task 9）。

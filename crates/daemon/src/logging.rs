@@ -18,6 +18,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 /// 非阻塞文件写入的 flush 句柄：进程退出前必须持有，drop 时 flush。
 pub use tracing_appender::non_blocking::WorkerGuard;
 
+/// 最低日志级别环境变量（D-13 修复：部署期注入，如 `info` / `warn,daemon=debug`）。
+pub const LOG_LEVEL_ENV: &str = "IOT_DAQ_LOG_LEVEL";
+/// JSON 结构化输出开关环境变量（`1` / `true` / `yes` / `on`，大小写不敏感）。
+pub const LOG_JSON_ENV: &str = "IOT_DAQ_LOG_JSON";
+
 /// 日志初始化配置。
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
@@ -39,6 +44,39 @@ impl Default for LoggingConfig {
             log_dir: None,
             remote_endpoint: None,
         }
+    }
+}
+
+impl LoggingConfig {
+    /// 从环境变量解析日志配置（bin 入口装配用；缺省回落 [`LoggingConfig::default`]）。
+    ///
+    /// 语义：变量缺失 / 空白 = 未配置（级别回落 `info`，JSON 回落 false）；
+    /// `IOT_DAQ_LOG_JSON` 取值 `1` / `true` / `yes` / `on`（大小写不敏感）为开启，
+    /// 其余取值一律视为关闭（绝不猜测意图）。
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_env_values(
+            std::env::var(LOG_LEVEL_ENV).ok(),
+            std::env::var(LOG_JSON_ENV).ok(),
+        )
+    }
+
+    /// 纯函数版本（单测注入）：env 语义见 [`Self::from_env`]。
+    fn from_env_values(level: Option<String>, json: Option<String>) -> Self {
+        let mut config = Self::default();
+        if let Some(level) = level
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            config.level = level;
+        }
+        if let Some(flag) = json
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+        {
+            config.json = matches!(flag.as_str(), "1" | "true" | "yes" | "on");
+        }
+        config
     }
 }
 
@@ -309,5 +347,41 @@ mod tests {
             config.log_dir.as_deref(),
             Some(std::path::Path::new("/var/log/iot-daq"))
         );
+    }
+
+    // ---- D-13：bin 入口的 env 解析（IOT_DAQ_LOG_LEVEL / IOT_DAQ_LOG_JSON） ----
+
+    /// env 解析（纯函数）：缺省回落 info/文本；级别与 JSON 开关逐分支覆盖。
+    #[test]
+    fn from_env_values_covers_all_branches() {
+        // 双缺省。
+        let config = LoggingConfig::from_env_values(None, None);
+        assert_eq!(config.level, "info");
+        assert!(!config.json);
+
+        // 空白 = 未配置（回落默认，不产生非法过滤器）。
+        let config = LoggingConfig::from_env_values(Some("  ".to_string()), Some("".to_string()));
+        assert_eq!(config.level, "info");
+        assert!(!config.json);
+
+        // 级别注入（含 EnvFilter 模块覆盖语法原样透传）。
+        let config = LoggingConfig::from_env_values(Some("warn,daemon=debug".to_string()), None);
+        assert_eq!(config.level, "warn,daemon=debug");
+        assert!(!config.json);
+
+        // JSON 开关：合法真值（大小写不敏感）。
+        for flag in ["1", "true", "TRUE", "Yes", "on"] {
+            let config = LoggingConfig::from_env_values(None, Some(flag.to_string()));
+            assert!(config.json, "flag {flag:?} must enable json");
+        }
+        // JSON 开关：假值 / 未知值一律关闭（绝不猜测意图）。
+        for flag in ["0", "false", "no", "off", "sometimes"] {
+            let config = LoggingConfig::from_env_values(None, Some(flag.to_string()));
+            assert!(!config.json, "flag {flag:?} must keep json off");
+        }
+
+        // 级别前后空白 trim。
+        let config = LoggingConfig::from_env_values(Some(" warn \n".to_string()), None);
+        assert_eq!(config.level, "warn");
     }
 }

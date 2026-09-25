@@ -10,7 +10,13 @@
 //! 环境变量：
 //! - `IOT_DAQ_CONFIG`：配置文件路径（默认 `./config.toml`，`--config` 可覆盖）；
 //! - `IOT_DAQ_MGMT_BIND`：管理面监听地址（默认 `127.0.0.1:8080`，`--bind` 可覆盖）；
-//! - `IOT_DAQ_WEB_DIST`：web-console 静态资源根目录（mgmt 模块读取，默认 `./web-dist`）。
+//!   task-61 D-11：兼容部署资产注入的 `IOT_DAQ_HTTP_BIND`（+`IOT_DAQ_HTTP_PORT`，
+//!   bind 不含端口时拼接）——解析顺序 `IOT_DAQ_MGMT_BIND` > `IOT_DAQ_HTTP_BIND` > 默认；
+//! - `IOT_DAQ_WEB_DIST`：web-console 静态资源根目录（mgmt 模块读取，默认 `./web-dist`）；
+//! - `IOT_DAQ_LOG_LEVEL` / `IOT_DAQ_LOG_JSON`：日志级别 / JSON 结构化开关
+//!   （task-61 D-13 修复：bin 早期初始化全局 tracing subscriber）；
+//! - `IOT_DAQ_DATA_DIR`：数据根目录（task-61 D-08：经 `GatewayConfig` 缺省解析
+//!   流入运行期，设备密钥 / 审计库 / 试用标记随之落宿主持久卷）。
 //!
 //! 退出码：`0` = 优雅停机 / preflight 通过；`1` = 启动失败（配置加载 / 端口绑定 /
 //! bootstrap 装配错误）；`2` = `--preflight` 前置校验失败（fail-fast，附可操作原因）。
@@ -114,19 +120,56 @@ fn resolve_args_with(raw: RawArgs, config_env: Option<String>, bind_env: Option<
         bind_addr: raw
             .bind_addr
             .or_else(|| bind_env.filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+            .unwrap_or_else(|| DEFAULT_MGMT_BIND.to_string()),
         preflight: raw.preflight,
         foreground: raw.foreground,
     }
 }
 
 /// [`resolve_args_with`] 的生产包装：从进程环境读取兜底值。
+///
+/// 管理面绑定解析顺序（task-61 D-11 修复）：`IOT_DAQ_MGMT_BIND` >
+/// `IOT_DAQ_HTTP_BIND`（+`IOT_DAQ_HTTP_PORT`，bind 不含端口时拼接）> 内置默认。
 fn resolve_args(raw: RawArgs) -> Args {
-    resolve_args_with(
-        raw,
-        std::env::var("IOT_DAQ_CONFIG").ok(),
+    let bind_env = mgmt_bind_from_env(
         std::env::var("IOT_DAQ_MGMT_BIND").ok(),
-    )
+        std::env::var("IOT_DAQ_HTTP_BIND").ok(),
+        std::env::var("IOT_DAQ_HTTP_PORT").ok(),
+    );
+    resolve_args_with(raw, std::env::var("IOT_DAQ_CONFIG").ok(), bind_env)
+}
+
+/// 管理面绑定地址的内置默认（宿主回环；容器形态经 env 覆盖为 `0.0.0.0:8080`）。
+const DEFAULT_MGMT_BIND: &str = "127.0.0.1:8080";
+/// `IOT_DAQ_HTTP_BIND` 不含端口且无 `IOT_DAQ_HTTP_PORT` 时的兜底端口。
+const DEFAULT_MGMT_PORT: &str = "8080";
+
+/// 管理面绑定地址的环境解析（task-61 D-11 修复，纯函数单测注入）：
+/// 1. `IOT_DAQ_MGMT_BIND` 存在且非空白 → 直接使用；
+/// 2. `IOT_DAQ_HTTP_BIND` 存在且非空白 → 含端口（含 `:`）直接使用；否则拼接
+///    `IOT_DAQ_HTTP_PORT`（非空白时）或默认端口 [`DEFAULT_MGMT_PORT`]；
+/// 3. 两者皆无 → `None`（由 [`resolve_args_with`] 回落内置默认）。
+fn mgmt_bind_from_env(
+    mgmt: Option<String>,
+    http_bind: Option<String>,
+    http_port: Option<String>,
+) -> Option<String> {
+    if let Some(bind) = mgmt.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        return Some(bind);
+    }
+    let bind = http_bind
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())?;
+    if bind.contains(':') {
+        return Some(bind);
+    }
+    let port = http_port
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    Some(match port {
+        Some(port) => format!("{bind}:{port}"),
+        None => format!("{bind}:{DEFAULT_MGMT_PORT}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +478,19 @@ fn check_persistent_volumes() -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // ⓪ 日志初始化（task-61 D-13 修复）：在任何组件初始化之前安装全局 tracing
+    //    subscriber——修复前 init_logging 无生产调用方，所有框架日志（含调度器 /
+    //    授权装配的关键告警）在生产形态不可见，IOT_DAQ_LOG_LEVEL/LOG_JSON 无效。
+    //    初始化失败不阻断启动（降级为 eprintln 输出），绝不 panic。
+    let _log_guard: Option<daemon::logging::WorkerGuard> =
+        match daemon::logging::init(&daemon::logging::LoggingConfig::from_env()) {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!("[iot-daq-daemon] 日志初始化失败（继续运行，仅 stdout 输出）: {err}");
+                None
+            }
+        };
+
     let raw = match parse_args(std::env::args().skip(1)) {
         Ok(raw) => raw,
         Err(msg) => {
@@ -481,7 +537,25 @@ async fn main() -> ExitCode {
         config.outlets.len(),
     );
 
-    // ②-b 授权生产装配（task 22/23 上岗；在 config 被 MgmtState 取走之前完成）。
+    // ②-b 数据根 / 南向采集装配（task-61 D-08 / D-12 修复；config 被 MgmtState
+    //     取走之前完成捕获）：
+    //     - data_dir：设备密钥（data_dir/license/device-ed25519.key）、审计库
+    //       （data_dir/audit.db）、试用标记统一落持久卷（缺省随 env
+    //       IOT_DAQ_DATA_DIR 解析，见 config::default_data_dir）；
+    //     - poll handler：配置声明了点位 → 构造真实南向轮询动作注入 bootstrap。
+    //       修复前 with_poll_handler 全仓无生产调用方，采集调度器在生产形态
+    //       永不启动（容器实测：点位注册成功但 mock 从站 0 连接）。
+    let data_dir = config.gateway.data_dir.clone();
+    let poll_handler: Option<Arc<dyn daemon::scheduler::PollHandler>> = if config.points.is_empty()
+    {
+        None
+    } else {
+        Some(Arc::new(
+            daemon::southbound::DevicePollHandler::from_config(&config),
+        ))
+    };
+
+    // ②-c 授权生产装配（task 22/23 上岗；在 config 被 MgmtState 取走之前完成）。
     //     读 [gateway.licensing]——
     //     - 未配置（无 cloud_url 且无 activation_code）→ 行为与既往完全一致；
     //     - 已配置 → 构造 MachineIdentity + 设备签名密钥 + LicensingClient +
@@ -516,7 +590,13 @@ async fn main() -> ExitCode {
     });
 
     // ④ bootstrap 全权接管：信号处理 / 热重载 / 调度 / 看门狗 / 优雅停机。
-    let mut builder = BootstrapBuilder::new(&args.config_path).with_shared(shared);
+    //    data_dir（D-08）与 poll handler（D-12）在此注入生产装配链。
+    let mut builder = BootstrapBuilder::new(&args.config_path)
+        .with_shared(shared)
+        .with_data_dir(data_dir);
+    if let Some(handler) = poll_handler {
+        builder = builder.with_poll_handler(handler);
+    }
     match licensing_outcome {
         daemon::auth::assembly::AssemblyOutcome::Assembled(rt_cfg) => {
             eprintln!(
@@ -663,5 +743,66 @@ mod tests {
         assert_eq!(f.config_path, PathBuf::from("cli.toml"));
         assert_eq!(f.bind_addr, "127.0.0.1:8080");
         assert!(f.preflight && f.foreground);
+    }
+
+    /// task-61 D-11：管理面绑定环境解析——`IOT_DAQ_MGMT_BIND` 优先 >
+    /// `IOT_DAQ_HTTP_BIND`(+`IOT_DAQ_HTTP_PORT`) > None（回落内置默认）。
+    #[test]
+    fn mgmt_bind_from_env_resolution_order() {
+        // 两者皆无 → None（resolve_args_with 回落 127.0.0.1:8080）。
+        assert_eq!(mgmt_bind_from_env(None, None, None), None);
+
+        // MGMT_BIND 优先（HTTP_* 同时在场也被忽略）。
+        assert_eq!(
+            mgmt_bind_from_env(
+                Some("0.0.0.0:9090".to_string()),
+                Some("0.0.0.0:7070".to_string()),
+                Some("1234".to_string()),
+            ),
+            Some("0.0.0.0:9090".to_string())
+        );
+
+        // MGMT_BIND 空白 = 未配置 → 回落 HTTP_BIND。
+        assert_eq!(
+            mgmt_bind_from_env(
+                Some("   ".to_string()),
+                Some("0.0.0.0:7070".to_string()),
+                None,
+            ),
+            Some("0.0.0.0:7070".to_string())
+        );
+
+        // HTTP_BIND 含端口 → 原样使用（HTTP_PORT 忽略）。
+        assert_eq!(
+            mgmt_bind_from_env(
+                None,
+                Some("0.0.0.0:7070".to_string()),
+                Some("1234".to_string())
+            ),
+            Some("0.0.0.0:7070".to_string())
+        );
+
+        // HTTP_BIND 不含端口 + HTTP_PORT → 拼接。
+        assert_eq!(
+            mgmt_bind_from_env(None, Some("0.0.0.0".to_string()), Some("7070".to_string())),
+            Some("0.0.0.0:7070".to_string())
+        );
+
+        // HTTP_BIND 不含端口、无 HTTP_PORT → 默认端口兜底。
+        assert_eq!(
+            mgmt_bind_from_env(None, Some("0.0.0.0".to_string()), None),
+            Some("0.0.0.0:8080".to_string())
+        );
+
+        // 空白 HTTP_BIND / HTTP_PORT = 未配置。
+        assert_eq!(
+            mgmt_bind_from_env(None, Some("  ".to_string()), Some("  ".to_string())),
+            None
+        );
+        // 前后空白 trim。
+        assert_eq!(
+            mgmt_bind_from_env(Some(" 0.0.0.0:9090 \n".to_string()), None, None),
+            Some("0.0.0.0:9090".to_string())
+        );
     }
 }

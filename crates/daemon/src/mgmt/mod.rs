@@ -404,6 +404,9 @@ pub fn router(state: MgmtState) -> Router {
 
     Router::new()
         .route("/api/health", get(health))
+        // task-61 D-01：`/healthz` 别名（与 `/api/health` 完全等价）——部署文档
+        // 与 install.sh 的健康判据统一走 `/healthz`，两个路径共享同一 handler。
+        .route("/healthz", get(health))
         .route("/api/status", get(status))
         // 读接口形状不变；写接口（writeapi）自带 AuthedRole extractor（401）
         // + ensure()（403）+ 审计，不经过 ops_guard（动作映射仅覆盖 /api/ops/*）。
@@ -973,6 +976,18 @@ frequency_ms = 500
         let port = spawn_server(test_state()).await;
         let (status, _, body) = http_get(port, "/api/health").await;
         assert_eq!(status, 200);
+        let value: Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// QA（task-61 D-01）：`/healthz` 别名与 `/api/health` 完全等价
+    /// （200 + 同 payload）——部署文档 / install.sh 的健康判据。
+    #[tokio::test]
+    async fn healthz_alias_matches_api_health() {
+        let port = spawn_server(test_state()).await;
+        let (status, _, body) = http_get(port, "/healthz").await;
+        assert_eq!(status, 200, "/healthz alias must answer 200");
         let value: Value = serde_json::from_str(&body).expect("json body");
         assert_eq!(value["status"], "ok");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));

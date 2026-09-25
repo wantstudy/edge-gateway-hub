@@ -1,52 +1,82 @@
 # iot-daq 网关默认配置模板（占位值，现场由持久卷 config/ 覆盖）
-# 权威设计：docs/design/container-deploy.md
+#
 # ⚠️ 本文件随镜像层分发 → 属公开内容 → 严禁写任何真实凭据 / 密钥 / 激活码。
+# ⚠️ 本模板的**每一行**都必须在 daemon 的 GatewayConfig schema 内
+#    （crates/daemon/src/config.rs：gateway / outlets / points / devices / mgmt_auth）。
+#    schema 之外的段会被 serde **静默忽略**（D-07 教训：惰性摆设比缺失更危险）。
+#
+# 以下部署参数不属于 TOML schema，全部经**环境变量**注入（勿写进本文件）：
+#   - 指纹 HMAC 盐：IOT_DAQ_FINGERPRINT_KEY（env）或 IOT_DAQ_FINGERPRINT_KEY_FILE（secret 文件路径）
+#   - 宿主锚点 / MAC：IOT_DAQ_HOST_ANCHOR_ROOT、IOT_DAQ_HOST_MACHINE_ID_PATH、
+#     IOT_DAQ_HOST_MAC、IOT_DAQ_HOST_FINGERPRINT_FILE
+#   - 数据根目录覆盖：IOT_DAQ_DATA_DIR（存在且非空时优先于下方 data_dir）
+#   - 管理面绑定：IOT_DAQ_MGMT_BIND（或 IOT_DAQ_HTTP_BIND / IOT_DAQ_HTTP_PORT）
+#   - 日志：IOT_DAQ_LOG_LEVEL / IOT_DAQ_LOG_JSON
+#
+# 权威设计：docs/design/container-deploy.md + container-persistence-layout.md
 
 [gateway]
-# 管理面监听（host 网络下即宿主端口）
-http_bind = "0.0.0.0"
-http_port = 8080
-# Web 控制台静态资源目录（镜像内路径）
-web_console_dir = "/srv/web-console"
-
-[storage]
-# 全部状态落宿主持久卷（陷阱 2 红线）
+# 网关标识（平台侧登记；缺省占位，现场覆盖）
+gateway_id = "gw-unset"
+# 数据根目录（陷阱 2 红线：设备签名密钥 / 试用标记 / 审计库全部落在这里）。
+# 容器形态：宿主持久卷挂载点 /var/lib/iot-daq（勿用容器内相对路径——
+# docker rm && docker run 即重置授权状态）。本地开发可省略本键（默认相对 data）。
 data_dir = "/var/lib/iot-daq"
-queue_db = "/var/lib/iot-daq/queue.db"
-telemetry_db = "/var/lib/iot-daq/telemetry.db"
-config_dir = "/var/lib/iot-daq/config"
-logs_dir = "/var/lib/iot-daq/logs"
 
-[fingerprint]
-# 宿主锚点（容器内只读挂载到此路径，陷阱 1 红线）
-host_machine_id = "/host/etc/machine-id"
-host_dmi_dir = "/host/sys/class/dmi/id"
-# 宿主 MAC 指纹文件（安装脚本生成，只读挂载）
-host_fingerprint_file = "/var/lib/iot-daq/host-fingerprint.json"
-# 宿主 MAC 经环境变量注入（daemon EnvAnchor 读取）
-host_mac_env = "IOT_DAQ_HOST_MAC"
-# 指纹 HMAC 盐：从文件读取，禁止内联
-fingerprint_key_file = "/run/secrets/iot-daq-fingerprint-key"
-# N-of-M 配额（与 task 41 口径一致：命中 ≥4/5 判同机）
-anchor_quorum_min = 3
+[gateway.licensing]
+# 云授权服务地址（离线现场留空 = 纯本地模式；未配置授权时北向闸门恒放行）
+cloud_url = ""
+# 心跳间隔（秒；默认 24h，与 auth::client 口径一致）
+heartbeat_interval_secs = 86400
+# 激活码是**敏感凭据**：默认注释掉（未配置 = 不启用云端激活）。
+# 真实值经 env IOTDAQ_ACTIVATION_CODE 注入；本文件只允许占位符。
+# activation_code = "IOTDAQ-0000-0000-0000-0000"
+# 试用 / 离线宽限天数（与 TRIAL_DAYS=3 / GRACE_DAYS=7 口径一致）
+trial_days = 3
+grace_days = 7
 
-[license]
-server_url = ""          # 离线现场留空
-heartbeat_secs = 300
-grace_secs = 86400
-license_dir = "/var/lib/iot-daq/license"
-trial_dir = "/var/lib/iot-daq/trial"
+[gateway.cache]
+# 本地缓存库（相对 data_dir）
+sqlite_path = "cache.db"
+# 缓存上限（MB；超出后按环形覆盖策略淘汰）
+max_size_mb = 512
+# 保留天数（离线缓存 ≥7 天）
+retention_days = 7
 
-[logging]
-level = "info"
-json = false
-# 审计 / 授权判定记录落持久卷，不走 stdout（container-deploy.md §2.4）
-audit_dir = "/var/lib/iot-daq/logs"
+[gateway.security]
+# Web 管理界面账号鉴权开关（缺省 true = 强制账号密码）
+web_auth_enabled = true
+# tls_cert_path / tls_key_path 可选（北向/界面 TLS 证书与私钥路径）
 
-[integrity]
-# 运行时自检失败行为：restricted（停北向）| refuse（拒绝启动）
-tamper_policy = "restricted"
+# ---- 以下段默认注释：按现场需求取消注释（示例值即 schema 字段名） ----
 
-[serial]
-# 串口在 compose 中以 devices 声明；此处仅列逻辑名，实际节点由 env 注入
-group = "dialout"
+# [[outlets]]
+# name = "north-1"
+# broker = "mqtts://broker.local:8883"
+# topic_prefix = "telemetry"
+# qos = 1
+# tls = true
+# encoding = "protobuf"                  # protobuf（默认）/ json
+# ca_cert_path = "/certs/ca.crt"         # 可选；缺省用操作系统根证书库
+# client_cert_path = "/certs/client.crt" # 可选；mTLS（与 client_key_path 成对）
+# client_key_path = "/certs/client.key"
+# server_name = "broker.local"           # 可选；SNI 覆盖（不是跳过校验开关）
+# alpn = ["mqtt"]
+
+# [[points]]
+# device_id = "dev-01"
+# point_id = "40001"                     # 点位标识（南向寄存器地址，如 Modbus 5 位编址）
+# protocol = "modbus-tcp"                # modbus-tcp / modbus-rtu / opcua / s7 / mc / http / mqtt
+# address = "192.168.1.10:502"           # 设备接入地址
+# frequency_ms = 1000                    # 采集频率（毫秒）
+
+# [[devices]]
+# device_id = "dev-01"
+# name = "一号设备"                       # 可选；显示名
+# enabled = true
+
+# [mgmt_auth]
+# [[mgmt_auth.users]]
+# name = "ops"
+# role = "ops"                           # ops / lic_ops / risk / system
+# password_hash = "<sha256(password) 的 hex>"
