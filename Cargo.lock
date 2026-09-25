@@ -1362,6 +1362,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "ed25519-dalek",
+ "hmac",
  "parking_lot",
  "rand 0.9.5",
  "rusqlite",

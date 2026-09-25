@@ -14,9 +14,12 @@ thiserror = "2"
 ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 # base64 编解码（密钥从环境变量注入、Token 传输）。
 base64 = "0.23"
-# SHA-256：回执语义哈希（与 daemon 侧 `semantic_digest` 同族）。
-# ⚠️ 仅在**回执**管线使用——Lease Token 是**直签域串、无预哈希**，两条管线不可混用。
+# SHA-256：回执语义哈希（与 daemon 侧 `semantic_digest` 同族）；亦用于管理面
+# JWT（HS256）签名与管理员口令摘要（镜像 daemon `mgmt/auth_jwt.rs` 口径）。
 sha2 = "0.10"
+# HMAC：管理面 JWT（HS256）签名（daemon mgmt 面同一实现口径；纯 Rust，已在
+# workspace 依赖树中——daemon 依赖同版本，零新增下载）。
+hmac = "0.12"
 # 序列化（Token 载荷、API 请求响应）。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

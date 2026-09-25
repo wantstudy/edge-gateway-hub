@@ -35,6 +35,14 @@ pub const ERR_LICENSE_BOUND_OTHER_DEVICE: u16 = 1130;
 pub const ERR_LICENSE_ACTIVATION_SIG: u16 = 1140;
 /// 授权域错误码：激活请求设备公钥与库中钉定公钥不一致（2026-09-25 主理人决策）。
 pub const ERR_LICENSE_ACTIVATION_PUBKEY: u16 = 1150;
+/// 授权域错误码：废弃确认串不符（`confirm_tail8`，设计 §2.2，HTTP 412）。
+pub const ERR_LICENSE_CONFIRM: u16 = 1160;
+/// 授权域错误码：废弃原因缺失（`reason` 必填，设计 §2.2，HTTP 400）。
+pub const ERR_LICENSE_REASON: u16 = 1170;
+/// 授权域错误码：管理端未认证（缺 token / token 无效或过期，HTTP 401）。
+pub const ERR_LICENSE_ADMIN_AUTH: u16 = 1180;
+/// 授权域错误码：管理端角色越权（RBAC 门控拒绝，HTTP 403）。
+pub const ERR_LICENSE_ADMIN_RBAC: u16 = 1190;
 
 /// licensing-server 主错误枚举。
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +162,32 @@ pub enum LicenseError {
     /// wire code `ACTIVATION_PUBKEY_MISMATCH`（HTTP **403**）。
     #[error("LicenseError: activation pubkey mismatch: {0}")]
     ActivationPubkeyMismatch(String),
+
+    /// 废弃确认串不符（`confirm_tail8` 与激活码尾 8 位不匹配）。
+    ///
+    /// 对应业务码 `CONFIRM_MISMATCH`（HTTP **412**，设计 §2.2 高危操作二次确认契约）。
+    /// **结构化变体**：绝不用 `msg.contains` 反查——消息不含激活码原文（防泄漏）。
+    #[error("LicenseError: confirm mismatch: {0}")]
+    ConfirmMismatch(String),
+
+    /// 废弃原因缺失（`reason` 为空白）。
+    ///
+    /// 对应业务码 `REASON_REQUIRED`（HTTP **400**，设计 §2.2）。
+    #[error("LicenseError: reason required: {0}")]
+    ReasonRequired(String),
+
+    /// 管理端未认证（缺 Bearer token / token 无效 / token 过期）。
+    ///
+    /// 对应业务码 `SESSION_EXPIRED`（HTTP **401**，设计 §2 通用错误）。
+    /// 消息**不含** token 原文（错误会进日志）。
+    #[error("LicenseError: admin unauthorized: {0}")]
+    Unauthorized(String),
+
+    /// 管理端角色越权（已认证但 RBAC 门控拒绝该操作）。
+    ///
+    /// 对应业务码 `ADMIN_ONLY`（HTTP **403**，设计 §2 / §4）。
+    #[error("LicenseError: admin forbidden: {0}")]
+    Forbidden(String),
 }
 
 /// 预绑定冲突的细分种类。
@@ -267,6 +301,26 @@ impl LicenseError {
         LicenseError::ActivationPubkeyMismatch(message.into())
     }
 
+    /// 构造「废弃确认串不符」错误（HTTP 412，`CONFIRM_MISMATCH`）。
+    pub fn confirm_mismatch(message: impl Into<String>) -> Self {
+        LicenseError::ConfirmMismatch(message.into())
+    }
+
+    /// 构造「废弃原因缺失」错误（HTTP 400，`REASON_REQUIRED`）。
+    pub fn reason_required(message: impl Into<String>) -> Self {
+        LicenseError::ReasonRequired(message.into())
+    }
+
+    /// 构造「管理端未认证」错误（HTTP 401，`SESSION_EXPIRED`）。
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        LicenseError::Unauthorized(message.into())
+    }
+
+    /// 构造「管理端角色越权」错误（HTTP 403，`ADMIN_ONLY`）。
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        LicenseError::Forbidden(message.into())
+    }
+
     /// 错误码（u16，非零）。
     pub fn error_code(&self) -> u16 {
         match self {
@@ -286,6 +340,10 @@ impl LicenseError {
             LicenseError::FieldWhitelistViolation(_) => ERR_LICENSE_RECEIPT,
             LicenseError::ActivationSignatureInvalid(_) => ERR_LICENSE_ACTIVATION_SIG,
             LicenseError::ActivationPubkeyMismatch(_) => ERR_LICENSE_ACTIVATION_PUBKEY,
+            LicenseError::ConfirmMismatch(_) => ERR_LICENSE_CONFIRM,
+            LicenseError::ReasonRequired(_) => ERR_LICENSE_REASON,
+            LicenseError::Unauthorized(_) => ERR_LICENSE_ADMIN_AUTH,
+            LicenseError::Forbidden(_) => ERR_LICENSE_ADMIN_RBAC,
         }
     }
 }
@@ -367,6 +425,19 @@ mod tests {
                 LicenseError::activation_pubkey_mismatch("pubkey drift"),
                 ERR_LICENSE_ACTIVATION_PUBKEY,
             ),
+            (
+                LicenseError::confirm_mismatch("tail8 mismatch"),
+                ERR_LICENSE_CONFIRM,
+            ),
+            (
+                LicenseError::reason_required("empty reason"),
+                ERR_LICENSE_REASON,
+            ),
+            (
+                LicenseError::unauthorized("no token"),
+                ERR_LICENSE_ADMIN_AUTH,
+            ),
+            (LicenseError::forbidden("role gate"), ERR_LICENSE_ADMIN_RBAC),
         ];
         let mut seen = std::collections::HashSet::new();
         for (err, code) in cases {

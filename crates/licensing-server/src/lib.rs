@@ -33,6 +33,7 @@
 //! 签名私钥**只经环境变量注入**（[`keys::KeyRing::register_from_b64`]），
 //! 绝不写入数据库、绝不写入日志、绝不进仓库（[`model::SigningKey`] 只存公钥与 `hsm_ref`）。
 
+pub mod admin_auth;
 pub mod audit;
 pub mod device_auth;
 pub mod error;

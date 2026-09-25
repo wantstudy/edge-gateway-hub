@@ -32,7 +32,7 @@ use crate::error::{LicenseError, LicenseResult, PrebindKind};
 use crate::keys::KeyRing;
 use crate::model::{
     now_ns_id, now_unix_secs, ActivationCode, ActorType, AuditLog, CodeStatus, Device,
-    DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, VerifyMode,
+    DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, Tenant, VerifyMode,
 };
 use crate::proto::{
     ActivationRequest, ActivationResponse, AuditReceiptRequest, AuditReceiptResponse, GapKind,
@@ -454,15 +454,16 @@ impl LicensingService {
             ));
         }
 
+        // 高危操作契约校验（设计 §2.2，先于幂等短路——confirm_tail8 是操作者侧的
+        // 「我确实要废弃这张码」确认，对已废弃码的重复提交同样强制）：
+        // - reason 必填（空白 → REASON_REQUIRED，400）；
+        // - note ≥ 10 字符（不足 → BAD_REQUEST）；
+        // - confirm_tail8 与码值尾 8 位一致（不符 → CONFIRM_MISMATCH，412）。
+        Self::validate_revoke_contract(&code, req)?;
+
         // G2：已废弃 = 幂等 no-op（fail-closed）。
         if matches!(code.status, CodeStatus::Revoked) {
             return Ok(());
-        }
-
-        if req.reason.trim().is_empty() {
-            return Err(LicenseError::KeyStateIllegal(
-                "revoke requires a non-empty reason".into(),
-            ));
         }
 
         self.store.revoke_code(code_id, &req.reason, now)?;
@@ -473,6 +474,130 @@ impl LicensingService {
             "activation_code",
             code_id,
             now,
+        )?;
+        Ok(())
+    }
+
+    /// 废弃契约校验（设计 §2.2；**结构化错误变体**，绝不 msg.contains）。
+    ///
+    /// - `reason` 空白 → [`LicenseError::ReasonRequired`]（400 `REASON_REQUIRED`）；
+    /// - `note` 少于 10 字符（`trim` 后按 Unicode 字符计数）→
+    ///   [`LicenseError::KeyStateIllegal`]（400 `BAD_REQUEST`）；
+    /// - `confirm_tail8` 与码值「去分隔符后尾 8 位（大写）」不一致（含空白）→
+    ///   [`LicenseError::ConfirmMismatch`]（412 `CONFIRM_MISMATCH`）。
+    ///   与 admin-console `tail8Of` 逐字段同构：`code.replace(/[^0-9A-Za-z]/g,'')
+    ///   .slice(-8).toUpperCase()`。
+    ///
+    /// 消息**不含**激活码原文与 confirm 值（错误会进日志与响应体）。
+    fn validate_revoke_contract(
+        code: &ActivationCode,
+        req: &RevokeCodeRequest,
+    ) -> LicenseResult<()> {
+        if req.reason.trim().is_empty() {
+            return Err(LicenseError::reason_required(
+                "revoke requires a non-empty reason",
+            ));
+        }
+        if req.note.trim().chars().count() < 10 {
+            return Err(LicenseError::KeyStateIllegal(
+                "revoke note must be at least 10 characters".into(),
+            ));
+        }
+        let expected_tail8: String = code
+            .code
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .rev()
+            .take(8)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+            .to_uppercase();
+        let supplied = req.confirm_tail8.trim().to_uppercase();
+        if supplied.is_empty() || supplied != expected_tail8 {
+            return Err(LicenseError::confirm_mismatch(
+                "confirm_tail8 does not match the activation code tail",
+            ));
+        }
+        Ok(())
+    }
+
+    // ----------------------------- 管理端：租户自举 / 策略 -----------------------------
+
+    /// 创建租户（`POST /admin/tenants`；新部署自举必需——issue 对不存在租户直接拒绝）。
+    ///
+    /// - `tenant_id` / `name` 空白 → [`LicenseError::KeyStateIllegal`]（400）；
+    /// - 租户已存在 → [`LicenseError::KeyStateIllegal`]（400，幂等键不适用：创建
+    ///   请求天然低频且要求显式唯一 ID）；
+    /// - `verify_mode` 非法 → 由 [`VerifyMode::parse`] 归一为 400；
+    /// - 成功后写审计（actor = 登录用户名）。
+    pub fn admin_create_tenant(
+        &self,
+        tenant_id: &str,
+        name: &str,
+        contact: &str,
+        verify_mode_raw: Option<&str>,
+        actor_id: &str,
+    ) -> LicenseResult<Tenant> {
+        let tenant_id = tenant_id.trim();
+        let name = name.trim();
+        if tenant_id.is_empty() || name.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "create tenant requires non-empty tenant_id and name".into(),
+            ));
+        }
+        if self.store.get_tenant(tenant_id)?.is_some() {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "tenant already exists: {tenant_id}"
+            )));
+        }
+        let verify_mode = match verify_mode_raw {
+            Some(raw) if !raw.trim().is_empty() => VerifyMode::parse(raw).map_err(|_| {
+                LicenseError::KeyStateIllegal(format!("invalid verify_mode_default: {raw}"))
+            })?,
+            _ => VerifyMode::B,
+        };
+        let tenant = Tenant {
+            tenant_id: tenant_id.to_string(),
+            name: name.to_string(),
+            verify_mode_default: verify_mode,
+            contact: contact.trim().to_string(),
+            created_at: now_unix_secs(),
+        };
+        self.store.insert_tenant(&tenant)?;
+        self.audit(
+            tenant_id,
+            actor_id,
+            "tenant_create",
+            "tenant",
+            tenant_id,
+            now_unix_secs(),
+        )?;
+        Ok(tenant)
+    }
+
+    /// 更新租户默认校验档位（`PUT /admin/tenants/:id/policy`）。
+    ///
+    /// 租户不存在 → [`LicenseError::KeyStateIllegal`]（400）；档位非法 → 400。
+    /// 成功后写审计（actor = 登录用户名）。
+    pub fn admin_update_tenant_policy(
+        &self,
+        tenant_id: &str,
+        verify_mode_raw: &str,
+        actor_id: &str,
+    ) -> LicenseResult<()> {
+        let verify_mode = VerifyMode::parse(verify_mode_raw).map_err(|_| {
+            LicenseError::KeyStateIllegal(format!("invalid verify_mode_default: {verify_mode_raw}"))
+        })?;
+        self.store.update_tenant_policy(tenant_id, verify_mode)?;
+        self.audit(
+            tenant_id,
+            actor_id,
+            "tenant_policy_update",
+            "tenant",
+            tenant_id,
+            now_unix_secs(),
         )?;
         Ok(())
     }
@@ -1632,11 +1757,24 @@ mod tests {
             .expect("device must exist")
     }
 
-    fn revoke_req(reason: &str) -> RevokeCodeRequest {
+    /// 构造废弃请求（`confirm_tail8` 按码值尾 8 位计算，与 HTTP 契约同构）。
+    fn revoke_req(code_value: &str, reason: &str) -> RevokeCodeRequest {
+        let tail8: String = code_value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_uppercase()
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         RevokeCodeRequest {
             reason: reason.to_string(),
             note: "note note note".to_string(),
-            confirm_tail8: "tail1234".to_string(),
+            confirm_tail8: tail8,
             second_approver: None,
         }
     }
@@ -1708,8 +1846,13 @@ mod tests {
             .issue_codes(&issue_req("t-1", None, "g2-issue"))
             .unwrap();
         let code_id = resp.codes[0].code_id.clone();
-        svc.revoke("t-1", &code_id, &revoke_req("compromised"), "admin")
-            .unwrap();
+        svc.revoke(
+            "t-1",
+            &code_id,
+            &revoke_req(&resp.codes[0].code, "compromised"),
+            "admin",
+        )
+        .unwrap();
 
         let r1 = svc
             .reissue("t-1", &code_id, &reissue_req(None, "g2-reissue"), "admin")
@@ -1819,8 +1962,13 @@ mod tests {
             .issue_codes(&issue_req("t-1", None, "g3-issue-g"))
             .unwrap();
         let code_id = resp.codes[0].code_id.clone();
-        svc.revoke("t-1", &code_id, &revoke_req("x"), "admin")
-            .unwrap();
+        svc.revoke(
+            "t-1",
+            &code_id,
+            &revoke_req(&resp.codes[0].code, "x"),
+            "admin",
+        )
+        .unwrap();
 
         // 重发预绑定到 M-X 与已用码冲突 → MachineAlreadyClaimed。
         let err = svc
@@ -1867,7 +2015,8 @@ mod tests {
             .issue_codes(&issue_req("t-1", None, "g4-issue-b"))
             .unwrap();
         let cid = resp2.codes[0].code_id.clone();
-        svc.revoke("t-1", &cid, &revoke_req("x"), "admin").unwrap();
+        svc.revoke("t-1", &cid, &revoke_req(&resp2.codes[0].code, "x"), "admin")
+            .unwrap();
         let r = svc
             .reissue(
                 "t-1",
@@ -1919,7 +2068,8 @@ mod tests {
             .issue_codes(&issue_req("t-1", None, "g5-issue"))
             .unwrap();
         let cid = resp.codes[0].code_id.clone();
-        svc.revoke("t-1", &cid, &revoke_req("x"), "admin").unwrap();
+        svc.revoke("t-1", &cid, &revoke_req(&resp.codes[0].code, "x"), "admin")
+            .unwrap();
         let r1 = svc
             .reissue("t-1", &cid, &reissue_req(None, "  g5-reissue  "), "admin")
             .unwrap();
@@ -2250,7 +2400,7 @@ mod tests {
             .unwrap();
         let cid = resp.codes[0].code_id.clone();
         let code = resp.codes[0].code.clone();
-        svc.revoke("t-1", &cid, &revoke_req("gone"), "admin")
+        svc.revoke("t-1", &cid, &revoke_req(&code, "gone"), "admin")
             .unwrap();
 
         let err = svc
@@ -2378,11 +2528,21 @@ mod tests {
             .issue_codes(&issue_req("t-1", None, "g-state-issue-b"))
             .unwrap();
         let cid = resp.codes[0].code_id.clone();
-        svc.revoke("t-1", &cid, &revoke_req("first"), "admin")
-            .unwrap();
+        svc.revoke(
+            "t-1",
+            &cid,
+            &revoke_req(&resp.codes[0].code, "first"),
+            "admin",
+        )
+        .unwrap();
         // 再次废弃：幂等成功（no-op）。
         assert!(svc
-            .revoke("t-1", &cid, &revoke_req("second"), "admin")
+            .revoke(
+                "t-1",
+                &cid,
+                &revoke_req(&resp.codes[0].code, "second"),
+                "admin"
+            )
             .is_ok());
         let stored = svc.store().get_code_by_id(&cid).unwrap().unwrap();
         assert_eq!(stored.status, CodeStatus::Revoked);

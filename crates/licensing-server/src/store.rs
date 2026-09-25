@@ -628,6 +628,27 @@ impl Store {
         Ok(out)
     }
 
+    /// 更新租户默认校验档位（管理端 `PUT /admin/tenants/:id/policy`）。
+    ///
+    /// 租户不存在 → [`LicenseError::KeyStateIllegal`]（HTTP 层映射 400）。
+    pub fn update_tenant_policy(
+        &self,
+        tenant_id: &str,
+        verify_mode: VerifyMode,
+    ) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        let affected = conn.execute(
+            "UPDATE tenant SET verify_mode_default = ?2 WHERE tenant_id = ?1",
+            params![tenant_id, verify_mode.as_str()],
+        )?;
+        if affected == 0 {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "tenant not found: {tenant_id}"
+            )));
+        }
+        Ok(())
+    }
+
     // ================= device =================
 
     /// 插入设备（`machine_code` 唯一；重复插入返回 [`LicenseError::Storage`]）。
@@ -1396,6 +1417,44 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// 分页列出**全部异常回执**（`gap_flag = 1`，管理端 `GET /admin/receipts/anomalies`）。
+    ///
+    /// 按 `received_at` 降序（最新异常在前）。
+    pub fn list_anomalous_receipts(
+        &self,
+        page: u32,
+        page_size: u32,
+    ) -> LicenseResult<Vec<AuditReceipt>> {
+        let page = page.max(1);
+        let page_size = page_size.max(1);
+        let offset = to_i64(((page - 1) as usize) * page_size as usize, "receipt offset")?;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, lease_id, device_mid, seq_from, seq_to, count, payload_digest, ts, sig,
+                    received_at, gap_flag
+             FROM audit_receipt WHERE gap_flag = 1
+             ORDER BY received_at DESC, rowid DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![i64::from(page_size), offset], row_to_receipt)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 统计异常回执数（`gap_flag = 1`）。
+    pub fn count_anomalous_receipts(&self) -> LicenseResult<u64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_receipt WHERE gap_flag = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        to_u64(count, "anomalous receipt count")
     }
 
     /// 更新某回执的跳空标记（风控扫描置位 / 人工核实后复位）。

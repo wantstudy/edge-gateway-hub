@@ -477,6 +477,8 @@ pub struct CodeListQuery {
     pub order_id: Option<String>,
     /// 页码（从 1 起）。
     pub page: Option<u32>,
+    /// 每页条数（缺省 20，上限 200）。
+    pub page_size: Option<u32>,
 }
 
 /// 码值列表项（设计 §2.4，**码值掩码显示**）。
@@ -555,6 +557,8 @@ pub struct DeviceListQuery {
     pub machine_code: Option<String>,
     /// 页码。
     pub page: Option<u32>,
+    /// 每页条数（缺省 20，上限 200）。
+    pub page_size: Option<u32>,
 }
 
 /// 设备列表项（设计 §2.6，**机器码掩码**）。
@@ -595,6 +599,8 @@ pub struct AuditLogQuery {
     pub time_to: Option<String>,
     /// 页码。
     pub page: Option<u32>,
+    /// 每页条数（缺省 20，上限 200）。
+    pub page_size: Option<u32>,
 }
 
 /// 审计日志项（设计 §2.7）。
@@ -612,6 +618,154 @@ pub struct AuditLogItem {
     pub detail: String,
     /// 来源 IP。
     pub ip: String,
+}
+
+// ============================================================================
+// §2.0 管理端登录 / 总览 / 租户 / 密钥 / 回执异常（admin-console 联调补齐）
+// ============================================================================
+
+/// `POST /admin/auth/login` 请求体（设计 §4 管理后台自身安全）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdminLoginRequest {
+    /// 用户名。
+    #[serde(default)]
+    pub username: String,
+    /// 口令（服务端 SHA-256 恒时比对，明文不落盘不落日志）。
+    #[serde(default)]
+    pub password: String,
+}
+
+/// `POST /admin/auth/login` 响应体。
+///
+/// token 为 HS256 JWT（1h TTL）；后续 `/admin/*` 请求以
+/// `Authorization: Bearer <token>` 携带。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminLoginResponse {
+    /// 会话 token（HS256 JWT）。
+    pub token: String,
+    /// 规范角色（`ops / lic_ops / risk / system`）。
+    pub role: String,
+}
+
+/// `GET /admin/overview` 响应体（总览聚合；**全部计数为 String**，大数红线）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverviewResponse {
+    /// 租户总数。
+    pub tenants: String,
+    /// 设备总数。
+    pub devices: String,
+    /// 激活码总数。
+    pub codes_total: String,
+    /// 处于 `issued` 状态的激活码数。
+    pub codes_issued: String,
+    /// 处于 `bound` 状态的激活码数（= 已授权设备数）。
+    pub codes_bound: String,
+    /// 处于 `revoked` 状态的激活码数。
+    pub codes_revoked: String,
+    /// 处于 `reissued` 状态的激活码数。
+    pub codes_reissued: String,
+    /// 异常回执数（`gap_flag = 1`：跳空 / 回退 / 缺失）。
+    pub receipts_anomalous: String,
+    /// 当前活跃签名密钥 kid（无活跃密钥为 `None`）。
+    pub active_kid: Option<String>,
+}
+
+/// 通用分页信封（设计 §2.4-2.7 的 `{ items, total, page }` 形状 + page_size）。
+///
+/// **total / page / page_size 一律 String**（大数红线：计数器字段不进 JSON number）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PagedResponse<T> {
+    /// 本页条目。
+    pub items: Vec<T>,
+    /// 总条数（**String**）。
+    pub total: String,
+    /// 当前页码（从 1 起，**String**）。
+    pub page: String,
+    /// 每页条数（**String**）。
+    pub page_size: String,
+}
+
+/// 租户列表 / 创建响应条目。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantItem {
+    /// 租户 ID。
+    pub tenant_id: String,
+    /// 租户名称。
+    pub name: String,
+    /// 默认校验档位（`A` / `B` / `C`）。
+    pub verify_mode_default: String,
+    /// 联系方式。
+    pub contact: String,
+    /// 创建时刻（UTC 秒，**String**）。
+    pub created_at: String,
+}
+
+/// `POST /admin/tenants` 请求体（新部署自举必需）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateTenantRequest {
+    /// 租户 ID（全局唯一主键）。
+    #[serde(default)]
+    pub tenant_id: String,
+    /// 租户名称。
+    #[serde(default)]
+    pub name: String,
+    /// 联系方式（可空）。
+    #[serde(default)]
+    pub contact: String,
+    /// 默认校验档位（缺省 `B`）。
+    #[serde(default)]
+    pub verify_mode_default: Option<String>,
+}
+
+/// `PUT /admin/tenants/{id}/policy` 请求体。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateTenantPolicyRequest {
+    /// 默认校验档位（`A` / `B` / `C`）。
+    #[serde(default)]
+    pub verify_mode_default: String,
+}
+
+/// 回执异常条目（`GET /admin/receipts/anomalies`；数据源 = 回执账本
+/// `audit_receipt_warning` 表——跳空 / 回退 / 缺失告警的权威落点）。
+///
+/// **序号 / 时间一律 String**（uint64 序号，大数红线）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptAnomalyItem {
+    /// 告警行 ID。
+    pub id: String,
+    /// 设备机器码指纹。
+    pub device_mid: String,
+    /// 租约 ID。
+    pub lease_id: String,
+    /// 异常类别（`gap` / `overlap` / `missing`）。
+    pub kind: String,
+    /// 区间起始序号（**String**）。
+    pub seq_from: String,
+    /// 区间结束序号（**String**）。
+    pub seq_to: String,
+    /// 判定时的 cursor 前沿（**String**）。
+    pub last_seq_to: String,
+    /// 告警明细（与设备侧响应 `warnings` 同文）。
+    pub detail: String,
+    /// 记录时间（UTC 秒，**String**）。
+    pub created_at: String,
+}
+
+/// 签名密钥条目（`GET /admin/keys`；**只含公钥**，私钥绝不落库不下发）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigningKeyItem {
+    /// 密钥 ID。
+    pub kid: String,
+    /// 状态（`active` / `retiring` / `retired`）。
+    pub status: String,
+    /// 公钥（base64）。
+    pub public_key: String,
+    /// HSM 引用（可选）。
+    pub hsm_ref: Option<String>,
+    /// 启用时刻（UTC 秒，**String**）。
+    pub enabled_at: String,
+    /// 退役时刻（UTC 秒，**String**，未退役为 `None`）。
+    pub retired_at: Option<String>,
 }
 
 // ============================================================================

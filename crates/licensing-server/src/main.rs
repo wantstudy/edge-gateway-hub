@@ -15,7 +15,12 @@
 //! - `IOT_DAQ_LOG_LEVEL`：最低日志级别（默认 `info`，EnvFilter 语法）；
 //! - `IOT_DAQ_LICENSE_SIGNING_KID` + `IOT_DAQ_LICENSE_SIGNING_KEY`：Lease Token
 //!   签名私钥注入（**成对出现才注册**；b64 Ed25519 32/64 字节；缺失时签发端点
-//!   fail-closed，验签路径不受影响——不猜测意图、不生成临时密钥）。
+//!   fail-closed，验签路径不受影响——不猜测意图、不生成临时密钥）；
+//! - `IOTDAQ_ADMIN_PASSWORD_SHA256`（64 hex，生产推荐）或 `IOTDAQ_ADMIN_PASSWORD`
+//!   （明文，引导用）：初始管理员凭据（fail-closed：皆缺 → 登录全拒）；
+//! - `IOTDAQ_ADMIN_USER`：初始管理员用户名（缺省 `admin`）；
+//! - `IOTDAQ_JWT_SECRET`：管理端 JWT 签名密钥（任意非空字符串，SHA-256 归一为
+//!   32 字节；缺省 → 内置 dev 密钥 + warn，仅限本地）。
 //!
 //! 退出码：`0` = 正常退出；`1` = 启动失败（数据库打开 / 端口绑定失败）。
 
@@ -24,6 +29,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use licensing_server::admin_auth::AdminAuth;
 use licensing_server::http;
 use licensing_server::keys::KeyRing;
 use licensing_server::service::LicensingService;
@@ -110,6 +116,10 @@ fn register_signing_key_from_env(keyring: &KeyRing) {
 
 /// 装配并运行服务（错误收敛为可读消息，由 main 映射退出码）。
 ///
+/// 管理端凭据经环境变量注入（[`AdminAuth::from_env_fn`]：`IOTDAQ_ADMIN_PASSWORD`
+/// / `IOTDAQ_ADMIN_PASSWORD_SHA256` + `IOTDAQ_JWT_SECRET`；fail-closed——
+/// 零账号时 `/admin/auth/login` 全拒）。
+///
 /// # Errors
 /// 数据库打开失败 / 端口绑定失败 / serve 异常时返回 `Err(String)`。
 async fn run(listen: String, db_path: PathBuf) -> Result<(), String> {
@@ -119,6 +129,9 @@ async fn run(listen: String, db_path: PathBuf) -> Result<(), String> {
     register_signing_key_from_env(&keyring);
     let service = Arc::new(LicensingService::new(store, keyring));
 
+    // 管理端鉴权器（env 注入；测试可替换为显式构造）。
+    let auth = Arc::new(AdminAuth::from_env_fn(&|key| std::env::var(key).ok()));
+
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .map_err(|e| format!("bind {listen}: {e}"))?;
@@ -127,7 +140,7 @@ async fn run(listen: String, db_path: PathBuf) -> Result<(), String> {
         db = %db_path.display(),
         "licensing-server listening"
     );
-    axum::serve(listener, http::router(service))
+    axum::serve(listener, http::router(service, auth))
         .await
         .map_err(|e| format!("serve: {e}"))
 }

@@ -160,6 +160,30 @@ impl fmt::Display for WarningRow {
     }
 }
 
+/// 一条告警记录的**列表形态**（管理端异常页；在 [`WarningRow`] 之上补充
+/// `rowid` / `device_mid` / `lease_id`，供跨设备总览展示与处置定位）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarningListRow {
+    /// 告警行 ID（`audit_receipt_warning.rowid`）。
+    pub id: i64,
+    /// 设备机位码。
+    pub device_mid: String,
+    /// 租约 ID。
+    pub lease_id: String,
+    /// 异常类别（`gap` / `overlap`）。
+    pub kind: String,
+    /// 触发批次的区间起点。
+    pub seq_from: i64,
+    /// 触发批次的区间终点。
+    pub seq_to: i64,
+    /// 判定时的 cursor 前沿。
+    pub last_seq_to: i64,
+    /// 告警明细。
+    pub detail: String,
+    /// 记录时间（unix 秒）。
+    pub created_at: i64,
+}
+
 // ============================================================================
 // 连续性判定（纯函数，单测全覆盖）
 // ============================================================================
@@ -450,6 +474,67 @@ impl ReceiptLedger {
         )
         .optional()
         .map_err(|e| LicenseError::Storage(format!("ledger cursor read failed: {e}")))
+    }
+
+    /// 分页列出**跨设备全部**告警记录（管理端 `GET /admin/receipts/anomalies`）。
+    ///
+    /// 与 [`Self::warnings_for`] 的差异：不限定设备（管理后台总览页），按 `id` 降序
+    /// （最新异常在前），并携带 `rowid` / `device_mid` / `lease_id` 供列表展示。
+    ///
+    /// # Errors
+    /// SQLite 错误 / 账本不可用 → [`LicenseError::Storage`]。
+    pub fn list_warnings(&self, page: u32, page_size: u32) -> LicenseResult<Vec<WarningListRow>> {
+        let page = page.max(1);
+        let page_size = page_size.max(1);
+        let offset = i64::from(page.saturating_sub(1).saturating_mul(page_size));
+        let guard = self.conn.lock();
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| LicenseError::Storage("receipt ledger is unavailable".into()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, device_mid, lease_id, kind, seq_from, seq_to, last_seq_to,
+                        detail, created_at
+                 FROM audit_receipt_warning
+                 ORDER BY id DESC
+                 LIMIT ?1 OFFSET ?2",
+            )
+            .map_err(|e| LicenseError::Storage(format!("ledger warning query failed: {e}")))?;
+        let rows = stmt
+            .query_map(params![i64::from(page_size), offset], |row| {
+                Ok(WarningListRow {
+                    id: row.get(0)?,
+                    device_mid: row.get(1)?,
+                    lease_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    seq_from: row.get(4)?,
+                    seq_to: row.get(5)?,
+                    last_seq_to: row.get(6)?,
+                    detail: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| LicenseError::Storage(format!("ledger warning query failed: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LicenseError::Storage(format!("ledger warning read failed: {e}")))
+    }
+
+    /// 统计告警记录总数（跨设备；管理端总览聚合）。
+    ///
+    /// # Errors
+    /// SQLite 错误 / 账本不可用 → [`LicenseError::Storage`]。
+    pub fn count_warnings(&self) -> LicenseResult<u64> {
+        let guard = self.conn.lock();
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| LicenseError::Storage("receipt ledger is unavailable".into()))?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_receipt_warning", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| LicenseError::Storage(format!("ledger warning count failed: {e}")))?;
+        u64::try_from(count)
+            .map_err(|_| LicenseError::Storage(format!("warning count is negative: {count}")))
     }
 }
 

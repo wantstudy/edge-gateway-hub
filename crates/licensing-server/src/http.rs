@@ -1,8 +1,9 @@
-//! `licensing-server` HTTP 层（task 46：激活码生命周期 + 一机一码预绑定）。
+//! `licensing-server` HTTP 层（task 46：激活码生命周期 + 一机一码预绑定；
+//! 管理端 API 补齐：登录鉴权 + 全量 GET 查询 + 租户自举写端点）。
 //!
 //! # 职责边界（见 `lib.rs` 模块地图）
 //!
-//! - axum 路由装配（issue / activate / revoke / reissue 四个端点）；
+//! - axum 路由装配（设备端 4 + 管理端 12 个端点）；
 //! - 反序列化请求体 → 调用 [`crate::service::LicensingService`]；
 //! - **结构化错误映射**：[`error_to_code`] 直接 `match` [`LicenseError`] 变体，把错误映射到
 //!   `proto::codes` 业务码（HTTP 状态码再经 `proto::http_status` 推出）。
@@ -10,84 +11,128 @@
 //!   任何人改一句文案都会让错误码静默退化成泛化 `BAD_REQUEST`，而单测通常察觉不到。
 //! - 统一 [`ApiEnvelope`] 响应包裹（`{ code, data, message, trace_id }`）。
 //!
-//! # 租户解析约定（重建决策）
+//! # 管理端鉴权（设计 §4；本文件此前完全无鉴权，为安全红线缺口）
 //!
-//! - `POST /admin/codes/issue`：租户来自请求体 `tenant_id`；
-//! - `POST /admin/codes/:code_id/revoke`、`.../:code_id/reissue`：租户取自请求头
-//!   `X-Tenant-Id`（原 `http.rs` 已损毁，该约定为重建时的最简合理选择；actor 取 `X-Actor-Id`，
-//!   缺省 `admin`）。上层反代应注入这两个头。
+//! - `POST /admin/auth/login`：凭据换 JWT（HS256，1h TTL；实现见 [`crate::admin_auth`]）；
+//! - **其余全部 `/admin/*` 端点必须携带 `Authorization: Bearer <token>`**：
+//!   缺 token / 坏 token / 过期 → 401 `SESSION_EXPIRED`；
+//!   已认证但角色不符 → 403 `ADMIN_ONLY`（角色门控见各 handler 注释）；
+//! - 设备端（`/activation`、`/heartbeat`、`/verify`、`/audit/receipt`）走
+//!   Lease Token + 设备签名体系，**不经**管理端 JWT（口径不变）。
+//!
+//! # 租户 / 操作者解析约定（本版收紧）
+//!
+//! - 管理端写操作的操作者一律取 **JWT `sub`**（登录用户名，入审计）；
+//!   原先「`X-Actor-Id` 缺省 admin」的宽松口径移除——未认证请求根本到不了 handler；
+//! - `POST /admin/codes/:code_id/revoke|reissue` 的租户取请求头 `X-Tenant-Id`
+//!   （**必填**：缺失 → 400 结构化错误，不再缺省 `unknown`）。
+//!   上层反代可注入该头；持有有效管理 token 的调用方（admin-console）总是携带它。
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Serialize;
 
+use crate::admin_auth::{AdminAuth, AuthedAdmin, Role};
 use crate::error::LicenseError;
-use crate::model::now_ns_id;
+use crate::model::{now_ns_id, ActorType, CodeStatus, Device, SigningKey, Tenant};
 use crate::proto::{
-    self, ActivationRequest, ApiEnvelope, HeartbeatRequest, IssueCodesRequest, ReissueCodeRequest,
-    RevokeCodeRequest,
+    self, ActivationRequest, AdminLoginRequest, AdminLoginResponse, ApiEnvelope, AuditLogItem,
+    AuditLogQuery, CodeDetail, CodeListQuery, CodeSummary, CreateTenantRequest, DeviceListItem,
+    DeviceListQuery, HeartbeatRequest, IssueCodesRequest, OverviewResponse, PagedResponse,
+    ReceiptAnomalyItem, ReissueCodeRequest, RevokeCodeRequest, SigningKeyItem, TenantItem,
+    TimelineEntry, UpdateTenantPolicyRequest,
 };
 use crate::service::LicensingService;
+use crate::store::{AuditFilter, CodeFilter};
 
 /// 共享服务句柄（axum 路由状态）。
 pub type SharedService = Arc<LicensingService>;
 
-/// 装配 HTTP 路由（设备端 4 + 管理端 3 共 7 个端点）。
+/// axum 路由状态：业务服务 + 管理端鉴权器。
+#[derive(Clone)]
+pub struct AppState {
+    /// 业务服务（store / keyring / ledger 聚合）。
+    pub service: SharedService,
+    /// 管理端鉴权器（账号表 + JWT 签发密钥）。
+    pub auth: Arc<AdminAuth>,
+}
+
+/// 每页条数缺省值。
+const DEFAULT_PAGE_SIZE: u32 = 20;
+/// 每页条数上限（防一次拉取过多）。
+const MAX_PAGE_SIZE: u32 = 200;
+/// 内存遍历扫描的批大小（store 无原生复合过滤时的分批拉取粒度）。
+const SCAN_BATCH: u32 = 500;
+
+/// 装配 HTTP 路由（设备端 4 + 管理端 12 共 16 个端点）。
 ///
-/// - `POST /admin/codes/issue`：批量发放（支持预绑定 + 幂等）。
-/// - `POST /activation`：设备首激 + 一机一码绑定。
-/// - `POST /heartbeat`：设备心跳保活（设计 §1.2）。
-/// - `POST /verify`：A 档二次校验（设计 §1.3）。
-/// - `POST /audit/receipt`：B 档审计回执（设计 §1.4）。
-/// - `POST /admin/codes/:code_id/revoke`：废弃（header `X-Tenant-Id` 取租户）。
-/// - `POST /admin/codes/:code_id/reissue`：重发（header `X-Tenant-Id` 取租户）。
-pub fn router(service: Arc<LicensingService>) -> Router {
+/// - 设备端：`POST /activation`、`POST /heartbeat`、`POST /verify`、`POST /audit/receipt`
+///   （Lease Token + 设备签名体系，不经管理端 JWT）；
+/// - 管理端（**全部需要 `Authorization: Bearer`，除 login 外**）：
+///   - `POST /admin/auth/login`（无需 token）；
+///   - `GET  /admin/overview`（任意角色）；
+///   - `GET  /admin/codes`、`GET /admin/codes/:code_id`（任意角色）；
+///   - `POST /admin/codes/issue`（ops / lic_ops / system）；
+///   - `POST /admin/codes/:code_id/revoke`、`.../reissue`（lic_ops / system，高危）；
+///   - `GET  /admin/tenants`（任意角色）；`POST /admin/tenants`、
+///     `PUT /admin/tenants/:tenant_id/policy`（仅 system）；
+///   - `GET  /admin/devices`、`GET /admin/receipts/anomalies`、`GET /admin/keys`、
+///     `GET /admin/audit/logs`（任意角色）。
+pub fn router(service: SharedService, auth: Arc<AdminAuth>) -> Router {
+    let state = AppState { service, auth };
     Router::new()
-        .route("/admin/codes/issue", post(issue_codes))
+        // 设备端（设备签名体系，无管理端 JWT）。
         .route("/activation", post(activate))
         .route("/heartbeat", post(heartbeat))
         .route("/verify", post(verify))
         .route("/audit/receipt", post(audit_receipt))
+        // 管理端：登录（唯一免 token 端点）。
+        .route("/admin/auth/login", post(admin_login))
+        // 管理端：总览 / 查询（任意已认证角色）。
+        .route("/admin/overview", get(admin_overview))
+        .route("/admin/codes", get(admin_codes))
+        .route("/admin/codes/:code_id", get(admin_code_detail))
+        .route(
+            "/admin/tenants",
+            get(admin_tenants).post(admin_create_tenant),
+        )
+        .route(
+            "/admin/tenants/:tenant_id/policy",
+            put(admin_update_tenant_policy),
+        )
+        .route("/admin/devices", get(admin_devices))
+        .route("/admin/receipts/anomalies", get(admin_receipt_anomalies))
+        .route("/admin/keys", get(admin_keys))
+        .route("/admin/audit/logs", get(admin_audit_logs))
+        // 管理端：高危写（lic_ops / system）。
+        .route("/admin/codes/issue", post(issue_codes))
         .route("/admin/codes/:code_id/revoke", post(revoke_code))
         .route("/admin/codes/:code_id/reissue", post(reissue_code))
-        .with_state(service)
+        .with_state(state)
 }
 
-/// `POST /admin/codes/issue`：批量发放。
-async fn issue_codes(
-    State(service): State<SharedService>,
-    Json(req): Json<IssueCodesRequest>,
-) -> impl IntoResponse {
-    match service.issue_codes(&req) {
-        Ok(resp) => ok_json(resp),
-        Err(e) => error_response(&e),
-    }
-}
+// ============================================================================
+// 设备端 handler（与既有口径一致：设备签名体系，不经管理端 JWT）
+// ============================================================================
 
 /// `POST /activation`：设备首激 + 一机一码绑定。
-async fn activate(
-    State(service): State<SharedService>,
-    Json(req): Json<ActivationRequest>,
-) -> impl IntoResponse {
-    match service.activate(&req) {
+async fn activate(State(state): State<AppState>, Json(req): Json<ActivationRequest>) -> Response {
+    match state.service.activate(&req) {
         Ok(resp) => ok_json(resp),
         Err(e) => error_response(&e),
     }
 }
 
 /// `POST /heartbeat`：设备心跳保活（设计 §1.2）。
-async fn heartbeat(
-    State(service): State<SharedService>,
-    Json(req): Json<HeartbeatRequest>,
-) -> impl IntoResponse {
-    match service.heartbeat(&req) {
+async fn heartbeat(State(state): State<AppState>, Json(req): Json<HeartbeatRequest>) -> Response {
+    match state.service.heartbeat(&req) {
         Ok(resp) => ok_json(resp),
         Err(e) => error_response(&e),
     }
@@ -98,11 +143,8 @@ async fn heartbeat(
 /// 取**原始 JSON**（而非强类型结构体）：字段白名单需对原始对象做「越界字段」判定，
 /// 而 serde 默认忽略未知字段——若先反序列化为结构体，越界字段会**静默消失**，
 /// 白名单形同虚设。
-async fn verify(
-    State(service): State<SharedService>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    match service.verify(&body) {
+async fn verify(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Response {
+    match state.service.verify(&body) {
         Ok(resp) => ok_json(resp),
         Err(e) => error_response(&e),
     }
@@ -113,40 +155,655 @@ async fn verify(
 /// 同样取**原始 JSON**：设计明确要求「服务端拒收任何业务字段」——越界字段必须
 /// 在**反序列化之前**对原始对象判定，否则 serde 会把它丢掉。
 async fn audit_receipt(
-    State(service): State<SharedService>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    match service.audit_receipt(&body) {
+) -> Response {
+    match state.service.audit_receipt(&body) {
         Ok(resp) => ok_json(resp),
         Err(e) => error_response(&e),
     }
 }
 
-/// `POST /admin/codes/:code_id/revoke`：废弃（仅总管理后台）。
-async fn revoke_code(
-    State(service): State<SharedService>,
-    Path(code_id): Path<String>,
+// ============================================================================
+// 管理端：鉴权辅助
+// ============================================================================
+
+/// 从请求头解析 Bearer token 并校验 JWT。
+///
+/// 缺 token / 坏 token / 过期 → 401 `SESSION_EXPIRED`（结构化信封）。
+/// `Err` 为完整 axum `Response`（错误信封）；`result_large_err` 为 axum
+/// handler 辅助函数的固有形态，显式豁免。
+#[allow(clippy::result_large_err)]
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthedAdmin, Response> {
+    const BEARER_PREFIX: &str = "Bearer ";
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix(BEARER_PREFIX))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let token = match token {
+        Some(t) => t,
+        None => {
+            return Err(error_response(&LicenseError::unauthorized(
+                "missing bearer token",
+            )));
+        }
+    };
+    match state.auth.verify_token(token) {
+        Some(authed) => Ok(authed),
+        None => Err(error_response(&LicenseError::unauthorized(
+            "invalid or expired admin token",
+        ))),
+    }
+}
+
+/// 角色门控：`authed.role` 不在 `allowed` 内 → 403 `ADMIN_ONLY`（结构化信封）。
+#[allow(clippy::result_large_err)]
+fn require_role(authed: &AuthedAdmin, allowed: &[Role], action: &str) -> Result<(), Response> {
+    if allowed.contains(&authed.role) {
+        Ok(())
+    } else {
+        Err(error_response(&LicenseError::forbidden(format!(
+            "role {} is not allowed to {action}",
+            authed.role.as_str()
+        ))))
+    }
+}
+
+/// 发放角色集（设计 §4：运营「只读 + 发放」；授权运营与系统全量）。
+const ROLES_ISSUE: [Role; 3] = [Role::Ops, Role::LicOps, Role::System];
+/// 高危操作角色集（废弃 / 重发：仅授权运营与系统）。
+const ROLES_DANGEROUS: [Role; 2] = [Role::LicOps, Role::System];
+/// 租户管理角色集（创建 / 策略：仅系统）。
+const ROLES_TENANT_ADMIN: [Role; 1] = [Role::System];
+
+/// `POST /admin/auth/login`：`{username, password}` → 200 `{token, role}`。
+///
+/// 凭据来源见 [`crate::admin_auth`]（env 注入初始管理员，fail-closed：零账号全拒）。
+/// 未知用户 / 错误口令 / 请求体非法一律**同一 401**（不区分原因，防账号枚举）。
+async fn admin_login(State(state): State<AppState>, body: Json<AdminLoginRequest>) -> Response {
+    let outcome = state
+        .auth
+        .login(body.username.trim(), &body.password)
+        .map(|(token, role)| AdminLoginResponse {
+            token,
+            role: role.as_str().to_string(),
+        });
+    match outcome {
+        Some(resp) => ok_json(resp),
+        None => error_response(&LicenseError::unauthorized("invalid credentials")),
+    }
+}
+
+// ============================================================================
+// 管理端：GET 查询（任意已认证角色）
+// ============================================================================
+
+/// `GET /admin/overview`：总览聚合（全部计数 **String**，大数红线）。
+async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let store = state.service.store();
+    let count = |status: CodeStatus| -> u64 {
+        let filter = CodeFilter {
+            status: Some(status),
+            ..Default::default()
+        };
+        store.count_codes(&filter).unwrap_or(0)
+    };
+    let active_kid = store.list_signing_keys().ok().and_then(|keys| {
+        keys.into_iter()
+            .find(|k| k.status.as_str() == "active")
+            .map(|k| k.kid)
+    });
+    let data = OverviewResponse {
+        tenants: store
+            .list_tenants()
+            .map(|t| t.len())
+            .unwrap_or(0)
+            .to_string(),
+        devices: store.count_devices(None).unwrap_or(0).to_string(),
+        codes_total: store
+            .count_codes(&CodeFilter::default())
+            .unwrap_or(0)
+            .to_string(),
+        codes_issued: count(CodeStatus::Issued).to_string(),
+        codes_bound: count(CodeStatus::Bound).to_string(),
+        codes_revoked: count(CodeStatus::Revoked).to_string(),
+        codes_reissued: count(CodeStatus::Reissued).to_string(),
+        receipts_anomalous: state
+            .service
+            .ledger()
+            .count_warnings()
+            .unwrap_or(0)
+            .to_string(),
+        active_kid,
+    };
+    ok_json(data)
+}
+
+/// `GET /admin/codes`：激活码列表 / 筛选 / 分页（设计 §2.4；码值掩码显示）。
+async fn admin_codes(
+    State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<RevokeCodeRequest>,
-) -> impl IntoResponse {
-    let tenant_id = extract_header(&headers, "x-tenant-id", "unknown");
-    let actor_id = extract_header(&headers, "x-actor-id", "admin");
-    match service.revoke(&tenant_id, &code_id, &req, &actor_id) {
+    Query(q): Query<CodeListQuery>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let (page, page_size) = page_params(q.page, q.page_size);
+    let filter = CodeFilter {
+        tenant_id: q.tenant_id,
+        status: match q.status.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => match CodeStatus::parse(raw) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    return error_response(&LicenseError::KeyStateIllegal(format!(
+                        "unknown status filter: {raw}"
+                    )));
+                }
+            },
+        },
+        tier: q.tier.filter(|t| !t.trim().is_empty()),
+        order_id: q.order_id.filter(|t| !t.trim().is_empty()),
+    };
+    let store = state.service.store();
+    let total = match store.count_codes(&filter) {
+        Ok(n) => n,
+        Err(e) => return error_response(&e),
+    };
+    let rows = match store.list_codes(&filter, page, page_size) {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let items: Vec<CodeSummary> = rows
+        .iter()
+        .map(|c| CodeSummary {
+            code_id: c.code_id.clone(),
+            code_masked: mask_code(&c.code),
+            status: c.status.as_str().to_string(),
+            tenant_id: c.tenant_id.clone(),
+            tier: c.tier.clone(),
+            bound_device_id: c.bound_device_id.clone(),
+            valid_until: c.valid_until.to_string(),
+            created_at: c.created_at.to_string(),
+        })
+        .collect();
+    ok_json(paged(items, total, page, page_size))
+}
+
+/// `GET /admin/codes/:code_id`：详情 + 时间线 + 重发溯源链（设计 §2.5）。
+async fn admin_code_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(code_id): Path<String>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let store = state.service.store();
+    let code = match store.get_code_by_id(&code_id) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return error_response(&LicenseError::KeyStateIllegal(format!(
+                "activation code not found: {code_id}"
+            )));
+        }
+        Err(e) => return error_response(&e),
+    };
+
+    // 时间线：audit_log 中 entity_id == code_id 的全部事件（激活 / 废弃 / 重发…）。
+    let timeline = match store.list_audit_logs(
+        &AuditFilter {
+            entity_id: Some(code_id.clone()),
+            ..Default::default()
+        },
+        1,
+        MAX_PAGE_SIZE,
+    ) {
+        Ok(logs) => logs
+            .iter()
+            .map(|l| TimelineEntry {
+                action: l.action.clone(),
+                actor: format!("{}:{}", l.actor_type.as_str(), l.actor_id),
+                at: l.ts.to_string(),
+                detail: l.detail.clone(),
+            })
+            .collect(),
+        Err(e) => return error_response(&e),
+    };
+
+    // 重发溯源链：沿 `reissued_from_id` 向上收集祖先 code_id（上限 20 层防环）。
+    let mut reissued_chain: Vec<String> = Vec::new();
+    let mut cursor = code.reissued_from_id.clone();
+    while let Some(ancestor) = cursor {
+        if reissued_chain.len() >= 20 {
+            break;
+        }
+        reissued_chain.push(ancestor.clone());
+        cursor = match store.get_code_by_id(&ancestor) {
+            Ok(Some(c)) => c.reissued_from_id,
+            _ => None,
+        };
+    }
+
+    let data = CodeDetail {
+        code_id: code.code_id.clone(),
+        code: code.code.clone(),
+        status: code.status.as_str().to_string(),
+        tenant_id: code.tenant_id.clone(),
+        tier: code.tier.clone(),
+        bound_device_id: code.bound_device_id.clone(),
+        valid_from: code.valid_from.to_string(),
+        valid_until: code.valid_until.to_string(),
+        timeline,
+        reissued_chain,
+        revoked_at: code.revoked_at.map(|t| t.to_string()),
+        revoked_reason: code.revoked_reason.clone(),
+    };
+    ok_json(data)
+}
+
+/// `GET /admin/tenants`：租户列表（任意角色）。
+async fn admin_tenants(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let rows = match state.service.store().list_tenants() {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let items: Vec<TenantItem> = rows.iter().map(tenant_item).collect();
+    let total = items.len() as u64;
+    let page_size = items.len().max(1) as u32;
+    ok_json(paged(items, total, 1, page_size))
+}
+
+/// `POST /admin/tenants`：创建租户（仅 system；新部署自举必需）。
+async fn admin_create_tenant(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateTenantRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_TENANT_ADMIN, "create tenants") {
+        return resp;
+    }
+    match state.service.admin_create_tenant(
+        &req.tenant_id,
+        &req.name,
+        &req.contact,
+        req.verify_mode_default.as_deref(),
+        &authed.sub,
+    ) {
+        Ok(tenant) => ok_json(tenant_item(&tenant)),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `PUT /admin/tenants/:tenant_id/policy`：更新租户默认校验档位（仅 system）。
+async fn admin_update_tenant_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+    Json(req): Json<UpdateTenantPolicyRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_TENANT_ADMIN, "update tenant policy") {
+        return resp;
+    }
+    match state.service.admin_update_tenant_policy(
+        &tenant_id,
+        &req.verify_mode_default,
+        &authed.sub,
+    ) {
         Ok(()) => ok_json(()),
         Err(e) => error_response(&e),
     }
 }
 
-/// `POST /admin/codes/:code_id/reissue`：重发（换机迁移）。
+/// `GET /admin/devices`：设备列表 / 筛选 / 分页（设计 §2.6；机器码掩码）。
+///
+/// store 原生只支持租户过滤；`deploy_mode` / `status` / `machine_code` 在内存过滤
+/// （管理台数据量级可接受，注释即契约）。
+async fn admin_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DeviceListQuery>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let (page, page_size) = page_params(q.page, q.page_size);
+    let store = state.service.store();
+    let deploy = q
+        .deploy_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let status = q.status.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let machine = q
+        .machine_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase());
+    let needs_scan = deploy.is_some() || status.is_some() || machine.is_some();
+
+    // 取候选集：无内存过滤直接走 store 分页；有过滤则分批扫描全量再过滤。
+    let candidates: Vec<Device> = if !needs_scan {
+        match store.list_devices(
+            q.tenant_id.as_deref().filter(|t| !t.trim().is_empty()),
+            page,
+            page_size,
+        ) {
+            Ok(rows) => rows,
+            Err(e) => return error_response(&e),
+        }
+    } else {
+        match scan_all_devices(
+            store,
+            q.tenant_id.as_deref().filter(|t| !t.trim().is_empty()),
+        ) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|d| {
+                    if let Some(want) = deploy {
+                        if d.deploy_mode.as_str() != want {
+                            return false;
+                        }
+                    }
+                    if let Some(want) = status {
+                        if d.status.as_str() != want {
+                            return false;
+                        }
+                    }
+                    if let Some(kw) = &machine {
+                        if !d.machine_code.to_lowercase().contains(kw) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect(),
+            Err(e) => return error_response(&e),
+        }
+    };
+
+    let total = if needs_scan {
+        candidates.len() as u64
+    } else {
+        store
+            .count_devices(q.tenant_id.as_deref().filter(|t| !t.trim().is_empty()))
+            .unwrap_or(0)
+    };
+    // needs_scan 时对内存过滤结果手动切页；无过滤时 store 已按页切好。
+    let page_items: Vec<Device> = if needs_scan {
+        let start = ((page - 1) as usize) * page_size as usize;
+        candidates
+            .into_iter()
+            .skip(start)
+            .take(page_size as usize)
+            .collect()
+    } else {
+        candidates
+    };
+    let items: Vec<DeviceListItem> = page_items.iter().map(|d| device_item(store, d)).collect();
+    ok_json(paged(items, total, page, page_size))
+}
+
+/// `GET /admin/receipts/anomalies`：异常回执列表（任意角色）。
+///
+/// 数据源 = 回执账本 `audit_receipt_warning` 表（设计 §1.4：跳空 / 回退 / 缺失
+/// 告警的权威落点，「人工核实、不自动封禁」）。
+async fn admin_receipt_anomalies(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let (page, page_size) = page_params(None, None);
+    let ledger = state.service.ledger();
+    let total = match ledger.count_warnings() {
+        Ok(n) => n,
+        Err(e) => return error_response(&e),
+    };
+    let rows = match ledger.list_warnings(page, page_size) {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let items: Vec<ReceiptAnomalyItem> = rows
+        .iter()
+        .map(|w| ReceiptAnomalyItem {
+            id: w.id.to_string(),
+            device_mid: w.device_mid.clone(),
+            lease_id: w.lease_id.clone(),
+            kind: w.kind.clone(),
+            seq_from: w.seq_from.to_string(),
+            seq_to: w.seq_to.to_string(),
+            last_seq_to: w.last_seq_to.to_string(),
+            detail: w.detail.clone(),
+            created_at: w.created_at.to_string(),
+        })
+        .collect();
+    ok_json(paged(items, total, page, page_size))
+}
+
+/// `GET /admin/keys`：签名密钥列表（**只含公钥**；任意角色）。
+async fn admin_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let rows: Vec<SigningKey> = match state.service.store().list_signing_keys() {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let items: Vec<SigningKeyItem> = rows
+        .iter()
+        .map(|k| SigningKeyItem {
+            kid: k.kid.clone(),
+            status: k.status.as_str().to_string(),
+            public_key: k.public_key.clone(),
+            hsm_ref: k.hsm_ref.clone(),
+            enabled_at: k.enabled_at.to_string(),
+            retired_at: k.retired_at.map(|t| t.to_string()),
+        })
+        .collect();
+    let total = items.len() as u64;
+    let page_size = items.len().max(1) as u32;
+    ok_json(paged(items, total, 1, page_size))
+}
+
+/// `GET /admin/audit/logs`：审计日志（筛选 / 分页；任意角色）。
+///
+/// store 原生支持 actor_type / action / entity 过滤；`time_from` / `time_to` 在
+/// 内存过滤（分批扫描，管理台数据量级可接受）。
+async fn admin_audit_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AuditLogQuery>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let (page, page_size) = page_params(q.page, q.page_size);
+    let actor_type = match q.actor_type.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match ActorType::parse(raw) {
+            Ok(t) => Some(t),
+            Err(_) => {
+                return error_response(&LicenseError::KeyStateIllegal(format!(
+                    "unknown actor_type filter: {raw}"
+                )));
+            }
+        },
+    };
+    let time_from = match parse_i64_filter(q.time_from.as_deref(), "time_from") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let time_to = match parse_i64_filter(q.time_to.as_deref(), "time_to") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let filter = AuditFilter {
+        actor_type,
+        action: q.action.filter(|s| !s.trim().is_empty()),
+        entity_type: q.entity_type.filter(|s| !s.trim().is_empty()),
+        entity_id: q.entity_id.filter(|s| !s.trim().is_empty()),
+    };
+    let store = state.service.store();
+
+    // 无时间范围 → store 直查分页；有时间范围 → 分批扫描 + 内存过滤 + 手动切页。
+    if time_from.is_none() && time_to.is_none() {
+        let total = match store.count_audit_logs(&filter) {
+            Ok(n) => n,
+            Err(e) => return error_response(&e),
+        };
+        let rows = match store.list_audit_logs(&filter, page, page_size) {
+            Ok(rows) => rows,
+            Err(e) => return error_response(&e),
+        };
+        let items: Vec<AuditLogItem> = rows.iter().map(audit_item).collect();
+        return ok_json(paged(items, total, page, page_size));
+    }
+
+    let mut all: Vec<crate::model::AuditLog> = Vec::new();
+    let mut scan_page: u32 = 1;
+    loop {
+        let batch = match store.list_audit_logs(&filter, scan_page, SCAN_BATCH) {
+            Ok(b) => b,
+            Err(e) => return error_response(&e),
+        };
+        let done = batch.len() < SCAN_BATCH as usize;
+        for log in batch {
+            if let Some(from) = time_from {
+                if log.ts < from {
+                    continue;
+                }
+            }
+            if let Some(to) = time_to {
+                if log.ts > to {
+                    continue;
+                }
+            }
+            all.push(log);
+        }
+        if done || scan_page >= 1000 {
+            break;
+        }
+        scan_page += 1;
+    }
+    let total = all.len() as u64;
+    let start = ((page - 1) as usize) * page_size as usize;
+    let slice: Vec<crate::model::AuditLog> = all
+        .into_iter()
+        .skip(start)
+        .take(page_size as usize)
+        .collect();
+    let items: Vec<AuditLogItem> = slice.iter().map(audit_item).collect();
+    ok_json(paged(items, total, page, page_size))
+}
+
+// ============================================================================
+// 管理端：写操作（issue / revoke / reissue，高危仅 lic_ops / system）
+// ============================================================================
+
+/// `POST /admin/codes/issue`：批量发放（ops / lic_ops / system）。
+async fn issue_codes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<IssueCodesRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_ISSUE, "issue codes") {
+        return resp;
+    }
+    match state.service.issue_codes(&req) {
+        Ok(resp) => ok_json(resp),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `POST /admin/codes/:code_id/revoke`：废弃（lic_ops / system，高危）。
+///
+/// 契约校验（设计 §2.2）在 service 层执行：`confirm_tail8` 尾 8 位不符 → 412
+/// `CONFIRM_MISMATCH`；`note` < 10 字 → 400；`reason` 空白 → 400 `REASON_REQUIRED`。
+async fn revoke_code(
+    State(state): State<AppState>,
+    Path(code_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeCodeRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_DANGEROUS, "revoke codes") {
+        return resp;
+    }
+    let tenant_id = match require_tenant_header(&headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    // 操作者 = JWT sub（登录用户名，入审计），不再取可伪造的 X-Actor-Id。
+    match state
+        .service
+        .revoke(&tenant_id, &code_id, &req, &authed.sub)
+    {
+        Ok(()) => ok_json(()),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `POST /admin/codes/:code_id/reissue`：重发 / 换机迁移（lic_ops / system，高危）。
 async fn reissue_code(
-    State(service): State<SharedService>,
+    State(state): State<AppState>,
     Path(code_id): Path<String>,
     headers: HeaderMap,
     Json(req): Json<ReissueCodeRequest>,
-) -> impl IntoResponse {
-    let tenant_id = extract_header(&headers, "x-tenant-id", "unknown");
-    let actor_id = extract_header(&headers, "x-actor-id", "admin");
-    match service.reissue(&tenant_id, &code_id, &req, &actor_id) {
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_DANGEROUS, "reissue codes") {
+        return resp;
+    }
+    let tenant_id = match require_tenant_header(&headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    match state
+        .service
+        .reissue(&tenant_id, &code_id, &req, &authed.sub)
+    {
         Ok(resp) => ok_json(resp),
         Err(e) => error_response(&e),
     }
@@ -156,13 +813,170 @@ async fn reissue_code(
 // 内部辅助
 // ============================================================================
 
-/// 从请求头取值，缺省回退到 `default`（`trim` 后空串也按缺省处理）。
+/// 从请求头取值，`trim` 后空串也按缺省处理。
 fn extract_header(headers: &HeaderMap, name: &str, default: &str) -> String {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// `X-Tenant-Id` 头必填（缺失 → 400 结构化错误；不再缺省 `unknown`）。
+#[allow(clippy::result_large_err)]
+fn require_tenant_header(headers: &HeaderMap) -> Result<String, Response> {
+    let raw = extract_header(headers, "x-tenant-id", "");
+    if raw.is_empty() {
+        return Err(error_response(&LicenseError::KeyStateIllegal(
+            "missing required header: X-Tenant-Id".into(),
+        )));
+    }
+    Ok(raw)
+}
+
+/// 解析分页参数（`page` 从 1 起；`page_size` 缺省 [`DEFAULT_PAGE_SIZE`]，上限
+/// [`MAX_PAGE_SIZE`]）。
+fn page_params(page: Option<u32>, page_size: Option<u32>) -> (u32, u32) {
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    (page, page_size)
+}
+
+/// 构造通用分页信封（total / page / page_size 均 **String**，大数红线）。
+fn paged<T>(items: Vec<T>, total: u64, page: u32, page_size: u32) -> PagedResponse<T> {
+    PagedResponse {
+        items,
+        total: total.to_string(),
+        page: page.to_string(),
+        page_size: page_size.to_string(),
+    }
+}
+
+/// 掩码激活码值（列表页显示；详情页揭示完整码值）。
+///
+/// 形如 `IOTDAQ-****-****-****-AB12`（保留前缀 `IOTDAQ-` 与尾 4 位）；
+/// 非 `IOTDAQ-` 前缀的短码一律整串掩码（不留可猜测片段）。
+fn mask_code(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    if code.starts_with("IOTDAQ-") && chars.len() >= 12 {
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        return format!("IOTDAQ-****-****-****-{tail}");
+    }
+    if chars.len() <= 4 {
+        return "*".repeat(chars.len());
+    }
+    let head: String = chars[..2].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}****{tail}")
+}
+
+/// 掩码机器码（列表页显示；保留首尾各 2 位，中间 `****`）。
+fn mask_machine_code(machine_code: &str) -> String {
+    let chars: Vec<char> = machine_code.chars().collect();
+    if chars.len() <= 4 {
+        return "****".to_string();
+    }
+    let head: String = chars[..2].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}****{tail}")
+}
+
+/// 分批拉取全部设备（store 无原生复合过滤时的扫描底座；批 [`SCAN_BATCH`]）。
+fn scan_all_devices(
+    store: &crate::store::Store,
+    tenant_id: Option<&str>,
+) -> crate::error::LicenseResult<Vec<Device>> {
+    let mut out = Vec::new();
+    let mut page: u32 = 1;
+    loop {
+        let batch = store.list_devices(tenant_id, page, SCAN_BATCH)?;
+        let done = batch.len() < SCAN_BATCH as usize;
+        out.extend(batch);
+        if done || page >= 1000 {
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
+}
+
+/// `Tenant` → 响应条目。
+fn tenant_item(t: &Tenant) -> TenantItem {
+    TenantItem {
+        tenant_id: t.tenant_id.clone(),
+        name: t.name.clone(),
+        verify_mode_default: t.verify_mode_default.as_str().to_string(),
+        contact: t.contact.clone(),
+        created_at: t.created_at.to_string(),
+    }
+}
+
+/// `Device` → 响应条目（机器码掩码 + 最近租约状态 + 回执异常汇总）。
+///
+/// 最近租约取该设备 `issued_at` 最新一条（其状态与 `last_heartbeat_at`）；
+/// 回执异常汇总 = 该设备全部租约的 `gap_flag = 1` 回执计数（形如 `anomalous=2`；
+/// 无租约 / 无异常为 `anomalous=0`）。
+fn device_item(store: &crate::store::Store, d: &Device) -> DeviceListItem {
+    let (lease_status, last_heartbeat_at) = match store.list_leases_by_device(&d.device_id) {
+        Ok(leases) => match leases.first() {
+            Some(l) => (
+                Some(l.status.as_str().to_string()),
+                l.last_heartbeat_at.map(|t| t.to_string()),
+            ),
+            None => (None, None),
+        },
+        Err(_) => (None, None),
+    };
+    let anomalous = store
+        .list_leases_by_device(&d.device_id)
+        .ok()
+        .map(|leases| {
+            leases
+                .iter()
+                .filter_map(|l| store.list_receipts_by_lease(&l.lease_id).ok())
+                .flat_map(|rs| rs.into_iter())
+                .filter(|r| r.gap_flag)
+                .count()
+        })
+        .unwrap_or(0);
+    DeviceListItem {
+        device_id: d.device_id.clone(),
+        tenant_id: d.tenant_id.clone(),
+        machine_code_masked: mask_machine_code(&d.machine_code),
+        deploy_mode: d.deploy_mode.as_str().to_string(),
+        image_digest: d.image_digest.clone(),
+        last_heartbeat_at,
+        lease_status,
+        receipt_gap_summary: format!("anomalous={anomalous}"),
+    }
+}
+
+/// `AuditLog` → 响应条目（actor / entity 拼接为 `type:id`）。
+fn audit_item(l: &crate::model::AuditLog) -> AuditLogItem {
+    AuditLogItem {
+        ts: l.ts.to_string(),
+        actor: format!("{}:{}", l.actor_type.as_str(), l.actor_id),
+        action: l.action.clone(),
+        entity: format!("{}:{}", l.entity_type, l.entity_id),
+        detail: l.detail.clone(),
+        ip: l.ip.clone(),
+    }
+}
+
+/// 解析可空的 i64 过滤参数（非法整数 → 400 结构化错误）。
+#[allow(clippy::result_large_err)]
+fn parse_i64_filter(raw: Option<&str>, name: &str) -> Result<Option<i64>, Response> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => match v.parse::<i64>() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(error_response(&LicenseError::KeyStateIllegal(format!(
+                "invalid {name}: must be integer seconds"
+            )))),
+        },
+    }
 }
 
 /// 生成本次响应的链路追踪 ID（大整数纪律：字符串时间戳前缀）。
@@ -199,7 +1013,7 @@ pub fn error_to_code(err: &LicenseError) -> &'static str {
         LicenseError::CodeBoundToOtherDevice { .. } => proto::codes::CODE_BOUND_TO_OTHER_DEVICE,
         // 激活被拒（码无效 / 已绑定他机 / 已废弃 / 未知租户）→ INVALID_CODE（400）。
         LicenseError::ActivationRejected(_) => proto::codes::INVALID_CODE,
-        // 状态机非法（未废弃重发 / 空有效期 / 空 reason 等）→ BAD_REQUEST（400）。
+        // 状态机非法（未废弃重发 / 空有效期 / 空 reason / note 过短等）→ BAD_REQUEST（400）。
         LicenseError::KeyStateIllegal(_) => proto::codes::BAD_REQUEST,
         // Token 无效 / 过期 → TOKEN_EXPIRED（401）。
         LicenseError::TokenInvalid(_) => proto::codes::TOKEN_EXPIRED,
@@ -223,6 +1037,14 @@ pub fn error_to_code(err: &LicenseError) -> &'static str {
         LicenseError::ActivationPubkeyMismatch(_) => proto::codes::ACTIVATION_PUBKEY_MISMATCH,
         // 配额超限 → QUOTA_EXCEEDED（403）。
         LicenseError::QuotaExceeded(_) => proto::codes::QUOTA_EXCEEDED,
+        // 废弃确认串不符 → CONFIRM_MISMATCH（412，设计 §2.2）。
+        LicenseError::ConfirmMismatch(_) => proto::codes::CONFIRM_MISMATCH,
+        // 废弃原因缺失 → REASON_REQUIRED（400，设计 §2.2）。
+        LicenseError::ReasonRequired(_) => proto::codes::REASON_REQUIRED,
+        // 管理端未认证 → SESSION_EXPIRED（401，设计 §2）。
+        LicenseError::Unauthorized(_) => proto::codes::SESSION_EXPIRED,
+        // 管理端角色越权 → ADMIN_ONLY（403，设计 §2 / §4）。
+        LicenseError::Forbidden(_) => proto::codes::ADMIN_ONLY,
         // 存储层异常属内部错误：用未知业务码，让 `http_status` 兜底为 500，
         // 绝不伪装成客户端 400（否则故障被掩盖）。
         LicenseError::Storage(_) => "INTERNAL_SERVER_ERROR",
@@ -232,9 +1054,9 @@ pub fn error_to_code(err: &LicenseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin_auth::{AdminAuth, Role};
     use crate::keys::KeyRing;
     use crate::model::{now_unix_secs, Tenant};
-    use crate::service::LicensingService;
     use crate::store::Store;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
@@ -251,6 +1073,19 @@ mod tests {
     const TEST_ONLY_ROGUE_SEED: [u8; 32] = *b"iotdaq-rogue-seed-http-000000001";
     /// **TEST_ONLY_** 设备密钥种子（激活请求 `req_sig` 签名；仅测试，禁止真实部署）。
     const TEST_ONLY_DEVICE_SEED: [u8; 32] = *b"iotdaq-device-seed-http-00000001";
+    /// **TEST_ONLY_** 管理员口令（仅测试）。
+    const TEST_ONLY_ADMIN_PASSWORD: &str = "test-admin-password";
+    /// **TEST_ONLY_** 运营角色账号（403 负例用）。
+    const TEST_ONLY_OPS_PASSWORD: &str = "test-ops-password";
+
+    /// 构造 **TEST_ONLY_** 管理端鉴权器（admin/system + oliver/ops）。
+    fn test_auth() -> Arc<AdminAuth> {
+        Arc::new(
+            AdminAuth::new(crate::admin_auth::IssuerKey([0x77u8; 32]))
+                .with_user("admin", Role::System, TEST_ONLY_ADMIN_PASSWORD)
+                .with_user("oliver", Role::Ops, TEST_ONLY_OPS_PASSWORD),
+        )
+    }
 
     /// 构造带内存库 + 已注册**已知测试密钥**的服务（测试专用）。
     fn build_service() -> SharedService {
@@ -267,6 +1102,27 @@ mod tests {
             .register_from_b64("k-test", &B64.encode(TEST_ONLY_SEED), None, 1_700_000_000)
             .expect("register signing key");
         Arc::new(LicensingService::new(store, keyring))
+    }
+
+    /// 以 admin 账号直接签发测试 token（绕过 HTTP，避免测试间串扰）。
+    fn admin_token() -> String {
+        test_auth()
+            .login("admin", TEST_ONLY_ADMIN_PASSWORD)
+            .expect("admin login")
+            .0
+    }
+
+    /// 以 oliver（ops 角色）签发测试 token。
+    fn ops_token() -> String {
+        test_auth()
+            .login("oliver", TEST_ONLY_OPS_PASSWORD)
+            .expect("ops login")
+            .0
+    }
+
+    /// Bearer 请求头键值。
+    fn bearer(token: &str) -> (String, String) {
+        ("authorization".to_string(), format!("Bearer {token}"))
     }
 
     /// 对摘要用测试密钥签名（STANDARD base64）。
@@ -349,29 +1205,51 @@ mod tests {
         })
     }
 
-    /// 取出 issue 响应里首个码的 code_id。
-    fn first_code_id(issue_body: &serde_json::Value) -> String {
-        issue_body["data"]["codes"][0]["code_id"]
+    /// 取出 issue 响应里首个码的 `(code_id, code_value)`。
+    fn first_code(issue_body: &serde_json::Value) -> (String, String) {
+        let id = issue_body["data"]["codes"][0]["code_id"]
             .as_str()
             .unwrap()
-            .to_string()
+            .to_string();
+        let value = issue_body["data"]["codes"][0]["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (id, value)
+    }
+
+    /// 激活码 → 后 8 位确认串（去分隔符，与 admin-console `tail8Of` 同构）。
+    fn tail8_of(code: &str) -> String {
+        code.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_uppercase()
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect()
     }
 
     /// 发出一次请求并返回 `(status, json_body)`。
+    ///
+    /// `headers` 为 `(名称, 值)` 元组切片（值统一 `String`，便于混入动态 Bearer）。
     async fn call_with(
         service: &SharedService,
         method: &str,
         uri: &str,
         body: serde_json::Value,
-        headers: &[(&str, &str)],
+        headers: &[(String, String)],
     ) -> (StatusCode, serde_json::Value) {
-        let router = router(Arc::clone(service));
+        let router = router(Arc::clone(service), test_auth());
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
             .header("content-type", "application/json");
         for (k, v) in headers {
-            builder = builder.header(*k, *v);
+            builder = builder.header(k.as_str(), v.as_str());
         }
         let req = builder
             .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -392,12 +1270,14 @@ mod tests {
     #[tokio::test]
     async fn http_issue_success_returns_200_and_envelope_ok() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (status, body) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(Some("M1"), "h-issue-1"),
-            &[],
+            &authed,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -411,12 +1291,14 @@ mod tests {
     #[tokio::test]
     async fn http_issue_prebind_conflict_returns_400_prebind_conflict() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(Some("M-X"), "h-issue-a"),
-            &[],
+            &authed,
         )
         .await;
         // 同租户再发同预绑定 → 结构化错误码 PREBIND_CONFLICT，HTTP 400。
@@ -425,7 +1307,7 @@ mod tests {
             "POST",
             "/admin/codes/issue",
             issue_body(Some("M-X"), "h-issue-b"),
-            &[],
+            &authed,
         )
         .await;
         assert_eq!(status, bad_request());
@@ -435,12 +1317,14 @@ mod tests {
     #[tokio::test]
     async fn http_issue_idempotent_returns_same_code() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, a) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-idem"),
-            &[],
+            &authed,
         )
         .await;
         let (_, b) = call_with(
@@ -448,7 +1332,7 @@ mod tests {
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-idem"),
-            &[],
+            &authed,
         )
         .await;
         assert_eq!(a["code"], "OK");
@@ -464,12 +1348,14 @@ mod tests {
     #[tokio::test]
     async fn http_activate_success_returns_200_and_lease() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(Some("M1"), "h-act-2"),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
@@ -490,12 +1376,14 @@ mod tests {
     #[tokio::test]
     async fn http_activate_prebind_mismatch_returns_400_prebind_conflict() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(Some("M1"), "h-act-3"),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
@@ -545,12 +1433,14 @@ mod tests {
     #[tokio::test]
     async fn http_activate_bound_to_other_device_returns_403_code_bound_to_other_device() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-nofm-1"),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
@@ -595,12 +1485,14 @@ mod tests {
     #[tokio::test]
     async fn http_activate_forged_signature_returns_401_activation_signature_invalid() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-act-sig"),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
@@ -619,12 +1511,14 @@ mod tests {
     #[tokio::test]
     async fn http_activate_pubkey_mismatch_returns_403_activation_pubkey_mismatch() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-act-pk"),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
@@ -660,12 +1554,14 @@ mod tests {
     #[tokio::test]
     async fn http_activate_stale_ts_returns_401_timestamp_skew() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-act-ts"),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
@@ -696,12 +1592,14 @@ mod tests {
     #[tokio::test]
     async fn http_activate_replayed_nonce_returns_409_nonce_replay() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-act-replay"),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
@@ -722,20 +1620,22 @@ mod tests {
     #[tokio::test]
     async fn http_revoke_then_reissue_idempotent() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-ri-1"),
-            &[],
+            &authed,
         )
         .await;
-        let code_id = first_code_id(&issue);
+        let (code_id, code_value) = first_code(&issue);
 
         let revoke_body = json!({
             "reason": "compromised",
             "note": "note note note",
-            "confirm_tail8": "tail1234",
+            "confirm_tail8": tail8_of(&code_value),
             "second_approver": null
         });
         let (rs, rb) = call_with(
@@ -743,10 +1643,13 @@ mod tests {
             "POST",
             &format!("/admin/codes/{code_id}/revoke"),
             revoke_body,
-            &[("x-tenant-id", "t-1")],
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
         )
         .await;
-        assert_eq!(rs, StatusCode::OK);
+        assert_eq!(rs, StatusCode::OK, "{rb}");
         assert_eq!(rb["code"], "OK");
 
         let reissue_body = json!({
@@ -761,10 +1664,13 @@ mod tests {
             "POST",
             &format!("/admin/codes/{code_id}/reissue"),
             reissue_body.clone(),
-            &[("x-tenant-id", "t-1")],
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
         )
         .await;
-        assert_eq!(rs1, StatusCode::OK);
+        assert_eq!(rs1, StatusCode::OK, "{rb1}");
         let new_id = rb1["data"]["new_code"]["code_id"]
             .as_str()
             .unwrap()
@@ -776,7 +1682,10 @@ mod tests {
             "POST",
             &format!("/admin/codes/{code_id}/reissue"),
             reissue_body,
-            &[("x-tenant-id", "t-1")],
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
         )
         .await;
         assert_eq!(rs2, StatusCode::OK);
@@ -790,15 +1699,17 @@ mod tests {
     #[tokio::test]
     async fn http_reissue_requires_revoked_original_returns_400() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-rr-1"),
-            &[],
+            &authed,
         )
         .await;
-        let code_id = first_code_id(&issue);
+        let (code_id, _) = first_code(&issue);
         // 未废弃直接重发 → KeyStateIllegal → BAD_REQUEST → 400。
         let reissue_body = json!({
             "prebind": null,
@@ -812,30 +1723,35 @@ mod tests {
             "POST",
             &format!("/admin/codes/{code_id}/reissue"),
             reissue_body,
-            &[("x-tenant-id", "t-1")],
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
         )
         .await;
         assert_eq!(status, bad_request());
         assert_eq!(body["code"], "BAD_REQUEST");
     }
 
+    /// 缺省 `X-Tenant-Id` 头 → 400 结构化错误（本版收紧：不再缺省 `unknown`）。
     #[tokio::test]
     async fn http_revop_missing_tenant_header_is_rejected() {
         let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, "h-rh-1"),
-            &[],
+            &authed,
         )
         .await;
-        let code_id = first_code_id(&issue);
-        // 缺省 X-Tenant-Id → tenant="unknown" → 未知租户 → INVALID_CODE → 400。
+        let (code_id, code_value) = first_code(&issue);
         let revoke_body = json!({
             "reason": "x",
             "note": "note note note",
-            "confirm_tail8": "tail1234",
+            "confirm_tail8": tail8_of(&code_value),
             "second_approver": null
         });
         let (status, body) = call_with(
@@ -843,23 +1759,776 @@ mod tests {
             "POST",
             &format!("/admin/codes/{code_id}/revoke"),
             revoke_body,
-            &[],
+            &[bearer(&token)],
         )
         .await;
         assert_eq!(status, bad_request());
+        assert_eq!(body["code"], "BAD_REQUEST");
+    }
+
+    /// **revoke 契约（设计 §2.2）**：`confirm_tail8` 不符 → 412 `CONFIRM_MISMATCH`。
+    #[tokio::test]
+    async fn http_revoke_wrong_tail8_returns_412_confirm_mismatch() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-cm-1"),
+            &authed,
+        )
+        .await;
+        let (code_id, _) = first_code(&issue);
+        let revoke_body = json!({
+            "reason": "compromised",
+            "note": "note note note",
+            "confirm_tail8": "AAAAAAAA",
+            "second_approver": null
+        });
+        let (status, body) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/codes/{code_id}/revoke"),
+            revoke_body,
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::from_u16(412).unwrap());
+        assert_eq!(body["code"], "CONFIRM_MISMATCH");
+        // 消息不得回显激活码原文。
+        let msg = body["message"].as_str().unwrap();
+        assert!(!msg.contains("IOTDAQ-"), "消息泄露激活码: {msg}");
+    }
+
+    /// **revoke 契约**：`note` < 10 字 → 400。
+    #[tokio::test]
+    async fn http_revoke_short_note_returns_400() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-cm-2"),
+            &authed,
+        )
+        .await;
+        let (code_id, code_value) = first_code(&issue);
+        let revoke_body = json!({
+            "reason": "compromised",
+            "note": "短",
+            "confirm_tail8": tail8_of(&code_value),
+            "second_approver": null
+        });
+        let (status, body) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/codes/{code_id}/revoke"),
+            revoke_body,
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(status, bad_request());
+        assert_eq!(body["code"], "BAD_REQUEST");
+    }
+
+    /// **revoke 契约**：`reason` 空白 → 400 `REASON_REQUIRED`。
+    #[tokio::test]
+    async fn http_revoke_blank_reason_returns_400_reason_required() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-cm-3"),
+            &authed,
+        )
+        .await;
+        let (code_id, code_value) = first_code(&issue);
+        let revoke_body = json!({
+            "reason": "   ",
+            "note": "note note note",
+            "confirm_tail8": tail8_of(&code_value),
+            "second_approver": null
+        });
+        let (status, body) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/codes/{code_id}/revoke"),
+            revoke_body,
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(status, bad_request());
+        assert_eq!(body["code"], "REASON_REQUIRED");
+    }
+
+    // ---------------- 管理端鉴权（login / Bearer / RBAC） ----------------
+
+    /// 登录正路径：正确口令 → 200 `{token, role}`；token 可调受保护端点。
+    #[tokio::test]
+    async fn http_admin_login_happy_returns_token_and_role() {
+        let svc = build_service();
+        let (status, body) = call_with(
+            &svc,
+            "POST",
+            "/admin/auth/login",
+            json!({"username": "admin", "password": TEST_ONLY_ADMIN_PASSWORD}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "OK");
+        assert_eq!(body["data"]["role"], "system");
+        let token = body["data"]["token"].as_str().unwrap().to_string();
+        assert!(token.split('.').count() == 3, "JWT 三段式");
+
+        // token 可访问受保护端点。
+        let (status, list) =
+            call_with(&svc, "GET", "/admin/codes", json!(null), &[bearer(&token)]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list["code"], "OK");
+    }
+
+    /// 登录负路径：错误口令 / 未知用户 / 请求体非法 → 一律 401 `SESSION_EXPIRED`。
+    #[tokio::test]
+    async fn http_admin_login_negative_paths_are_401() {
+        let svc = build_service();
+        for (uri, body) in [
+            (
+                "/admin/auth/login",
+                json!({"username": "admin", "password": "wrong"}),
+            ),
+            (
+                "/admin/auth/login",
+                json!({"username": "nobody", "password": TEST_ONLY_ADMIN_PASSWORD}),
+            ),
+            ("/admin/auth/login", json!({})),
+        ] {
+            let (status, body) = call_with(&svc, "POST", uri, body, &[]).await;
+            assert_eq!(status, StatusCode::from_u16(401).unwrap(), "{body}");
+            assert_eq!(body["code"], "SESSION_EXPIRED");
+        }
+    }
+
+    /// 无 token / 坏 token 调受保护端点 → 401 `SESSION_EXPIRED`。
+    #[tokio::test]
+    async fn http_admin_endpoints_require_valid_token() {
+        let svc = build_service();
+        // 无 token。
+        let (status, body) = call_with(&svc, "GET", "/admin/overview", json!(null), &[]).await;
+        assert_eq!(status, StatusCode::from_u16(401).unwrap());
+        assert_eq!(body["code"], "SESSION_EXPIRED");
+        // 垃圾 token。
+        let (status, body) = call_with(
+            &svc,
+            "GET",
+            "/admin/overview",
+            json!(null),
+            &[bearer("not.a.jwt")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::from_u16(401).unwrap());
+        assert_eq!(body["code"], "SESSION_EXPIRED");
+        // 写端点同样受保护。
+        let (status, _) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-noauth"),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::from_u16(401).unwrap());
+    }
+
+    /// RBAC 门控：ops 角色调高危端点（revoke）→ 403 `ADMIN_ONLY`；
+    /// system 正常。读端点任意角色可访问。
+    #[tokio::test]
+    async fn http_admin_rbac_gates_dangerous_endpoints() {
+        let svc = build_service();
+        let admin = admin_token();
+        let ops = ops_token();
+        let admin_authed = [bearer(&admin)];
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-rbac-1"),
+            &admin_authed,
+        )
+        .await;
+        let (code_id, code_value) = first_code(&issue);
+        let revoke_body = json!({
+            "reason": "compromised",
+            "note": "note note note",
+            "confirm_tail8": tail8_of(&code_value),
+            "second_approver": null
+        });
+        // ops（有 token 但角色不符）→ 403。
+        let (status, body) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/codes/{code_id}/revoke"),
+            revoke_body.clone(),
+            &[bearer(&ops), ("x-tenant-id".to_string(), "t-1".to_string())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::from_u16(403).unwrap());
+        assert_eq!(body["code"], "ADMIN_ONLY");
+        // ops 调租户创建（仅 system）→ 403。
+        let (status, body) = call_with(
+            &svc,
+            "POST",
+            "/admin/tenants",
+            json!({"tenant_id": "t-ops", "name": "x"}),
+            &[bearer(&ops)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::from_u16(403).unwrap());
+        assert_eq!(body["code"], "ADMIN_ONLY");
+        // 读端点 ops 可访问。
+        let (status, _) =
+            call_with(&svc, "GET", "/admin/codes", json!(null), &[bearer(&ops)]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // ---------------- GET 端点（happy + 筛选 / 分页） ----------------
+
+    /// `GET /admin/codes`：列表 + tenant/tier 筛选 + 分页 + 码值掩码。
+    #[tokio::test]
+    async fn http_admin_codes_list_filter_and_pagination() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        for i in 0..3 {
+            call_with(
+                &svc,
+                "POST",
+                "/admin/codes/issue",
+                issue_body(None, &format!("h-codes-{i}")),
+                &authed,
+            )
+            .await;
+        }
+        // 全量：3 条 + total 为字符串（大数红线）。
+        let (status, body) = call_with(
+            &svc,
+            "GET",
+            "/admin/codes?page=1&page_size=2",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"]["total"], "3");
+        assert_eq!(body["data"]["page"], "1");
+        assert!(
+            body["data"]["items"][0]["code_masked"]
+                .as_str()
+                .unwrap()
+                .contains("****"),
+            "码值必须掩码"
+        );
+        // 第二页。
+        let (_, p2) = call_with(
+            &svc,
+            "GET",
+            "/admin/codes?page=2&page_size=2",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(p2["data"]["items"].as_array().unwrap().len(), 1);
+        // tier 筛选（全部为 pro）。
+        let (_, pro) = call_with(&svc, "GET", "/admin/codes?tier=pro", json!(null), &authed).await;
+        assert_eq!(pro["data"]["total"], "3");
+        // 非法 status 筛选 → 400。
+        let (status, _) = call_with(
+            &svc,
+            "GET",
+            "/admin/codes?status=weird",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+    }
+
+    /// `GET /admin/codes/:id`：详情含完整码值 + 时间线 + 溯源链。
+    #[tokio::test]
+    async fn http_admin_code_detail_returns_timeline_and_chain() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-detail-1"),
+            &authed,
+        )
+        .await;
+        let (code_id, code_value) = first_code(&issue);
+
+        // 废弃 + 重发，产生时间线与溯源链。
+        call_with(
+            &svc,
+            "POST",
+            &format!("/admin/codes/{code_id}/revoke"),
+            json!({
+                "reason": "compromised",
+                "note": "note note note",
+                "confirm_tail8": tail8_of(&code_value),
+                "second_approver": null
+            }),
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
+        )
+        .await;
+        let (_, reissued) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/codes/{code_id}/reissue"),
+            json!({
+                "prebind": null, "inherit_tier": true, "inherit_validity": true,
+                "overrides": null, "idempotency_key": "h-detail-reissue"
+            }),
+            &[
+                bearer(&token),
+                ("x-tenant-id".to_string(), "t-1".to_string()),
+            ],
+        )
+        .await;
+        let new_id = reissued["data"]["new_code"]["code_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 新码详情：溯源链含原码；原码详情：完整码值 + revoke 时间线。
+        let (_, detail) = call_with(
+            &svc,
+            "GET",
+            &format!("/admin/codes/{new_id}"),
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(detail["data"]["code_id"], new_id.as_str());
+        assert_eq!(
+            detail["data"]["reissued_chain"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            detail["data"]["reissued_chain"][0],
+            code_id.as_str(),
+            "溯源链必须指向原码"
+        );
+
+        let (_, orig) = call_with(
+            &svc,
+            "GET",
+            &format!("/admin/codes/{code_id}"),
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(
+            orig["data"]["code"],
+            code_value.as_str(),
+            "详情页揭示完整码值"
+        );
+        assert_eq!(orig["data"]["status"], "reissued");
+        let actions: Vec<&str> = orig["data"]["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action"].as_str().unwrap())
+            .collect();
+        assert!(
+            actions.contains(&"revoke"),
+            "时间线必须含 revoke: {actions:?}"
+        );
+        // 未知码 → 400。
+        let (status, _) = call_with(&svc, "GET", "/admin/codes/nope", json!(null), &authed).await;
+        assert_eq!(status, bad_request());
+    }
+
+    /// 租户链路：`POST /admin/tenants` 创建 → `POST /admin/codes/issue` 对新租户发放
+    /// → `GET /admin/tenants` 列表可见（新部署自举必需）。
+    #[tokio::test]
+    async fn http_admin_tenant_create_then_issue_bootstrap_chain() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+
+        // 前置：对新租户 issue 直接失败（租户不存在）。
+        let mut new_issue = issue_body(None, "h-boot-0");
+        new_issue["tenant_id"] = json!("t-new");
+        let (status, body) =
+            call_with(&svc, "POST", "/admin/codes/issue", new_issue, &authed).await;
+        assert_eq!(status, bad_request());
         assert_eq!(body["code"], "INVALID_CODE");
+
+        // 创建租户 → issue 成功（自举链路）。
+        let (status, created) = call_with(
+            &svc,
+            "POST",
+            "/admin/tenants",
+            json!({"tenant_id": "t-new", "name": "New Tenant", "contact": "a@b.c"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["data"]["verify_mode_default"], "B");
+        let mut new_issue = issue_body(None, "h-boot-1");
+        new_issue["tenant_id"] = json!("t-new");
+        let (status, body) =
+            call_with(&svc, "POST", "/admin/codes/issue", new_issue, &authed).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["codes"].as_array().unwrap().len(), 1);
+
+        // 列表可见 + 重复创建被拒。
+        let (_, list) = call_with(&svc, "GET", "/admin/tenants", json!(null), &authed).await;
+        let tenants = list["data"]["items"].as_array().unwrap();
+        assert!(tenants.iter().any(|t| t["tenant_id"] == "t-new"));
+        let (status, _dup) = call_with(
+            &svc,
+            "POST",
+            "/admin/tenants",
+            json!({"tenant_id": "t-new", "name": "dup"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+
+        // 策略更新 + 非法档位被拒。
+        let (status, _) = call_with(
+            &svc,
+            "PUT",
+            "/admin/tenants/t-new/policy",
+            json!({"verify_mode_default": "A"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call_with(
+            &svc,
+            "PUT",
+            "/admin/tenants/t-new/policy",
+            json!({"verify_mode_default": "Z"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+        // 未知租户策略更新 → 400。
+        let (status, _) = call_with(
+            &svc,
+            "PUT",
+            "/admin/tenants/t-missing/policy",
+            json!({"verify_mode_default": "A"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+    }
+
+    /// `GET /admin/devices`：设备列表 + 机器码掩码 + status 内存筛选。
+    #[tokio::test]
+    async fn http_admin_devices_list_and_filter() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        // 发码 + 激活 → 产生设备。
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-dev-1"),
+            &authed,
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"].as_str().unwrap();
+        let (status, _) = call_with(
+            &svc,
+            "POST",
+            "/activation",
+            activate_body(code, "MID-DEV-1"),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, list) = call_with(&svc, "GET", "/admin/devices", json!(null), &authed).await;
+        assert_eq!(list["code"], "OK");
+        let items = list["data"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0]["machine_code_masked"]
+                .as_str()
+                .unwrap()
+                .contains("****"),
+            "机器码必须掩码"
+        );
+        assert_eq!(items[0]["deploy_mode"], "native");
+        // 状态筛选命中。
+        let (_, hit) = call_with(
+            &svc,
+            "GET",
+            "/admin/devices?status=active",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(hit["data"]["total"], "1");
+        // 状态筛选不命中。
+        let (_, miss) = call_with(
+            &svc,
+            "GET",
+            "/admin/devices?status=stopped",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(miss["data"]["total"], "0");
+        // 关键字筛选（machine_code contains，大小写不敏感）。
+        let (_, kw) = call_with(
+            &svc,
+            "GET",
+            "/admin/devices?machine_code=mid-dev",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(kw["data"]["total"], "1");
+    }
+
+    /// `GET /admin/receipts/anomalies`：gap 回执出现在异常列表（大数字段为字符串）。
+    #[tokio::test]
+    async fn http_admin_receipt_anomalies_lists_gap_receipts() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        // 发码 + 激活。
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-anom-1"),
+            &authed,
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"].as_str().unwrap();
+        let (_, act) = call_with(
+            &svc,
+            "POST",
+            "/activation",
+            activate_body(code, "MID-ANOM"),
+            &[],
+        )
+        .await;
+        let lease_id = act["data"]["lease_id"].as_str().unwrap().to_string();
+
+        // 上报正常区间 → 无异常；再上报跳空区间 → gap_flag 置位。
+        let now = now_unix_secs();
+        let count = 100i64;
+        let hash = crate::receipt::receipt_payload_hash(
+            "MID-ANOM", &lease_id, 1, 100, count, "sha256:d", now,
+        );
+        let (_, r1) = call_with(
+            &svc,
+            "POST",
+            "/audit/receipt",
+            json!({
+                "device_mid": "MID-ANOM", "lease_id": lease_id,
+                "seq_from": "1", "seq_to": "100", "count": "100",
+                "payload_digest": "sha256:d", "ts": now.to_string(),
+                "sig": sign_hash(&hash)
+            }),
+            &[],
+        )
+        .await;
+        assert_eq!(r1["data"]["gap"], "none");
+        let hash2 = crate::receipt::receipt_payload_hash(
+            "MID-ANOM", &lease_id, 150, 300, 151, "sha256:d", now,
+        );
+        let (_, r2) = call_with(
+            &svc,
+            "POST",
+            "/audit/receipt",
+            json!({
+                "device_mid": "MID-ANOM", "lease_id": lease_id,
+                "seq_from": "150", "seq_to": "300", "count": "151",
+                "payload_digest": "sha256:d", "ts": now.to_string(),
+                "sig": sign_hash(&hash2)
+            }),
+            &[],
+        )
+        .await;
+        assert_eq!(r2["data"]["gap"], "gap");
+
+        // 异常列表含该 gap 回执；序号为字符串（大数红线）。
+        let (_, list) = call_with(
+            &svc,
+            "GET",
+            "/admin/receipts/anomalies",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(list["code"], "OK");
+        let items = list["data"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["seq_from"].is_string(), "seq_from 必须为字符串");
+        assert_eq!(items[0]["seq_from"], "150");
+        assert_eq!(items[0]["kind"], "gap");
+        assert_eq!(items[0]["device_mid"], "MID-ANOM");
+
+        // overview 的 receipts_anomalous 同步为 "1"。
+        let (_, ov) = call_with(&svc, "GET", "/admin/overview", json!(null), &authed).await;
+        assert_eq!(ov["data"]["receipts_anomalous"], "1");
+        assert_eq!(ov["data"]["codes_bound"], "1");
+    }
+
+    /// `GET /admin/keys`：只含公钥的密钥列表。
+    #[tokio::test]
+    async fn http_admin_keys_lists_signing_keys() {
+        let svc = build_service();
+        // 直接登记一条公钥记录（service 端点不发私钥）。
+        svc.store()
+            .insert_signing_key(&crate::model::SigningKey {
+                kid: "k-admin".into(),
+                status: crate::model::SigningKeyStatus::Active,
+                public_key: "cHVia2V5".into(),
+                hsm_ref: None,
+                enabled_at: 1_700_000_000,
+                retired_at: None,
+            })
+            .expect("insert key");
+        let token = admin_token();
+        let (_, list) = call_with(&svc, "GET", "/admin/keys", json!(null), &[bearer(&token)]).await;
+        assert_eq!(list["code"], "OK");
+        let items = list["data"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kid"], "k-admin");
+        assert_eq!(items[0]["status"], "active");
+        // overview 的 active_kid 指向该密钥。
+        let (_, ov) = call_with(
+            &svc,
+            "GET",
+            "/admin/overview",
+            json!(null),
+            &[bearer(&token)],
+        )
+        .await;
+        assert_eq!(ov["data"]["active_kid"], "k-admin");
+    }
+
+    /// `GET /admin/audit/logs`：审计查询 + action 筛选 + 时间范围过滤 + 大数 ts 字符串。
+    #[tokio::test]
+    async fn http_admin_audit_logs_filter_and_time_range() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        // 产生 issue 审计事件。
+        call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-audit-1"),
+            &authed,
+        )
+        .await;
+        // 全量。
+        let (_, list) = call_with(&svc, "GET", "/admin/audit/logs", json!(null), &authed).await;
+        assert_eq!(list["code"], "OK");
+        let items = list["data"]["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        assert!(items[0]["ts"].is_string(), "ts 必须为字符串（大数红线）");
+        // action 筛选。
+        let (_, issue_only) = call_with(
+            &svc,
+            "GET",
+            "/admin/audit/logs?action=issue",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(issue_only["data"]["items"].as_array().unwrap().len(), 1);
+        // 时间范围（未来窗口 → 空）。
+        let far = now_unix_secs() + 100_000;
+        let (_, empty) = call_with(
+            &svc,
+            "GET",
+            &format!("/admin/audit/logs?time_from={far}"),
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(empty["data"]["total"], "0");
+        // 非法时间范围 → 400。
+        let (status, _) = call_with(
+            &svc,
+            "GET",
+            "/admin/audit/logs?time_from=abc",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+    }
+
+    /// `GET /admin/overview`：聚合计数（字符串编码）+ 无活跃密钥时 active_kid 为 null。
+    #[tokio::test]
+    async fn http_admin_overview_aggregates_counts() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body(None, "h-ov-1"),
+            &authed,
+        )
+        .await;
+        let (_, ov) = call_with(&svc, "GET", "/admin/overview", json!(null), &authed).await;
+        assert_eq!(ov["code"], "OK");
+        assert_eq!(ov["data"]["tenants"], "1");
+        assert_eq!(ov["data"]["codes_total"], "1");
+        assert_eq!(ov["data"]["codes_issued"], "1");
+        assert!(ov["data"]["active_kid"].is_null(), "无公钥记录 → null");
     }
 
     // ---------------- 设备端：心跳 / 校验 / 回执 ----------------
 
     /// 经 HTTP 端点走一遍「发码 → 激活」，返回 `lease_id`。
     async fn activate_lease(svc: &SharedService, idem: &str, machine: &str) -> String {
+        let token = admin_token();
+        let authed = [bearer(&token)];
         let (_, issue) = call_with(
             svc,
             "POST",
             "/admin/codes/issue",
             issue_body(None, idem),
-            &[],
+            &authed,
         )
         .await;
         let code = issue["data"]["codes"][0]["code"]
