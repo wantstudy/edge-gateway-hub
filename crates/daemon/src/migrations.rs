@@ -95,6 +95,60 @@ pub fn builtin_latest_version() -> u32 {
         .map_or(0, |m: &Migration| m.version)
 }
 
+/// v2 迁移 SQL（task 26 安全审计）：`audit_log` 追加链表 + `audit_meta` 派生盐表。
+///
+/// - `audit_log`：一行一条安全审计事件；**追加写**由两个触发器强制——
+///   UPDATE / DELETE 一律 `RAISE(ABORT)`（QA 场景「尝试删除日志 → 断言失败」
+///   的落点；链完整性由 `audit.rs` 的 HMAC-SHA256 哈希链校验承担）；
+/// - `audit_meta`：链盐（`chain_salt`）等派生材料的持久化（重开库可复算链密钥）；
+/// - 时间/事件索引服务 mgmt 远程拉取端点的时间窗与事件类型过滤。
+pub const V2_AUDIT_SQL: &str = "
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq        INTEGER PRIMARY KEY,
+    ts_ns      INTEGER NOT NULL,
+    actor      TEXT    NOT NULL,
+    event      TEXT    NOT NULL,
+    outcome    TEXT    NOT NULL,
+    detail     TEXT    NOT NULL,
+    prev_hash  TEXT    NOT NULL,
+    entry_hash TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_log_ts_idx    ON audit_log(ts_ns);
+CREATE INDEX IF NOT EXISTS audit_log_event_idx ON audit_log(event);
+CREATE TABLE IF NOT EXISTS audit_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only: update rejected');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only: delete rejected');
+END;
+";
+
+/// 审计库迁移注册表（v1 账本 + v2 审计表）。
+///
+/// 与 `builtin_registry()`（只到 v1）分离：telemetry.db / queue.db 继续用内置
+/// 注册表不受影响；审计库（audit.db）用本注册表独立迁移（task 26）。
+#[must_use]
+pub fn audit_registry() -> Vec<Migration> {
+    vec![
+        Migration {
+            version: 1,
+            description: "create schema_migrations ledger table",
+            step: MigrationStep::Sql(V1_LEDGER_SQL),
+        },
+        Migration {
+            version: 2,
+            description: "create audit_log append-only chain table and audit_meta",
+            step: MigrationStep::Sql(V2_AUDIT_SQL),
+        },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // 执行报告
 // ---------------------------------------------------------------------------

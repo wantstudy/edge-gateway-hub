@@ -272,10 +272,37 @@ struct LoginBody {
 /// `{"error":"unauthorized","message":"invalid credentials"}`——不区分原因，
 /// 防账号枚举（安全契约见模块注释）。
 pub async fn login(State(state): State<super::MgmtState>, body: Bytes) -> Response {
-    let outcome = serde_json::from_slice::<LoginBody>(&body)
-        .ok()
+    let parsed = serde_json::from_slice::<LoginBody>(&body).ok();
+    // task 26：登录成功 / 失败均落持久安全审计（防篡改哈希链）。detail 不含
+    // 凭据、不区分失败原因（与 401 统一响应同口径，防账号枚举）；写失败仅告警。
+    let username = parsed
+        .as_ref()
+        .map(|req| req.username.trim().to_string())
+        .unwrap_or_default();
+    let outcome = parsed
         .filter(|req| !req.username.is_empty() && !req.password.is_empty())
         .and_then(|req| state.login_auth().login(&req.username, &req.password));
+    if let Some(logger) = state.daemon().audit_logger() {
+        let (event, outcome_literal) = if outcome.is_some() {
+            (
+                crate::audit::AuditEventType::Login,
+                crate::audit::OUTCOME_ACCEPTED,
+            )
+        } else {
+            (
+                crate::audit::AuditEventType::LoginFailed,
+                crate::audit::OUTCOME_DENIED,
+            )
+        };
+        let actor = if username.is_empty() {
+            "<missing>"
+        } else {
+            username.as_str()
+        };
+        if let Err(err) = logger.record(actor, event, outcome_literal, "mgmt login") {
+            tracing::warn!(error = %err, "auth_login: persistent audit record failed");
+        }
+    }
     match outcome {
         Some((token, role)) => Json(serde_json::json!({
             "token": token,
@@ -781,5 +808,63 @@ password_hash = "{SHA256_ABC_HEX}"
         let digest = sha256_bytes(b"abc");
         assert_eq!(hex::encode(&digest), SHA256_ABC_HEX, "known-answer vector");
         assert_eq!(digest.len(), 32);
+    }
+
+    /// QA（task 26）: 登录成功 / 失败均落**持久安全审计**——成功 = `login`
+    ///（accepted），失败 = `login_failed`（denied）；detail 不含凭据；两次事件
+    /// 入防篡改哈希链且整链校验通过。
+    #[tokio::test]
+    async fn login_events_land_in_persistent_audit_chain() {
+        let config = config_with_users();
+        let state = make_state_with(&config, &no_env);
+        // 挂载审计库（make_state_with 本身不挂载；task 26 生产路由 bootstrap 装配）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = crate::audit::AuditLogger::open(&dir.path().join("audit.db"), Some(b"ikm"))
+            .expect("open audit db");
+        let logger = Arc::new(logger);
+        state.daemon().set_audit_logger(Arc::clone(&logger));
+
+        let port = spawn_server(state).await;
+
+        // 成功登录（alice/system，密码 "abc"）→ 200 + login(accepted)。
+        let (status, _, _) = http_post(
+            port,
+            "/api/auth/login",
+            r#"{"username":"alice","password":"abc"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // 失败登录 → 401 + login_failed(denied)。
+        let (status, _, _) = http_post(
+            port,
+            "/api/auth/login",
+            r#"{"username":"alice","password":"wrong"}"#,
+        )
+        .await;
+        assert_eq!(status, 401);
+
+        // 两条事件都在持久审计里：actor、event、outcome 正确，detail 无凭据。
+        let rows = logger
+            .query(&crate::audit::AuditQuery::new())
+            .expect("query audit");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event, "login");
+        assert_eq!(rows[0].actor, "alice");
+        assert_eq!(rows[0].outcome, crate::audit::OUTCOME_ACCEPTED);
+        assert_eq!(rows[1].event, "login_failed");
+        assert_eq!(rows[1].outcome, crate::audit::OUTCOME_DENIED);
+        for row in &rows {
+            assert!(
+                !row.detail.contains("abc"),
+                "audit must not contain credentials"
+            );
+            assert!(
+                !row.detail.contains("wrong"),
+                "audit must not contain credentials"
+            );
+        }
+        // 哈希链完好（登录事件正确入链）。
+        assert!(logger.verify_chain().expect("verify").ok);
     }
 }

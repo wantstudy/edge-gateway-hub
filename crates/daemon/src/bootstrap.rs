@@ -125,6 +125,8 @@ struct DaemonSharedInner {
     /// 采集侧 / mgmt / 测试据此在运行期读取授权状态（[`LicenseRuntime::state`]）与
     /// 北向转发判据（[`LicenseRuntime::north_forward_allowed`]）。
     license: RwLock<Option<Arc<LicenseRuntime>>>,
+    /// 安全审计记录器（task 26 最小接线；`None` = 未挂载，mgmt 审计端点 503）。
+    audit: RwLock<Option<Arc<crate::audit::AuditLogger>>>,
 }
 
 /// daemon 全局共享状态：生命周期 / 心跳 / 配置快照（task 51）。
@@ -152,6 +154,7 @@ impl DaemonShared {
                 shutdown_timed_out: AtomicBool::new(false),
                 north: RwLock::new(None),
                 license: RwLock::new(None),
+                audit: RwLock::new(None),
             }),
         }
     }
@@ -304,6 +307,28 @@ impl DaemonShared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    /// 挂载安全审计记录器（task 26 最小接线；bootstrap 装配期调用一次）。
+    ///
+    /// 照 [`Self::set_license_runtime`] 的「注入后只读共享」范式：
+    /// 重复调用只替换句柄；未挂载时保持 `None`，不 panic。
+    pub fn set_audit_logger(&self, logger: Arc<crate::audit::AuditLogger>) {
+        let mut guard = self
+            .inner
+            .audit
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(logger);
+    }
+
+    /// 安全审计记录器（`None` = 未挂载；mgmt 审计端点据此 503 fail-closed）。
+    pub fn audit_logger(&self) -> Option<Arc<crate::audit::AuditLogger>> {
+        self.inner
+            .audit
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl Default for DaemonShared {
@@ -381,6 +406,8 @@ pub struct BootstrapBuilder {
     north: Option<NorthRuntimeConfig>,
     /// 授权运行期装配输入（task 22/23/24；`None` = 未接线，跳过授权编排）。
     license: Option<LicenseRuntimeConfig>,
+    /// 安全审计记录器（task 26；`None` = run 内按默认路径 audit.db 自建）。
+    audit_logger: Option<Arc<crate::audit::AuditLogger>>,
 }
 
 impl BootstrapBuilder {
@@ -401,7 +428,15 @@ impl BootstrapBuilder {
             ota_boot_check: None,
             north: None,
             license: None,
+            audit_logger: None,
         }
+    }
+
+    /// 注入外部已建好的安全审计记录器（task 26；测试 / 嵌入式装配用；
+    /// 未注入则 run 内按「配置同目录 audit.db」自建）。
+    pub fn with_audit_logger(mut self, logger: Arc<crate::audit::AuditLogger>) -> Self {
+        self.audit_logger = Some(logger);
+        self
     }
 
     /// 注入外部共享状态（mgmt / 北向在运行期需要同一句柄时使用；
@@ -513,6 +548,20 @@ impl BootstrapBuilder {
         let shared = self.shared.clone().unwrap_or_default();
         shared.set_state(LifecycleState::Starting);
         info!("bootstrap: daemon starting");
+
+        // ①-a2 安全审计库（task 26 最小接线）：尝试打开配置同目录 audit.db 并
+        // 挂载到共享态（IKM 优先 env 部署密钥，回退授权机器码）。失败只记
+        // error 不阻断启动（fail-safe：审计缺失可观测、采集不受影响）。
+        let audit_machine_code = self
+            .license
+            .as_ref()
+            .map(|cfg| cfg.client.machine_code().to_string());
+        mount_audit_logger(
+            &shared,
+            &self.config_path,
+            self.audit_logger.take(),
+            audit_machine_code.as_deref(),
+        );
 
         // ①-a 完整性自检（task 50 接线）：早期执行、fail-safe 不 panic、
         // 不中断启动；进入 RestrictedMode 仅打 [WARN] 并继续（敏感能力的
@@ -747,6 +796,53 @@ impl PollHandler for DynPollHandler {
 impl std::fmt::Debug for DynPollHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynPollHandler").finish_non_exhaustive()
+    }
+}
+
+/// 安全审计库装配（task 26 最小接线）：把 [`crate::audit::AuditLogger`] 挂载到
+/// [`DaemonShared`]，供 mgmt 审计端点与配置写 / 登录事件消费。
+///
+/// 装配顺序：外部注入优先（测试 / 嵌入式）；否则按「配置同目录 `audit.db`」
+/// 自建，IKM 由 [`crate::audit::resolve_audit_ikm`] 解析（env 部署密钥 → 授权
+/// 机器码 → 无 → 盐自派生降级）。共享态已挂载时跳过（幂等）；开库失败只记
+/// `error!` 不阻断启动（fail-safe：审计缺失可观测，采集数据面不受影响）。
+fn mount_audit_logger(
+    shared: &DaemonShared,
+    config_path: &Path,
+    injected: Option<Arc<crate::audit::AuditLogger>>,
+    machine_code: Option<&str>,
+) {
+    if shared.audit_logger().is_some() {
+        return; // 装配方已挂载，幂等跳过。
+    }
+    if let Some(logger) = injected {
+        shared.set_audit_logger(logger);
+        info!("bootstrap: audit logger mounted (injected)");
+        return;
+    }
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let db_path = dir.join(crate::audit::AUDIT_DB_FILE_NAME);
+    let ikm = crate::audit::resolve_audit_ikm(machine_code);
+    match crate::audit::AuditLogger::open(&db_path, ikm.as_deref()) {
+        Ok(logger) => {
+            shared.set_audit_logger(Arc::new(logger));
+            info!(
+                path = %db_path.display(),
+                "bootstrap: audit logger mounted ({}; ikm={})",
+                db_path.display(),
+                if ikm.is_some() { "deployment-bound" } else { "salt-only degraded" }
+            );
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                path = %db_path.display(),
+                "bootstrap: [ERROR] audit logger unavailable; security audit persistence disabled"
+            );
+        }
     }
 }
 

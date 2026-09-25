@@ -37,6 +37,7 @@
 //   [`ops_guard`] 包裹——AuthedRole（401）+ `permission_for_ops_action`（403），
 //   被拒动作入 ops 审计环；**读接口保持开放**（web-console 16 页契约不变）；
 // - **whoami**：`GET /api/auth/whoami` 返回 sub/role/exp（exp 字符串编码）。
+pub mod audit_api;
 pub mod auth_jwt;
 pub mod auth_login;
 pub mod rbac;
@@ -420,6 +421,10 @@ pub fn router(state: MgmtState) -> Router {
         .route("/api/events", get(events))
         .route("/api/auth/login", axum::routing::post(auth_login::login))
         .route("/api/auth/whoami", get(auth_login::whoami))
+        // task 26：安全审计远程拉取（只读；handler 自带 AuthedRole extractor +
+        // ensure 门控——list=audit.view(risk/system)，export=audit.export(仅 system)）。
+        .route("/api/audit", get(audit_api::list))
+        .route("/api/audit/export", get(audit_api::export))
         .merge(ops)
         .route("/", get(serve_root))
         .route("/assets/*path", get(serve_asset))

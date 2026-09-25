@@ -93,6 +93,10 @@ const OUTCOME_FAILED: &str = "failed";
 // ---- 审计 ----
 
 /// 记审计（actor = JWT sub；被拒 / 非法 / 失败 / 成功全记）。
+///
+/// task 26：内存环（remote_ops）之外同步落**持久安全审计**（防篡改哈希链）——
+/// 放行的配置写 = `config_change`，被拒 = `authz_failed`；持久写失败仅告警
+/// 不阻塞主流程（内存环仍是兜底轨迹）。
 fn audit(
     state: &MgmtState,
     actor: &str,
@@ -102,6 +106,21 @@ fn audit(
     reason: &str,
 ) {
     remote_ops::runtime_for(state).record_audit(actor, action, allowed, outcome, reason);
+    if let Some(logger) = state.daemon().audit_logger() {
+        let event = if allowed {
+            crate::audit::AuditEventType::ConfigChange
+        } else {
+            crate::audit::AuditEventType::AuthzFailed
+        };
+        if let Err(err) = logger.record(
+            actor,
+            event,
+            outcome,
+            &format!("{}: {reason}", action.as_str()),
+        ) {
+            tracing::warn!(error = %err, "writeapi: persistent audit record failed");
+        }
+    }
 }
 
 // ---- 响应辅助 ----
@@ -1019,6 +1038,7 @@ pub async fn point_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditQuery;
     use crate::bootstrap::DaemonShared;
     use crate::config::{ConfigShared, GatewayConfig};
     use crate::mgmt::auth_jwt::{now_unix_secs, sign, Claims};
@@ -1782,5 +1802,55 @@ frequency_ms = 100
             value["device_count"], "2",
             "two devices with points: {value}"
         );
+    }
+
+    /// QA（task 26）: 配置写受理 → 持久安全审计落 `config_change`（accepted），
+    /// RBAC 拒绝 → `authz_failed`（denied）；事件进入防篡改哈希链且整链校验通过。
+    #[tokio::test]
+    async fn config_write_lands_in_persistent_audit_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir);
+        // 挂载持久审计库（make_state 本身不挂载；生产由 bootstrap 装配）。
+        let audit_dir = tempfile::tempdir().expect("audit tempdir");
+        let logger = Arc::new(
+            crate::audit::AuditLogger::open(&audit_dir.path().join("audit.db"), Some(b"ikm"))
+                .expect("open audit db"),
+        );
+        state.daemon().set_audit_logger(Arc::clone(&logger));
+
+        let system = token_for(&state, Role::System);
+        let ops = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        // ① system（持 device.write）新增设备 → 200 + config_change(accepted)。
+        let (status, _, body) = http_post_bearer(
+            port,
+            "/api/devices",
+            r#"{"id":"dev-audit","protocol":"modbus-tcp"}"#,
+            &system,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        // ② ops（不持 device.write）新增设备 → 403 + authz_failed(denied)。
+        let (status, _, _) = http_post_bearer(
+            port,
+            "/api/devices",
+            r#"{"id":"dev-denied","protocol":"modbus-tcp"}"#,
+            &ops,
+        )
+        .await;
+        assert_eq!(status, 403);
+
+        // ③ 持久审计两事件齐备 + 链校验通过。
+        let rows = logger.query(&AuditQuery::new()).expect("query audit");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event, "config_change");
+        assert_eq!(rows[0].actor, "ops-admin");
+        assert_eq!(rows[0].outcome, OUTCOME_ACCEPTED);
+        assert_eq!(rows[1].event, "authz_failed");
+        assert_eq!(rows[1].outcome, OUTCOME_DENIED);
+        assert!(rows.iter().all(|r| r.detail.contains("device_create")));
+        assert!(logger.verify_chain().expect("verify").ok);
     }
 }
