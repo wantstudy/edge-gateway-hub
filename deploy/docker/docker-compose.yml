@@ -117,10 +117,13 @@ services:
     restart: unless-stopped
 
     # ---- 健康检查（判据见 deploy.md §3.1）----
-    # 注意：镜像为 distroless/static（无 curl/wget），健康检查走 TCP 端口探测，
-    # 由 compose 内建机制执行；HTTP 语义的 /healthz 校验由 install.sh 在宿主侧补做。
+    # ★ D-06 修复：镜像为 distroless/static（无 shell、无 curl/wget），
+    #   CMD-SHELL + /dev/tcp 在容器内必失败。改用镜像内置的静态探针二进制
+    #   /usr/local/bin/healthprobe（纯 std 零依赖，源码见 deploy/docker/healthprobe/），
+    #   exec-form 调用：每次执行一次 TCP connect 127.0.0.1:$IOT_DAQ_HTTP_PORT，
+    #   成功 exit 0 / 失败 exit 1。HTTP 语义的 /healthz 校验由 install.sh 在宿主侧补做。
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/${IOT_DAQ_HTTP_PORT:-8080} || exit 1"]
+      test: ["CMD", "/usr/local/bin/healthprobe"]
       interval: ${IOT_DAQ_HEALTHCHECK_INTERVAL:-30s}
       timeout: ${IOT_DAQ_HEALTHCHECK_TIMEOUT:-5s}
       retries: ${IOT_DAQ_HEALTHCHECK_RETRIES:-3}

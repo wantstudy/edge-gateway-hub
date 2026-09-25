@@ -171,8 +171,9 @@ sudo ./deploy/scripts/install.sh \
 判据（与 `container-deploy.md` §3.1 一致）：
 
 1. `docker compose ps` 显示 `gateway` 为 `running`（观察 60s 无重启抖动）；
-2. 宿主 `curl -fsS http://127.0.0.1:8080/healthz` 返回 200，body `mode` 为预期值（新装=未激活/试用中）；
-3. 未通过：`docker compose logs --tail=200` 排查；**禁止**以删指纹文件 / 改挂载点方式绕过（会被运行时自检判为环境变更）。
+2. 容器内健康检查（compose `healthcheck`）：调用镜像内置静态探针 `/usr/local/bin/healthprobe`（纯 std 零依赖，源码 `deploy/docker/healthprobe/main.rs`），每次执行一次 TCP connect `127.0.0.1:${IOT_DAQ_HTTP_PORT:-8080}`，成功 exit 0 / 失败 exit 1。runtime 镜像为 distroless/static（无 shell、无 curl/wget），**不能**使用 `CMD-SHELL` + `/dev/tcp` 形式的探针；
+3. 宿主 `curl -fsS http://127.0.0.1:8080/healthz` 返回 200，body `mode` 为预期值（新装=未激活/试用中）；
+4. 未通过：`docker compose logs --tail=200` 与 `docker inspect --format '{{json .State.Health}}' <容器>` 排查；**禁止**以删指纹文件 / 改挂载点方式绕过（会被运行时自检判为环境变更）。
 
 ---
 
@@ -198,6 +199,9 @@ sudo ./deploy/scripts/install.sh \
     deploy/scripts/render-dockerfile-digests.sh --check   # CI 门禁：仅校验结构/格式
     ```
   - `deploy/scripts/build-offline-bundle.sh` 已内置该渲染步骤（从 lock 注入 digest 后再 buildx）。
+  - 当前锁定的基础镜像（2026-09-25，D-04/D-09b 受审变更）：
+    - builder：`rust:1.88-slim-bookworm`——Cargo.lock 传递依赖要求 rustc ≥ 1.88，1.85 容器内编译必失败；builder 内安装 `musl-tools`，以 `--target <musl triple> -C target-feature=+crt-static` 编出**完全静态**二进制；
+    - runtime：`gcr.io/distroless/static-debian12:nonroot`——无 shell / 无 loader，要求二进制 musl 静态链接（与 builder 产物匹配）。若未来改用 glibc 动态二进制，必须换 `distroless/cc-debian12` 并同步 Dockerfile 注释与本手册。
 - **`latest` 禁止出现在任何交付物中**（supply-chain §2.2）。
 
 ---

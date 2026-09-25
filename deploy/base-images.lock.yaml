@@ -12,11 +12,15 @@
 #   - **digest 为空即「未锁定」**：render 脚本遇空 digest 会 fail-closed（非零退出），
 #     使「未 pin 的构建」不可能静默成功。
 #
-# ⚠️ 当前状态：digest 字段为空（有意为之，非占位假值）。
-#   本仓库所处的离线/受限构建环境无法可靠地解析上游 registry 的真实 digest
-#   （Docker 未运行、registry 访问受限）。按「绝不伪造 digest」原则，
-#   在 CI 具备网络后由依赖升级流水线填入真实 64 位十六进制值。
-#   在此之前任何构建都会因 render 脚本 fail-closed 而被拒绝 —— 这正是预期行为。
+# ⚠️ 当前状态：已锁定（D-04 修复，2026-09-25）。
+#   digest 由 deploy-fix 在具备网络的环境 `docker pull` 后经
+#   `docker image inspect --format '{{json .RepoDigests}}'` 取得真实值填入：
+#     - builder-rust：docker.io/library/rust:1.88-slim-bookworm
+#       （sha256:38bc5a86…；rustc 1.88.x 满足 Cargo.lock 传递依赖的 rustc ≥ 1.88 要求）
+#     - runtime-distroless：gcr.io/distroless/static-debian12:nonroot
+#       （sha256:afa5c872…；经 gcr.m.daocloud.io 镜像源拉取，digest 为内容寻址，
+#       对 gcr.io 官方引用同样有效）
+#   digest 变更仍须走受审变更流程（填 locked_at / approver / reason）。
 #
 # 填写规范：
 #   digest: "sha256:<64位小写十六进制>"   # 含 sha256: 前缀
@@ -28,21 +32,22 @@ images:
   # ---- 构建阶段基础镜像（rust 编译环境）----
   - name: builder-rust
     repository: docker.io/library/rust
-    tag: 1.85-slim-bookworm
-    digest: ""
+    tag: 1.88-slim-bookworm
+    digest: "sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89"
     stage: builder
-    locked_at: ""
-    approver: ""
-    reason: ""
+    locked_at: "2026-09-25T13:16:38+08:00"
+    approver: "deploy-fix (task-61-fix / D-04)"
+    reason: "Cargo.lock 传递依赖要求 rustc>=1.88（icu_properties_data 2.3.0 / time 0.3.55 / idna_adapter 等 34 条），1.85 容器内编译必失败；升级至 1.88-slim-bookworm 并 pin 实测拉取 digest"
 
   # ---- 运行阶段基础镜像（distroless 静态、非 root）----
-  # 要求二进制为 musl 静态链接（headless/README.md 构建期决策）。
-  # 若改用 glibc 动态二进制，换成 gcr.io/distroless/cc-debian12（同款 digest 方案）。
+  # 二进制为 musl 静态链接（D-09b 方案 A：--target <musl triple> + crt-static）。
+  # 若改用 glibc 动态二进制，换成 gcr.io/distroless/cc-debian12（同款 digest 方案），
+  # 并同步 Dockerfile 注释与 deploy/README.md。
   - name: runtime-distroless
     repository: gcr.io/distroless/static-debian12
     tag: nonroot
-    digest: ""
+    digest: "sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab"
     stage: runtime
-    locked_at: ""
-    approver: ""
-    reason: ""
+    locked_at: "2026-09-25T13:16:38+08:00"
+    approver: "deploy-fix (task-61-fix / D-09b)"
+    reason: "D-09b 落实 musl 静态链接决策：builder 按 --target <musl> + crt-static 编出完全静态二进制，匹配 distroless/static（无 loader）；digest 实测拉取（daocloud 镜像源，内容寻址一致）"
