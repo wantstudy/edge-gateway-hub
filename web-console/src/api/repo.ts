@@ -19,6 +19,7 @@
  *  · **不改 mock-data.ts 本身**（它是契约与 fallback）。
  */
 import {
+  DEFAULT_ACTOR,
   PROTOCOL_OPTIONS,
   repo as mockRepo,
   type AlarmRecord,
@@ -29,16 +30,19 @@ import {
   type Encoding,
   type ForwarderRecord,
   type GatewayInfo,
+  type MockLicense,
   type Paged,
   type PointDraft,
   type PointRecord,
   type ProtocolType,
+  type RuleRecord,
 } from '../mock/mock-data';
 
 // 透传 mock-data 的类型 / 常量 / 快照（`repo` 由下方局部导出遮蔽，属 ES 模块规范行为）
 export * from '../mock/mock-data';
 
-import { API_MODE, apiRequest } from './client';
+import { ref, type Ref } from 'vue';
+import { API_MODE, ApiError, apiRequest, apiRequestText } from './client';
 
 // 再导出模式常量，页面可统一从本模块取用
 export { API_MODE } from './client';
@@ -108,11 +112,22 @@ interface RealCache {
   points: PointRecord[];
   outlets: ForwarderRecord[];
   status: GatewayInfo | null;
+  /** 审计条目（唯一数据源：`GET /api/audit`——有限 JSON；**不是** `/api/events` 无限 SSE 流） */
   events: AuditEntry[];
+  /** 告警（`GET /api/alerts`；后端无告警引擎 → 诚实空态，绝不回退 mock 造假） */
   alarms: AlarmRecord[];
+  /** 转发规则（`GET /api/rules`；后端无规则引擎 → 诚实空态） */
+  rules: RuleRecord[];
+  /** 授权状态（`GET /api/license/status` 原始快照；全字段字符串透传） */
+  license: LicenseStatusSnapshot | null;
+  /** 各数据源的「不可得原因」（诚实空态 / 501 / 503 / 网络失败；空串 = 正常） */
+  notices: Record<NoticeKey, string>;
 }
 
-/** 缓存初始值（全部为空 → 各读取方法回退 mock）。 */
+/** 可解释提示的键（对应一处真实数据源）。 */
+export type NoticeKey = 'audit' | 'alerts' | 'rules' | 'license' | 'forwarders' | 'points';
+
+/** 缓存初始值（全部为空 → 各读取方法回退 mock / 诚实空态）。 */
 const realCache: RealCache = {
   loaded: false,
   devices: [],
@@ -121,7 +136,38 @@ const realCache: RealCache = {
   status: null,
   events: [],
   alarms: [],
+  rules: [],
+  license: null,
+  notices: { audit: '', alerts: '', rules: '', license: '', forwarders: '', points: '' },
 };
+
+/**
+ * 缓存版本号（`dataVersion` 的源）。
+ *
+ * real 模式下 preload 在**后台**跑，挂载 / 登录不再等待它；缓存填充完成后
+ * 本值自增，页面可用 `watch(dataVersion, reload)` 由响应式驱动刷新
+ * （总览页等带 tick 的页面无需额外接线）。
+ */
+let cacheVersion = 0;
+
+/** 读取当前缓存版本号（配合 `dataVersion` 使用）。 */
+export function getCacheVersion(): number {
+  return cacheVersion;
+}
+
+/**
+ * 缓存版本（响应式）：real 模式后台 preload 完成后自增。
+ *
+ * 页面可 `watch(dataVersion, reload)` 实现「缓存填充后自动刷新」，
+ * 从而不必在挂载 / 登录路径上阻塞等待网络。
+ */
+export const dataVersion: Ref<number> = ref(0);
+
+/** 自增缓存版本（后台 preload 每完成一批分组调用一次）。 */
+function bumpCacheVersion(): void {
+  cacheVersion += 1;
+  dataVersion.value = cacheVersion;
+}
 
 /** 本地覆盖层：real 模式下承载后端契约未覆盖的写操作（语义与 mock 一致）。 */
 const overlay = {
@@ -289,6 +335,153 @@ function mapEventAlarm(raw: Record<string, unknown>, idx: number): AlarmRecord |
   };
 }
 
+/** 后端审计事件类型字面量 → 中文动作名（未知字面量原样透传，不猜译）。 */
+const AUDIT_EVENT_LABELS: Readonly<Record<string, string>> = {
+  login: '登录成功',
+  login_failed: '登录失败',
+  config_change: '配置变更',
+  authz_failed: '鉴权拒绝',
+  trial_expired: '试用期到期',
+  audit_read: '审计查询',
+  audit_export: '审计导出',
+};
+
+/** 后端审计 outcome → 前端 `AuditEntry.result` 域（success / denied / failed）。 */
+const AUDIT_OUTCOME_MAP: Readonly<Record<string, string>> = {
+  accepted: 'success',
+  denied: 'denied',
+  bad_request: 'failed',
+  failed: 'failed',
+};
+
+/**
+ * `/api/audit` 行 → AuditEntry（复用 `mapEventAudit` 的统一映射）。
+ *
+ * 后端行形状：`{seq, ts_ns, actor, event, outcome, detail, prev_hash, entry_hash}`
+ * （`seq` / `ts_ns` 为字符串编码的大数，红线要求透传）。这里先做「字段名与量纲
+ * 归一化」，再交给 `mapEventAudit` 落前端形状，保证只有一条映射路径。
+ */
+function mapAuditRow(raw: Record<string, unknown>, idx: number): AuditEntry {
+  const event = pickStr(raw, 'event', '');
+  const outcome = pickStr(raw, 'outcome', '');
+  return mapEventAudit(
+    {
+      // 大数红线：seq 为链内序号字符串，原样作为主键，绝不 parseInt。
+      id: pickStr(raw, 'seq', `audit-${idx}`),
+      ts: formatNsText(pickStr(raw, 'ts_ns', '')),
+      actor: pickStr(raw, 'actor', 'system'),
+      actorType: 'human',
+      action: AUDIT_EVENT_LABELS[event] ?? (event || '—'),
+      entityType: 'system',
+      entityLabel: '系统',
+      entityId: event || '—',
+      detail: pickStr(raw, 'detail', '—'),
+      // 后端审计记录不含来源 IP：诚实留空占位，不伪造地址。
+      ip: '',
+      result: AUDIT_OUTCOME_MAP[outcome] ?? (outcome || 'success'),
+    },
+    idx,
+  );
+}
+
+/**
+ * UTC 纳秒字符串 → `YYYY-MM-DD HH:mm:ss`。
+ *
+ * 大数红线：`ts_ns`（≈1.7e18）超出 `Number` 安全整数区间，故**只截取秒段**
+ * （去掉末 9 位）再格式化，全程不把整串转成数字，避免精度损失与误用。
+ */
+function formatNsText(value: string): string {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return trimmed || '—';
+  }
+  const secsText = trimmed.length > 9 ? trimmed.slice(0, -9) : '0';
+  const secs = Number(secsText);
+  if (!Number.isFinite(secs) || secs <= 0) {
+    return '—';
+  }
+  return formatDateTimeMs(secs * 1000);
+}
+
+/** `/api/rules` 行 → RuleRecord（后端当前恒空；保留宽容映射防未来字段漂移）。 */
+function mapRule(raw: Record<string, unknown>, idx: number): RuleRecord {
+  return {
+    id: pickStr(raw, 'id', `rule-${idx}`),
+    name: pickStr(raw, 'name', `规则-${idx + 1}`),
+    forwarderId: pickStr(raw, 'forwarderId', pickStr(raw, 'forwarder_id', '')),
+    forwarderName: pickStr(raw, 'forwarderName', pickStr(raw, 'forwarder_name', '—')),
+    condition: pickStr(raw, 'condition', '—'),
+    action: pickStr(raw, 'action', '—'),
+    hitCount: pickNum(raw, 'hitCount', pickNum(raw, 'hit_count', 0)),
+    priority: pickNum(raw, 'priority', 0),
+    enabled: pickBool(raw, 'enabled', true),
+    lastHitAt: pickStr(raw, 'lastHitAt', pickStr(raw, 'last_hit_at', '—')),
+  };
+}
+
+/** 授权状态快照（`GET /api/license/status` 原始形状；**全字段字符串**，绝不数值化）。 */
+export interface LicenseStatusSnapshot {
+  /** 状态字面量：`unlicensed` / `trial` / `active` / `grace` / `degraded` */
+  status: string;
+  /** 档位（`free` / `standard` / `pro` …；未授权为空串） */
+  tier: string;
+  /** 租约有效至（epoch 秒字符串） */
+  validUntil: string;
+  /** 剩余秒数（字符串） */
+  remainingSecs: string;
+  /** 剩余天数（字符串） */
+  remainingDays: string;
+  /** 降级原因（未降级为空串） */
+  degradeReason: string;
+  /** 北向转发是否放行（免费版 / 未授权为 false） */
+  northForwardAllowed: boolean;
+  /** 后端附注（如 runtime 未装配说明） */
+  note: string;
+}
+
+/**
+ * 统一失败描述（**不静默吞错**）：给出「原因 + 恢复路径」。
+ *
+ * 501 = 能力未落地；503 = 依赖未装配（如审计库）；403 = 权限不足；
+ * 400 = 参数非法（附后端 `message`）；0 = 网络 / 超时。
+ */
+function describeFailure(cause: unknown, subject: string): string {
+  if (cause instanceof ApiError) {
+    const detail = extractErrorMessage(cause.body);
+    switch (cause.status) {
+      case 501:
+        return `${subject}：后端能力未落地（501）${detail}。恢复路径：等待该能力上线，当前不可用功能请勿依赖。`;
+      case 503:
+        return `${subject}：后端依赖未装配（503）${detail}。恢复路径：检查 daemon 启动装配（如审计库挂载）后重试。`;
+      case 403:
+        return `${subject}：权限不足（403）${detail}。恢复路径：使用具备相应权限的账号登录。`;
+      case 404:
+        return `${subject}：资源不存在（404）${detail}。`;
+      case 400:
+        return `${subject}：请求参数非法（400）${detail}。`;
+      case 401:
+        return `${subject}：登录已失效（401），请重新登录。`;
+      default:
+        return `${subject}：请求失败（HTTP ${cause.status}）${detail}。`;
+    }
+  }
+  return `${subject}：${cause instanceof Error ? cause.message : String(cause)}`;
+}
+
+/** 从后端错误体取人读消息（`{message}` / `{error}` 优先，其次原文）。 */
+function extractErrorMessage(body: unknown): string {
+  const rec = asRecord(body);
+  const message = pickStr(rec, 'message', '');
+  if (message) {
+    return `——${message}`;
+  }
+  const error = pickStr(rec, 'error', '');
+  if (error) {
+    return `——${error}`;
+  }
+  return typeof body === 'string' && body ? `——${body}` : '';
+}
+
 /** epoch 秒 / 毫秒字符串 → `YYYY-MM-DD HH:mm:ss`（非纯时间戳则原样透传）。
  *
  * `/api/overview` 的 `startedAt` 当前为 epoch 秒字符串（小值，远低于 2^53），
@@ -410,16 +603,95 @@ async function fetchOverview(): Promise<void> {
   }
 }
 
-/** 拉取事件流（宽容映射为审计条目 + 告警两类形状）。 */
-async function fetchEvents(): Promise<void> {
+/**
+ * 拉取审计条目：`GET /api/audit`（**有限 JSON**，RBAC `audit.view`）。
+ *
+ * ⚠️ D-01 根因修复点：旧实现读 `/api/events`——那是**无限 SSE 事件流**，
+ * `res.text()` 永不 resolve，导致 preload 永不 settle（刷新白屏 / 登录卡死）。
+ * 审计页的正确数据源是本端点；SSE 通道由 `stream.ts` 用 EventSource 消费。
+ *
+ * 失败语义（不静默吞错）：503 = 审计库未装配、400 = 查询参数非法、403 = 无
+ * `audit.view` 权限——原因写入 `realCache.notices.audit` 供页面给出恢复路径。
+ */
+async function fetchAudit(): Promise<void> {
   try {
-    const raw = await apiRequest<unknown[]>('/api/events');
-    const rows = Array.isArray(raw) ? raw.map(asRecord) : [];
-    realCache.events = rows.map((row, i) => mapEventAudit(row, i));
-    realCache.alarms = rows.map((row, i) => mapEventAlarm(row, i)).filter((a): a is AlarmRecord => a !== null);
-  } catch {
+    const raw = await apiRequest<Record<string, unknown>>('/api/audit?limit=200');
+    const rows = Array.isArray(raw.rows) ? raw.rows.map(asRecord) : [];
+    realCache.events = rows.map((row, i) => mapAuditRow(row, i));
+    realCache.notices.audit = '';
+  } catch (cause) {
     realCache.events = [];
+    realCache.notices.audit = describeFailure(cause, '审计日志');
+  }
+}
+
+/**
+ * 拉取告警：`GET /api/alerts`（后端无告警引擎 → `{items:[],source:"unsupported",reason}`）。
+ *
+ * **诚实空态**：real 模式下告警清单恒取本端点结果，**绝不回退 mock 告警**、
+ * 也绝不从审计行伪造告警（后端 `reason` 原样透传给页面）。
+ */
+async function fetchAlerts(): Promise<void> {
+  try {
+    const raw = await apiRequest<Record<string, unknown>>('/api/alerts');
+    const rows = Array.isArray(raw.items) ? raw.items.map(asRecord) : [];
+    realCache.alarms = rows.map((row, i) => mapEventAlarm(row, i)).filter((a): a is AlarmRecord => a !== null);
+    realCache.notices.alerts =
+      raw.source === 'unsupported' ? pickStr(raw, 'reason', '后端告警引擎未落地，当前无真实告警数据源') : '';
+  } catch (cause) {
     realCache.alarms = [];
+    realCache.notices.alerts = describeFailure(cause, '告警');
+  }
+}
+
+/** 拉取转发规则：`GET /api/rules`（后端无规则引擎 → 诚实空态）。 */
+async function fetchRules(): Promise<void> {
+  try {
+    const raw = await apiRequest<Record<string, unknown>>('/api/rules');
+    const rows = Array.isArray(raw.items) ? raw.items.map(asRecord) : [];
+    realCache.rules = rows.map((row, i) => mapRule(row, i));
+    realCache.notices.rules =
+      raw.source === 'unsupported' ? pickStr(raw, 'reason', '后端规则引擎未落地，当前无真实规则数据源') : '';
+  } catch (cause) {
+    realCache.rules = [];
+    realCache.notices.rules = describeFailure(cause, '转发规则');
+  }
+}
+
+/**
+ * 拉取北向出口：`GET /api/forwarders`（`id` = 出口名，前端 id 锚点）；
+ * 不可得时落回 `GET /api/outlets`（同一数据源与字段）。
+ */
+async function fetchForwarders(): Promise<void> {
+  try {
+    const raw = await apiRequest<unknown[]>('/api/forwarders');
+    const rows = Array.isArray(raw) ? raw.map((row, i) => mapForwarder(asRecord(row), i)) : [];
+    realCache.outlets = rows;
+    realCache.notices.forwarders = '';
+  } catch (cause) {
+    await fetchOutlets();
+    realCache.notices.forwarders = describeFailure(cause, '北向出口');
+  }
+}
+
+/** 拉取授权状态：`GET /api/license/status`（全字段字符串；未装配诚实返回 `unlicensed`）。 */
+async function fetchLicense(): Promise<void> {
+  try {
+    const raw = await apiRequest<Record<string, unknown>>('/api/license/status');
+    realCache.license = {
+      status: pickStr(raw, 'status', 'unlicensed'),
+      tier: pickStr(raw, 'tier', ''),
+      validUntil: pickStr(raw, 'valid_until', ''),
+      remainingSecs: pickStr(raw, 'remaining_secs', ''),
+      remainingDays: pickStr(raw, 'remaining_days', ''),
+      degradeReason: pickStr(raw, 'degrade_reason', ''),
+      northForwardAllowed: pickBool(raw, 'north_forward_allowed', false),
+      note: pickStr(raw, 'note', ''),
+    };
+    realCache.notices.license = '';
+  } catch (cause) {
+    realCache.license = null;
+    realCache.notices.license = describeFailure(cause, '授权状态');
   }
 }
 
@@ -430,11 +702,21 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+/** preload 整体超时护栏（毫秒）：超时后按**已成功分组**继续，不再阻塞调用方。 */
+const PRELOAD_TIMEOUT_MS = 8000;
+
 /**
  * 预取真实数据（real 模式专用；mock 模式直接返回 false）。
  *
- * 四路请求 `allSettled` 并行：任一失败只影响自身缓存（回退 mock），不影响其余。
- * 点位在分组内按设备并行二次展开（`/api/points` 需逐设备过滤）。
+ * ── D-01 修复要点 ────────────────────────────────────────────────────────────
+ *  1. **不再拉取 `/api/events`**：那是无限 SSE 流（`res.text()` 永不 resolve），
+ *     旧实现把它放进 `allSettled` 导致本函数永不 settle → 刷新白屏 / 登录卡死。
+ *     审计改走有限 JSON 的 `GET /api/audit`；SSE 由 `stream.ts` 的 EventSource 消费。
+ *  2. **整体 8s 超时护栏**：`Promise.race` 兜底，超时即以已成功分组继续
+ *     （仍在飞行的分组会在后台继续填缓存，完成后自增 `dataVersion`）。
+ *     单请求另有 client.ts 的 15s AbortController 超时。
+ *
+ * 分组并行 `allSettled`：任一失败只影响自身缓存（回退 mock / 诚实空态）。
  *
  * @returns 全部成功返回 true（仅供日志 / 调试，页面无需关心）
  */
@@ -442,14 +724,39 @@ export async function preloadRealData(): Promise<boolean> {
   if (API_MODE !== 'real') {
     return false;
   }
-  const results = await Promise.allSettled([fetchDevicesAndPoints(), fetchOutlets(), fetchOverview(), fetchEvents()]);
+  const groups: Promise<void>[] = [
+    fetchDevicesAndPoints(),
+    fetchForwarders(),
+    fetchOverview(),
+    fetchAudit(),
+    fetchAlerts(),
+    fetchRules(),
+    fetchLicense(),
+  ];
+  const raced = await Promise.race([
+    Promise.allSettled(groups).then((results) => ({ results, timedOut: false })),
+    new Promise<{ results: PromiseSettledResult<void>[] | null; timedOut: boolean }>((resolve) => {
+      setTimeout(() => resolve({ results: null, timedOut: true }), PRELOAD_TIMEOUT_MS);
+    }),
+  ]);
+
   realCache.loaded = true;
-  const okCount = results.filter((r) => r.status === 'fulfilled').length;
-  if (okCount < results.length) {
-    // 容差：部分失败已由各读取方法回退 mock，这里仅打印便于联调排障
-    console.warn(`[web-console] preloadRealData：${okCount}/${results.length} 接口成功，失败分组已回退 mock 数据`);
+  bumpCacheVersion();
+
+  if (raced.timedOut || raced.results === null) {
+    // 超时：已成功的分组已生效，未完成的分组在后台继续填缓存（各自 try/catch 兜底）
+    console.warn(`[web-console] preloadRealData：超过 ${PRELOAD_TIMEOUT_MS} ms 未全部完成，按已成功分组继续`);
+    // 后台补填完成后再自增一次版本，供页面响应式刷新
+    void Promise.allSettled(groups).then(() => bumpCacheVersion());
+    return false;
   }
-  return okCount === results.length;
+
+  const okCount = raced.results.filter((r) => r.status === 'fulfilled').length;
+  if (okCount < raced.results.length) {
+    // 容差：部分失败已由各读取方法回退 mock / 诚实空态，这里仅打印便于联调排障
+    console.warn(`[web-console] preloadRealData：${okCount}/${raced.results.length} 分组成功，失败分组已回退`);
+  }
+  return okCount === raced.results.length;
 }
 
 /** 设备清单 + 逐设备点位（先设备后点位，两段串行；组内各自容错）。 */
@@ -498,9 +805,15 @@ function effectiveOutlets(): ForwarderRecord[] {
   });
 }
 
-/** 生效告警清单（含处置状态覆盖）。 */
+/**
+ * 生效告警清单（含处置状态覆盖）。
+ *
+ * **诚实空态（D-01 修复项）**：real 模式恒取 `GET /api/alerts` 的结果
+ * （后端无告警引擎 → 空数组），**绝不回退 mock 告警**、也不从审计行伪造告警；
+ * 原因见 `realCache.notices.alerts`。
+ */
 function effectiveAlarms(): AlarmRecord[] {
-  const base = realCache.alarms.length > 0 ? realCache.alarms : mockRepo.allAlarms();
+  const base = realCache.alarms;
   return base.map((a) => {
     const o = overlay.alarmStates.get(a.id);
     if (!o) {
@@ -510,10 +823,92 @@ function effectiveAlarms(): AlarmRecord[] {
   });
 }
 
-/** 生效审计清单（本地覆盖层在前 + 运维日志 + 事件流）。 */
+/** 生效审计清单（本地覆盖层在前 + `GET /api/audit` 真实条目）。 */
 function effectiveAudit(): AuditEntry[] {
-  const base = realCache.events.length > 0 ? realCache.events : mockRepo.queryAudit({ actorType: '', action: '', entityType: '', result: '', page: 1, pageSize: 100000 }).items;
+  const base =
+    realCache.events.length > 0
+      ? realCache.events
+      : mockRepo.queryAudit({ actorType: '', action: '', entityType: '', result: '', page: 1, pageSize: 100000 }).items;
   return [...overlay.localAudit, ...base];
+}
+
+/** 生效转发规则清单（real 模式取 `GET /api/rules`，后端无规则引擎 → 诚实空态）。 */
+function effectiveRules(): RuleRecord[] {
+  return realCache.rules;
+}
+
+/**
+ * 生效授权状态：以 `GET /api/license/status` 的真实快照覆盖 mock 快照的
+ * 「有真实数据源」字段；纯展示字段（校验档位 / 心跳时间 / 能力矩阵）无后端
+ * 数据源，沿用 mock 契约值并**不做任何真实性暗示**。
+ */
+function effectiveLicense(degradedView: boolean): MockLicense {
+  const base = degradedView ? mockRepo.getLicenseDegraded() : mockRepo.getLicense();
+  const real = realCache.license;
+  if (!real) {
+    return base;
+  }
+  return {
+    ...base,
+    status: mapLicenseStatus(real.status),
+    tierId: real.tier || base.tierId,
+    tierName: LICENSE_TIER_LABELS[real.tier] ?? (real.tier || base.tierName),
+    remainingDays: pickCountFromText(real.remainingDays),
+    remainingText: licenseRemainingText(real),
+    validUntil: real.validUntil ? formatEpochText(real.validUntil) : real.status === 'unlicensed' ? '未授权' : base.validUntil,
+    degradeReason: real.degradeReason || (real.status === 'degraded' ? '授权降级（后端未提供原因）' : ''),
+    onExpireText: real.northForwardAllowed
+      ? '授权有效：北向转发正常放行'
+      : '北向转发已停用，本地采集继续（恢复路径：完成授权激活）',
+  };
+}
+
+/** `GET /api/license/status` 状态字面量 → 前端 `LicenseStatus` 域。 */
+function mapLicenseStatus(status: string): MockLicense['status'] {
+  switch (status) {
+    case 'active':
+      return 'active';
+    case 'trial':
+      return 'trial';
+    case 'grace':
+    case 'degraded':
+      return 'grace';
+    default:
+      // unlicensed / 未知字面量：fail-closed 展示为「已停用」
+      return 'stopped';
+  }
+}
+
+/** 档位 id → 中文名（未知档位原样透传）。 */
+const LICENSE_TIER_LABELS: Readonly<Record<string, string>> = {
+  free: '免费版',
+  trial: '试用版',
+  standard: '标准版',
+  pro: '专业版',
+};
+
+/** 剩余天数字符串 → 小值计数（非法 / 缺失 → 0，绝不 parseFloat 大数）。 */
+function pickCountFromText(text: string): number {
+  const trimmed = text.trim();
+  if (!/^\d{1,6}$/.test(trimmed)) {
+    return 0;
+  }
+  return Number(trimmed);
+}
+
+/** 剩余时长文本（优先剩余秒数；缺失退回天数；都缺失给「—」）。 */
+function licenseRemainingText(real: LicenseStatusSnapshot): string {
+  const days = pickCountFromText(real.remainingDays);
+  if (days > 0) {
+    return `${days} 天`;
+  }
+  const secs = pickCountFromText(real.remainingSecs);
+  if (secs > 0) {
+    const d = Math.floor(secs / 86_400);
+    const h = Math.floor((secs % 86_400) / 3_600);
+    return d > 0 ? `${d} 天 ${h} 小时` : `${h} 小时`;
+  }
+  return real.status === 'unlicensed' ? '未授权' : '—';
 }
 
 /** 通用分页。 */
@@ -633,7 +1028,12 @@ function buildRealRepo(): typeof mockRepo {
       return true;
     },
 
-    // ---------- 告警（读 + 处置覆盖） ----------
+    // ---------- 转发规则（读；`GET /api/rules` 诚实空态） ----------
+    allRules(): RuleRecord[] {
+      return effectiveRules();
+    },
+
+    // ---------- 告警（读 + 处置覆盖；`GET /api/alerts` 诚实空态） ----------
     allAlarms(): AlarmRecord[] {
       return effectiveAlarms();
     },
@@ -675,6 +1075,15 @@ function buildRealRepo(): typeof mockRepo {
         return true;
       });
       return paginate(filtered, query.page, query.pageSize);
+    },
+
+    // ---------- 授权状态（读；真实快照覆盖 `GET /api/license/status`） ----------
+    getLicense(): MockLicense {
+      return effectiveLicense(false);
+    },
+
+    getLicenseDegraded(): MockLicense {
+      return effectiveLicense(true);
     },
 
     // ---------- 设备写操作（覆盖层；后端契约未含设备写接口） ----------
@@ -970,11 +1379,496 @@ function buildOps(): OpsApi {
 }
 
 // ===========================================================================
+// 动作型端点（actions）：真实写 / 探测能力
+//   POST /api/devices/test · POST /api/points/import · GET /api/points/export
+//   GET /api/forwarders · POST /api/forwarders/{id}/test · GET /api/license/status
+//   POST /api/forwarders（501）· PUT /api/alerts/rules（501）
+// ===========================================================================
+
+/** 结构化探测结果（`POST /api/devices/test` / `POST /api/forwarders/{id}/test`）。 */
+export interface ProbeResult {
+  /** 探测是否成功 */
+  ok: boolean;
+  /** 结构化失败类型（unreachable / timeout / protocol_error / no_endpoint / invalid_endpoint / unsupported_protocol / not_found / …） */
+  errorKind: string;
+  /** 后端原始原因（人读） */
+  reason: string;
+  /** 耗时（毫秒，字符串透传；失败时可能为空串） */
+  elapsedMs: string;
+  /** 面向用户的可解释提示（原因 + 恢复路径），可直接展示 */
+  message: string;
+}
+
+/** 设备探测入参。 */
+export interface DeviceTestInput {
+  /** 已登记设备：按配置内首条点位的端点 + 首个 4xxxx/3xxxx 寄存器探测 */
+  deviceId?: string;
+  /** 登记前探测：协议（仅 modbus-tcp / modbus-rtu 支持全探测） */
+  protocol?: string;
+  /** 登记前探测：端点 `host[:port]` */
+  address?: string;
+  /** 探针寄存器（缺省 `40001`） */
+  register?: string;
+  /** 从站号（字符串 / 数字均可，透传） */
+  slave?: string | number;
+  /** 超时（毫秒，后端钳制 100..=10000） */
+  timeoutMs?: string | number;
+}
+
+/** 点表导入结果（含逐行校验错误；失败零落盘）。 */
+export interface ImportResult {
+  ok: boolean;
+  /** 成功导入行数（字符串透传） */
+  imported: string;
+  /** 被覆盖替换的旧行数（字符串透传） */
+  replaced: string;
+  /** 受影响的设备 id 列表 */
+  devices: string[];
+  /** 新配置版本（字符串，大数红线） */
+  configVersion: string;
+  /** 行级错误（`{line, reason, allowed}`；`line` 为文件内 1 基物理行号字符串） */
+  errors: ImportRowError[];
+  /** 面向用户的可解释提示（原因 + 恢复路径） */
+  message: string;
+}
+
+/** 导入行级错误（后端「行号 + 原因 + 允许值」硬契约）。 */
+export interface ImportRowError {
+  /** 物理行号（表头 = 1；0 = 请求级错误）；字符串透传 */
+  line: string;
+  /** 失败原因 */
+  reason: string;
+  /** 允许值说明 */
+  allowed: string;
+}
+
+/** 点表导出结果。 */
+export interface ExportResult {
+  ok: boolean;
+  /** CSV 原文（表头 `device_id,point_id,protocol,address,frequency_ms`，可直接当导入模板） */
+  csv: string;
+  /** 建议文件名 */
+  fileName: string;
+  /** 数据行数（不含表头） */
+  rowCount: number;
+  message: string;
+}
+
+/** 动作型端点 API（`repo.actions.*`）。 */
+export interface ActionApi {
+  /** 设备连通性探测（结构化失败，绝不 500）。 */
+  testDevice(input: DeviceTestInput): Promise<ProbeResult>;
+  /** 点表 CSV 批量导入（坏行整批拒绝，逐行返回 `{line, reason, allowed}`）。 */
+  importPoints(input: { csv: string; deviceId?: string; replace?: boolean }): Promise<ImportResult>;
+  /** 点表 CSV 导出（`?device_id=` 过滤；导出即可当导入模板）。 */
+  exportPoints(deviceId?: string): Promise<ExportResult>;
+  /** 导出并触发浏览器下载（导出端点 + Blob 落盘）。 */
+  downloadPointsCsv(deviceId?: string): Promise<ExportResult>;
+  /** 北向出口列表（`GET /api/forwarders`；`id` = 出口名）。 */
+  listForwarders(): Promise<ForwarderRecord[]>;
+  /** 出口 TCP 可达性探测（`POST /api/forwarders/{id}/test`，未知出口 404）。 */
+  testForwarder(id: string, timeoutMs?: string | number): Promise<ProbeResult>;
+  /** 授权状态原始快照（全字段字符串；runtime 未装配 → `unlicensed`）。 */
+  licenseStatus(): Promise<LicenseStatusSnapshot>;
+  /** 出口登记（后端诚实 501；返回可解释提示，不静默吞错）。 */
+  createForwarder(input: { name: string; broker: string; actor: string }): Promise<{ ok: boolean; message: string }>;
+  /** 告警规则写（后端诚实 501；返回可解释提示）。 */
+  saveAlarmRules(actor: string): Promise<{ ok: boolean; message: string }>;
+  /** 各数据源的「不可得原因」（诚实空态 / 501 / 503 / 网络失败；空串 = 正常）。 */
+  notices(): Record<NoticeKey, string>;
+}
+
+/** 从后端响应构造探测结果（`ok` 由调用方按语义给出）。 */
+function probeFromResponse(raw: Record<string, unknown>, okFallback: boolean): ProbeResult {
+  const ok = typeof raw.ok === 'boolean' ? raw.ok : okFallback;
+  const errorKind = pickStr(raw, 'error_kind', ok ? '' : 'error');
+  const reason = pickStr(raw, 'reason', ok ? pickStr(raw, 'detail', '') : '');
+  const elapsedMs = pickStr(raw, 'elapsed_ms', '');
+  return {
+    ok,
+    errorKind,
+    reason,
+    elapsedMs,
+    message: ok
+      ? `探测成功${elapsedMs ? `（${elapsedMs} ms）` : ''}`
+      : `${PROBE_ERROR_HINTS[errorKind] ?? `探测失败（${errorKind || '未知原因'}）`}${reason ? `：${reason}` : ''}`,
+  };
+}
+
+/** 探测失败类型 → 可解释提示（含恢复路径）。 */
+const PROBE_ERROR_HINTS: Readonly<Record<string, string>> = {
+  unreachable: '目标不可达（TCP 建连被拒 / 网络不通）。恢复路径：确认设备 IP 与端口、网线及防火墙策略后重试',
+  timeout: '探测超时。恢复路径：增大超时或排查目标设备响应',
+  protocol_error: '协议层错误（设备已连上但应答非法）。恢复路径：核对从站号 / 寄存器地址与设备协议配置',
+  no_endpoint: '无可用探测端点。恢复路径：先为该设备登记点位（或在表单里显式填写协议与地址）再探测',
+  invalid_endpoint: '端点无法解析。恢复路径：地址须为 host:port 或可解析主机名',
+  unsupported_protocol:
+    '该协议暂不支持结构化探测（后端仅实现 modbus-tcp / modbus-rtu）。恢复路径：改用设备自带的协议工具验证，或改登记为 modbus 协议后再探测',
+  invalid_target: '出口目标地址无法解析。恢复路径：broker 地址须为 scheme://host[:port]',
+  not_found: '目标不存在（后端 404）。恢复路径：刷新列表后重试',
+};
+
+/** 由结构化失败响应体 / ApiError 构造探测结果。 */
+function probeFailure(cause: unknown): ProbeResult {
+  if (cause instanceof ApiError) {
+    const detail = extractErrorMessage(cause.body);
+    const kind = cause.status === 404 ? 'not_found' : cause.status === 403 ? 'denied' : cause.status === 401 ? 'unauthorized' : `http_${cause.status}`;
+    return {
+      ok: false,
+      errorKind: kind,
+      reason: detail.replace(/^——/, ''),
+      elapsedMs: '',
+      message: describeFailure(cause, '探测'),
+    };
+  }
+  return {
+    ok: false,
+    errorKind: 'error',
+    reason: cause instanceof Error ? cause.message : String(cause),
+    elapsedMs: '',
+    message: `探测失败：${cause instanceof Error ? cause.message : String(cause)}`,
+  };
+}
+
+/** 触发浏览器下载（Blob + 临时 `<a download>`；零依赖）。 */
+function triggerDownload(fileName: string, content: string, mime: string): void {
+  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
+/** 点表 CSV 导出实现（real：`GET /api/points/export`；mock：本地演示 CSV）。 */
+async function exportPointsImpl(deviceId?: string): Promise<ExportResult> {
+  if (API_MODE !== 'real') {
+    const header = 'device_id,point_id,protocol,address,frequency_ms';
+    const rows = mockRepo.allPoints().filter((p) => !deviceId || p.deviceId === deviceId);
+    const csv = [header, ...rows.map((p) => `${p.deviceId},${p.name},modbus-tcp,${p.address},1000`)].join('\n');
+    return {
+      ok: true,
+      csv,
+      fileName: `points${deviceId ? `-${deviceId}` : ''}.csv`,
+      rowCount: rows.length,
+      message: `mock 模式：已生成 ${rows.length} 行点表 CSV。`,
+    };
+  }
+  const qs = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
+  try {
+    const csv = await apiRequestText(`/api/points/export${qs}`);
+    const rowCount = Math.max(0, csv.split(/\r?\n/).filter((l) => l.trim() !== '').length - 1);
+    return {
+      ok: true,
+      csv,
+      fileName: `points${deviceId ? `-${deviceId}` : ''}.csv`,
+      rowCount,
+      message: `已导出 ${rowCount} 行点表（可直接当导入模板）。`,
+    };
+  } catch (cause) {
+    realCache.notices.points = describeFailure(cause, '点表导出');
+    return { ok: false, csv: '', fileName: '', rowCount: 0, message: describeFailure(cause, '点表导出') };
+  }
+}
+
+/** 动作型端点实现（real → 真实端点；mock → 模拟成功 + 本地审计，行为零回归）。 */
+function buildActions(): ActionApi {
+  return {
+    async testDevice(input: DeviceTestInput): Promise<ProbeResult> {
+      if (API_MODE !== 'real') {
+        pushLocalAudit({
+          actor: DEFAULT_ACTOR,
+          actorType: 'human',
+          action: '设备连通性探测',
+          entityType: 'device',
+          entityLabel: '设备',
+          entityId: input.deviceId ?? input.address ?? '—',
+          detail: `mock 模式：模拟探测成功（${input.protocol ?? '按设备配置'}）`,
+          result: 'success',
+        });
+        return { ok: true, errorKind: '', reason: '', elapsedMs: '12', message: 'mock 模式：模拟探测成功（12 ms）。' };
+      }
+      try {
+        const body: Record<string, unknown> = {};
+        if (input.deviceId) {
+          body.device_id = input.deviceId;
+        }
+        if (input.protocol) {
+          body.protocol = input.protocol;
+        }
+        if (input.address) {
+          body.address = input.address;
+        }
+        if (input.register) {
+          body.register = input.register;
+        }
+        if (input.slave !== undefined && input.slave !== '') {
+          body.slave = input.slave;
+        }
+        if (input.timeoutMs !== undefined && input.timeoutMs !== '') {
+          body.timeout_ms = input.timeoutMs;
+        }
+        const raw = await apiRequest<Record<string, unknown>>('/api/devices/test', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        return probeFromResponse(asRecord(raw), false);
+      } catch (cause) {
+        return probeFailure(cause);
+      }
+    },
+
+    async importPoints(input: { csv: string; deviceId?: string; replace?: boolean }): Promise<ImportResult> {
+      if (API_MODE !== 'real') {
+        // mock 模式：按 CSV 行数模拟导入（保留既有前端流程语义，零回归）
+        const dataRows = input.csv
+          .split(/\r?\n/)
+          .slice(1)
+          .filter((line) => line.trim() !== '').length;
+        pushLocalAudit({
+          actor: DEFAULT_ACTOR,
+          actorType: 'human',
+          action: '导入点表',
+          entityType: 'point',
+          entityLabel: '点位',
+          entityId: input.deviceId ?? '—',
+          detail: `mock 模式：模拟导入 ${dataRows} 行`,
+          result: 'success',
+        });
+        return {
+          ok: true,
+          imported: String(dataRows),
+          replaced: '0',
+          devices: input.deviceId ? [input.deviceId] : [],
+          configVersion: '',
+          errors: [],
+          message: `mock 模式：模拟导入 ${dataRows} 行。`,
+        };
+      }
+      const qs = new URLSearchParams();
+      if (input.deviceId) {
+        qs.set('device_id', input.deviceId);
+      }
+      if (input.replace) {
+        qs.set('replace', 'true');
+      }
+      const query = qs.toString();
+      try {
+        const raw = await apiRequest<Record<string, unknown>>(`/api/points/import${query ? `?${query}` : ''}`, {
+          method: 'POST',
+          body: JSON.stringify({ csv: input.csv, device_id: input.deviceId ?? '', replace: Boolean(input.replace) }),
+        });
+        // 导入成功 → 立即使缓存可见（后端已热生效，前端缓存同步刷新）
+        void fetchAllPoints().then(() => bumpCacheVersion());
+        const imported = pickStr(raw, 'imported', '0');
+        return {
+          ok: true,
+          imported,
+          replaced: pickStr(raw, 'replaced', '0'),
+          devices: Array.isArray(raw.devices) ? raw.devices.map((d) => String(d)) : [],
+          configVersion: pickStr(raw, 'config_version', ''),
+          errors: [],
+          message: `导入成功：${imported} 行已落盘并热生效。`,
+        };
+      } catch (cause) {
+        const errors = extractImportErrors(cause);
+        if (errors.length > 0) {
+          return {
+            ok: false,
+            imported: '0',
+            replaced: '0',
+            devices: [],
+            configVersion: '',
+            errors,
+            message: `导入被整批拒绝（零落盘）：${errors.length} 行不合法，请按「行号 + 原因 + 允许值」修正后重试。`,
+          };
+        }
+        return {
+          ok: false,
+          imported: '0',
+          replaced: '0',
+          devices: [],
+          configVersion: '',
+          errors: [],
+          message: describeFailure(cause, '点表导入'),
+        };
+      }
+    },
+
+    exportPoints(deviceId?: string): Promise<ExportResult> {
+      return exportPointsImpl(deviceId);
+    },
+
+    async downloadPointsCsv(deviceId?: string): Promise<ExportResult> {
+      const result = await exportPointsImpl(deviceId);
+      if (result.ok) {
+        triggerDownload(result.fileName, result.csv, 'text/csv');
+      }
+      return result;
+    },
+
+    async listForwarders(): Promise<ForwarderRecord[]> {
+      if (API_MODE !== 'real') {
+        return mockRepo.allForwarders();
+      }
+      try {
+        const raw = await apiRequest<unknown[]>('/api/forwarders');
+        return Array.isArray(raw) ? raw.map((row, i) => mapForwarder(asRecord(row), i)) : [];
+      } catch (cause) {
+        realCache.notices.forwarders = describeFailure(cause, '北向出口');
+        return [];
+      }
+    },
+
+    async testForwarder(id: string, timeoutMs?: string | number): Promise<ProbeResult> {
+      if (API_MODE !== 'real') {
+        pushLocalAudit({
+          actor: DEFAULT_ACTOR,
+          actorType: 'human',
+          action: '出口连通性探测',
+          entityType: 'forwarder',
+          entityLabel: '北向出口',
+          entityId: id,
+          detail: 'mock 模式：模拟出口探测成功',
+          result: 'success',
+        });
+        return { ok: true, errorKind: '', reason: '', elapsedMs: '8', message: 'mock 模式：模拟出口探测成功（8 ms）。' };
+      }
+      const qs = timeoutMs !== undefined && timeoutMs !== '' ? `?timeout_ms=${encodeURIComponent(String(timeoutMs))}` : '';
+      try {
+        const raw = await apiRequest<Record<string, unknown>>(`/api/forwarders/${encodeURIComponent(id)}/test${qs}`, {
+          method: 'POST',
+        });
+        const result = probeFromResponse(asRecord(raw), false);
+        // 诚实限制：后端仅做 TCP 建连，不做 TLS 握手 / MQTT CONNACK
+        return result.ok
+          ? { ...result, message: `${result.message}（仅 TCP 建连探测：未校验 TLS 握手与 MQTT CONNACK）` }
+          : result;
+      } catch (cause) {
+        return probeFailure(cause);
+      }
+    },
+
+    async licenseStatus(): Promise<LicenseStatusSnapshot> {
+      if (API_MODE !== 'real') {
+        const mock = mockRepo.getLicense();
+        return {
+          status: mock.status === 'active' ? 'active' : mock.status === 'trial' ? 'trial' : mock.status === 'grace' ? 'grace' : 'unlicensed',
+          tier: mock.tierId,
+          validUntil: '',
+          remainingSecs: '',
+          remainingDays: String(mock.remainingDays),
+          degradeReason: mock.degradeReason,
+          northForwardAllowed: mock.status === 'active' || mock.status === 'trial',
+          note: 'mock 模式：授权状态为演示数据',
+        };
+      }
+      if (realCache.license) {
+        return realCache.license;
+      }
+      await fetchLicense();
+      return (
+        realCache.license ?? {
+          status: 'unlicensed',
+          tier: '',
+          validUntil: '',
+          remainingSecs: '',
+          remainingDays: '',
+          degradeReason: '',
+          northForwardAllowed: false,
+          note: realCache.notices.license || '授权状态不可得（runtime 未装配 / 请求失败）',
+        }
+      );
+    },
+
+    async createForwarder(input: { name: string; broker: string; actor: string }): Promise<{ ok: boolean; message: string }> {
+      if (API_MODE !== 'real') {
+        pushLocalAudit({
+          actor: input.actor,
+          actorType: 'human',
+          action: '新增北向出口',
+          entityType: 'forwarder',
+          entityLabel: '北向出口',
+          entityId: input.name,
+          detail: `mock 模式：模拟新增出口 ${input.name}`,
+          result: 'success',
+        });
+        return { ok: true, message: '出口已新增（mock 模拟）。' };
+      }
+      try {
+        await apiRequest<unknown>('/api/forwarders', {
+          method: 'POST',
+          body: JSON.stringify({ name: input.name, broker: input.broker }),
+        });
+        void fetchForwarders().then(() => bumpCacheVersion());
+        return { ok: true, message: `出口 ${input.name} 已登记。` };
+      } catch (cause) {
+        return { ok: false, message: describeFailure(cause, '北向出口登记') };
+      }
+    },
+
+    async saveAlarmRules(actor: string): Promise<{ ok: boolean; message: string }> {
+      if (API_MODE !== 'real') {
+        pushLocalAudit({
+          actor,
+          actorType: 'human',
+          action: '保存告警规则',
+          entityType: 'alarm',
+          entityLabel: '告警规则',
+          entityId: 'alarm-rules',
+          detail: 'mock 模式：模拟保存告警规则',
+          result: 'success',
+        });
+        return { ok: true, message: '告警规则已保存（mock 模拟）。' };
+      }
+      try {
+        await apiRequest<unknown>('/api/alerts/rules', { method: 'PUT', body: JSON.stringify({ rules: [] }) });
+        return { ok: true, message: '告警规则已保存。' };
+      } catch (cause) {
+        return { ok: false, message: describeFailure(cause, '告警规则保存') };
+      }
+    },
+
+    notices(): Record<NoticeKey, string> {
+      return { ...realCache.notices };
+    },
+  };
+}
+
+/** 从 400 响应体提取逐行导入错误（`{line, reason, allowed}`，行号字符串透传）。 */
+function extractImportErrors(cause: unknown): ImportRowError[] {
+  if (!(cause instanceof ApiError)) {
+    return [];
+  }
+  const body = asRecord(cause.body);
+  const rawErrors = Array.isArray(body.errors) ? body.errors : [];
+  return rawErrors.map((item) => {
+    const row = asRecord(item);
+    return {
+      // 行号是物理行号（可含 `0` = 请求级错误）：字符串透传，绝不 parseInt。
+      line: pickStr(row, 'line', '0'),
+      reason: pickStr(row, 'reason', '原因未给出'),
+      allowed: pickStr(row, 'allowed', ''),
+    };
+  });
+}
+
+// ===========================================================================
 // 统一导出
 // ===========================================================================
 
 /** 页面层唯一数据入口：mock 模式 = mock 仓库；real 模式 = 真实缓存 + 覆盖层。 */
 const baseRepo: typeof mockRepo = API_MODE === 'real' ? buildRealRepo() : mockRepo;
 
-/** 最终仓库（含 ops 运维动作；mock 模式下 ops 为模拟实现）。 */
-export const repo: typeof mockRepo & { ops: OpsApi } = { ...baseRepo, ops: buildOps() };
+/**
+ * 最终仓库（含 `ops` 运维动作与 `actions` 动作型端点；mock 模式下二者均为模拟实现）。
+ */
+export const repo: typeof mockRepo & { ops: OpsApi; actions: ActionApi } = {
+  ...baseRepo,
+  ops: buildOps(),
+  actions: buildActions(),
+};

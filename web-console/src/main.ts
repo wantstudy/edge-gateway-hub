@@ -32,13 +32,21 @@ app.use(ArcoVueIcon);
 app.use(router);
 
 /**
- * 启动引导：real 模式且已有 token（页面刷新场景）时，先预取真实数据再挂载，
- * 保证首屏读到的是后端数据而非 mock 回退；任一接口失败由 repo 层回退 mock 兜底。
- * mock 模式（默认）与未登录场景直接挂载，无任何网络请求。
+ * 启动引导。
+ *
+ * ── D-01 修复要点 ────────────────────────────────────────────────────────────
+ * 旧实现在挂载前 `await preloadRealData()`，而 preload 里混入了 `/api/events`
+ * （**无限 SSE 流**，`res.text()` 永不 resolve）→ 带 token 刷新时**永久白屏**。
+ * 现改为：preload **后台触发**（内部另有 8s 超时护栏），`app.mount` 不再等待它；
+ * 缓存填充完成后由 `dataVersion`（响应式）驱动页面刷新（总览页 1s tick 亦会
+ * 自动取到最新缓存）。mock 模式与未登录场景不发任何网络请求。
  */
 async function bootstrap(): Promise<void> {
   if (API_MODE === 'real' && getStoredToken()) {
-    await preloadRealData();
+    // 后台预取：失败 / 超时均由 repo 层回退 mock 或诚实空态，不影响首屏挂载
+    void preloadRealData().catch((cause: unknown) => {
+      console.warn('[web-console] bootstrap 预取真实数据失败，页面回退 mock / 诚实空态', cause);
+    });
   }
   // real 模式：SSE 生命周期由登录态驱动（刷新 / 登录 / 登出三态全覆盖）；
   // SSE 通道状态同步到顶栏连接指示（open→connected，connecting→degraded，

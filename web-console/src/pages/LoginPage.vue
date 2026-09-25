@@ -81,9 +81,16 @@ async function onSubmit(): Promise<void> {
     const res = await apiLogin(form.username.trim(), form.password);
     setStoredToken(res.token);
     setStoredBackendRole(res.role);
-    // 写会话（后端角色原文 + 前端可见性映射），随后预取真实数据再回跳
+    // 写会话（后端角色原文 + 前端可见性映射）
     session.login(form.username.trim(), { backendRole: res.role, role: mapBackendRole(res.role) });
-    await preloadRealData();
+    //
+    // D-01 修复：登录成功后**立即回跳**，preload 转后台执行。
+    // 旧实现 `await preloadRealData()` 混入了 `/api/events`（无限 SSE 流，
+    // `res.text()` 永不 resolve）→ 登录按钮永久 loading、页面卡在登录页。
+    // preload 内部另有 8s 超时护栏，完成后由 `dataVersion` 驱动页面刷新。
+    void preloadRealData().catch((cause: unknown) => {
+      console.warn('[web-console] 登录后预取真实数据失败，页面回退 mock / 诚实空态', cause);
+    });
     const redirect = typeof route.query.redirect === 'string' && route.query.redirect ? route.query.redirect : '/overview';
     await router.replace(redirect);
   } catch (cause) {

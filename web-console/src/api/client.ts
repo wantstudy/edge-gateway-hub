@@ -96,10 +96,51 @@ export class ApiError extends Error {
   /** HTTP 状态码（0 = 网络层错误） */
   readonly status: number;
 
-  constructor(status: number, message: string) {
+  /**
+   * 后端错误体（JSON 解析成功则为对象 / 数组，否则为原文字符串，无则 `null`）。
+   *
+   * 结构化失败契约依赖此字段：如 `POST /api/points/import` 的 400 携带
+   * `{errors:[{line, reason, allowed}, ...]}`、`GET /api/audit` 的 503 携带
+   * `{error, message}`——调用方据此给出「原因 + 恢复路径」，而非静默吞错。
+   */
+  readonly body: unknown;
+
+  constructor(status: number, message: string, body: unknown = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.body = body;
+  }
+}
+
+/** 单请求超时（毫秒）：AbortController 硬中断，防无限流 / 挂死连接拖死页面。 */
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * 发起带超时的 fetch（15s 未响应则 abort → 抛 `ApiError(0)`）。
+ *
+ * SSE（`/api/stream` / `/api/events`）不走本函数（EventSource 自行管理生命周期），
+ * 因此超时只作用于一次性 HTTP 请求。
+ */
+async function fetchWithTimeout(path: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(path, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 把响应体解析为「JSON 优先、其次原文」的宽容形态（供 `ApiError.body` 携带）。 */
+function parseErrorBody(text: string): unknown {
+  if (!text) {
+    return null;
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
   }
 }
 
@@ -138,10 +179,15 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
 
   let res: Response;
   try {
-    res = await fetch(path, { ...init, headers });
+    res = await fetchWithTimeout(path, { ...init, headers });
   } catch (cause) {
-    // 网络错误不崩：包装为 status=0 的 rejected promise，调用方降级
-    const reason = cause instanceof Error ? cause.message : String(cause);
+    // 网络错误 / 超时不崩：包装为 status=0 的 rejected promise，调用方降级
+    const aborted = cause instanceof Error && cause.name === 'AbortError';
+    const reason = aborted
+      ? `请求超时（${REQUEST_TIMEOUT_MS} ms）`
+      : cause instanceof Error
+        ? cause.message
+        : String(cause);
     throw new ApiError(0, `网络请求失败：${reason}`);
   }
 
@@ -152,7 +198,8 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   }
 
   if (!res.ok) {
-    throw new ApiError(res.status, `请求失败（HTTP ${res.status}）`);
+    // 结构化失败（400 校验错误 / 501 未落地 / 503 未装配）依赖 body 上报原因
+    throw new ApiError(res.status, `请求失败（HTTP ${res.status}）`, parseErrorBody(await res.text()));
   }
 
   if (res.status === 204) {
@@ -167,6 +214,42 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   } catch {
     throw new ApiError(res.status, '响应不是合法 JSON');
   }
+}
+
+/**
+ * 文本型请求（CSV 导出等 `text/*` 响应；与 `apiRequest` 同鉴权 / 同超时）。
+ *
+ * @returns 响应原文（`res.text()`）；204 / 空体返回空串
+ * @throws `ApiError`（语义与 `apiRequest` 完全一致）
+ */
+export async function apiRequestText(path: string, init: RequestInit = {}): Promise<string> {
+  const headers = new Headers(init.headers ?? {});
+  const token = getStoredToken();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(path, { ...init, headers });
+  } catch (cause) {
+    const aborted = cause instanceof Error && cause.name === 'AbortError';
+    const reason = aborted
+      ? `请求超时（${REQUEST_TIMEOUT_MS} ms）`
+      : cause instanceof Error
+        ? cause.message
+        : String(cause);
+    throw new ApiError(0, `网络请求失败：${reason}`);
+  }
+
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new ApiError(401, '登录已失效，请重新登录');
+  }
+  if (!res.ok) {
+    throw new ApiError(res.status, `请求失败（HTTP ${res.status}）`, parseErrorBody(await res.text()));
+  }
+  return await res.text();
 }
 
 /** 登录接口响应体（后端契约：200 `{token, role}`）。 */
