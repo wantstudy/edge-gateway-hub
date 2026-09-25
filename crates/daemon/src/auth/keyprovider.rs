@@ -5,9 +5,10 @@
 //! 重启加载解密复用**同一密钥**（跨实例一致）。
 //!
 //! # V1 方案与平台边界（模块头声明，硬性红线）
-//! - **纯 Rust 栈**：不做 Windows DPAPI / Linux keyring 等 OS 原生密钥库调用；
-//!   V1 采用「受限权限文件 + HKDF 机器码派生加密」方案。OS 原生密钥集成
-//!   （DPAPI / keyring / TPM）留给后续平台差异任务。
+//! - **纯 Rust 栈**：容器层只用 `sha2`（HKDF 手写）+ `ed25519-dalek`；OS 原生
+//!   密钥托管（Windows DPAPI）由 task 49 的 [`super::keycustody`] 层承担——
+//!   本模块容器字节在落盘前经所选 custody 后端包装（Windows 默认 DPAPI 用户域，
+//!   其余平台透传 + 0600），Linux keyring / Secret Service（dbus 依赖）明确不引入。
 //! - **拷盘即失效**：加密密钥由机器码指纹（task 3 `MachineIdentity` 输出，
 //!   64 hex）经 HKDF-SHA256 域分隔派生（与 `trial.rs` 的机器码派生同源思路）；
 //!   密钥文件拷贝到另一台机器后必然解密失败。
@@ -39,12 +40,13 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::keycustody::{CustodyError, FileCustody, KeyCustody};
 use crate::error::DaemonError;
 
 /// 机器码指纹长度：64 字符 hex（task 3 输出，与 signing.rs 的 mid 校验一致）。
@@ -102,6 +104,11 @@ pub enum KeyError {
     #[error("key file corrupt: {0}")]
     Corrupt(String),
 
+    /// custody 托管后端失败（task 49）：封装 / 解封 / 后端 IO（结构化透传，
+    /// 调用方对 [`CustodyError`] 做 `matches!` 判别，禁 msg.contains 字符串匹配）。
+    #[error("key custody backend failure: {0}")]
+    Custody(#[from] CustodyError),
+
     /// 文件 IO 失败（读取 / 创建 / 写入 / 权限）。
     #[error("key file io: {0}")]
     Io(#[from] io::Error),
@@ -114,6 +121,8 @@ impl From<KeyError> for DaemonError {
             KeyError::TamperedOrForeign | KeyError::Corrupt(_) => {
                 DaemonError::SecurityError(err.to_string())
             }
+            // custody 错误自带 Security/Config/Storage 语义细分（含恢复路径文案）。
+            KeyError::Custody(custody_err) => DaemonError::from(custody_err),
             KeyError::Io(_) => DaemonError::StorageError(err.to_string()),
         }
     }
@@ -382,16 +391,33 @@ impl KeyHandle {
 ///
 /// 路径与指纹均由调用方注入：测试注入临时路径与假指纹；
 /// 生产由调用方传 task 3 `machine_id` 模块产物（本模块不接线、不采集指纹）。
-#[derive(Debug)]
+///
+/// 持久化字节在落盘前经 [`KeyCustody`] 后端包装（task 49：Windows 默认 DPAPI
+/// 用户域，其余平台透传 + 0600；默认 [`FileCustody`] 保持与历史裸容器逐字节
+/// 兼容——既有测试与部署零回归）。旧版无包装文件在首次加载后按所选后端
+/// 重新落盘并原子替换（升级幂等：包装后字节不变则跳过重写）。
 pub struct FileKeyProvider {
     /// 密钥容器文件路径。
     path: PathBuf,
     /// 机器码指纹（64 hex，task 3 输出）。
     fingerprint_hex: String,
+    /// 持久化托管后端（seal/open 包装层；默认 file 透传）。
+    custody: Arc<dyn KeyCustody>,
+}
+
+impl fmt::Debug for FileKeyProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 脱敏：只含路径、指纹（非密钥，可记录）与后端名；绝无密钥材料。
+        f.debug_struct("FileKeyProvider")
+            .field("path", &self.path)
+            .field("fingerprint_hex", &self.fingerprint_hex)
+            .field("custody", &self.custody.name())
+            .finish()
+    }
 }
 
 impl FileKeyProvider {
-    /// 构造文件密钥托管器。
+    /// 构造文件密钥托管器（默认 file 透传后端，与历史行为逐字节兼容）。
     ///
     /// # Errors
     /// 指纹非 64 字符 hex 时返回 [`KeyError::BadFingerprint`]（构造期早失败）。
@@ -399,7 +425,15 @@ impl FileKeyProvider {
         Ok(Self {
             path,
             fingerprint_hex: validate_fingerprint(machine_fingerprint)?,
+            custody: Arc::new(FileCustody),
         })
+    }
+
+    /// 指定持久化托管后端（builder；装配点按 env `IOT_DAQ_KEY_CUSTODY` 注入）。
+    #[must_use]
+    pub fn with_custody(mut self, custody: Arc<dyn KeyCustody>) -> Self {
+        self.custody = custody;
+        self
     }
 
     /// 当前绑定（派生用）指纹。
@@ -407,8 +441,8 @@ impl FileKeyProvider {
         &self.fingerprint_hex
     }
 
-    /// 写入容器文件（`create_new` 防覆盖；Unix 上收紧为 0600）。
-    fn write_container(&self, container: &[u8; CONTAINER_LEN]) -> Result<(), KeyError> {
+    /// 首次写入容器文件（`create_new` 防覆盖；Unix 上收紧为 0600）。
+    fn write_container(&self, container: &[u8]) -> Result<(), KeyError> {
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -422,9 +456,45 @@ impl FileKeyProvider {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
         }
-        // cfg(not(unix))：Windows ACL 从简（依赖用户 profile 默认 ACL），
-        // 精细 ACL 留给平台差异任务（见模块头声明）。
+        // cfg(not(unix))：Windows ACL 从简（依赖用户 profile 默认 ACL + DPAPI
+        // 用户域包装），精细 ACL 留给平台差异任务（见模块头声明）。
         Ok(())
+    }
+
+    /// 旧文件升级：按所选 custody 重新落盘并**原子替换**（task 49 兼容路径）。
+    ///
+    /// 先写临时文件（同目录、sync、0600）再 rename；Windows 上 rename 不能覆盖
+    /// 已存在目标，故先删旧文件（微小窗口内旧文件缺失，属可接受的升级语义——
+    /// 明文窗口为零：新旧文件均为容器/托管密文）。任一步失败清理临时文件、
+    /// 返回结构化错误，不留半成品。
+    fn replace_container(&self, sealed: &[u8]) -> Result<(), KeyError> {
+        use std::io::Write as _;
+        let tmp_path = PathBuf::from(format!("{}.custody-tmp", self.path.display()));
+        // 清理历史残留，避免 create_new 撞文件（残留仅可能是上次中断的升级）。
+        let _ = std::fs::remove_file(&tmp_path);
+        let write_result = (|| -> Result<(), KeyError> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(sealed)?;
+            file.sync_all()?;
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            if self.path.exists() {
+                std::fs::remove_file(&self.path)?;
+            }
+            std::fs::rename(&tmp_path, &self.path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_result
     }
 }
 
@@ -433,16 +503,27 @@ impl KeyProvider for FileKeyProvider {
         let keys = derive_container_keys(&self.fingerprint_hex)?;
         match std::fs::read(&self.path) {
             Ok(bytes) => {
-                // 已有容器：开封复用同一密钥。任何失败都拒绝服务，绝不重建。
-                let seed = unseal_container(&bytes, &keys)?;
+                // custody 解封（dpapi 剥包装 / file 透传旧裸容器）。任何失败都
+                // 结构化拒绝（fail-closed），绝不静默重建。
+                let container = self.custody.open(&bytes)?;
+                let seed = unseal_container(&container, &keys)?;
+                // 旧版无包装文件：按所选 custody 升级重写（幂等——包装后字节
+                // 不变则跳过，避免每次启动无谓写盘）。
+                if !self.custody.is_sealed(&bytes) {
+                    let sealed = self.custody.seal(&container)?;
+                    if sealed != bytes {
+                        self.replace_container(&sealed)?;
+                    }
+                }
                 Ok(KeyHandle::from_seed(&seed))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // 首次启动：生成密钥对，加密落盘。
+                // 首次启动：生成密钥对，容器经 custody 包装后落盘。
                 let seed = generate_seed();
                 let nonce = generate_nonce();
                 let container = seal_container(&seed, &nonce, &keys);
-                self.write_container(&container)?;
+                let sealed = self.custody.seal(&container)?;
+                self.write_container(&sealed)?;
                 Ok(KeyHandle::from_seed(&seed))
             }
             Err(e) => Err(KeyError::Io(e)),
@@ -834,6 +915,297 @@ mod tests {
             handle_a.public_key().expect("pk a"),
             handle_b.public_key().expect("pk b"),
             "independent creates must yield independent keys"
+        );
+    }
+
+    // ---- task 49：custody 托管集成（包装落盘 / 旧文件升级 / fail-closed） ----
+
+    /// test-only 包装后端（前置 8 字节魔数，语义与 dpapi 对齐：非本后端包装的
+    /// 旧裸容器透传；本后端包装的格式 `is_sealed` = true）。跨平台驱动升级
+    /// 路径单测（dpapi 分支另有 cfg(windows) 实测）。
+    struct WrapCustody;
+
+    impl KeyCustody for WrapCustody {
+        fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, CustodyError> {
+            let mut out = b"TESTWRAP".to_vec();
+            out.extend_from_slice(plaintext);
+            Ok(out)
+        }
+
+        fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, CustodyError> {
+            match sealed.strip_prefix(b"TESTWRAP".as_slice()) {
+                Some(inner) => Ok(inner.to_vec()),
+                // 旧裸容器（无本后端包装）透传，与 dpapi 语义一致。
+                None => Ok(sealed.to_vec()),
+            }
+        }
+
+        fn is_sealed(&self, blob: &[u8]) -> bool {
+            blob.starts_with(b"TESTWRAP".as_slice())
+        }
+
+        fn name(&self) -> &'static str {
+            "test-wrap"
+        }
+    }
+
+    /// QA Happy（task 49 兼容路径）：默认 file 后端先落旧版裸容器；换包装后端
+    /// 首次加载 → 密钥不变 + 文件升级为包装格式；再次加载复用同一密钥。
+    #[test]
+    fn legacy_container_upgraded_to_custody_with_key_preserved() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("gw.key");
+
+        // ① 旧版行为：默认 file 透传后端 → 落盘为裸容器（IOTDAQKP 直写）。
+        let first = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .load_or_create()
+            .expect("create legacy container");
+        let legacy_bytes = fs::read(&path).expect("read legacy container");
+        assert_eq!(&legacy_bytes[..MAGIC.len()], MAGIC, "legacy raw container");
+
+        // ② 升级：包装后端首次加载 → 同一密钥；文件重写为包装格式。
+        let custody = Arc::new(WrapCustody) as Arc<dyn KeyCustody>;
+        let upgraded = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(Arc::clone(&custody))
+            .load_or_create()
+            .expect("upgrade load");
+        assert_eq!(
+            upgraded.public_key().expect("pk"),
+            first.public_key().expect("pk"),
+            "custody upgrade must preserve the device key"
+        );
+        let upgraded_bytes = fs::read(&path).expect("read upgraded file");
+        assert!(
+            upgraded_bytes.starts_with(b"TESTWRAP".as_slice()),
+            "file must be rewritten in wrapped format"
+        );
+        assert_ne!(
+            upgraded_bytes, legacy_bytes,
+            "upgrade must rewrite the file"
+        );
+
+        // ③ 重启语义：包装后端再次加载 → 同一密钥（幂等，无重复升级破坏）。
+        let reloaded = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(custody)
+            .load_or_create()
+            .expect("reload wrapped");
+        assert_eq!(
+            reloaded.public_key().expect("pk"),
+            first.public_key().expect("pk")
+        );
+        assert_eq!(
+            fs::read(&path).expect("read after reload"),
+            upgraded_bytes,
+            "wrapped file must stay byte-stable across reloads"
+        );
+    }
+
+    /// QA 兼容（task 49）：默认 file 透传后端加载旧裸容器 → 字节逐字节不变
+    /// （升级幂等：包装后字节不变则跳过重写，不产生无谓写盘）。
+    #[test]
+    fn default_file_custody_keeps_legacy_bytes_unchanged() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("gw.key");
+        FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .load_or_create()
+            .expect("create");
+        let before = fs::read(&path).expect("read legacy");
+
+        FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .load_or_create()
+            .expect("reload");
+        assert_eq!(
+            fs::read(&path).expect("read after reload"),
+            before,
+            "file passthrough custody must never rewrite legacy bytes"
+        );
+    }
+
+    /// QA Happy（task 49）：包装后端落盘的文件**不再是裸容器**（包装生效：
+    /// 字节表示被改变、往返完整），且跨实例复用同一密钥。
+    /// 「密文绝不含明文窗口」这一更强断言由 DPAPI 后端实测覆盖
+    /// （keycustody::dpapi_roundtrip_hides_plaintext_and_marks_sealed）。
+    #[test]
+    fn wrapped_file_is_transformed_and_roundtrips() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("gw.key");
+        let custody = Arc::new(WrapCustody) as Arc<dyn KeyCustody>;
+        let handle = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(Arc::clone(&custody))
+            .load_or_create()
+            .expect("create wrapped");
+
+        let bytes = fs::read(&path).expect("read wrapped file");
+        // 经 WrapCustody 还原容器原文：包装确实改变了字节表示（非裸容器直写），
+        // 且往返完整（还原结果即容器原文，密钥可用）。
+        let container = custody.open(&bytes).expect("unwrap");
+        assert_ne!(
+            bytes, container,
+            "wrap must transform the byte representation"
+        );
+        assert!(
+            bytes.starts_with(b"TESTWRAP".as_slice()),
+            "wrapped file must carry the custody wrapper"
+        );
+        assert_eq!(
+            handle.public_key().expect("pk"),
+            {
+                FileKeyProvider::new(path, &fingerprint_a())
+                    .expect("valid fp")
+                    .with_custody(Arc::new(WrapCustody))
+                    .load_or_create()
+                    .expect("reload")
+                    .public_key()
+                    .expect("pk")
+            },
+            "wrapped reload must reuse the same key"
+        );
+    }
+
+    /// QA Error（task 49 fail-closed）：包装文件被篡改（剥不出合法容器）→
+    /// 结构化 KeyError::Custody(OpenFailed)，绝不静默重建。
+    #[test]
+    fn tampered_wrapped_file_is_structured_fail_closed() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("gw.key");
+        let custody = Arc::new(WrapCustody) as Arc<dyn KeyCustody>;
+        FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(Arc::clone(&custody))
+            .load_or_create()
+            .expect("create wrapped");
+        let before = fs::read(&path).expect("read wrapped file");
+
+        // 篡改包装头部（TESTWRAP → TESTWRAZ）：后端判为「未包装」透传，
+        // 容器开封必然失败——两条防线都成立，最终结构化报错且不改文件。
+        let mut tampered = before.clone();
+        tampered[0] = b'Z';
+        fs::write(&path, &tampered).expect("write tampered");
+        let err = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(custody)
+            .load_or_create()
+            .expect_err("tampered wrap must fail");
+        assert!(
+            matches!(err, KeyError::Corrupt(_)),
+            "wrap-header tamper degrades to container-level rejection, got {err}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read after failure"),
+            tampered,
+            "fail-closed: file must NOT be silently recreated"
+        );
+
+        // 完全撕掉包装（裸容器 + 非法版本）：加载结构化失败（Corrupt），不重建。
+        let mut stripped = before[8..].to_vec();
+        stripped[MAGIC.len()] = 0xFF;
+        fs::write(&path, &stripped).expect("write stripped");
+        let err = FileKeyProvider::new(path, &fingerprint_a())
+            .expect("valid fp")
+            .load_or_create()
+            .expect_err("bad container version must fail");
+        assert!(matches!(err, KeyError::Corrupt(_)), "got {err}");
+    }
+
+    /// 错误映射（task 49）：KeyError::Custody → DaemonError（结构化透传）。
+    #[test]
+    fn custody_key_error_maps_to_daemon_error() {
+        let open_failed: KeyError = CustodyError::OpenFailed {
+            reason: "test".to_string(),
+        }
+        .into();
+        let daemon: DaemonError = open_failed.into();
+        assert!(matches!(daemon, DaemonError::SecurityError(_)));
+        assert_eq!(daemon.error_code(), 7000);
+        assert!(
+            daemon.to_string().contains("re-activate"),
+            "recovery path (re-activation) must be in the error text: {daemon}"
+        );
+    }
+
+    // ---- task 49：Windows DPAPI 后端实测（本机可跑；非 Windows cfg 隔离） ----
+
+    /// DPAPI 端到端：默认装配语义（auto = Windows → dpapi）下首跑落盘为包装
+    /// 格式、跨实例复用同一密钥；旧裸容器首次加载后升级为 DPAPI 包装。
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_custody_wraps_persists_and_upgrades_legacy() {
+        use super::super::keycustody::{DpapiCustody, CUSTODY_MAGIC};
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("gw.key");
+        let custody = Arc::new(DpapiCustody) as Arc<dyn KeyCustody>;
+
+        // 旧裸容器（默认 file 后端产出）。
+        let first = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .load_or_create()
+            .expect("create legacy");
+        let legacy_bytes = fs::read(&path).expect("read legacy");
+        assert_eq!(&legacy_bytes[..MAGIC.len()], MAGIC, "legacy raw container");
+
+        // DPAPI 首次加载 → 升级重写为包装格式，密钥不变。
+        let upgraded = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(Arc::clone(&custody))
+            .load_or_create()
+            .expect("upgrade load");
+        assert_eq!(
+            upgraded.public_key().expect("pk"),
+            first.public_key().expect("pk")
+        );
+        let wrapped = fs::read(&path).expect("read wrapped file");
+        assert!(wrapped.starts_with(CUSTODY_MAGIC), "dpapi magic prefix");
+        assert_ne!(wrapped, legacy_bytes, "legacy file must be upgraded");
+
+        // 重启：同后端再加载 → 同一密钥；文件字节稳定。
+        let reloaded = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(custody)
+            .load_or_create()
+            .expect("reload");
+        assert_eq!(
+            reloaded.public_key().expect("pk"),
+            first.public_key().expect("pk")
+        );
+        assert_eq!(fs::read(&path).expect("read again"), wrapped);
+    }
+
+    /// DPAPI ↔ file 模式切换 fail-closed：dpapi 落盘的文件在 file 后端下加载
+    /// → 结构化 Custody(OpenFailed)，文件不动、绝不静默重建。
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_sealed_file_rejected_by_file_custody_without_recreate() {
+        use super::super::keycustody::{DpapiCustody, CUSTODY_MAGIC};
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("gw.key");
+        FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .with_custody(Arc::new(DpapiCustody))
+            .load_or_create()
+            .expect("create dpapi-sealed");
+        let before = fs::read(&path).expect("read sealed file");
+        assert!(before.starts_with(CUSTODY_MAGIC));
+
+        let err = FileKeyProvider::new(path.clone(), &fingerprint_a())
+            .expect("valid fp")
+            .load_or_create()
+            .expect_err("file custody must refuse dpapi-sealed blob");
+        assert!(
+            matches!(err, KeyError::Custody(CustodyError::OpenFailed { .. })),
+            "structured Custody(OpenFailed) required, got {err}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read after failure"),
+            before,
+            "fail-closed: file must NOT be silently recreated"
         );
     }
 }

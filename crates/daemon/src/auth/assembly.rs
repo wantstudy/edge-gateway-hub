@@ -49,6 +49,7 @@ use crate::auth::client::{
     LicenseTransport, LicensingClient, LicensingClientConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
     DEFAULT_REQUEST_TIMEOUT_SECS,
 };
+use crate::auth::keycustody::{custody_from_env, KEY_CUSTODY_ENV};
 use crate::auth::keyprovider::{FileKeyProvider, KeyProvider as _};
 use crate::auth::machine_id::{AnchorProvider, FingerprintKey, MachineIdentity};
 use crate::auth::signing::{AuthSigner, HandleSigner, KeyHandleKeyProviderAdapter, LicenseGate};
@@ -233,6 +234,20 @@ pub fn assemble(input: AssemblyInput<'_>) -> AssemblyOutcome {
     };
 
     // ③ 设备签名密钥：首跑生成 / 加载，HKDF 机器码绑定加密落盘（拷盘即失效）。
+    // ③′ custody 托管后端选择（task 49）：env IOT_DAQ_KEY_CUSTODY
+    //     （auto|dpapi|file，默认 auto：Windows→DPAPI 用户域，其余→0600 裸容器
+    //     文件）；env 非法 / 平台不支持 → fail-closed（绝不静默降级，降级必须由
+    //     运维显式选择）。
+    let custody = match custody_from_env() {
+        Ok(custody) => custody,
+        Err(err) => {
+            return AssemblyOutcome::Failed(format!(
+                "device key custody configuration invalid ({err}); license assembly \
+                 cannot proceed. Recovery: set {KEY_CUSTODY_ENV} to auto|dpapi|file \
+                 and restart"
+            ))
+        }
+    };
     let key_path = input
         .device_key_path
         .unwrap_or_else(|| default_device_key_path(input.data_dir));
@@ -247,7 +262,7 @@ pub fn assemble(input: AssemblyInput<'_>) -> AssemblyOutcome {
         }
     }
     let key_provider = match FileKeyProvider::new(key_path, &machine_code) {
-        Ok(provider) => provider,
+        Ok(provider) => provider.with_custody(custody),
         Err(err) => {
             return AssemblyOutcome::Failed(format!(
                 "device key provider rejected the machine fingerprint ({err}); license \
@@ -261,7 +276,9 @@ pub fn assemble(input: AssemblyInput<'_>) -> AssemblyOutcome {
             return AssemblyOutcome::Failed(format!(
                 "device signing key unavailable ({err}); license assembly cannot proceed and \
                  northbound stays closed. Recovery: for TamperedOrForeign the operator must \
-                 reset the key manually (never copy key files between machines); for IO errors \
+                 reset the key manually (never copy key files between machines); for custody \
+                 unseal failures the key must be re-provisioned by re-activating the device \
+                 against the cloud licensing service (never silently re-created); for IO errors \
                  fix the persistent volume and restart"
             ))
         }
@@ -1349,6 +1366,13 @@ mod tests {
     /// 设备密钥容器损坏 → fail-closed（绝不静默重建密钥，防克隆）。
     #[test]
     fn fails_closed_on_corrupt_device_key() {
+        // assemble() 会读 custody env（本测试持锁防并行 env 竞态）。
+        let _guard = crate::auth::keycustody::test_support::custody_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if std::env::var(KEY_CUSTODY_ENV).is_ok() {
+            return; // CI 环境不应设置该变量；被占用则跳过（既有 env 测试护栏）。
+        }
         let dir = temp_dir();
         let key_path = dir.path().join("device.key");
         std::fs::write(&key_path, b"not-a-key-container").expect("write garbage");
@@ -1371,6 +1395,13 @@ mod tests {
     /// 设备密钥持久化在 data_dir/license/ 默认路径；试用标记同盘（红线 #13）。
     #[test]
     fn happy_path_assembles_client_and_runtime_config() {
+        // assemble() 会读 custody env（本测试持锁防并行 env 竞态）。
+        let _guard = crate::auth::keycustody::test_support::custody_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if std::env::var(KEY_CUSTODY_ENV).is_ok() {
+            return; // CI 环境不应设置该变量；被占用则跳过（既有 env 测试护栏）。
+        }
         let dir = temp_dir();
         let data_dir = dir.path().join("data");
         let outcome = assemble(AssemblyInput {
@@ -1406,6 +1437,70 @@ mod tests {
         assert_eq!(
             rt_cfg.data_dir, data_dir,
             "trial marker dir must come from gateway.data_dir"
+        );
+    }
+
+    /// custody 选择开关（task 49）：env 值非法 → fail-closed，错误只引用变量名
+    /// 与合法取值（值是模式名非敏感；绝不静默降级到 file）。
+    #[test]
+    fn fails_closed_on_invalid_custody_env() {
+        let _guard = crate::auth::keycustody::test_support::custody_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if std::env::var(KEY_CUSTODY_ENV).is_ok() {
+            return; // CI 环境不应设置该变量；被占用则跳过。
+        }
+        let dir = temp_dir();
+        std::env::set_var(KEY_CUSTODY_ENV, "keyring");
+        let outcome = assemble(AssemblyInput {
+            licensing: &licensing_section(),
+            data_dir: dir.path(),
+            transport: Some(Arc::new(crate::auth::client::UnavailableTransport)),
+            anchor_providers: Some(two_anchors()),
+            fingerprint_key: Some(test_key()),
+            device_key_path: Some(dir.path().join("device.key")),
+            lease_public_keys: Some(Vec::new()),
+        });
+        // 先清理 env 再断言（失败也不污染其它测试）。
+        std::env::remove_var(KEY_CUSTODY_ENV);
+        let AssemblyOutcome::Failed(reason) = outcome else {
+            panic!("expected Failed");
+        };
+        assert!(reason.contains(KEY_CUSTODY_ENV), "env name: {reason}");
+        assert!(reason.contains("Recovery"), "recovery path: {reason}");
+    }
+
+    /// custody 选择开关（task 49）：env=file 显式固定行为 → 装配成功且落盘为
+    /// 旧版裸容器格式（透传后端字节与历史部署逐字节兼容；容器场景确定性）。
+    #[test]
+    fn env_file_custody_keeps_legacy_container_format() {
+        let _guard = crate::auth::keycustody::test_support::custody_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if std::env::var(KEY_CUSTODY_ENV).is_ok() {
+            return;
+        }
+        let dir = temp_dir();
+        std::env::set_var(KEY_CUSTODY_ENV, "file");
+        let outcome = assemble(AssemblyInput {
+            licensing: &licensing_section(),
+            data_dir: dir.path(),
+            transport: Some(Arc::new(crate::auth::client::UnavailableTransport)),
+            anchor_providers: Some(two_anchors()),
+            fingerprint_key: Some(test_key()),
+            device_key_path: None,
+            lease_public_keys: Some(Vec::new()),
+        });
+        std::env::remove_var(KEY_CUSTODY_ENV);
+        assert!(
+            matches!(outcome, AssemblyOutcome::Assembled(_)),
+            "file custody must assemble cleanly"
+        );
+        let bytes = std::fs::read(default_device_key_path(dir.path())).expect("key file");
+        assert_eq!(
+            &bytes[..8],
+            b"IOTDAQKP",
+            "file custody persists the legacy raw container format"
         );
     }
 

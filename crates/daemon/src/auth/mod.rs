@@ -8,6 +8,7 @@
 pub mod assembly;
 pub mod client;
 pub mod clock;
+pub mod keycustody;
 pub mod keyprovider;
 pub mod limits;
 pub mod machine_id;
