@@ -1,65 +1,191 @@
 /**
  * @file tokens.css
- * @description IoT-DAQ 设计 token（CSS 变量）。权威来源：docs/design/ui-design-system.md §2。
+ * @description IoT-DAQ 设计 token（CSS 变量）。
+ *              视觉权威：docs/design/prototype/gateway-v2a-glacier.html（方案 A · 冰川，用户确认稿）。
+ *              结构性说明：docs/design/ui-design-system.md §2。
  *
  * 两端（web-console / admin-console）共用本文件，禁止各应用自建第二套 token（必然漂移）。
  * 首期仅 Light 主题，不做深色切换。
+ *
+ * 兼容性约定：既有变量名全部保留（消费方无需改动），仅按 A·冰川基准更新取值；
+ * 新增 glacier 专属变量组（渐变 / 侧栏 / 圆角梯度 / 阴影梯度 / 氛围背景）与
+ * 全局覆盖类（.uik-atmo 氛围层、.uik-btn-* 按钮渐变、Arco 主按钮对齐）。
  */
 
 :root {
-  /* ---------- 品牌与中性 ---------- */
-  --brand: #1f6feb;
-  --brand-hover: #3b82f6;
-  --brand-active: #1a5fd0;
-  --brand-subtle: #e8f1fe;
-  --text-1: #1d2129;
-  --text-2: #4e5969;
-  --text-3: #86909c;
-  --border: #e5e6eb;
-  --divider: #f2f3f5;
-  --bg-app: #f7f8fa;
-  --bg-card: #ffffff;
-  --bg-hover: #f7f8fa;
+  /* ---------- 品牌与中性（A·冰川：青绿强调） ---------- */
+  --brand: #17c3b2; /* 原型 --accent */
+  --brand-hover: #0fa396; /* 原型 --accent-2（加深派生） */
+  --brand-active: #0d8f84; /* accent-2 再深一档（按下态派生） */
+  --brand-subtle: #e2fbf7; /* 原型 --accent-soft */
+  --brand-line: #a8ede4; /* 原型 --accent-line */
+  --text-1: #101733; /* 原型 --text */
+  --text-2: #5a6486; /* 原型 --text-2 */
+  --text-3: #8e97b4; /* 原型 --text-3 */
+  --border: #e1e5ef; /* 原型按钮 / 胶囊描边 */
+  --divider: #f3f5fa; /* 原型表格行分隔 / tbl-foot 顶线 */
+  --bg-app: #f4f6fb; /* 原型 --bg */
+  --bg-card: #ffffff; /* 原型 --surface */
+  --bg-hover: #fafbfe; /* 原型 --surface-2（行悬浮底） */
 
-  /* ---------- 语义状态色（工业设备语境） ---------- */
-  --ok: #00a870;
-  --warn: #ff7d00;
-  --danger: #f53f3f;
-  --info: #1f6feb;
-  --unknown: #86909c;
+  /* ---------- 语义状态色（工业设备语境，对齐原型 :31-36） ---------- */
+  --ok: #12b76a;
+  --warn: #f79009;
+  --danger: #f04438;
+  --info: #2e90fa;
+  --unknown: #8e97b4; /* 原型 --idle */
 
   /* ---------- 语义状态浅底（标签用；浅底 + 深字，对比度 ≥ 4.5:1） ---------- */
-  --ok-bg: #e8ffea;
+  --ok-bg: #e6f9f0;
   --ok-fg: #0a6b47;
-  --ok-border: #b5f0ce;
-  --warn-bg: #fff7e8;
+  --ok-border: #a9ebc8;
+  --warn-bg: #fff6e6;
   --warn-fg: #8a4b00;
-  --warn-border: #ffe0b2;
-  --danger-bg: #ffece8;
-  --danger-fg: #a8171b;
-  --danger-border: #ffcdc5;
-  --info-bg: #e8f1fe;
+  --warn-border: #ffdfa6;
+  --danger-bg: #feecea;
+  --danger-fg: #8c1d18;
+  --danger-border: #fbc9c4;
+  --info-bg: #e9f3fe;
   --info-fg: #12489c;
-  --info-border: #c6ddfb;
-  --unknown-bg: #f2f3f5;
-  --unknown-fg: #5a6069;
-  --unknown-border: #e5e6eb;
+  --info-border: #bfddfb;
+  --unknown-bg: #f0f3f9;
+  --unknown-fg: #5a6486;
+  --unknown-border: #dde2ec;
 
-  /* ---------- 尺度 ---------- */
-  --radius: 8px; /* 卡片 */
-  --radius-sm: 4px; /* 控件 / 标签 */
+  /* ---------- 形状（A·冰川：大圆角卡片） ---------- */
+  --radius: 16px; /* 卡片（原型 --r-card） */
+  --radius-inner: 12px; /* 卡内分区（原型 --r-inner） */
+  --radius-btn: 10px; /* 按钮（原型 --r-btn） */
+  --radius-sm: 8px; /* 控件 / 标签（原型 --r-sm） */
   --radius-pill: 999px; /* 状态胶囊 */
-  --shadow: 0 4px 16px rgba(29, 33, 41, 0.08);
+
+  /* ---------- 阴影梯度（柔和扩散，对齐原型 :39-42） ---------- */
+  --shadow-1: 0 1px 2px rgba(16, 24, 60, 0.05);
+  --shadow-2: 0 10px 26px -10px rgba(16, 24, 60, 0.16);
+  --shadow-3: 0 30px 70px -20px rgba(16, 24, 60, 0.3);
+  --shadow-pop: 0 24px 60px -16px rgba(16, 24, 60, 0.28);
+  /* 兼容旧名：默认卡片阴影 = shadow-2 */
+  --shadow: 0 10px 26px -10px rgba(16, 24, 60, 0.16);
+
+  /* ---------- 品牌渐变（按钮 / 图标方块，原型 :27-29） ---------- */
+  --grad-brand: linear-gradient(135deg, #17c3b2 0%, #1b6be0 100%);
+  --grad-teal: linear-gradient(135deg, #2bd9c8 0%, #0fa396 100%);
+  --grad-ink: linear-gradient(135deg, #4c8df6 0%, #1b4fd8 100%);
+
+  /* ---------- 深色侧栏专用（原型 :20, :77-100） ---------- */
+  --sidebar-bg: #0f1b3d; /* 深海军蓝 */
+  --sidebar-bg-2: #16244c;
+  --sidebar-line: rgba(255, 255, 255, 0.08);
+  --sidebar-text: #b9c2dc; /* 常态导航文字 */
+  --sidebar-text-active: #ffffff; /* 选中 / 悬浮文字 */
+  --sidebar-muted: #8a94b8; /* 弱化文字（副标题 / 页脚） */
+  --sidebar-active-bg: rgba(23, 195, 178, 0.16); /* 选中项青绿衬底 */
+
+  /* ---------- 布局尺度 ---------- */
   --sidebar-w: 236px;
   --topbar-h: 56px;
   --content-max: 1600px;
 
-  /* ---------- 字体 ---------- */
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
-  --font-mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  /* ---------- 字体（Sora 标题 + Noto Sans SC 正文；不引入字体文件，仅声明） ---------- */
+  --font-sans: 'Sora', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-display: 'Sora', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New', monospace;
   --fs-page: 20px;
   --fs-section: 16px;
   --fs-body: 14px;
   --fs-table: 13px;
   --fs-caption: 12px;
+}
+
+/* ============================================================
+   全局类（随 tokens.css 一并下发，两端均可直接使用）
+   ============================================================ */
+
+/* 氛围层：两枚极淡径向渐变 + 极细网格，替代纯色平铺（原型 .atmo :59-71）。
+   用法：<div class="uik-atmo"></div> 置于应用根节点，pointer-events 不拦截交互。 */
+.uik-atmo {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(48rem 30rem at 8% -8%, rgba(23, 195, 178, 0.13), transparent 62%),
+    radial-gradient(52rem 34rem at 102% 2%, rgba(27, 107, 224, 0.1), transparent 60%);
+}
+.uik-atmo::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.5;
+  background-image: linear-gradient(rgba(16, 24, 60, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(16, 24, 60, 0.035) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(70% 60% at 40% 0%, #000, transparent 75%);
+  -webkit-mask-image: radial-gradient(70% 60% at 40% 0%, #000, transparent 75%);
+}
+
+/* 按钮渐变覆盖类（ui-kit 无自有按钮组件，按钮由 Arco 提供）。
+   附加到任意按钮即可获得 A·冰川渐变 + hover 位移（原型 :156-171）：
+   <a-button class="uik-btn-teal">…</a-button> */
+.uik-btn-teal,
+.uik-btn-ink {
+  border-color: transparent;
+  transition: all 160ms ease-out;
+}
+.uik-btn-teal {
+  background: var(--grad-teal);
+  color: #04241f;
+  box-shadow: 0 8px 20px -8px rgba(15, 163, 150, 0.75);
+}
+.uik-btn-ink {
+  background: var(--grad-ink);
+  color: #fff;
+  box-shadow: 0 8px 20px -8px rgba(27, 79, 216, 0.7);
+}
+.uik-btn-teal:hover:not(:disabled),
+.uik-btn-ink:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.05);
+}
+.uik-btn-teal:active:not(:disabled),
+.uik-btn-ink:active:not(:disabled) {
+  transform: none;
+  filter: brightness(0.97);
+}
+.uik-btn-teal:disabled,
+.uik-btn-ink:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* Arco 主按钮全局对齐 A·冰川（原型 .btn.primary：蓝渐变 + hover 位移）。
+   用双类选择器压过 arco.css（tokens.css 先于 arco.css 加载，靠特异性取胜）。 */
+.arco-btn.arco-btn-primary {
+  background: var(--grad-ink);
+  border-color: transparent;
+  box-shadow: 0 8px 20px -8px rgba(27, 79, 216, 0.7);
+}
+.arco-btn.arco-btn-primary:hover:not(.arco-btn-disabled) {
+  background: var(--grad-ink);
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+  box-shadow: 0 12px 26px -8px rgba(27, 79, 216, 0.85);
+}
+.arco-btn.arco-btn-primary:active:not(.arco-btn-disabled) {
+  background: var(--grad-ink);
+  filter: brightness(0.97);
+  transform: none;
+}
+.arco-btn.arco-btn-primary.arco-btn-disabled {
+  background: var(--grad-ink);
+  opacity: 0.45;
+  box-shadow: none;
+}
+/* 所有 Arco 按钮 hover 轻微上浮（原型 .btn:hover :159） */
+.arco-btn.arco-btn:hover:not(.arco-btn-disabled) {
+  transform: translateY(-1px);
+}
+.arco-btn.arco-btn:active:not(.arco-btn-disabled) {
+  transform: none;
 }
