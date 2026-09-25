@@ -6,10 +6,13 @@
       KPI 四卡 → 启动策略 / 启动方式识别 → 计划重启 / 危险操作。
 
     危险操作契约（本次修复重点）：
-      · 「立即重启服务」改走 ui-kit `DangerConfirmModal`：影响清单 + 原因必填（枚举 + 补充说明）；
-      · 「停止服务（不自动启动）」同样走该弹窗，并在原因之上追加**服务名二次校验**；
+      · 「立即重启服务」走 ui-kit `DangerConfirmModal`：影响清单 + 原因必填（枚举 + 补充说明）+
+        **服务名二次校验**；real 模式调真实 `POST /api/ops/restart`，body `{actor, confirm, reason}`，
+        `confirm` 由页面自动回显网关标识（/api/overview 的 `name` = gateway_id）；
+      · 「停止服务（不自动启动）」同样走该弹窗并追加**服务名二次校验**；
+        后端当前未提供停止端点（实测 POST /api/ops/stop → 404），确认后诚实告知并给宿主机命令；
       · 确认后的动作：mock 模式执行既有演示行为（`repo.ops.restart`），结果区标注「未产生真实动作」；
-        real 模式调用真实 `POST /api/ops/restart`，后端返回的结果（含 403 权限不足）原样呈现。
+        real 模式后端返回的结果（含 403 / 400 confirm_mismatch）原样呈现。
 
     其它硬性约定：
       · 部署形态「自动识别」：二者并列展示并高亮当前形态，绝不让用户手动二选一；
@@ -270,7 +273,7 @@ systemctl enable --now {{ runtime.native.serviceName }}</pre>
     </div>
   </div>
 
-  <!-- 重启服务：影响清单 + 原因必填（原型 confirmRestart :3345-3358） -->
+  <!-- 重启服务：影响清单 + 原因必填 + 服务名二次校验（原型 confirmRestart :3345-3358） -->
   <DangerConfirmModal
     :open="restartModal.open"
     :title="`重启服务 · ${formCn}`"
@@ -278,6 +281,9 @@ systemctl enable --now {{ runtime.native.serviceName }}</pre>
     :facts="restartModal.facts"
     :reasons="RESTART_REASONS"
     :min-note-length="10"
+    :confirm-value="SERVICE_KEY"
+    confirm-label="风险二次确认（输入服务名）"
+    :confirm-placeholder="`输入 ${SERVICE_KEY} 以确认`"
     confirm-text="确认重启"
     @close="restartModal.open = false"
     @submit="confirmRestart"
@@ -486,9 +492,11 @@ function openRestart(): void {
     '北向转发短暂中断，客户 Broker 可能出现一个空档。',
     '若队列中有待补发数据，将优先 flush 后再退出（优雅停机）。',
     '操作不可撤销；原因与补充说明将写入审计日志。',
+    `需输入服务名 ${SERVICE_KEY} 完成二次校验。`,
   ];
   restartModal.facts = [
     { label: '作用对象', value: unitName.value },
+    { label: '网关标识', value: gateway.value.name },
     { label: '部署形态', value: formCn.value },
     { label: '操作者', value: session.state.displayName },
     { label: '执行模式', value: API_MODE === 'real' ? 'real（真实下发网关）' : 'mock（演示，无真实动作）' },
@@ -512,10 +520,19 @@ function openStop(): void {
   stopModal.open = true;
 }
 
-/** 确认重启：real 走 `repo.ops.restart`（真实 `POST /api/ops/restart`）；mock 走既有演示行为。 */
+/**
+ * 确认重启：real 走 `repo.ops.restart`（真实 `POST /api/ops/restart`）；
+ * 后端要求 body `{actor, confirm, reason}`，`confirm` 必须回显当前 gateway_id
+ * （即 `/api/overview` 的 `name` 字段），此处由页面自动回显，用户弹窗输入的服务名
+ * （`payload.tail`）作为前端侧二次校验门槛；mock 走既有演示行为。
+ */
 async function confirmRestart(payload: { reason: string; note: string }): Promise<void> {
   restartModal.open = false;
-  const result = await repo.ops.restart(session.state.displayName);
+  const result = await repo.ops.restart({
+    actor: session.state.displayName,
+    confirm: gateway.value.name,
+    reason: `${payload.reason} · ${payload.note}`,
+  });
   const tail = `原因：${payload.reason} · ${payload.note}`;
   if (API_MODE === 'real') {
     note(result.ok ? `${result.message} ${tail}` : `重启未成功：${result.message} ${tail}`, result.ok ? 'ok' : 'warn');

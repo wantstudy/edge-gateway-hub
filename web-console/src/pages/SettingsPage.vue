@@ -7,10 +7,13 @@
     原型的「模拟策略」页签整体留给 P0-4 立项 —— 本页**不提供**该页签骨架之外的假内容。
 
   诚实降级边界（重要）：
-    网关后端当前只有读型 `/api/overview` 等端点，**没有**写型 settings 端点。因此
-    本页所有表单/开关均为**本地界面状态**（刷新即回到默认值），并在每处明确标注
-    「后端暂未开放写入端点，改动不会下发到网关」。
-    本页唯一「有真实动作入口」的能力是「配置回滚」（见「基础」页签末）。
+    网关后端当前只有读型 `/api/overview` 等端点，**没有**写型 settings 端点（实测
+    `GET /api/settings` → 404）。因此本页所有表单/开关均为**本地界面状态**（刷新即回到
+    默认值），并在每处明确标注「后端暂未开放写入端点，改动不会下发到网关」。
+    本页唯一「有真实动作入口」的能力是「配置回滚」（见「基础」页签末）：real 模式调用真实
+    `POST /api/settings/rollback`（body `{reason}`，不传 backup → 网关回滚到 config 目录内
+    最新的 `config.toml.bak-*` 备份）。注意：后端暂无备份清单读端点，本页快照列表为本地示意，
+    实际回滚目标以网关最新备份为准，结果区原样呈现后端返回（含 403 / 404 no_backup）。
 -->
 <template>
   <PageHeader
@@ -128,8 +131,22 @@
 
             <p class="wc-note" data-testid="rollback-note">
               <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-              <span>回滚会将配置恢复到所选快照；若该快照与当前版本不兼容，网关可能提示需重启。</span>
+              <span>
+                real 模式下回滚调用真实接口 <code>POST /api/settings/rollback</code>：网关按 config 目录内
+                <code>config.toml.bak-*</code> 备份执行，本页快照列表为本地示意（后端暂无备份清单读端点），
+                实际回滚目标以网关最新备份为准；回滚前网关会对当前配置自动再备份（可逆），热重载即时生效。
+              </span>
             </p>
+
+            <div
+              v-if="rollbackResult"
+              class="st-rollback-result"
+              :class="`is-${rollbackResultKind}`"
+              data-testid="rollback-result"
+            >
+              <span aria-hidden="true">{{ rollbackResultKind === 'ok' ? '✓' : '⚠' }}</span>
+              <span>{{ rollbackResult }}</span>
+            </div>
           </div>
         </section>
       </div>
@@ -416,6 +433,7 @@ import {
 } from '@ui-kit';
 import { session } from '../store/session';
 import { repo } from '@/api/repo';
+import { API_MODE } from '@/api/client';
 
 /** 页签名（原型 :2143）。 */
 const TABS = ['基础', '网络', '存储', '安全'] as const;
@@ -609,6 +627,8 @@ function openRollback(snap: Snapshot): void {
     { label: '快照时间', value: snap.at },
     { label: '快照说明', value: snap.note },
     { label: '当前版本', value: currentVersion },
+    { label: '操作者', value: session.state.displayName },
+    { label: '执行模式', value: API_MODE === 'real' ? 'real（真实下发网关）' : 'mock（演示，无真实动作）' },
   ];
 }
 
@@ -617,13 +637,31 @@ function closeRollback(): void {
   rollback.open = false;
 }
 
-/** 提交回滚（演示：本版本无 /api/settings/rollback 端点，落到结果区说明）。 */
-function submitRollback(_payload: { reason: string; note: string; tail: string }): void {
+/** 回滚结果反馈（后端结果原样呈现，含失败；不伪造成功）。 */
+const rollbackResult = ref('');
+const rollbackResultKind = ref<'ok' | 'warn'>('ok');
+
+/**
+ * 提交回滚：real 调 `repo.settings.rollback`（真实 `POST /api/settings/rollback`，
+ * body `{reason}`，不传 backup → 网关回滚到 config 目录内最新 `config.toml.bak-*` 备份）；
+ * mock 走模拟并在结果区注明「未产生真实动作」。弹窗四要素（影响清单 + 原因必填 +
+ * 快照编号二次校验 + 草稿隔离）由 DangerConfirmModal 契约保证。
+ */
+async function submitRollback(payload: { reason: string; note: string; tail: string }): Promise<void> {
   rollback.open = false;
-  saved.value = true;
-  setTimeout(() => {
-    saved.value = false;
-  }, 1600);
+  const result = await repo.settings.rollback({
+    actor: session.state.displayName,
+    reason: `${payload.reason} · ${payload.note}`,
+  });
+  if (API_MODE === 'real') {
+    rollbackResult.value = result.ok
+      ? `${result.message}${result.restoredFrom ? `（恢复自备份 ${result.restoredFrom}${result.version ? `，配置版本 ${result.version}` : ''}）` : ''}`
+      : `回滚未执行：${result.message}`;
+    rollbackResultKind.value = result.ok ? 'ok' : 'warn';
+    return;
+  }
+  rollbackResult.value = `${result.message} —— 演示模式未向网关发出任何回滚指令，配置不变。`;
+  rollbackResultKind.value = 'warn';
 }
 </script>
 
@@ -773,5 +811,25 @@ function submitRollback(_payload: { reason: string; note: string; tail: string }
   margin-left: 8px;
   font-size: var(--fs-caption);
   color: var(--text-3);
+}
+
+/* 回滚结果反馈（token 化，与 StartupPage 结果区同一口径） */
+.st-rollback-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-caption);
+  line-height: 1.6;
+  border: 1px solid var(--ok-border);
+  background: var(--ok-bg);
+  color: var(--ok-fg);
+}
+.st-rollback-result.is-warn {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn-fg);
 }
 </style>

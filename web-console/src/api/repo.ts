@@ -1288,8 +1288,13 @@ function buildRealRepo(): typeof mockRepo {
 
 /** 运维动作 API（repo.ops.*）。 */
 export interface OpsApi {
-  /** 触发网关重启（real：`POST /api/ops/restart`；危险操作二次确认由页面层完成）。 */
-  restart(actor: string): Promise<{ ok: boolean; message: string }>;
+  /**
+   * 触发网关重启（real：`POST /api/ops/restart`）。
+   * 后端契约（remote_ops.rs）：body `{actor, confirm, reason}`，`confirm` 必须回显
+   * 当前 gateway_id（即 `/api/overview` 的 `name` 字段），缺失/不匹配 → 400 confirm_mismatch；
+   * 弹窗二次确认由页面层（DangerConfirmModal）完成，此处忠实下发。
+   */
+  restart(input: { actor: string; confirm: string; reason: string }): Promise<{ ok: boolean; message: string }>;
   /** 新建采集器（real：`POST /api/ops/collectors`）。 */
   createCollector(input: { name: string; deviceId?: string; actor: string }): Promise<{ ok: boolean; message: string }>;
   /** 拉取运行日志（real：`GET /api/ops/logs`，结果并入审计清单）。 */
@@ -1301,10 +1306,10 @@ export interface OpsApi {
 /** 运维动作实现（两种模式都可用）。 */
 function buildOps(): OpsApi {
   return {
-    async restart(actor: string): Promise<{ ok: boolean; message: string }> {
+    async restart(input: { actor: string; confirm: string; reason: string }): Promise<{ ok: boolean; message: string }> {
       if (API_MODE !== 'real') {
         pushLocalAudit({
-          actor,
+          actor: input.actor,
           actorType: 'human',
           action: '重启网关',
           entityType: 'system',
@@ -1316,11 +1321,22 @@ function buildOps(): OpsApi {
         return { ok: true, message: '重启指令已下发（mock 模拟）。' };
       }
       try {
-        await apiRequest<unknown>('/api/ops/restart', { method: 'POST' });
-        return { ok: true, message: '重启指令已下发，网关将在数秒内重启。' };
+        await apiRequest<unknown>('/api/ops/restart', {
+          method: 'POST',
+          body: JSON.stringify({ actor: input.actor, confirm: input.confirm, reason: input.reason }),
+        });
+        return { ok: true, message: '重启指令已下发，网关将优雅停机并由 Supervisor / 服务管理器拉起。' };
       } catch (cause) {
-        if (cause instanceof Error && 'status' in cause && (cause as { status: number }).status === 403) {
+        const status = cause instanceof Error && 'status' in cause ? (cause as { status: number }).status : 0;
+        if (status === 403) {
           return { ok: false, message: '权限不足（403），当前角色不可执行重启。' };
+        }
+        if (status === 400) {
+          return {
+            ok: false,
+            message:
+              '网关拒绝（400）：网关标识（gateway id）回显校验未通过。页面取到的标识可能与网关运行期配置不一致，请刷新页面后重试。',
+          };
         }
         return { ok: false, message: cause instanceof Error ? cause.message : '重启指令下发失败。' };
       }
@@ -1380,6 +1396,81 @@ function buildOps(): OpsApi {
           return { ok: false, message: '权限不足（403）。' };
         }
         return { ok: false, message: cause instanceof Error ? cause.message : '健康检查失败。' };
+      }
+    },
+  };
+}
+
+// ===========================================================================
+// 设置写动作（settings）：real → 真实接口；mock → 模拟成功 + 本地审计
+// ===========================================================================
+
+/** 设置写动作 API（repo.settings.*）。 */
+export interface SettingsApi {
+  /**
+   * 配置回滚（real：`POST /api/settings/rollback`，`device.write` 权限，实测仅 system 角色可执行）。
+   * 后端契约（pages.rs）：body `{backup?, reason?}` 均可选；缺省 `backup` 时回滚到网关
+   * config 目录内文件名字典序最大的 `config.toml.bak-*` 备份；无备份 → 404 no_backup；
+   * 回滚前会对当前配置再做一次写前备份（可逆），热重载即时生效。
+   * 注意：后端暂无备份清单读端点，页面快照列表为本地示意，故本封装不传 `backup`，
+   * 实际回滚目标以网关最新备份为准。
+   */
+  rollback(input: { actor: string; reason: string }): Promise<{
+    ok: boolean;
+    message: string;
+    restoredFrom?: string;
+    version?: string;
+  }>;
+}
+
+/** 设置写动作实现（两种模式都可用）。 */
+function buildSettings(): SettingsApi {
+  return {
+    async rollback(input: { actor: string; reason: string }): Promise<{
+      ok: boolean;
+      message: string;
+      restoredFrom?: string;
+      version?: string;
+    }> {
+      if (API_MODE !== 'real') {
+        pushLocalAudit({
+          actor: input.actor,
+          actorType: 'human',
+          action: '配置回滚',
+          entityType: 'system',
+          entityLabel: '系统',
+          entityId: 'config',
+          detail: 'mock 模式：模拟回滚成功',
+          result: 'success',
+        });
+        return { ok: true, message: '回滚指令已下发（mock 模拟）。' };
+      }
+      try {
+        const raw = await apiRequest<Record<string, unknown>>('/api/settings/rollback', {
+          method: 'POST',
+          body: JSON.stringify({ reason: input.reason }),
+        });
+        const restoredFrom = typeof raw['restored_from'] === 'string' ? raw['restored_from'] : '';
+        const version = typeof raw['config_version'] === 'string' ? raw['config_version'] : '';
+        return {
+          ok: true,
+          message: '回滚成功：当前配置已在回滚前自动再备份（可逆），热重载即时生效。',
+          restoredFrom: restoredFrom || undefined,
+          version: version || undefined,
+        };
+      } catch (cause) {
+        const status = cause instanceof Error && 'status' in cause ? (cause as { status: number }).status : 0;
+        if (status === 403) {
+          return { ok: false, message: '权限不足（403），配置回滚仅限 system 角色执行。' };
+        }
+        if (status === 404) {
+          return {
+            ok: false,
+            message:
+              '网关无可回滚备份（404 no_backup）：config 目录内不存在 config.toml.bak-* 备份。每次配置写入前网关才会生成写前备份。',
+          };
+        }
+        return { ok: false, message: cause instanceof Error ? cause.message : '回滚指令下发失败。' };
       }
     },
   };
@@ -1872,10 +1963,12 @@ function extractImportErrors(cause: unknown): ImportRowError[] {
 const baseRepo: typeof mockRepo = API_MODE === 'real' ? buildRealRepo() : mockRepo;
 
 /**
- * 最终仓库（含 `ops` 运维动作与 `actions` 动作型端点；mock 模式下二者均为模拟实现）。
+ * 最终仓库（含 `ops` 运维动作、`settings` 设置写动作与 `actions` 动作型端点；
+ * mock 模式下三者均为模拟实现）。
  */
-export const repo: typeof mockRepo & { ops: OpsApi; actions: ActionApi } = {
+export const repo: typeof mockRepo & { ops: OpsApi; settings: SettingsApi; actions: ActionApi } = {
   ...baseRepo,
   ops: buildOps(),
+  settings: buildSettings(),
   actions: buildActions(),
 };
