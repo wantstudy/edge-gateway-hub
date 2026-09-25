@@ -37,6 +37,12 @@
         <span class="wc-card__sub">每路出口独立编码与重发策略 · 共 {{ forwarderTotal }} 条</span>
       </div>
 
+      <!-- real 模式：出口数据源不可得时给出「原因 + 恢复路径」，不静默吞错 -->
+      <div v-if="forwardersNotice" class="wc-banner wc-banner--warn" data-testid="forwarders-notice">
+        <span class="wc-banner__icon">!</span>
+        <span>{{ forwardersNotice }}</span>
+      </div>
+
       <EmptyState
         v-if="forwarderTotal === 0"
         title="还没有配置北向出口"
@@ -79,7 +85,7 @@
             <StatusTag :status="row.status" />
           </template>
           <template #cell-covered="{ row }">
-            <span class="wc-mono">{{ row.coveredDevices }} / {{ row.recommendedDeviceLimit }}</span>
+            <span class="wc-mono">{{ countText(row.coveredDevices) }} / {{ countText(row.recommendedDeviceLimit) }}</span>
           </template>
           <template #cell-lastConsistencyCheckAt="{ row }">
             <span class="wc-mono">{{ row.lastConsistencyCheckAt }}</span>
@@ -150,14 +156,14 @@
               该出口使用 JSON 编码：超出 2<sup>53</sup>−1（9007199254740991）的整数将编码为字符串
               （纳秒时间戳、大 uint64 计数器）。JSON 的 number 是 IEEE754 double，直接编码会<b>静默丢精度</b>。
               体积约为 protobuf 的 1.5–3×，推荐设备上限
-              {{ selected.recommendedDeviceLimit }} 台（当前 {{ selected.coveredDevices }} 台）。
+              {{ countText(selected.recommendedDeviceLimit) }} 台（当前 {{ countText(selected.coveredDevices) }} 台）。
               <br />
               编码与签名解耦：protobuf / json 两种编码语义一致、验签结果相同。
             </span>
           </div>
           <div v-else class="wc-hint" data-testid="proto-hint">
             protobuf（默认）：体积小、性能高，二进制编码；与 json 编码语义一致、验签结果相同。推荐设备上限
-            {{ selected.recommendedDeviceLimit }} 台（当前 {{ selected.coveredDevices }} 台）。
+            {{ countText(selected.recommendedDeviceLimit) }} 台（当前 {{ countText(selected.coveredDevices) }} 台）。
           </div>
         </div>
 
@@ -214,21 +220,47 @@
         <div class="wc-card__body">
           <UiRadio v-model="outletType" :options="outletTypeOptions" :disabled="!canEdit" />
 
-          <div class="nb-form-grid">
+          <!-- ── MQTT Broker 分支（原型 outletTypeBody :1319-1325）── -->
+          <div v-if="outletType === 'mqtt'" class="nb-form-grid">
             <UiField label="出口名称" required>
               <UiInput v-model="outletForm.name" placeholder="如：客户 EMQX（生产）" :disabled="!canEdit" />
             </UiField>
-            <UiField label="Broker / 接口地址" required hint="mqtt://host:1883 / mqtts://host:8883 / https://host/path">
+            <UiField label="Broker 地址" required hint="mqtt://host:1883 / mqtts://host:8883">
               <UiInput v-model="outletForm.brokerUrl" placeholder="mqtt://10.0.0.5:1883" :disabled="!canEdit" />
             </UiField>
             <UiField label="客户端 ID">
               <UiInput v-model="outletForm.clientId" placeholder="iotdaq-line1-01" :disabled="!canEdit" />
             </UiField>
-            <UiField label="Topic 模板">
-              <UiInput v-model="outletForm.topicTemplate" placeholder="factory/line1/${device}/${point}" :disabled="!canEdit" />
-            </UiField>
             <UiField label="数据编码" required hint="每路出口独立可选；默认 protobuf">
               <UiSelect v-model="outletForm.encoding" :options="encodingSelectOptions" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="QoS" required hint="0 至多一次 / 1 至少一次 / 2 恰好一次（默认 1）">
+              <UiSelect v-model="outletForm.qos" :options="qosOptions" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="Topic 前缀" hint="MQTT 5 报文以 Payload Format Indicator + Content Type 声明编码">
+              <UiInput v-model="outletForm.topicTemplate" placeholder="factory/line1" :disabled="!canEdit" />
+            </UiField>
+          </div>
+
+          <!-- ── HTTP(S) 接口分支（原型 outletTypeBody :1327-1334）── -->
+          <div v-else class="nb-form-grid">
+            <UiField label="出口名称" required>
+              <UiInput v-model="outletForm.name" placeholder="如：客户 HTTP 接口" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="接口地址（URL）" required hint="支持 http / https；https 强制校验服务端证书">
+              <UiInput v-model="outletForm.brokerUrl" placeholder="https://client.example.com/api/ingest" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="请求方法">
+              <UiSelect v-model="outletForm.httpMethod" :options="httpMethodOptions" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="批量大小">
+              <UiSelect v-model="outletForm.batchSize" :options="batchSizeOptions" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="认证 Header" hint="原样随请求发送；也可留空由客户网关鉴权">
+              <UiInput v-model="outletForm.authHeader" placeholder="Authorization: Bearer &lt;token&gt;" :disabled="!canEdit" />
+            </UiField>
+            <UiField label="超时 / 重试" hint="失败进入本地队列，恢复后按序补发（与 MQTT 出口同一套断网续传）">
+              <UiInput v-model="outletForm.timeoutRetry" placeholder="5 s · 3 次" :disabled="!canEdit" />
             </UiField>
           </div>
 
@@ -254,9 +286,23 @@
             </p>
           </div>
 
-          <!-- 新增出口选 JSON 时同样给出精度提示 -->
-          <div v-if="outletForm.encoding === 'json'" class="wc-banner wc-banner--warn" data-testid="new-json-warning">
+          <!-- 新增出口选 JSON 时同样给出精度提示（MQTT 分支；原型 outletTypeHint :1339） -->
+          <div
+            v-if="outletType === 'mqtt' && outletForm.encoding === 'json'"
+            class="wc-banner wc-banner--warn"
+            data-testid="new-json-warning"
+          >
             <span>JSON 编码：纳秒时间戳 / 大 uint64 计数器将编码为字符串，避免超出 2<sup>53</sup>−1 静默丢精度。</span>
+          </div>
+
+          <!-- HTTP 出口固定 JSON 编码（原型 outletTypeHint :1338） -->
+          <div v-if="outletType === 'http'" class="wc-banner wc-banner--warn" data-testid="new-http-hint">
+            <span class="wc-banner__icon">!</span>
+            <span>
+              HTTP 出口<b>固定 JSON 编码</b>：请求体为
+              <code>{"device_mid":…,"ts":…,"points":{target:value,…}}</code>，Content-Type: application/json；
+              纳秒时间戳 / 大 uint64 计数器<b>必须编码为字符串</b>（安全整数上限 2<sup>53</sup>−1）。
+            </span>
           </div>
 
           <div style="display: flex; gap: 8px">
@@ -332,7 +378,7 @@
  * @module web-console/pages/NorthboundPage
  * @description 北向转发页（出口列表分页 + 每路出口独立编码 + JSON 精度提示 + 一致性自检）。
  */
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import {
   PageHeader,
   UiTable,
@@ -348,17 +394,172 @@ import {
   type SelectOption,
   type RadioOption,
 } from '@ui-kit';
-import { repo, DEFAULT_ACTOR, type Encoding, type ForwarderRecord } from '@/api/repo';
+import { API_MODE, repo, DEFAULT_ACTOR, type Encoding, type ForwarderRecord } from '@/api/repo';
+import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
+const IS_REAL = API_MODE === 'real';
 
 /** 每页条数（出口列表）。 */
 const FORWARDER_PAGE_SIZE = 5;
+
+// ---------------------------------------------------------------------------
+// 出口行视图
+// ---------------------------------------------------------------------------
+
+/**
+ * 出口行视图：`/api/forwarders`（真实）与 mock 仓库（演示）共用同一行形状。
+ *
+ * 与 `ForwarderRecord` 的差异（**诚实表示未知**，不用 0 / false 冒充已知值）：
+ *  · `status` 放宽为 string —— 后端 `/api/forwarders` 不上报连接态，空串渲染为「—」；
+ *  · `coveredDevices` / `recommendedDeviceLimit` 可为 `null` —— 后端不上报时渲染为「—」；
+ *  · `qosText` —— QoS 展示文本（HTTP 出口无 QoS，固定「—」）。
+ */
+type OutletRow = Omit<ForwarderRecord, 'status' | 'coveredDevices' | 'recommendedDeviceLimit'> & {
+  /** 连接状态（空串 = 后端未上报，渲染为「—」） */
+  status: string;
+  /** 覆盖设备数（null = 后端未上报） */
+  coveredDevices: number | null;
+  /** 推荐设备上限（null = 后端未上报） */
+  recommendedDeviceLimit: number | null;
+  /** QoS 展示文本 */
+  qosText: string;
+  /** 出口类别（由地址协议前缀判定） */
+  kind: 'mqtt' | 'http';
+};
+
+/** 按 Broker / URL 的协议前缀判定出口类别。 */
+function kindOfUrl(url: string): 'mqtt' | 'http' {
+  return /^https?:\/\//i.test(url.trim()) ? 'http' : 'mqtt';
+}
+
+/** mock 仓库出口 → 行视图（QoS 文本按出口类别给出）。 */
+function toOutletRow(f: ForwarderRecord): OutletRow {
+  const kind = kindOfUrl(f.brokerUrl);
+  return {
+    ...f,
+    status: f.status,
+    coveredDevices: f.coveredDevices,
+    recommendedDeviceLimit: f.recommendedDeviceLimit,
+    kind,
+    qosText: kind === 'http' ? '—' : String(f.qos),
+  };
+}
+
+/** 取字符串字段（数字按字符串透传，不做数值转换）。 */
+function pickText(src: Record<string, unknown>, key: string, dflt: string): string {
+  const v = src[key];
+  if (typeof v === 'string') {
+    return v;
+  }
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    return String(v);
+  }
+  return dflt;
+}
+
+/** `/api/forwarders` 原始行 → 行视图（未知字段一律「— / null」，绝不猜值）。 */
+function mapForwarderRow(raw: Record<string, unknown>, idx: number): OutletRow {
+  const id = pickText(raw, 'id', pickText(raw, 'name', `outlet-${idx}`));
+  const target = pickText(raw, 'target', pickText(raw, 'broker', '—'));
+  const kind = kindOfUrl(target);
+  const qosRaw = pickText(raw, 'qos', '');
+  const qos: 0 | 1 | 2 = qosRaw === '0' ? 0 : qosRaw === '2' ? 2 : 1;
+  return {
+    id,
+    name: pickText(raw, 'name', id),
+    brokerUrl: target,
+    transportSecurity: raw['tls'] === true ? 'TLS' : '无',
+    certStatusText: '—',
+    clientId: '—',
+    qos,
+    retained: false,
+    topicTemplate: pickText(raw, 'topic_prefix', '—'),
+    encoding: pickText(raw, 'encoding', 'protobuf') === 'json' ? 'json' : 'protobuf',
+    status: '',
+    connectedForText: '后端未上报连接时长',
+    coveredDevices: null,
+    recommendedDeviceLimit: null,
+    lastConsistencyCheckAt: '—',
+    enabled: true,
+    kind,
+    qosText: kind === 'http' ? '—' : qosRaw || '—',
+  };
+}
+
+/** 把 unknown 收敛为 Record（数组 / 非对象回空对象）。 */
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/** 小值计数渲染：null（后端未上报）渲染为「—」，避免用 0 冒充已知值。 */
+function countText(value: number | null): string {
+  return value === null ? '—' : String(value);
+}
 
 /** 当前角色是否可编辑（RoleGate 仅控制可见性，非授权判定）。 */
 const canEdit = computed<boolean>(() => session.state.role === 'admin' || session.state.role === 'engineer');
 
 // ---------- 出口列表 ----------
-const allForwarders = ref<ForwarderRecord[]>(repo.allForwarders());
+const allForwarders = ref<OutletRow[]>(repo.allForwarders().map(toOutletRow));
+
+/**
+ * 出口数据源不可得的原因（real 模式专用）。
+ *
+ * 不静默吞错：`GET /api/forwarders` 失败时保留现有数据源，并把原因展示出来。
+ */
+const forwardersNotice = ref('');
+
+/** 出口数据源失败的「原因 + 恢复路径」文案。 */
+function forwarderFailureText(cause: unknown, subject: string): string {
+  const status = cause instanceof ApiError ? cause.status : 0;
+  const prefix = `${subject}接口不可得`;
+  if (status === 0) {
+    return `${prefix}：网关不可达（网络层失败）。恢复路径：确认网关进程在监听 8080 端口后刷新页面。`;
+  }
+  if (status === 403) {
+    return `${prefix}：当前账号无 device.view 权限（HTTP 403）。恢复路径：改用具备该权限的账号登录。`;
+  }
+  if (status === 501) {
+    return `${prefix}：后端能力未落地（HTTP 501）。恢复路径：等待对应能力上线后本页自动展示。`;
+  }
+  return `${prefix}：HTTP ${status}。恢复路径：查看网关日志定位，或刷新页面重试。`;
+}
+
+/**
+ * real 模式：出口清单直接取 `GET /api/forwarders`（`id` = 出口名）。
+ *
+ * 失败时**不静默吞错**：保留 repo 数据源并展示原因，页面不崩、不伪造出口。
+ */
+async function loadForwarders(): Promise<void> {
+  if (!IS_REAL) {
+    return;
+  }
+  try {
+    const raw = await apiRequest<unknown[]>('/api/forwarders');
+    if (!Array.isArray(raw)) {
+      forwardersNotice.value = '出口接口返回了非数组结构，已沿用现有数据源。';
+      return;
+    }
+    allForwarders.value = raw.map((row, i) => mapForwarderRow(asRecord(row), i));
+    forwardersNotice.value = '';
+    if (selected.value) {
+      selected.value = allForwarders.value.find((f) => f.id === selected.value?.id) ?? allForwarders.value[0] ?? null;
+    } else {
+      selected.value = allForwarders.value[0] ?? null;
+    }
+  } catch (cause) {
+    allForwarders.value = repo.allForwarders().map(toOutletRow);
+    forwardersNotice.value = forwarderFailureText(cause, 'GET /api/forwarders');
+  }
+}
+
+onMounted(() => {
+  void loadForwarders();
+});
 
 /** 出口总数（条数只有分页条一个口径）。 */
 const forwarderTotal = computed<number>(() => allForwarders.value.length);
@@ -366,7 +567,7 @@ const forwarderTotal = computed<number>(() => allForwarders.value.length);
 const forwarderPage = ref(1);
 
 /** 当前页出口。 */
-const pagedForwarders = computed<ForwarderRecord[]>(() => {
+const pagedForwarders = computed<OutletRow[]>(() => {
   const start = (forwarderPage.value - 1) * FORWARDER_PAGE_SIZE;
   return allForwarders.value.slice(start, start + FORWARDER_PAGE_SIZE);
 });
@@ -376,7 +577,7 @@ const forwarderColumns: readonly TableColumn[] = [
   { key: 'name', label: '出口名称' },
   { key: 'brokerUrl', label: 'Broker', mono: true },
   { key: 'encoding', label: '编码' },
-  { key: 'qos', label: 'QoS' },
+  { key: 'qosText', label: 'QoS', mono: true },
   { key: 'status', label: '状态' },
   { key: 'covered', label: '覆盖 / 上限' },
   { key: 'lastConsistencyCheckAt', label: '编码自检' },
@@ -388,7 +589,7 @@ function onForwarderPage(next: number): void {
 }
 
 /** 当前选中的出口（编辑区展示）。 */
-const selected = ref<ForwarderRecord | null>(allForwarders.value[0] ?? null);
+const selected = ref<OutletRow | null>(allForwarders.value[0] ?? null);
 
 /** 编辑区编码草稿（与列表行解耦，保存后才写回）。 */
 const selectedEncoding = ref<Encoding>(selected.value?.encoding ?? 'protobuf');
@@ -420,17 +621,17 @@ const encodingSelectOptions: readonly SelectOption[] = [
 /**
  * 列表内直接切换某路出口的编码（**只改该行**，其余出口不受影响）。
  */
-function onEncodingChange(row: ForwarderRecord, event: Event): void {
+function onEncodingChange(row: OutletRow, event: Event): void {
   if (!canEdit.value) {
     return;
   }
   const next = (event.target as HTMLSelectElement).value as Encoding;
   const ok = repo.setForwarderEncoding({ id: row.id, encoding: next, actor: DEFAULT_ACTOR });
   if (ok) {
-    // 重新拉取，保证列表与真相一致
-    allForwarders.value = repo.allForwarders();
+    // 重新拉取，保证列表与真相一致（real 模式下改编码走本地覆盖层，后端无写接口）
+    allForwarders.value = repo.allForwarders().map(toOutletRow);
     if (selected.value?.id === row.id) {
-      selected.value = repo.getForwarder(row.id);
+      selected.value = allForwarders.value.find((f) => f.id === row.id) ?? null;
     }
   }
 }
@@ -440,10 +641,11 @@ function saveEncoding(): void {
   if (!canEdit.value || !selected.value) {
     return;
   }
-  const ok = repo.setForwarderEncoding({ id: selected.value.id, encoding: selectedEncoding.value, actor: DEFAULT_ACTOR });
+  const id = selected.value.id;
+  const ok = repo.setForwarderEncoding({ id, encoding: selectedEncoding.value, actor: DEFAULT_ACTOR });
   if (ok) {
-    allForwarders.value = repo.allForwarders();
-    selected.value = repo.getForwarder(selected.value.id);
+    allForwarders.value = repo.allForwarders().map(toOutletRow);
+    selected.value = allForwarders.value.find((f) => f.id === id) ?? null;
   }
 }
 
@@ -452,13 +654,47 @@ function saveEncoding(): void {
 const testResult = ref('');
 
 /** 选中某行进入编辑区。 */
-function selectRow(row: ForwarderRecord): void {
-  selected.value = repo.getForwarder(row.id);
+function selectRow(row: OutletRow): void {
+  selected.value = allForwarders.value.find((f) => f.id === row.id) ?? null;
 }
 
-/** 测试某条出口连接。 */
-function testConnection(row: ForwarderRecord): void {
-  testResult.value = `${row.name}：连接${row.status === 'connected' ? '正常' : '异常'}，编码 ${row.encoding}。`;
+/**
+ * 测试某条出口连接。
+ *
+ * real：`POST /api/forwarders/{id}/test` —— 后端仅做 **TCP 建连**探测
+ * （响应含 `probe:"tcp_connect"`；`mqtts://` 不做 TLS 握手 / MQTT CONNACK），
+ * 未知出口 404；结果原样展示，不把「TCP 通」说成「MQTT 可用」。
+ * mock：保持原演示行为。
+ */
+async function testConnection(row: OutletRow): Promise<void> {
+  if (!IS_REAL) {
+    testResult.value = `${row.name}：连接${row.status === 'connected' ? '正常' : '异常'}，编码 ${row.encoding}。`;
+    return;
+  }
+  testResult.value = `正在探测「${row.name}」…`;
+  try {
+    const raw = await apiRequest<Record<string, unknown>>(
+      `/api/forwarders/${encodeURIComponent(row.id)}/test`,
+      { method: 'POST' },
+    );
+    const ok = raw['ok'] === true;
+    const elapsed = pickText(raw, 'elapsed_ms', '—');
+    if (ok) {
+      testResult.value =
+        `「${row.name}」：${pickText(raw, 'probe', 'tcp_connect')} 探测通过，耗时 ${elapsed} ms。` +
+        `注意：${pickText(raw, 'note', '仅 TCP 建连探测，不含 TLS 握手与 MQTT CONNACK')}。`;
+    } else {
+      testResult.value =
+        `「${row.name}」：探测失败（${pickText(raw, 'error_kind', 'failed')}），耗时 ${elapsed} ms —— ` +
+        `${pickText(raw, 'reason', '后端未给出失败原因')}。`;
+    }
+  } catch (cause) {
+    const status = cause instanceof ApiError ? cause.status : 0;
+    testResult.value =
+      status === 404
+        ? `「${row.name}」：后端未收录该出口名（HTTP 404）—— 出口以「名称」为唯一键，请先确认配置中的出口名。`
+        : `「${row.name}」：${forwarderFailureText(cause, 'POST /api/forwarders/{id}/test')}`;
+  }
 }
 
 // ---------- 一致性自检 / 测试发布 ----------
@@ -505,7 +741,28 @@ const scopeOptions: readonly RadioOption[] = [
   { value: 'devices', label: '指定设备', desc: '仅转发所选设备的点位；未勾选时不转发任何数据。' },
 ];
 
-/** 新增出口表单草稿。 */
+/** QoS 选项（原型 :1323）。 */
+const qosOptions: readonly SelectOption[] = [
+  { value: '0', label: '0（至多一次）' },
+  { value: '1', label: '1（至少一次）' },
+  { value: '2', label: '2（恰好一次）' },
+];
+
+/** HTTP 请求方法选项（原型 :1330）。 */
+const httpMethodOptions: readonly SelectOption[] = [
+  { value: 'POST', label: 'POST' },
+  { value: 'PUT', label: 'PUT' },
+];
+
+/** HTTP 批量大小选项（原型 :1333）。 */
+const batchSizeOptions: readonly SelectOption[] = [
+  { value: '1 条 / 请求', label: '1 条 / 请求' },
+  { value: '50 条 / 请求', label: '50 条 / 请求' },
+  { value: '100 条 / 请求', label: '100 条 / 请求' },
+  { value: '500 条 / 请求', label: '500 条 / 请求' },
+];
+
+/** 新增出口表单草稿（MQTT / HTTP 分支共用同一草稿对象）。 */
 const outletForm = reactive({
   name: '',
   brokerUrl: '',
@@ -513,6 +770,16 @@ const outletForm = reactive({
   topicTemplate: 'factory/line1/${device}/${point}',
   encoding: 'protobuf' as Encoding,
   deviceIds: [] as string[],
+  /** QoS（MQTT 分支；原型 :1323） */
+  qos: '1',
+  /** 请求方法（HTTP 分支；原型 :1330） */
+  httpMethod: 'POST',
+  /** 认证 Header（HTTP 分支；原型 :1331） */
+  authHeader: '',
+  /** 超时 / 重试（HTTP 分支；原型 :1332） */
+  timeoutRetry: '5 s · 3 次',
+  /** 批量大小（HTTP 分支；原型 :1333） */
+  batchSize: '100 条 / 请求',
 });
 
 /** 设备 chips（来自 mock 仓库）。 */
@@ -531,21 +798,80 @@ function toggleDevice(id: string): void {
 /** 新增出口结果提示。 */
 const outletMessage = ref('');
 
-/** 保存新出口（演示：仅校验 + 提示，真实写入在网关侧）。 */
-function saveOutlet(): void {
+/** 出口登记写失败的「原因 + 恢复路径」（后端 `POST /api/forwarders` 恒 501）。 */
+function outletWriteFailureText(cause: unknown): string {
+  const status = cause instanceof ApiError ? cause.status : 0;
+  if (status === 501) {
+    return (
+      '出口未登记：后端写接口未落地（HTTP 501 not_implemented）—— 北向出口登记涉及 TLS 证书字段校验，' +
+      '该能力尚未收口。恢复路径：当前请在网关配置文件的 [[outlets]] 段登记出口并热重载；' +
+      '写接口上线后本表单即可直接保存。'
+    );
+  }
+  if (status === 403) {
+    return '出口未登记：当前账号无 device.write 权限（HTTP 403）。恢复路径：改用具备该权限的账号登录。';
+  }
+  return `出口未登记：${forwarderFailureText(cause, 'POST /api/forwarders')}`;
+}
+
+/**
+ * 保存新出口。
+ *
+ * mock：保持原演示行为（仅校验 + 提示）；
+ * real：`POST /api/forwarders` —— 后端当前返回 501，页面**原样呈现原因与恢复路径**，
+ * 绝不把 501 吞成「已保存」。
+ */
+async function saveOutlet(): Promise<void> {
   if (!outletForm.name.trim() || !outletForm.brokerUrl.trim()) {
     outletMessage.value = '请填写出口名称与 Broker / 接口地址。';
     return;
   }
-  outletMessage.value =
-    `出口「${outletForm.name}」已保存：编码 ${outletForm.encoding}，范围 ` +
-    `${outletScope.value === 'all' ? '全部设备' : `指定 ${outletForm.deviceIds.length} 台设备`}。`;
+  const scopeText = outletScope.value === 'all' ? '全部设备' : `指定 ${outletForm.deviceIds.length} 台设备`;
+  if (!IS_REAL) {
+    outletMessage.value = `出口「${outletForm.name}」已保存：编码 ${outletForm.encoding}，范围 ${scopeText}。`;
+    return;
+  }
+  const payload =
+    outletType.value === 'mqtt'
+      ? {
+          name: outletForm.name.trim(),
+          broker: outletForm.brokerUrl.trim(),
+          topic_prefix: outletForm.topicTemplate.trim(),
+          qos: outletForm.qos,
+          encoding: outletForm.encoding,
+        }
+      : {
+          name: outletForm.name.trim(),
+          url: outletForm.brokerUrl.trim(),
+          method: outletForm.httpMethod,
+          auth_header: outletForm.authHeader.trim(),
+          timeout_retry: outletForm.timeoutRetry.trim(),
+          batch_size: outletForm.batchSize,
+          encoding: 'json',
+        };
+  try {
+    await apiRequest<unknown>('/api/forwarders', { method: 'POST', body: JSON.stringify(payload) });
+    outletMessage.value = `出口「${outletForm.name}」已登记：范围 ${scopeText}。`;
+  } catch (cause) {
+    outletMessage.value = outletWriteFailureText(cause);
+  }
 }
 
-/** 测试新增出口表单的连通性。 */
+/**
+ * 测试新增出口表单的连通性。
+ *
+ * real：后端只支持对**已登记**出口（`id` = 出口名）做探测，未保存的出口无从探测 ——
+ * 如实说明限制与替代路径，不伪造「可达 38 ms」这类演示数值。
+ */
 function testOutletForm(): void {
   if (!outletForm.brokerUrl.trim()) {
     outletMessage.value = '请先填写 Broker / 接口地址再测试。';
+    return;
+  }
+  if (IS_REAL) {
+    outletMessage.value =
+      '未保存的出口无法探测：后端仅支持对已登记出口做 TCP 建连探测（POST /api/forwarders/{id}/test，' +
+      'id = 出口名）。替代路径：先在网关配置文件的 [[outlets]] 段登记该出口，再回到出口列表点「测试连接」。';
     return;
   }
   outletMessage.value = `测试连接：${outletForm.brokerUrl} 可达，握手耗时 38 ms，编码 ${outletForm.encoding}。`;

@@ -77,6 +77,45 @@
       </span>
     </div>
 
+    <!-- ===== 网关实时授权状态（real 模式：`GET /api/license/status`）===== -->
+    <section v-if="IS_REAL" class="wc-card">
+      <div class="wc-card__head">
+        <h3>网关授权状态</h3>
+        <span class="wc-card__sub">GET /api/license/status · 判定在 Rust 侧，前端只做展示</span>
+      </div>
+      <div class="wc-card__body">
+        <div v-if="licenseNotice" class="wc-banner wc-banner--warn" data-testid="license-status-notice">
+          <span aria-hidden="true">!</span>
+          <span>{{ licenseNotice }}</span>
+        </div>
+        <template v-else-if="realLicense">
+          <dl class="wc-kv">
+            <dt>状态</dt>
+            <dd data-testid="real-status">{{ realLicense.statusText }}</dd>
+            <dt>档位</dt>
+            <dd>{{ realLicense.tierText }}</dd>
+            <dt>租约有效至</dt>
+            <dd class="wc-mono">{{ realLicense.validUntilText }}</dd>
+            <dt>剩余天数</dt>
+            <dd class="wc-mono" data-testid="real-remaining">{{ realLicense.remainingDays }}</dd>
+            <dt>北向转发</dt>
+            <dd>{{ realLicense.northForwardAllowed ? '已放行' : '已停用（免费版 / 未授权）' }}</dd>
+            <dt v-if="realLicense.degradeReason">降级原因</dt>
+            <dd v-if="realLicense.degradeReason">{{ realLicense.degradeReason }}</dd>
+            <dt v-if="realLicense.note">后端附注</dt>
+            <dd v-if="realLicense.note" class="wc-mono">{{ realLicense.note }}</dd>
+          </dl>
+          <p class="wc-note">
+            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+            <span>
+              剩余天数 / 到期时间均为后端<b>字符串原样透传</b>（不做数值换算）；
+              `lease.raw`（签名租约原文）不在任何接口中回显。
+            </span>
+          </p>
+        </template>
+      </div>
+    </section>
+
     <!-- ===== 主体栅格：机器码指纹 + 授权操作 ===== -->
     <div class="wc-grid wc-grid--2-1">
       <!-- 机器码指纹 -->
@@ -98,6 +137,31 @@
               N-of-M 容错：替换任一易变锚点仍判为同机，整机更换则判为异机。
             </span>
           </p>
+          <!-- 机器码锚点明细（原型 :1805-1812）：锚点来源 / 脱敏值 / 稳定性 -->
+          <UiTable
+            :columns="anchorColumns"
+            :rows="anchorRows"
+            row-key-field="source"
+            :footer="anchorFoot"
+            data-testid="anchor-table"
+          >
+            <template #cell-value="{ row }">
+              <span class="wc-mono">{{ row.value }}</span>
+            </template>
+            <template #cell-stability="{ row }">
+              <span class="wc-tag" :class="stabilityTagClass(row.stability)">{{ row.stability }}</span>
+            </template>
+          </UiTable>
+
+          <p v-if="IS_REAL" class="wc-note">
+            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+            <span>
+              网关未提供锚点明细接口：上表来源取自本页授权快照（现有来源），脱敏值与稳定性<b>未上报</b>，
+              前端<b>不做推断</b>（稳定性权重见 `docs/design/machine-fingerprint.md` §1，仅用于诊断排序，
+              不改变 N-of-M 判定阈值）。
+            </span>
+          </p>
+
           <dl class="wc-kv">
             <dt>设备名称</dt>
             <dd>{{ gateway.name }}</dd>
@@ -351,7 +415,7 @@
  *  · 无任何自助「解绑 / 重置试用 / 废弃 / revoke」入口（判定标准是**可点元素**）；
  *  · 授权判定在 Rust 侧，前端只做展示与「提交申请」。
  */
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import {
   PageHeader,
   StatusTag,
@@ -362,11 +426,17 @@ import {
   DangerConfirmModal,
   UiField,
   UiInput,
+  UiTable,
   formatMachineCode,
   type DangerFact,
+  type TableColumn,
 } from '@ui-kit';
-import { repo, DEFAULT_ACTOR } from '@/api/repo';
+import { API_MODE, repo, DEFAULT_ACTOR } from '@/api/repo';
+import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
+const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 展示态
@@ -467,6 +537,62 @@ const anchorList = computed<readonly string[]>(() =>
     .map((s) => s.trim())
     .filter((s) => s.length > 0),
 );
+
+// ---------------------------------------------------------------------------
+// 机器码锚点明细（原型 :1805-1812：锚点来源 / 值（已脱敏）/ 稳定性）
+// ---------------------------------------------------------------------------
+
+/** 锚点明细行。 */
+interface AnchorRow {
+  /** 锚点来源 */
+  source: string;
+  /** 脱敏后的锚点值 */
+  value: string;
+  /** 稳定性 tag（高 / 中 / —） */
+  stability: string;
+}
+
+/** 锚点明细列定义（原型 :1807）。 */
+const anchorColumns: readonly TableColumn[] = [
+  { key: 'source', label: '锚点来源' },
+  { key: 'value', label: '值（已脱敏）', mono: true },
+  { key: 'stability', label: '稳定性' },
+];
+
+/**
+ * 演示态锚点明细（原型 :1808-1811 四行）。
+ *
+ * 仅 mock 模式使用；real 模式下网关未提供锚点明细接口，稳定性一律展示「—」，
+ * **前端不做推断**（见下方 note）。
+ */
+const DEMO_ANCHOR_ROWS: readonly AnchorRow[] = [
+  { source: '主板序列号', value: 'MB-****-4471', stability: '高' },
+  { source: 'CPU 标识', value: 'BFEBFBFF****', stability: '高' },
+  { source: '系统盘序列号', value: 'WD-****-9C21', stability: '高' },
+  { source: '物理网卡 MAC', value: '3C:7C:****:A2', stability: '中' },
+];
+
+/** 锚点明细行（mock = 原型四行；real = 网关上报的锚点来源，脱敏值与稳定性未上报时为「—」）。 */
+const anchorRows = computed<readonly AnchorRow[]>(() =>
+  IS_REAL
+    ? anchorList.value.map((src) => ({ source: src, value: '—', stability: '—' }))
+    : DEMO_ANCHOR_ROWS,
+);
+
+/** 锚点表 foot（原型 :1806）。 */
+const anchorFoot =
+  'N-of-M 容错：替换任一易变锚点仍判为同机；整机更换则判为异机（判定阈值 N=4 / M=5 在 Rust 侧）';
+
+/** 稳定性 tag 色调：高 ok / 中 warn / 未知 unknown。 */
+function stabilityTagClass(stability: string): string {
+  if (stability === '高') {
+    return 'wc-tag--ok';
+  }
+  if (stability === '中') {
+    return 'wc-tag--warn';
+  }
+  return 'wc-tag--unknown';
+}
 
 /**
  * 全局横幅（授权类，优先级最高；见设计 §4.6）。
@@ -670,7 +796,116 @@ function onRevealCode(): void {
 /** 刷新授权快照。 */
 function refresh(): void {
   reloadKey.value += 1;
+  void loadLicenseStatus();
 }
+
+// ---------------------------------------------------------------------------
+// real 模式：网关授权状态（`GET /api/license/status`）
+// ---------------------------------------------------------------------------
+
+/** 网关授权状态视图（全字段字符串透传，不参与任何判定）。 */
+interface LicenseStatusView {
+  /** 原始状态字面量 */
+  status: string;
+  /** 状态中文 */
+  statusText: string;
+  /** 档位中文 */
+  tierText: string;
+  /** 租约有效至（展示文本） */
+  validUntilText: string;
+  /** 剩余天数（字符串） */
+  remainingDays: string;
+  /** 降级原因（未降级为空串） */
+  degradeReason: string;
+  /** 北向转发是否放行 */
+  northForwardAllowed: boolean;
+  /** 后端附注 */
+  note: string;
+}
+
+/** 网关授权状态快照（real 模式；null = 尚未取得）。 */
+const realLicense = ref<LicenseStatusView | null>(null);
+
+/** 授权状态不可得的原因（原因 + 恢复路径；不静默吞错）。 */
+const licenseNotice = ref('');
+
+/** 状态字面量 → 中文（与 Rust `LicenseState` 对齐）。 */
+const LICENSE_STATUS_TEXT: Record<string, string> = {
+  unlicensed: '未授权（免费基础版）',
+  trial: '试用中',
+  active: '已授权',
+  grace: '已降级（离线宽限）',
+  degraded: '已降级',
+};
+
+/** 档位字面量 → 中文（未知档位原样透传，不猜）。 */
+const LICENSE_TIER_TEXT: Record<string, string> = {
+  free: '免费基础版',
+  standard: '标准版',
+  pro: '专业版',
+  trial: '试用版',
+};
+
+/**
+ * epoch 秒字符串 → `YYYY-MM-DD`（仅用于展示）。
+ *
+ * 安全边界：epoch 秒为 10 位量级（≈1.7e9），**远低于 2^53**，换算无精度损失；
+ * 非纯数字形态（后端未来可能直接返回人类可读串）原样透传。
+ */
+function epochToDateText(value: string): string {
+  const trimmed = value.trim();
+  if (!/^\d{1,15}$/.test(trimmed)) {
+    return trimmed || '—';
+  }
+  const ms = Number(trimmed) * (trimmed.length <= 10 ? 1000 : 1);
+  if (!Number.isFinite(ms)) {
+    return trimmed;
+  }
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/**
+ * 读取网关授权状态。
+ *
+ * `GET /api/license/status`（读，开放）：`{state, tier, valid_until, remaining, …}`，
+ * 全字段字符串；runtime 未装配时后端诚实返回 `unlicensed`。
+ * 不可得时**不静默吞错**：给出原因与恢复路径，沿用页面现有来源展示。
+ */
+async function loadLicenseStatus(): Promise<void> {
+  if (!IS_REAL) {
+    return;
+  }
+  try {
+    const raw = await apiRequest<Record<string, unknown>>('/api/license/status');
+    const status = typeof raw['status'] === 'string' ? raw['status'] : 'unlicensed';
+    const tier = typeof raw['tier'] === 'string' ? raw['tier'] : '';
+    const validUntil = typeof raw['valid_until'] === 'string' ? raw['valid_until'] : '';
+    realLicense.value = {
+      status,
+      statusText: LICENSE_STATUS_TEXT[status] ?? status,
+      tierText: LICENSE_TIER_TEXT[tier] ?? (tier || '—'),
+      validUntilText: validUntil ? epochToDateText(validUntil) : '—',
+      remainingDays: typeof raw['remaining_days'] === 'string' ? raw['remaining_days'] : '—',
+      degradeReason: typeof raw['degrade_reason'] === 'string' ? raw['degrade_reason'] : '',
+      northForwardAllowed: raw['north_forward_allowed'] === true,
+      note: typeof raw['note'] === 'string' ? raw['note'] : '',
+    };
+    licenseNotice.value = '';
+  } catch (cause) {
+    realLicense.value = null;
+    const code = cause instanceof ApiError ? cause.status : 0;
+    licenseNotice.value =
+      code === 0
+        ? '授权状态不可得：网关不可达（网络层失败）。恢复路径：确认网关进程在监听 8080 端口后点「刷新状态」重试（本页其余字段沿用现有来源）。'
+        : `授权状态不可得：HTTP ${code}。恢复路径：查看网关日志定位后点「刷新状态」重试（本页其余字段沿用现有来源）。`;
+  }
+}
+
+onMounted(() => {
+  void loadLicenseStatus();
+});
 </script>
 
 <style scoped>

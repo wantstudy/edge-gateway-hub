@@ -25,15 +25,24 @@
   <div class="wc-content">
     <!-- KPI 卡片行 -->
     <div class="wc-grid wc-grid--4">
-      <StatCard label="设备总数" :value="String(kpi.total)" unit="台" />
-      <StatCard label="在线" :value="String(kpi.online)" unit="台" tone="ok" />
+      <StatCard label="设备总数" :value="String(kpi.total)" unit="台" icon-tone="ink" :sub="`免费基础版上限 ${FREE_TIER_DEVICE_LIMIT} 台`">
+        <template #icon>▣</template>
+      </StatCard>
+      <StatCard label="在线" :value="String(kpi.online)" unit="台" tone="ok" icon-tone="teal">
+        <template #icon>✓</template>
+      </StatCard>
       <StatCard
         label="离线 / 故障"
         :value="String(kpi.abnormal)"
         unit="台"
         :tone="kpi.abnormal > 0 ? 'warn' : 'default'"
-      />
-      <StatCard label="点位总数" :value="formatInt(kpi.points)" unit="点" />
+        icon-tone="amber"
+      >
+        <template #icon>!</template>
+      </StatCard>
+      <StatCard label="点位总数" :value="formatInt(kpi.points)" unit="点" icon-tone="violet">
+        <template #icon>◈</template>
+      </StatCard>
     </div>
 
     <!-- 设备列表 -->
@@ -94,12 +103,62 @@
             <span class="dv-rate" :class="rateClass(row.successRate)">{{ row.successRate }}%</span>
           </template>
           <template #actions="{ row }">
-            <button type="button" class="wc-btn wc-btn--sm" @click="goPoints(row.id)">点位</button>
+            <!-- 原型 :1197-1199：实时数据（primary，下钻实时曲线）/ 点位映射 / 编辑 -->
+            <button
+              type="button"
+              class="wc-btn wc-btn--sm wc-btn--primary"
+              data-test="device-live"
+              @click="goLive(row.id)"
+            >
+              实时数据
+            </button>
+            <button
+              type="button"
+              class="wc-btn wc-btn--sm"
+              data-test="device-points"
+              @click="goPoints(row.id)"
+            >
+              点位映射
+            </button>
+            <button type="button" class="wc-btn wc-btn--sm" data-test="device-edit" @click="goEdit(row.id)">
+              编辑
+            </button>
             <RoleGate :allowed="canWrite">
               <button type="button" class="wc-btn wc-btn--sm wc-btn--danger" @click="askDelete(row)">删除</button>
             </RoleGate>
           </template>
         </UiTable>
+
+        <!-- 表格 foot（原型 :1524）：配额口径 + 批量连通性探测 -->
+        <div class="dv-foot">
+          <span class="dv-foot__text" data-test="quota-note">{{ quotaNote }}</span>
+          <button
+            type="button"
+            class="wc-btn wc-btn--sm"
+            :disabled="testingAll"
+            data-test="test-all"
+            @click="testAllConnections"
+          >
+            {{ testingAll ? '测试中…' : '测试全部连接' }}
+          </button>
+        </div>
+
+        <!-- 逐台探测结果（real 模式为后端结构化结果；mock 为演示行为） -->
+        <div v-if="probeResults.length > 0" class="dv-probe">
+          <p class="dv-probe__head" data-test="probe-summary">
+            {{ probeSummary }}
+          </p>
+          <UiTable :columns="probeColumns" :rows="probeResults" row-key-field="id">
+            <template #cell-ok="{ row }">
+              <span v-if="row.ok" class="wc-tag wc-tag--ok">连通</span>
+              <span v-else class="wc-tag wc-tag--danger">未连通</span>
+            </template>
+            <template #cell-elapsedMs="{ row }">
+              <span class="wc-mono">{{ row.elapsedMs }}</span>
+            </template>
+          </UiTable>
+        </div>
+
         <UiPager :page="page" :total="total" :page-size="PAGE_SIZE" @update:page="onPage" />
       </template>
     </section>
@@ -146,10 +205,14 @@ import {
   type TableColumn,
   type DangerFact,
 } from '@ui-kit';
-import { repo, PROTOCOL_OPTIONS, type DeviceRecord } from '@/api/repo';
+import { API_MODE, repo, PROTOCOL_OPTIONS, type DeviceRecord } from '@/api/repo';
+import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
 
 const router = useRouter();
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式完全不发请求。 */
+const IS_REAL = API_MODE === 'real';
 
 /** 每页条数（UiPager 单一口径）。 */
 const PAGE_SIZE = 8;
@@ -264,9 +327,165 @@ function go(name: string): void {
   void router.push({ name });
 }
 
-/** 跳到点位页并预选设备（列表「点位」按钮 / 点位数链接）。 */
+/** 跳到点位页并预选设备（列表「点位映射」按钮 / 点位数链接）。 */
 function goPoints(deviceId: string): void {
   void router.push({ name: 'points', query: { device: deviceId } });
+}
+
+/** 「实时数据」下钻：进入实时点位值页并预选该设备（原型 :1197 `goLive`）。 */
+function goLive(deviceId: string): void {
+  void router.push({ name: 'live', query: { device: deviceId } });
+}
+
+/** 「编辑」：进入新增 / 编辑设备页并带入该设备（原型 :1199）。 */
+function goEdit(deviceId: string): void {
+  void router.push({ name: 'device-new', query: { device: deviceId } });
+}
+
+// ---------------------------------------------------------------------------
+// 表格 foot：配额口径 + 批量连通性探测（原型 :1524）
+// ---------------------------------------------------------------------------
+
+/** 免费基础版设备上限（原型 :1515 / :1524）。 */
+const FREE_TIER_DEVICE_LIMIT = 8;
+
+/** 配额文案：超过免费额度才说「已按专业版计费」，额度内不得暗示计费。 */
+const quotaNote = computed<string>(() => {
+  const n = kpi.value.total;
+  return n > FREE_TIER_DEVICE_LIMIT
+    ? `免费基础版上限 ${FREE_TIER_DEVICE_LIMIT} 台（当前 ${n} 台，已按专业版计费）`
+    : `免费基础版上限 ${FREE_TIER_DEVICE_LIMIT} 台（当前 ${n} 台，额度内）`;
+});
+
+/** 单台连通性探测结果（后端结构化字段原样透传）。 */
+interface ProbeResult {
+  /** 设备 id */
+  id: string;
+  /** 设备名 */
+  name: string;
+  /** 是否连通 */
+  ok: boolean;
+  /** 结构化失败类型（`ok` 时为空串） */
+  errorKind: string;
+  /** 原因（后端原文；非 Modbus 协议为 `unsupported_protocol`） */
+  reason: string;
+  /** 耗时毫秒（**字符串透传**，绝不 parseInt） */
+  elapsedMs: string;
+  /** 行色条（失败行左侧红色条，见 UiTable `_rowClass`） */
+  _rowClass?: string;
+}
+
+/** 探测结果列定义。 */
+const probeColumns: readonly TableColumn[] = [
+  { key: 'name', label: '设备' },
+  { key: 'ok', label: '结果' },
+  { key: 'errorKind', label: '失败类型', mono: true },
+  { key: 'reason', label: '原因' },
+  { key: 'elapsedMs', label: '耗时(ms)', align: 'right', mono: true },
+];
+
+/** 探测结果（逐台展示）。 */
+const probeResults = ref<ProbeResult[]>([]);
+
+/** 是否正在批量探测（禁用按钮，避免重复提交）。 */
+const testingAll = ref(false);
+
+/** 探测汇总文案（成功 / 失败台数 + 数据源口径）。 */
+const probeSummary = computed<string>(() => {
+  const okCount = probeResults.value.filter((r) => r.ok).length;
+  const source = IS_REAL ? 'POST /api/devices/test（后端结构化探测）' : 'mock 演示（未发真实请求）';
+  return `测试全部连接：${okCount} / ${probeResults.value.length} 台连通 · 数据源 ${source}`;
+});
+
+/** 取字符串字段（缺失回默认；数字也按字符串透传，不做数值转换）。 */
+function pickText(src: Record<string, unknown>, key: string, dflt: string): string {
+  const v = src[key];
+  if (typeof v === 'string') {
+    return v;
+  }
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    return String(v);
+  }
+  return dflt;
+}
+
+/** HTTP 状态 → 可解释失败文案（不静默吞错，写清原因与恢复路径）。 */
+function probeHttpErrorText(status: number): { errorKind: string; reason: string } {
+  if (status === 404) {
+    return { errorKind: 'unknown_device', reason: '后端未收录该设备（HTTP 404）：请先在网关侧登记设备与点位' };
+  }
+  if (status === 403) {
+    return { errorKind: 'forbidden', reason: '当前账号无 device.view 权限（HTTP 403）：请用具备该权限的账号登录' };
+  }
+  if (status === 0) {
+    return { errorKind: 'network', reason: '网关不可达（网络层失败）：请确认网关进程在监听 8080 端口' };
+  }
+  return { errorKind: `http_${status}`, reason: `探测请求失败（HTTP ${status}）：详见网关日志` };
+}
+
+/**
+ * 逐台探测连通性。
+ *
+ * real：`POST /api/devices/test {device_id}`（后端恒 200，结构化失败不 500；
+ * 非 Modbus 协议返回 `unsupported_protocol`）；
+ * mock：不发请求，按设备当前状态给出**明确标注为演示**的结果。
+ */
+async function testAllConnections(): Promise<void> {
+  if (testingAll.value) {
+    return;
+  }
+  testingAll.value = true;
+  const results: ProbeResult[] = [];
+  try {
+    for (const device of allDevices.value) {
+      if (!IS_REAL) {
+        const ok = device.status === 'online';
+        results.push({
+          id: device.id,
+          name: device.name,
+          ok,
+          errorKind: ok ? '' : 'demo_offline',
+          reason: ok
+            ? 'mock 演示：设备在线（未发起真实请求）'
+            : `mock 演示：设备当前为「${device.status}」状态（未发起真实请求）`,
+          elapsedMs: '—',
+          _rowClass: ok ? '' : 'row-danger',
+        });
+        continue;
+      }
+      try {
+        const raw = await apiRequest<Record<string, unknown>>('/api/devices/test', {
+          method: 'POST',
+          body: JSON.stringify({ device_id: device.id }),
+        });
+        const ok = raw['ok'] === true;
+        results.push({
+          id: device.id,
+          name: device.name,
+          ok,
+          errorKind: ok ? '' : pickText(raw, 'error_kind', 'failed'),
+          reason: ok ? pickText(raw, 'detail', 'TCP connect + read 1 holding register succeeded') : pickText(raw, 'reason', '探测失败（后端未给出原因）'),
+          elapsedMs: pickText(raw, 'elapsed_ms', '—'),
+          _rowClass: ok ? '' : 'row-danger',
+        });
+      } catch (err) {
+        const status = err instanceof ApiError ? err.status : 0;
+        const text = probeHttpErrorText(status);
+        results.push({
+          id: device.id,
+          name: device.name,
+          ok: false,
+          errorKind: text.errorKind,
+          reason: text.reason,
+          elapsedMs: '—',
+          _rowClass: 'row-danger',
+        });
+      }
+    }
+  } finally {
+    testingAll.value = false;
+  }
+  probeResults.value = results;
 }
 
 onMounted(() => {
@@ -335,6 +554,31 @@ function confirmDelete(): void {
 </script>
 
 <style scoped>
+/* 表格 foot（原型 :1524）：左文案 + 右操作，与 UiTable__footer 同口径 */
+.dv-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  font-size: var(--fs-caption);
+  color: var(--text-3);
+  border-top: 1px solid var(--divider);
+}
+.dv-foot__text {
+  line-height: 1.6;
+}
+/* 逐台探测结果 */
+.dv-probe {
+  padding: 4px 12px 12px;
+  border-top: 1px solid var(--divider);
+}
+.dv-probe__head {
+  margin: 8px 0 10px;
+  font-size: var(--fs-caption);
+  color: var(--text-2);
+}
 .dv-link {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;

@@ -35,10 +35,25 @@
         :delta="kpi.critical > 0 ? 1 : 0"
         sub="需立即处理"
         :tone="kpi.critical > 0 ? 'danger' : 'default'"
-      />
-      <StatCard label="重要" :value="String(kpi.major)" :sub="`含 ${kpi.minor} 条次要`" :tone="kpi.major > 0 ? 'warn' : 'default'" />
-      <StatCard label="24h 新增" :value="String(kpi.total)" sub="近 24 小时产生的告警" />
-      <StatCard label="已确认 / 已恢复" :value="String(kpi.closed)" :sub="`待处理 ${kpi.open} 条`" tone="ok" />
+        icon-tone="rose"
+      >
+        <template #icon>✕</template>
+      </StatCard>
+      <StatCard
+        label="警告"
+        :value="String(kpi.warning)"
+        :sub="`含 ${kpi.info} 条提示`"
+        :tone="kpi.warning > 0 ? 'warn' : 'default'"
+        icon-tone="amber"
+      >
+        <template #icon>!</template>
+      </StatCard>
+      <StatCard label="24h 新增" :value="String(kpi.total)" sub="近 24 小时产生的告警" icon-tone="ink">
+        <template #icon>◷</template>
+      </StatCard>
+      <StatCard label="已确认 / 已恢复" :value="String(kpi.closed)" :sub="`待处理 ${kpi.open} 条`" tone="ok" icon-tone="teal">
+        <template #icon>✓</template>
+      </StatCard>
     </div>
 
     <!-- 筛选栏 -->
@@ -75,6 +90,23 @@
         </div>
       </div>
 
+      <!-- real 模式：后端无告警引擎（`GET /api/alerts` → source=unsupported）→ 可解释空态 -->
+      <div
+        v-if="alertsUnsupported"
+        class="wc-banner wc-banner--warn wc-banner--block al-unsupported"
+        data-testid="alerts-unsupported"
+      >
+        <span aria-hidden="true">!</span>
+        <span class="wc-banner__stack">
+          <span class="wc-banner__line"><b>当前没有告警数据 · 后端告警引擎未落地</b></span>
+          <span class="wc-banner__line">原因：{{ alertsApiNotice }}</span>
+          <span class="wc-banner__line">
+            恢复路径：告警引擎落地后本页自动展示；在此之前请用「实时监控」观察通讯异常、
+            或用「诊断与自检」排查连通性。本页<b>绝不伪造告警数据</b>。
+          </span>
+        </span>
+      </div>
+
       <EmptyState
         v-if="filtered.length === 0"
         title="没有符合条件的告警"
@@ -97,7 +129,7 @@
             />
           </template>
           <template #cell-level="{ row }">
-            <span class="wc-tag" :class="levelTagClass(row.level)">{{ row.levelLabel }}</span>
+            <span class="wc-tag" :class="levelTagClass(row.level)">{{ levelTextOf(row.level) }}</span>
           </template>
           <template #cell-lastSeenAt="{ row }">
             <span class="wc-mono">{{ row.lastSeenAt }}</span>
@@ -160,6 +192,18 @@
         </UiField>
 
         <p v-if="ruleError" class="al-error" role="alert">{{ ruleError }}</p>
+
+        <p v-if="ruleMessage" class="wc-hint" data-testid="rule-message">{{ ruleMessage }}</p>
+
+        <!-- real 模式：告警规则写接口当前返回 501 —— 诚实告知，不静默吞错 -->
+        <p v-if="IS_REAL" class="wc-note">
+          <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+          <span>
+            规则写入走 <span class="wc-mono">PUT /api/alerts/rules</span>；后端当前返回
+            <b>501 not_implemented</b>（告警引擎未落地，无规则可写）。保存时本页会原样呈现原因与恢复路径，
+            不会显示「已保存」。
+          </span>
+        </p>
 
         <div class="al-rule-actions">
           <button type="button" class="wc-btn" @click="resetRuleDraft">重置草稿</button>
@@ -263,7 +307,7 @@
           <div class="al-drawer__body">
             <dl class="wc-kv">
               <dt>级别</dt>
-              <dd><span class="wc-tag" :class="levelTagClass(detail.level)">{{ detail.levelLabel }}</span></dd>
+              <dd><span class="wc-tag" :class="levelTagClass(detail.level)">{{ levelTextOf(detail.level) }}</span></dd>
               <dt>对象</dt>
               <dd>{{ detail.sourceLabel }}（{{ sourceTypeLabel(detail.sourceType) }}）</dd>
               <dt>标题</dt>
@@ -322,7 +366,7 @@
  * 规则草稿（`ruleDraft`）与处置说明草稿（`ackNote`）都**只存在于页面本地**，
  * 绝不可直接写入 `repo` 返回的记录对象；保存时才提交。
  */
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   DangerConfirmModal,
@@ -339,10 +383,14 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '@/api/repo';
+import { API_MODE, repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '@/api/repo';
+import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
 
 const router = useRouter();
+
+/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
+const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -387,22 +435,152 @@ const canEditRules = computed<boolean>(() => session.state.role === 'admin' || s
 /** 全部告警快照。 */
 const alarms = ref<AlarmRecord[]>(repo.allAlarms());
 
+/**
+ * 告警数据源不可得 / 不支持的说明（real 模式：`GET /api/alerts` 的 `reason` 原文）。
+ *
+ * 非空即表示「后端当前没有真实告警数据源」，页面据此给出可解释空态。
+ */
+const alertsApiNotice = ref('');
+
+/** real 模式且后端无告警数据源 → 展示可解释空态（绝不伪造告警）。 */
+const alertsUnsupported = computed<boolean>(() => IS_REAL && alarms.value.length === 0 && alertsApiNotice.value !== '');
+
+/** 取字符串字段（数字按字符串透传）。 */
+function pickText(src: Record<string, unknown>, key: string, dflt: string): string {
+  const v = src[key];
+  if (typeof v === 'string') {
+    return v;
+  }
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    return String(v);
+  }
+  return dflt;
+}
+
+/** `/api/alerts` 条目 → 告警记录（后端当前恒为空数组；落地后按契约宽容映射）。 */
+function mapAlarmRow(raw: Record<string, unknown>, idx: number): AlarmRecord {
+  const level = pickText(raw, 'level', 'minor');
+  const state = pickText(raw, 'state', 'open');
+  return {
+    id: pickText(raw, 'id', `al-${idx}`),
+    level: (['critical', 'major', 'minor', 'warning'].includes(level) ? level : 'minor') as AlarmLevel,
+    levelLabel: levelTextOf((['critical', 'major', 'minor', 'warning'].includes(level) ? level : 'minor') as AlarmLevel),
+    sourceType: pickText(raw, 'sourceType', pickText(raw, 'source_type', 'system')),
+    sourceLabel: pickText(raw, 'sourceLabel', pickText(raw, 'source', '—')),
+    title: pickText(raw, 'title', '—'),
+    detail: pickText(raw, 'detail', ''),
+    firstSeenAt: pickText(raw, 'firstSeenAt', pickText(raw, 'first_seen_at', '—')),
+    lastSeenAt: pickText(raw, 'lastSeenAt', pickText(raw, 'last_seen_at', '—')),
+    count: 1,
+    state: (['open', 'acking', 'resolved'].includes(state) ? state : 'open') as AlarmState,
+    stateLabel: STATE_TEXT[state] ?? state,
+    ackedBy: pickText(raw, 'ackedBy', pickText(raw, 'acked_by', '')),
+    note: pickText(raw, 'note', ''),
+  };
+}
+
+/** 处置状态 → 中文（与数据层口径一致）。 */
+const STATE_TEXT: Record<string, string> = { open: '待处理', acking: '已确认', resolved: '已恢复' };
+
+/**
+ * 加载告警。
+ *
+ * real：以 `GET /api/alerts` 为**唯一**告警数据源（后端无告警引擎 →
+ * `{items:[],source:"unsupported",reason}`，页面给出可解释空态，**绝不回退 mock 造假**）；
+ * 接口不可得（网络 / 5xx）时沿用现有来源并如实说明。
+ * mock：保持原演示数据源。
+ */
+async function loadAlarms(): Promise<void> {
+  if (!IS_REAL) {
+    alarms.value = repo.allAlarms();
+    return;
+  }
+  try {
+    const raw = await apiRequest<Record<string, unknown>>('/api/alerts');
+    const items = Array.isArray(raw['items']) ? raw['items'] : [];
+    alarms.value = items
+      .map((row, i) => (row !== null && typeof row === 'object' && !Array.isArray(row) ? mapAlarmRow(row as Record<string, unknown>, i) : null))
+      .filter((a): a is AlarmRecord => a !== null);
+    alertsApiNotice.value =
+      raw['source'] === 'unsupported'
+        ? pickText(raw, 'reason', '后端告警引擎未落地，当前无真实告警数据源')
+        : '';
+  } catch (cause) {
+    alarms.value = repo.allAlarms();
+    const code = cause instanceof ApiError ? cause.status : 0;
+    alertsApiNotice.value =
+      code === 0
+        ? 'GET /api/alerts 不可得：网关不可达（网络层失败）；当前展示的是现有来源数据。'
+        : `GET /api/alerts 不可得：HTTP ${code}；当前展示的是现有来源数据。`;
+  }
+}
+
+onMounted(() => {
+  void loadAlarms();
+});
+
 /** 筛选草稿（页面级，非持久）。 */
 const filters = reactive({
-  level: '',
+  level: '' as LevelBucket,
   state: '',
   range: '24h',
   keyword: '',
 });
 
-/** 级别选项。 */
+// ---------------------------------------------------------------------------
+// 级别枚举（原型 :1480-1483 / :1493-1504：**严重 / 警告 / 提示** 三档）
+// ---------------------------------------------------------------------------
+
+/** 告警级别桶（原型三档）。 */
+type LevelBucket = '' | 'critical' | 'warning' | 'info';
+
+/** 桶 → 展示文案（原型用字，不另行造同义词）。 */
+const LEVEL_TEXT: Record<'critical' | 'warning' | 'info', string> = {
+  critical: '严重',
+  warning: '警告',
+  info: '提示',
+};
+
+/**
+ * 记录级别 → 桶。
+ *
+ * 数据层沿用 `critical / major / minor / warning` 四值；页面按原型收敛为三档展示：
+ * `major`（重要）与 `minor`（次要）同属「警告」，`warning` 归「提示」。
+ */
+function bucketOf(level: AlarmLevel): 'critical' | 'warning' | 'info' {
+  if (level === 'critical') {
+    return 'critical';
+  }
+  if (level === 'warning') {
+    return 'info';
+  }
+  return 'warning';
+}
+
+/** 记录 → 级别展示文案（覆盖数据层 levelLabel，保证枚举与原型一致）。 */
+function levelTextOf(level: AlarmLevel): string {
+  return LEVEL_TEXT[bucketOf(level)];
+}
+
+/** 级别选项（原型三档 + 全部）。 */
 const levelOptions: readonly SelectOption[] = [
   { value: '', label: '全部级别' },
   { value: 'critical', label: '严重' },
-  { value: 'major', label: '重要' },
-  { value: 'minor', label: '次要' },
-  { value: 'warning', label: '提示' },
+  { value: 'warning', label: '警告' },
+  { value: 'info', label: '提示' },
 ];
+
+/** 级别 tag 色调：严重 danger / 警告 warn / 提示 中性。 */
+function levelTagClass(level: AlarmLevel): string {
+  const bucket = bucketOf(level);
+  if (bucket === 'critical') {
+    return 'wc-tag--danger';
+  }
+  if (bucket === 'warning') {
+    return 'wc-tag--warn';
+  }
+  return 'wc-tag--unknown';
+}
 
 /** 处理状态选项。 */
 const stateOptions: readonly SelectOption[] = [
@@ -452,7 +630,8 @@ const filtered = computed<readonly AlarmRecord[]>(() => {
   const start = rangeStart(filters.range);
   return alarms.value
     .filter((a) => {
-      if (filters.level && a.level !== filters.level) {
+      // 级别按原型三档（严重 / 警告 / 提示）筛选
+      if (filters.level && bucketOf(a.level) !== filters.level) {
         return false;
       }
       if (filters.state && a.state !== filters.state) {
@@ -462,7 +641,7 @@ const filtered = computed<readonly AlarmRecord[]>(() => {
         return false;
       }
       if (kw) {
-        const haystack = `${a.sourceLabel} ${a.title} ${a.detail} ${a.levelLabel}`.toLowerCase();
+        const haystack = `${a.sourceLabel} ${a.title} ${a.detail} ${levelTextOf(a.level)}`.toLowerCase();
         if (!haystack.includes(kw)) {
           return false;
         }
@@ -472,14 +651,14 @@ const filtered = computed<readonly AlarmRecord[]>(() => {
     .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 });
 
-/** KPI（基于**全部**告警，不受筛选影响）。 */
-const kpi = computed<{ critical: number; major: number; minor: number; total: number; open: number; closed: number }>(
+/** KPI（基于**全部**告警，不受筛选影响；级别按原型三档统计）。 */
+const kpi = computed<{ critical: number; warning: number; info: number; total: number; open: number; closed: number }>(
   () => {
     const list = alarms.value;
     return {
-      critical: list.filter((a) => a.level === 'critical').length,
-      major: list.filter((a) => a.level === 'major').length,
-      minor: list.filter((a) => a.level === 'minor' || a.level === 'warning').length,
+      critical: list.filter((a) => bucketOf(a.level) === 'critical').length,
+      warning: list.filter((a) => bucketOf(a.level) === 'warning').length,
+      info: list.filter((a) => bucketOf(a.level) === 'info').length,
       total: list.length,
       open: list.filter((a) => a.state === 'open').length,
       closed: list.filter((a) => a.state !== 'open').length,
@@ -663,12 +842,58 @@ function resetRuleDraft(): void {
   ruleDraft.target = '';
 }
 
-/** 保存规则（危险操作之外的一般写操作；仍需审计）。 */
-function saveRule(): void {
+/** 规则保存结果提示（real 模式的 501 / 403 等结构化结果写在这里）。 */
+const ruleMessage = ref('');
+
+/** 告警规则写失败的「原因 + 恢复路径」（后端 `PUT /api/alerts/rules` 当前返回 501）。 */
+function ruleWriteFailureText(cause: unknown): string {
+  const code = cause instanceof ApiError ? cause.status : 0;
+  if (code === 501) {
+    return (
+      '规则未保存：后端告警引擎未落地（HTTP 501 not_implemented），无规则可写。' +
+      '恢复路径：告警引擎落地后本表单即可直接保存；在此之前告警只来自驱动层通讯异常。'
+    );
+  }
+  if (code === 403) {
+    return '规则未保存：当前账号无 device.write 权限（HTTP 403）。恢复路径：改用具备该权限的账号登录。';
+  }
+  if (code === 0) {
+    return '规则未保存：网关不可达（网络层失败）。恢复路径：确认网关进程在监听 8080 端口后重试。';
+  }
+  return `规则未保存：HTTP ${code}。恢复路径：查看网关日志定位后重试。`;
+}
+
+/**
+ * 保存规则（危险操作之外的一般写操作；仍需审计）。
+ *
+ * real：`PUT /api/alerts/rules` —— 后端当前返回 501，页面**原样呈现原因与恢复路径**，
+ * 绝不把 501 吞成「已保存」；
+ * mock：保持原本地演示行为。
+ */
+async function saveRule(): Promise<void> {
   if (ruleError.value.length > 0) {
     return;
   }
   const target = ruleDraft.target ? repo.getDevice(ruleDraft.target)?.name ?? '指定设备' : '全部设备';
+  if (IS_REAL) {
+    ruleMessage.value = '';
+    try {
+      await apiRequest<unknown>('/api/alerts/rules', {
+        method: 'PUT',
+        body: JSON.stringify({
+          threshold: ruleDraft.threshold.trim(),
+          duration_sec: ruleDraft.durationSec,
+          suppress_min: ruleDraft.suppressMin,
+          target: ruleDraft.target,
+        }),
+      });
+      ruleMessage.value = `规则「${target} · ${ruleDraft.threshold.trim()}」已保存。`;
+      resetRuleDraft();
+    } catch (cause) {
+      ruleMessage.value = ruleWriteFailureText(cause);
+    }
+    return;
+  }
   rules.value = [
     ...rules.value,
     {
@@ -769,20 +994,6 @@ function submitDelete(payload: { reason: string; note: string }): void {
 // 渲染辅助 / 导出 / 导航
 // ---------------------------------------------------------------------------
 
-/** 级别标签色调。 */
-function levelTagClass(level: AlarmLevel): string {
-  if (level === 'critical') {
-    return 'wc-tag--danger';
-  }
-  if (level === 'major') {
-    return 'wc-tag--warn';
-  }
-  if (level === 'minor') {
-    return 'wc-tag--info';
-  }
-  return 'wc-tag--unknown';
-}
-
 /** 处置状态标签色调。 */
 function stateTagClass(state: AlarmState): string {
   if (state === 'resolved') {
@@ -812,7 +1023,7 @@ function exportCsv(): void {
   const body = filtered.value
     .map((a) =>
       [
-        a.levelLabel,
+        levelTextOf(a.level),
         a.lastSeenAt,
         a.sourceLabel,
         sourceTypeLabel(a.sourceType),
@@ -843,6 +1054,19 @@ function go(name: string): void {
 </script>
 
 <style scoped>
+/* 可解释空态：后端无告警引擎时的「原因 + 恢复路径」块（与 LicensePage 同契约） */
+.al-unsupported {
+  align-items: flex-start;
+  margin: 0 0 12px;
+}
+.wc-banner__stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wc-banner__line {
+  line-height: 1.6;
+}
 .al-src {
   margin-left: 6px;
   font-size: 11px;
