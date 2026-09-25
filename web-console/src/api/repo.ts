@@ -1290,6 +1290,11 @@ export interface OpsApi {
    * 弹窗二次确认由页面层（DangerConfirmModal）完成，此处忠实下发。
    */
   restart(input: { actor: string; confirm: string; reason: string }): Promise<{ ok: boolean; message: string }>;
+  /**
+   * 触发网关停止（real：`POST /api/ops/stop`；契约与 restart 完全一致）。
+   * 200 → `{accepted, mode: "graceful_stop", note}`（优雅停机，**不承诺拉起**——比 restart 更保守）。
+   */
+  stop(input: { actor: string; confirm: string; reason: string }): Promise<{ ok: boolean; message: string }>;
   /** 新建采集器（real：`POST /api/ops/collectors`）。 */
   createCollector(input: { name: string; deviceId?: string; actor: string }): Promise<{ ok: boolean; message: string }>;
   /** 拉取运行日志（real：`GET /api/ops/logs`，结果并入审计清单）。 */
@@ -1298,43 +1303,71 @@ export interface OpsApi {
   health(): Promise<{ ok: boolean; message: string }>;
 }
 
+/**
+ * ops 写动作公共实现（restart / stop 同一后端契约）：
+ * real → 真实 POST（body `{actor, confirm, reason}`）；mock → 本地审计 + 模拟成功。
+ * 403（权限不足）/ 400（confirm 回显校验）分类呈现，其余错误透传 message。
+ */
+async function postOpsAction(
+  path: string,
+  input: { actor: string; confirm: string; reason: string },
+  mockAction: string,
+  okMessage: string,
+): Promise<{ ok: boolean; message: string }> {
+  if (API_MODE !== 'real') {
+    pushLocalAudit({
+      actor: input.actor,
+      actorType: 'human',
+      action: mockAction,
+      entityType: 'system',
+      entityLabel: '系统',
+      entityId: 'gateway',
+      detail: 'mock 模式：模拟成功',
+      result: 'success',
+    });
+    return { ok: true, message: `${mockAction}指令已下发（mock 模拟）。` };
+  }
+  try {
+    await apiRequest<unknown>(path, {
+      method: 'POST',
+      body: JSON.stringify({ actor: input.actor, confirm: input.confirm, reason: input.reason }),
+    });
+    return { ok: true, message: okMessage };
+  } catch (cause) {
+    const status = cause instanceof Error && 'status' in cause ? (cause as { status: number }).status : 0;
+    if (status === 403) {
+      return { ok: false, message: '权限不足（403），当前角色不可执行该操作。' };
+    }
+    if (status === 400) {
+      return {
+        ok: false,
+        message:
+          '网关拒绝（400）：网关标识（gateway id）回显校验未通过。页面取到的标识可能与网关运行期配置不一致，请刷新页面后重试。',
+      };
+    }
+    return { ok: false, message: cause instanceof Error ? cause.message : '指令下发失败。' };
+  }
+}
+
 /** 运维动作实现（两种模式都可用）。 */
 function buildOps(): OpsApi {
   return {
     async restart(input: { actor: string; confirm: string; reason: string }): Promise<{ ok: boolean; message: string }> {
-      if (API_MODE !== 'real') {
-        pushLocalAudit({
-          actor: input.actor,
-          actorType: 'human',
-          action: '重启网关',
-          entityType: 'system',
-          entityLabel: '系统',
-          entityId: 'gateway',
-          detail: 'mock 模式：模拟重启成功',
-          result: 'success',
-        });
-        return { ok: true, message: '重启指令已下发（mock 模拟）。' };
-      }
-      try {
-        await apiRequest<unknown>('/api/ops/restart', {
-          method: 'POST',
-          body: JSON.stringify({ actor: input.actor, confirm: input.confirm, reason: input.reason }),
-        });
-        return { ok: true, message: '重启指令已下发，网关将优雅停机并由 Supervisor / 服务管理器拉起。' };
-      } catch (cause) {
-        const status = cause instanceof Error && 'status' in cause ? (cause as { status: number }).status : 0;
-        if (status === 403) {
-          return { ok: false, message: '权限不足（403），当前角色不可执行重启。' };
-        }
-        if (status === 400) {
-          return {
-            ok: false,
-            message:
-              '网关拒绝（400）：网关标识（gateway id）回显校验未通过。页面取到的标识可能与网关运行期配置不一致，请刷新页面后重试。',
-          };
-        }
-        return { ok: false, message: cause instanceof Error ? cause.message : '重启指令下发失败。' };
-      }
+      return postOpsAction(
+        '/api/ops/restart',
+        input,
+        '重启网关',
+        '重启指令已下发，网关将优雅停机并由 Supervisor / 服务管理器拉起。',
+      );
+    },
+
+    async stop(input: { actor: string; confirm: string; reason: string }): Promise<{ ok: boolean; message: string }> {
+      return postOpsAction(
+        '/api/ops/stop',
+        input,
+        '停止服务',
+        '停止指令已下发，网关将优雅停机（是否再次拉起由 Supervisor / 服务管理器决定，不承诺自动重启）。',
+      );
     },
 
     async createCollector(input: { name: string; deviceId?: string; actor: string }): Promise<{ ok: boolean; message: string }> {
@@ -1397,20 +1430,78 @@ function buildOps(): OpsApi {
 }
 
 // ===========================================================================
-// 设置写动作（settings）：real → 真实接口；mock → 模拟成功 + 本地审计
+// 设置读写（settings）：real → 真实接口；mock → 模拟 / 空态
+//   GET  /api/settings          只读视图（开放读；oem/network 只读组；敏感字段脱敏）
+//   PUT  /api/settings          设置持久化（device.write，仅 system；白名单 basic/storage/security）
+//   GET  /api/settings/backups  备份清单（开放读；文件名升序 = 时间序）
+//   POST /api/settings/rollback 回滚（backup 可选：缺省 = 最新备份）
 // ===========================================================================
+
+/** 备份清单行（`GET /api/settings/backups`；字节 / mtime 一律字符串——大数红线）。 */
+export interface SettingsBackupRow {
+  /** 备份文件名（`config.toml.bak-*`；文件名含 unix 秒，升序 = 时间序，末位最新） */
+  file: string;
+  /** 文件大小（字节，字符串） */
+  sizeBytes: string;
+  /** 修改时刻（epoch 毫秒，字符串） */
+  mtimeMs: string;
+}
+
+/** 北向出口只读行（settings.network.outlets；password 已脱敏：`<redacted>` 或 null）。 */
+export interface SettingsOutletRow {
+  id: string;
+  name: string;
+  broker: string;
+  topicPrefix: string;
+  qos: string;
+  tls: boolean;
+  encoding: string;
+  username: string;
+  /** 后端已脱敏："<redacted>"（已配置）或 ""（未配置）；前端不得尝试还原明文 */
+  password: string;
+}
+
+/** `GET /api/settings` 只读视图（脱敏红线：出口 password、激活码只回布尔位、用户不含口令哈希）。 */
+export interface SettingsView {
+  basic: { gatewayId: string; dataDir: string };
+  oem: { managedBy: string; note: string };
+  network: { outlets: SettingsOutletRow[] };
+  storage: { sqlitePath: string; maxSizeMb: string; retentionDays: string };
+  security: {
+    tlsCertPath: string;
+    tlsKeyPath: string;
+    webAuthEnabled: boolean;
+    activationCodeSet: boolean;
+    mgmtUsers: { name: string; role: string }[];
+  };
+  configVersion: string;
+}
 
 /** 设置写动作 API（repo.settings.*）。 */
 export interface SettingsApi {
+  /** 读取设置只读视图（real：`GET /api/settings`；mock 返回 `{ok:true, view:null}`，页面保持本地默认态）。 */
+  get(): Promise<{ ok: boolean; message: string; view: SettingsView | null }>;
   /**
-   * 配置回滚（real：`POST /api/settings/rollback`，`device.write` 权限，实测仅 system 角色可执行）。
-   * 后端契约（pages.rs）：body `{backup?, reason?}` 均可选；缺省 `backup` 时回滚到网关
-   * config 目录内文件名字典序最大的 `config.toml.bak-*` 备份；无备份 → 404 no_backup；
-   * 回滚前会对当前配置再做一次写前备份（可逆），热重载即时生效。
-   * 注意：后端暂无备份清单读端点，页面快照列表为本地示意，故本封装不传 `backup`，
-   * 实际回滚目标以网关最新备份为准。
+   * 设置持久化（real：`PUT /api/settings`，仅 system 角色 device.write）。
+   * 后端白名单：basic{gateway_id} / storage{sqlite_path,max_size_mb,retention_days} /
+   * security{web_auth_enabled,tls_cert_path,tls_key_path}；未知字段 → 400 validation_failed
+   * （错误体 {error,field,reason}，field 带组前缀）——原样呈现给用户。
+   * 成功响应 `{accepted, config_version, backup}`（backup = 本次写前备份文件名）。
    */
-  rollback(input: { actor: string; reason: string }): Promise<{
+  update(input: {
+    actor: string;
+    basic?: { gatewayId: string };
+    storage?: { sqlitePath?: string; maxSizeMb?: string; retentionDays?: string };
+    security?: { webAuthEnabled?: boolean; tlsCertPath?: string; tlsKeyPath?: string };
+  }): Promise<{ ok: boolean; message: string; configVersion?: string; backup?: string }>;
+  /** 备份清单（real：`GET /api/settings/backups`；mock 返回空 rows——诚实空态）。 */
+  backups(): Promise<{ ok: boolean; message: string; rows: SettingsBackupRow[] }>;
+  /**
+   * 配置回滚（real：`POST /api/settings/rollback`，device.write 权限）。
+   * `backup` 可选：传文件名 = 定向回滚该备份（后端校验前缀 `config.toml.bak-*`，防路径穿越）；
+   * 缺省 = 回滚到最新备份。无备份 → 404 no_backup；回滚前网关自动再备份（可逆），热重载即时生效。
+   */
+  rollback(input: { actor: string; reason: string; backup?: string }): Promise<{
     ok: boolean;
     message: string;
     restoredFrom?: string;
@@ -1418,10 +1509,177 @@ export interface SettingsApi {
   }>;
 }
 
-/** 设置写动作实现（两种模式都可用）。 */
+/** 出口行映射（snake_case → camelCase；password 保持脱敏原样）。 */
+function mapSettingsOutlet(row: Record<string, unknown>, index: number): SettingsOutletRow {
+  return {
+    id: pickStr(row, 'id', `outlet-${index}`),
+    name: pickStr(row, 'name', ''),
+    broker: pickStr(row, 'broker', ''),
+    topicPrefix: pickStr(row, 'topic_prefix', ''),
+    qos: pickStr(row, 'qos', '0'),
+    tls: pickBool(row, 'tls', false),
+    encoding: pickStr(row, 'encoding', 'json'),
+    username: pickStr(row, 'username', ''),
+    password: pickStr(row, 'password', ''),
+  };
+}
+
+/** 设置视图映射（全部字段按 wire 形状显式挑取；计数/容量字符串直通）。 */
+function mapSettingsView(raw: Record<string, unknown>): SettingsView {
+  const basic = asRecord(raw['basic'] ?? {});
+  const oem = asRecord(raw['oem'] ?? {});
+  const network = asRecord(raw['network'] ?? {});
+  const storage = asRecord(raw['storage'] ?? {});
+  const security = asRecord(raw['security'] ?? {});
+  const outlets = Array.isArray(network['outlets']) ? network['outlets'] : [];
+  const users = Array.isArray(security['mgmt_users']) ? security['mgmt_users'] : [];
+  return {
+    basic: { gatewayId: pickStr(basic, 'gateway_id', ''), dataDir: pickStr(basic, 'data_dir', '') },
+    oem: { managedBy: pickStr(oem, 'managed_by', ''), note: pickStr(oem, 'note', '') },
+    network: { outlets: outlets.map((row, i) => mapSettingsOutlet(asRecord(row), i)) },
+    storage: {
+      sqlitePath: pickStr(storage, 'sqlite_path', ''),
+      maxSizeMb: pickStr(storage, 'max_size_mb', ''),
+      retentionDays: pickStr(storage, 'retention_days', ''),
+    },
+    security: {
+      tlsCertPath: pickStr(security, 'tls_cert_path', ''),
+      tlsKeyPath: pickStr(security, 'tls_key_path', ''),
+      webAuthEnabled: pickBool(security, 'web_auth_enabled', false),
+      activationCodeSet: pickBool(security, 'activation_code_set', false),
+      mgmtUsers: users.map((row) => {
+        const rec = asRecord(row);
+        return { name: pickStr(rec, 'name', ''), role: pickStr(rec, 'role', '') };
+      }),
+    },
+    configVersion: pickStr(raw, 'config_version', ''),
+  };
+}
+
+/** 从 ApiError 错误体提取字段级校验原因（writeapi validation_error：{error,field,reason}）。 */
+function validationReason(cause: unknown): string {
+  const body = (cause as { body?: unknown }).body;
+  if (body && typeof body === 'object') {
+    const rec = asRecord(body);
+    const field = typeof rec['field'] === 'string' ? rec['field'] : '';
+    const reason = typeof rec['reason'] === 'string' ? rec['reason'] : '';
+    if (field || reason) {
+      return `${field ? `${field} —— ` : ''}${reason || '字段校验失败'}`;
+    }
+  }
+  return '';
+}
+
+/** 设置读写实现（两种模式都可用）。 */
 function buildSettings(): SettingsApi {
   return {
-    async rollback(input: { actor: string; reason: string }): Promise<{
+    async get(): Promise<{ ok: boolean; message: string; view: SettingsView | null }> {
+      if (API_MODE !== 'real') {
+        return { ok: true, message: 'mock 模式：无真实设置视图。', view: null };
+      }
+      try {
+        const raw = await apiRequest<Record<string, unknown>>('/api/settings');
+        return { ok: true, message: 'ok', view: mapSettingsView(asRecord(raw)) };
+      } catch (cause) {
+        const status = cause instanceof Error && 'status' in cause ? (cause as { status: number }).status : 0;
+        return {
+          ok: false,
+          message: status === 403 ? '权限不足（403）。' : cause instanceof Error ? cause.message : '设置读取失败。',
+          view: null,
+        };
+      }
+    },
+
+    async update(input: {
+      actor: string;
+      basic?: { gatewayId: string };
+      storage?: { sqlitePath?: string; maxSizeMb?: string; retentionDays?: string };
+      security?: { webAuthEnabled?: boolean; tlsCertPath?: string; tlsKeyPath?: string };
+    }): Promise<{ ok: boolean; message: string; configVersion?: string; backup?: string }> {
+      if (API_MODE !== 'real') {
+        pushLocalAudit({
+          actor: input.actor,
+          actorType: 'human',
+          action: '保存设置',
+          entityType: 'system',
+          entityLabel: '系统',
+          entityId: 'config',
+          detail: 'mock 模式：模拟保存成功',
+          result: 'success',
+        });
+        return { ok: true, message: '设置已保存（mock 模拟）。' };
+      }
+      // 组装白名单 body（camelCase → snake_case；只发出现的字段，未知键后端 400）。
+      const body: Record<string, unknown> = {};
+      if (input.basic) {
+        body['basic'] = { gateway_id: input.basic.gatewayId };
+      }
+      if (input.storage) {
+        const storage: Record<string, unknown> = {};
+        if (input.storage.sqlitePath !== undefined) storage['sqlite_path'] = input.storage.sqlitePath;
+        if (input.storage.maxSizeMb !== undefined) storage['max_size_mb'] = input.storage.maxSizeMb;
+        if (input.storage.retentionDays !== undefined) storage['retention_days'] = input.storage.retentionDays;
+        body['storage'] = storage;
+      }
+      if (input.security) {
+        const security: Record<string, unknown> = {};
+        if (input.security.webAuthEnabled !== undefined) security['web_auth_enabled'] = input.security.webAuthEnabled;
+        if (input.security.tlsCertPath !== undefined) security['tls_cert_path'] = input.security.tlsCertPath;
+        if (input.security.tlsKeyPath !== undefined) security['tls_key_path'] = input.security.tlsKeyPath;
+        body['security'] = security;
+      }
+      try {
+        const raw = await apiRequest<Record<string, unknown>>('/api/settings', {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        });
+        const configVersion = typeof raw['config_version'] === 'string' ? raw['config_version'] : undefined;
+        const backup = typeof raw['backup'] === 'string' ? raw['backup'] : undefined;
+        return {
+          ok: true,
+          message: '设置已保存：写前自动备份，热重载即时生效。',
+          configVersion,
+          backup,
+        };
+      } catch (cause) {
+        const status = cause instanceof Error && 'status' in cause ? (cause as { status: number }).status : 0;
+        if (status === 403) {
+          return { ok: false, message: '权限不足（403）：设置写入仅限 system 角色。' };
+        }
+        if (status === 400) {
+          const reason = validationReason(cause);
+          return { ok: false, message: `网关拒绝（400）：${reason || '字段校验失败，请检查输入。'}` };
+        }
+        return { ok: false, message: cause instanceof Error ? cause.message : '设置保存失败。' };
+      }
+    },
+
+    async backups(): Promise<{ ok: boolean; message: string; rows: SettingsBackupRow[] }> {
+      if (API_MODE !== 'real') {
+        return { ok: true, message: 'mock 模式：无真实备份清单。', rows: [] };
+      }
+      try {
+        const raw = await apiRequest<unknown[]>('/api/settings/backups');
+        const rows = (Array.isArray(raw) ? raw : []).map((row, i) => {
+          const rec = asRecord(row);
+          return {
+            file: pickStr(rec, 'file', `bak-${i}`),
+            sizeBytes: pickStr(rec, 'size_bytes', '0'),
+            mtimeMs: pickStr(rec, 'mtime_ms', '0'),
+          };
+        });
+        return { ok: true, message: 'ok', rows };
+      } catch (cause) {
+        const status = cause instanceof Error && 'status' in cause ? (cause as { status: number }).status : 0;
+        return {
+          ok: false,
+          message: status === 403 ? '权限不足（403）。' : cause instanceof Error ? cause.message : '备份清单读取失败。',
+          rows: [],
+        };
+      }
+    },
+
+    async rollback(input: { actor: string; reason: string; backup?: string }): Promise<{
       ok: boolean;
       message: string;
       restoredFrom?: string;
@@ -1443,7 +1701,7 @@ function buildSettings(): SettingsApi {
       try {
         const raw = await apiRequest<Record<string, unknown>>('/api/settings/rollback', {
           method: 'POST',
-          body: JSON.stringify({ reason: input.reason }),
+          body: JSON.stringify(input.backup ? { backup: input.backup, reason: input.reason } : { reason: input.reason }),
         });
         const restoredFrom = typeof raw['restored_from'] === 'string' ? raw['restored_from'] : '';
         const version = typeof raw['config_version'] === 'string' ? raw['config_version'] : '';
@@ -1464,6 +1722,10 @@ function buildSettings(): SettingsApi {
             message:
               '网关无可回滚备份（404 no_backup）：config 目录内不存在 config.toml.bak-* 备份。每次配置写入前网关才会生成写前备份。',
           };
+        }
+        if (status === 400) {
+          const reason = validationReason(cause);
+          return { ok: false, message: `网关拒绝（400）：${reason || '备份名校验失败。'}` };
         }
         return { ok: false, message: cause instanceof Error ? cause.message : '回滚指令下发失败。' };
       }

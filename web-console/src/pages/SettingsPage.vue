@@ -4,27 +4,36 @@
   =============================================================================
   页签结构（`docs/design/prototype/gateway-v2a-glacier.html` :2141-2253）：
     基础 / 网络 / 存储 / 安全。
-    原型的「模拟策略」页签整体留给 P0-4 立项 —— 本页**不提供**该页签骨架之外的假内容。
 
-  诚实降级边界（重要）：
-    网关后端当前只有读型 `/api/overview` 等端点，**没有**写型 settings 端点（实测
-    `GET /api/settings` → 404）。因此本页所有表单/开关均为**本地界面状态**（刷新即回到
-    默认值），并在每处明确标注「后端暂未开放写入端点，改动不会下发到网关」。
-    本页唯一「有真实动作入口」的能力是「配置回滚」（见「基础」页签末）：real 模式调用真实
-    `POST /api/settings/rollback`（body `{reason}`，不传 backup → 网关回滚到 config 目录内
-    最新的 `config.toml.bak-*` 备份）。注意：后端暂无备份清单读端点，本页快照列表为本地示意，
-    实际回滚目标以网关最新备份为准，结果区原样呈现后端返回（含 403 / 404 no_backup）。
+  真实读写边界（重要）：
+    · real 模式：进页 `GET /api/settings` 填充 → 「保存」`PUT /api/settings` 持久化
+      （写前自动备份 + 热重载生效，结果区展示 config_version 与备份文件名）；
+      400 字段级校验原因（field + reason）原样呈现；
+    · 可写组（后端白名单）：basic{gateway_id} / storage{sqlite_path,max_size_mb,retention_days} /
+      security{web_auth_enabled,tls_cert_path,tls_key_path}；
+    · 只读组：OEM（由厂商授权后台随牌照下发）与 network（出口在北向转发页管理）——
+      展示为只读态并注明原因（PUT 这两组会 400）；
+    · 脱敏红线：出口 password 后端已脱敏（<redacted>/null），激活码只回布尔位，
+      管理用户不含口令哈希——前端一律原样展示，不尝试还原；
+    · 「配置回滚」：备份清单来自真实 `GET /api/settings/backups`，支持定向回滚
+      （DangerConfirmModal 完整契约 + 备份文件名后 8 位二次校验）。
 -->
 <template>
   <PageHeader
     crumb="系统 / 系统设置"
     title="系统设置"
-    desc="按「基础 / 网络 / 存储 / 安全」四类组织。除配置回滚外，所有表单项为本地界面状态 —— 网关当前未开放对应写入端点，已在各处标注。"
+    desc="按「基础 / 网络 / 存储 / 安全」四类组织：基础 / 存储 / 安全三组真实读写（保存即持久化并热重载），OEM 与网络为只读组（分别由厂商授权后台与北向转发页管理）。"
   >
     <template #actions>
-      <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色无权保存设置" fallback-label="无权保存">
-        <button type="button" class="wc-btn wc-btn--primary wc-btn--sm" data-testid="btn-save-settings" @click="saveSettings">
-          {{ saved ? '已保存' : '保存' }}
+      <RoleGate :allowed="canEdit" mode="disable" deny-text="设置写入仅限管理员（system 角色）" fallback-label="无权保存">
+        <button
+          type="button"
+          class="wc-btn wc-btn--primary wc-btn--sm"
+          data-testid="btn-save-settings"
+          :disabled="saving"
+          @click="saveSettings"
+        >
+          {{ saving ? '保存中…' : saved ? '已保存' : '保存' }}
         </button>
       </RoleGate>
     </template>
@@ -34,17 +43,26 @@
     <!-- 未保存提示 -->
     <div v-if="dirty" class="wc-banner wc-banner--warn" data-testid="dirty-banner">
       <span aria-hidden="true">⚠</span>
-      <span>有未保存的修改。保存后可在此页「基础 · 配置回滚」中回退到历史版本。</span>
+      <span>有未保存的修改。保存后网关自动生成写前备份，可在此页「基础 · 配置回滚」中回退。</span>
     </div>
 
-    <!-- 降级说明（一次说清，避免每卡重复） -->
-    <div class="wc-banner wc-banner--info">
+    <!-- real：读取失败；mock：演示态说明 -->
+    <div v-if="API_MODE === 'real' && settingsLoadError" class="wc-banner wc-banner--danger" data-testid="settings-load-error">
+      <span aria-hidden="true">⚠</span>
+      <span>设置读取失败：{{ settingsLoadError }}（请检查网关连接后刷新页面重试。）</span>
+    </div>
+    <div v-else-if="API_MODE !== 'real'" class="wc-banner wc-banner--info">
       <span aria-hidden="true">ⓘ</span>
       <span>
-        本页表单与开关<b>只改本地界面状态</b>：网关（Rust 侧）尚未开放 settings 写入端点，
-        因此改动<b>不会下发到服务端、也不会落审计</b>，刷新页面即回到默认值。需真实生效的
-        配置项请等待后续版本开放。
+        mock 演示态：下方表单为本地默认值，「保存」只更新本机界面状态、不向网关发送任何请求。
+        real 模式下基础 / 存储 / 安全三组真实读写并持久化到网关。
       </span>
+    </div>
+
+    <!-- 保存结果（后端结果原样呈现，含 400 字段级原因） -->
+    <div v-if="saveResult" class="st-result" :class="`is-${saveResultKind}`" data-testid="save-result">
+      <span aria-hidden="true">{{ saveResultKind === 'ok' ? '✓' : '⚠' }}</span>
+      <span>{{ saveResult }}</span>
     </div>
 
     <!-- 页签 -->
@@ -69,142 +87,133 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>网关标识</h3>
-            <span class="wc-card__sub">本地界面状态（保存后即时反映到本页，不下发网关）</span>
+            <span class="wc-card__sub">real：真实读写（PUT basic）· mock：本地默认值</span>
           </div>
           <div class="wc-card__body">
             <div class="wc-form">
-              <UiField label="网关名称" required>
-                <UiInput v-model="form.name" placeholder="如 线1-网关-01" data-testid="set-name" />
+              <UiField label="网关标识（gateway_id）" required hint="重启 / 停止等运维操作需回显该标识；保存后热重载生效">
+                <UiInput v-model="basicForm.gatewayId" data-testid="set-gateway-id" />
               </UiField>
-              <UiField label="所属站点" required hint="位置区 / 线体，用于运维定位">
-                <UiInput v-model="form.site" placeholder="如 长沙工厂 / 注塑一车间" data-testid="set-site" />
-              </UiField>
-              <UiField label="时区" required hint="影响审计时间与数据时间戳">
-                <UiSelect v-model="form.timezone" :options="timezoneOptions" data-testid="set-timezone" />
-              </UiField>
-              <UiField label="界面语言" hint="首期仅提供简体中文">
-                <UiSelect v-model="form.locale" :options="localeOptions" :disabled="true" />
-              </UiField>
-              <UiField label="NTP 时间源" required hint="可信时间是试用防改时间、±5min 验签窗口的共同依赖">
-                <UiInput v-model="form.ntp" placeholder="如 ntp.aliyun.com" data-testid="set-ntp" />
+              <UiField label="数据目录" hint="网关运行期数据根目录（只读）">
+                <UiInput :model-value="dataDir" :disabled="true" placeholder="—" />
               </UiField>
             </div>
-            <p class="wc-hint" data-testid="clock-hint">当前时钟 {{ clockText }} · 校时正常，偏移 12 ms</p>
+            <p class="wc-note" data-testid="basic-note">
+              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+              <span>
+                原型中的 所属站点 / 时区 / 界面语言 / NTP 时间源 暂无后端设置项（PUT basic 白名单仅
+                <code>gateway_id</code>），待端点扩展后接入，此处不做假表单。
+              </span>
+            </p>
           </div>
         </section>
 
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>配置回滚</h3>
-            <span class="wc-card__sub">危险操作 · 已有能力</span>
+            <span class="wc-card__sub">危险操作 · 备份来自网关 config 目录</span>
           </div>
           <div class="wc-card__body">
             <dl class="wc-kv">
-              <dt>当前版本</dt>
-              <dd class="wc-mono" data-testid="current-version">{{ currentVersion }}</dd>
-              <dt>可用历史版本</dt>
-              <dd data-testid="history-count">{{ history.length }} 个</dd>
+              <dt>当前配置版本</dt>
+              <dd class="wc-mono" data-testid="current-version">{{ configVersion || '—' }}</dd>
+              <dt>可用备份</dt>
+              <dd data-testid="backups-count">{{ backups.length }} 份</dd>
               <dt>回滚影响</dt>
-              <dd>仅回滚配置，不回滚采集数据与设备连接</dd>
+              <dd>仅回滚配置，不影响采集数据与设备连接</dd>
             </dl>
 
-            <div class="wc-list">
-              <div v-for="snap in history" :key="snap.id" class="wc-list__item">
-                <div>
-                  <div class="wc-list__title wc-mono">{{ snap.id }}</div>
-                  <div class="wc-list__desc">{{ snap.at }} · {{ snap.note }} · 操作者 {{ snap.operator }}</div>
-                </div>
-                <div class="wc-list__ops">
-                  <RoleGate :allowed="canRollback" mode="disable" deny-text="当前角色无权执行配置回滚" fallback-label="回滚">
-                    <button
-                      type="button"
-                      class="wc-btn wc-btn--sm wc-btn--danger"
-                      data-testid="btn-rollback"
-                      @click="openRollback(snap)"
-                    >
-                      回滚到此版本
-                    </button>
-                  </RoleGate>
-                </div>
-              </div>
-            </div>
-
-            <p class="wc-note" data-testid="rollback-note">
+            <p v-if="backupsError" class="wc-note wc-note--warn" data-testid="backups-error">
+              <span class="wc-note__icon" aria-hidden="true">⚠</span>
+              <span>备份清单读取失败：{{ backupsError }}</span>
+            </p>
+            <p v-else-if="!backups.length" class="wc-note" data-testid="backups-empty">
               <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
               <span>
-                real 模式下回滚调用真实接口 <code>POST /api/settings/rollback</code>：网关按 config 目录内
-                <code>config.toml.bak-*</code> 备份执行，本页快照列表为本地示意（后端暂无备份清单读端点），
-                实际回滚目标以网关最新备份为准；回滚前网关会对当前配置自动再备份（可逆），热重载即时生效。
+                网关 config 目录暂无备份：每次配置写入 / 回滚前会自动生成 <code>config.toml.bak-*</code>
+                写前备份；执行一次「保存」后再来查看。
               </span>
             </p>
+            <template v-else>
+              <div class="wc-list">
+                <div v-for="bak in backups" :key="bak.file" class="wc-list__item">
+                  <div>
+                    <div class="wc-list__title wc-mono">{{ bak.file }}</div>
+                    <div class="wc-list__desc">{{ formatBytes(bak.sizeBytes) }} · {{ formatMtime(bak.mtimeMs) }}</div>
+                  </div>
+                  <div class="wc-list__ops">
+                    <RoleGate :allowed="canRollback" mode="disable" deny-text="当前角色无权执行配置回滚" fallback-label="回滚">
+                      <button
+                        type="button"
+                        class="wc-btn wc-btn--sm wc-btn--danger"
+                        data-testid="btn-rollback"
+                        @click="openRollback(bak)"
+                      >
+                        回滚到此版本
+                      </button>
+                    </RoleGate>
+                  </div>
+                </div>
+              </div>
+              <RoleGate
+                :allowed="canRollback"
+                mode="disable"
+                deny-text="当前角色无权执行配置回滚"
+                fallback-label="回滚到最新备份"
+              >
+                <button
+                  type="button"
+                  class="wc-btn wc-btn--sm st-latest-btn"
+                  data-testid="btn-rollback-latest"
+                  @click="openRollback()"
+                >
+                  回滚到最新备份
+                </button>
+              </RoleGate>
+            </template>
 
             <div
               v-if="rollbackResult"
-              class="st-rollback-result"
+              class="st-result"
               :class="`is-${rollbackResultKind}`"
               data-testid="rollback-result"
             >
               <span aria-hidden="true">{{ rollbackResultKind === 'ok' ? '✓' : '⚠' }}</span>
               <span>{{ rollbackResult }}</span>
             </div>
+
+            <p class="wc-note" data-testid="rollback-note">
+              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+              <span>
+                real 模式调用真实接口 <code>POST /api/settings/rollback</code>：选择某份备份即定向回滚
+                （后端校验文件名前缀，防路径穿越）；不选则回滚到最新备份。回滚前网关对当前配置自动再备份
+                （可逆），热重载即时生效。
+              </span>
+            </p>
           </div>
         </section>
       </div>
 
-      <!-- 贴牌（OEM） -->
+      <!-- 贴牌（OEM）—— 只读组 -->
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>贴牌（OEM）</h3>
-          <span class="wc-card__sub">面向 ISV 的白标交付 · 本机预览</span>
+          <span class="wc-tag wc-tag--neutral">只读 · 由厂商授权后台下发</span>
         </div>
         <div class="wc-card__body">
-          <div class="st-row">
-            <div class="st-row__text">
-              <div class="st-row__title">启用贴牌</div>
-              <div class="st-row__desc">
-                开启后界面品牌跟随下方配置；关闭即恢复 IoT-DAQ 原厂标识。贴牌配置由厂商管理后台统一下发，
-                <b>网关本地只读应用</b> —— 因此这里的编辑仅更新本机预览。
-              </div>
-            </div>
-            <UiSwitch v-model="oem.enabled" on-text="已启用" off-text="已关闭" />
-          </div>
-
-          <div class="wc-form" :class="{ 'is-off': !oem.enabled }">
-            <UiField label="品牌名称" hint="留空显示 IoT-DAQ">
-              <UiInput v-model="oem.name" placeholder="例：智采科技" />
-            </UiField>
-            <UiField label="Logo 文字（1–2 字）" hint="留空取品牌名前两位">
-              <UiInput v-model="oem.logo" placeholder="如 智" />
-            </UiField>
-            <UiField label="副标题" hint="留空显示 Powered by IoT-DAQ">
-              <UiInput v-model="oem.sub" placeholder="如 Edge Gateway" />
-            </UiField>
-            <UiField label="登录页标语">
-              <UiInput v-model="oem.slogan" placeholder="例：让每一条产线数据可信可达" />
-            </UiField>
-          </div>
-
-          <UiRadio v-model="oem.theme" :options="themeOptions" />
-
-          <!-- 实时预览（原型 oemPreviewHTML :725-732） -->
-          <div class="oem-pv">
-            <div class="oem-pv__brand">
-              <span class="oem-pv__logo">{{ preview.logo }}</span>
-              <span class="oem-pv__txt">
-                <b>{{ preview.name }}</b>
-                <span>{{ preview.sub }}</span>
-              </span>
-            </div>
-            <div class="oem-pv__slogan">{{ preview.slogan }}</div>
-            <div class="oem-pv__cap">预览 · 品牌名 / Logo / 副标题 / 标语的呈现效果</div>
-          </div>
-
+          <dl class="wc-kv">
+            <dt>管理方</dt>
+            <dd class="wc-mono" data-testid="oem-managed-by">{{ oemInfo.managedBy || 'vendor-license-backend' }}</dd>
+            <dt>说明</dt>
+            <dd data-testid="oem-note">{{ oemInfo.note || '贴牌品牌信息由厂商管理后台随牌照统一下发，网关本地只读应用。' }}</dd>
+            <dt>当前生效品牌</dt>
+            <dd>IoT-DAQ（原厂标识）</dd>
+          </dl>
           <p class="wc-note">
             <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
             <span>
-              贴牌仅替换<b>视觉层</b>：品牌名、Logo、主题色与登录页文案。<b>授权判定、数据链路与审计标识不受影响</b>
-              —— 审计日志始终记录设备与授权真实归属。主题色跟随客户 VI 需在下发牌照时由总后台写入，
-              本机不支持自定义色值输入，避免与 ui-kit 设计 token 口径分裂。
+              OEM 组只读（PUT 会 400）：品牌名 / Logo / 主题色由厂商总后台在下发牌照时写入，网关本地只读应用。
+              贴牌仅替换视觉层——<b>授权判定、数据链路与审计标识不受影响</b>，审计日志始终记录设备与授权真实归属。
             </span>
           </p>
         </div>
@@ -213,55 +222,46 @@
 
     <!-- ══════════ 网络 ══════════ -->
     <template v-else-if="activeTab === 1">
-      <div class="wc-grid wc-grid--2">
-        <section class="wc-card">
-          <div class="wc-card__head">
-            <h3>管理端口</h3>
-            <span class="wc-card__sub">本地界面状态 · 不下发网关</span>
-          </div>
-          <div class="wc-card__body">
-            <div class="wc-form">
-              <UiField label="监听地址" hint="网关管理端口，改后需重启网关进程">
-                <UiInput v-model="net.listen" placeholder="0.0.0.0:8080" />
-              </UiField>
-              <UiField label="HTTPS" hint="生产环境必须启用">
-                <UiSelect v-model="net.https" :options="httpsOptions" />
-              </UiField>
-              <UiField label="会话超时（分钟）" hint="超时后需重新登录">
-                <UiInput v-model="net.sessionMinutes" type="number" />
-              </UiField>
-            </div>
-            <p class="wc-note wc-note--warn">
-              <span class="wc-note__icon" aria-hidden="true">⚠</span>
-              <span>管理界面暴露在局域网时<b>必须启用 HTTPS</b>，否则口令与会话令牌可被嗅探。</span>
-            </p>
-          </div>
-        </section>
-
-        <section class="wc-card">
-          <div class="wc-card__head">
-            <h3>代理与时钟</h3>
-            <span class="wc-card__sub">时钟取自网关自检，本机只读</span>
-          </div>
-          <div class="wc-card__body">
-            <div class="wc-form">
-              <UiField label="HTTP 代理" hint="留空即禁用；仅影响北向出站">
-                <UiInput v-model="net.proxy" placeholder="（未启用）" />
-              </UiField>
-              <UiField label="NTP 服务器" hint="在「基础 · 网关标识」中修改">
-                <UiInput v-model="form.ntp" placeholder="ntp.aliyun.com" />
-              </UiField>
-              <UiField label="当前时钟" hint="校时正常，偏移 12 ms">
-                <UiInput :model-value="clockText" :disabled="true" />
-              </UiField>
-            </div>
-            <p class="wc-note">
-              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-              <span>可信时间是<b>试用防改时间、±5min 验签窗口、时间戳统一</b>三者的共同依赖。</span>
-            </p>
-          </div>
-        </section>
-      </div>
+      <section class="wc-card">
+        <div class="wc-card__head">
+          <h3>北向出口（network）</h3>
+          <span class="wc-tag wc-tag--neutral">只读 · 出口在「北向转发」页管理</span>
+        </div>
+        <div class="wc-card__body">
+          <p class="wc-note">
+            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+            <span>
+              network 组为只读（PUT 会 400）：出口登记 / 编辑在「北向转发」页进行；出口密码已由后端脱敏为
+              <code>&lt;redacted&gt;</code>，前端不还原明文。
+            </span>
+          </p>
+          <table v-if="outlets.length" class="st-outlets" data-testid="outlets-table">
+            <thead>
+              <tr>
+                <th>名称</th><th>Broker</th><th>Topic 前缀</th><th>QoS</th><th>TLS</th><th>编码</th><th>用户名</th><th>密码</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="o in outlets" :key="o.id">
+                <td class="wc-mono">{{ o.name || o.id }}</td>
+                <td class="wc-mono">{{ o.broker }}</td>
+                <td class="wc-mono">{{ o.topicPrefix }}</td>
+                <td class="wc-mono">{{ o.qos }}</td>
+                <td>
+                  <span class="wc-tag" :class="o.tls ? 'wc-tag--ok' : 'wc-tag--neutral'">{{ o.tls ? '启用' : '关闭' }}</span>
+                </td>
+                <td class="wc-mono">{{ o.encoding }}</td>
+                <td class="wc-mono">{{ o.username || '—' }}</td>
+                <td class="wc-mono">{{ o.password || '未配置' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-else class="wc-note" data-testid="outlets-empty">
+            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+            <span>当前配置没有北向出口。出口登记在「北向转发」页进行。</span>
+          </p>
+        </div>
+      </section>
     </template>
 
     <!-- ══════════ 存储 ══════════ -->
@@ -270,48 +270,43 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>本地存储</h3>
-            <span class="wc-card__sub">队列上限 / 遥测保留随右侧清理策略同步</span>
+            <span class="wc-card__sub">取自网关当前生效配置（GET storage）</span>
           </div>
           <div class="wc-card__body">
             <dl class="wc-kv">
-              <dt>数据目录</dt><dd class="wc-mono">/var/lib/iot-daq</dd>
-              <dt>离线队列库</dt><dd class="wc-mono">queue.db</dd>
-              <dt>遥测库</dt><dd class="wc-mono">telemetry.db</dd>
+              <dt>数据目录</dt><dd class="wc-mono">{{ dataDir || '—' }}</dd>
+              <dt>SQLite 队列库</dt><dd class="wc-mono">{{ storageForm.sqlitePath || '—' }}</dd>
               <dt>加密方式</dt><dd class="wc-mono">SQLCipher · HKDF(机器码)</dd>
-              <dt>队列上限</dt><dd class="wc-mono">{{ store.queueGb }} GB / {{ store.queueDays }} 天</dd>
-              <dt>遥测保留</dt><dd class="wc-mono">{{ store.telemetryDays }} 天</dd>
+              <dt>队列上限</dt><dd class="wc-mono">{{ storageForm.maxSizeMb || '—' }} MB</dd>
+              <dt>遥测保留</dt><dd class="wc-mono">{{ storageForm.retentionDays || '—' }} 天</dd>
             </dl>
-            <div class="st-prog">
-              <span class="st-prog__label">磁盘占用</span>
-              <div class="wc-bar"><i class="wc-bar__fill" :style="{ width: '18%' }" /></div>
-              <span class="st-prog__num wc-mono">18%</span>
-            </div>
           </div>
         </section>
 
         <section class="wc-card">
           <div class="wc-card__head">
-            <h3>清理策略</h3>
-            <span class="wc-card__sub">本地界面状态 · 不下发网关</span>
+            <h3>存储参数</h3>
+            <span class="wc-card__sub">real：真实读写（PUT storage）· mock：本地默认值</span>
           </div>
           <div class="wc-card__body">
-            <div class="wc-form">
-              <UiField label="遥测数据保留（天）" hint="超期由网关后台线程清理">
-                <UiInput v-model="store.telemetryDays" type="number" />
+            <div class="wc-form wc-form--single">
+              <UiField label="SQLite 队列库文件（sqlite_path）" hint="相对数据目录的库文件名；保存后热重载生效">
+                <UiInput v-model="storageForm.sqlitePath" data-testid="set-sqlite-path" />
               </UiField>
-              <UiField label="队列环形覆盖上限（GB）" hint="达到上限后覆盖最旧数据">
-                <UiInput v-model="store.queueGb" type="number" />
+              <UiField label="队列环形覆盖上限（max_size_mb，MB）" hint="达到上限后覆盖最旧数据">
+                <UiInput v-model="storageForm.maxSizeMb" type="number" data-testid="set-max-size-mb" />
               </UiField>
-              <UiField label="队列最长保留（天）">
-                <UiInput v-model="store.queueDays" type="number" />
-              </UiField>
-              <UiField label="日志保留（天）" hint="审计日志追加不可篡改，到期按段归档">
-                <UiInput v-model="store.logDays" type="number" />
+              <UiField label="遥测数据保留（retention_days，天）" hint="超期由网关后台线程清理">
+                <UiInput v-model="storageForm.retentionDays" type="number" data-testid="set-retention-days" />
               </UiField>
             </div>
             <p class="wc-note wc-note--warn">
               <span class="wc-note__icon" aria-hidden="true">⚠</span>
-              <span>Docker 部署时数据目录必须挂载到<b>宿主机持久卷</b>，否则容器重建即丢失队列与遥测。</span>
+              <span>
+                Docker 部署时数据目录必须挂载到<b>宿主机持久卷</b>，否则容器重建即丢失队列与遥测。
+                原型中的日志保留 / 队列保留天数细分项暂无后端设置项（PUT storage 白名单仅
+                sqlite_path / max_size_mb / retention_days），待端点扩展后接入。
+              </span>
             </p>
           </div>
         </section>
@@ -323,42 +318,51 @@
       <div class="wc-grid wc-grid--2">
         <section class="wc-card">
           <div class="wc-card__head">
-            <h3>传输安全</h3>
-            <span class="wc-card__sub">本地界面状态 · 不下发网关</span>
+            <h3>安全设置</h3>
+            <span class="wc-card__sub">real：真实读写（PUT security）· mock：本地默认值</span>
           </div>
           <div class="wc-card__body">
             <div class="st-row">
               <div class="st-row__text">
-                <div class="st-row__title">北向 TLS 强制校验服务端证书</div>
-                <div class="st-row__desc">关闭会暴露于中间人攻击，仅调试用。</div>
+                <div class="st-row__title">管理端登录鉴权（web_auth_enabled）</div>
+                <div class="st-row__desc">关闭后管理 API 不再校验登录，仅限隔离内网使用。</div>
               </div>
-              <UiSwitch v-model="sec.northTls" />
-              <span class="st-cur wc-mono">{{ sec.northTls ? '强制校验' : '未校验（不推荐）' }}</span>
+              <UiSwitch v-model="securityForm.webAuthEnabled" />
+              <span class="st-cur wc-mono">{{ securityForm.webAuthEnabled ? '启用' : '关闭' }}</span>
             </div>
 
-            <div class="st-row">
-              <div class="st-row__text">
-                <div class="st-row__title">mTLS 双向认证</div>
-                <div class="st-row__desc">客户 Broker 支持时启用，网关出示客户端证书。</div>
-              </div>
-              <UiSwitch v-model="sec.mtls" />
-              <span class="st-cur wc-mono">{{ sec.mtls ? '双向认证' : '单向认证' }}</span>
+            <div class="wc-form wc-form--single">
+              <UiField label="TLS 证书路径（tls_cert_path）" hint="管理端 HTTPS 证书 PEM；留空表示未配置">
+                <UiInput v-model="securityForm.tlsCertPath" placeholder="/pem/cert.pem" data-testid="set-tls-cert-path" />
+              </UiField>
+              <UiField label="TLS 私钥路径（tls_key_path）" hint="仅存路径，内容不回显">
+                <UiInput v-model="securityForm.tlsKeyPath" placeholder="/pem/key.pem" data-testid="set-tls-key-path" />
+              </UiField>
             </div>
 
-            <div class="st-row">
-              <div class="st-row__text">
-                <div class="st-row__title">管理界面 HTTPS</div>
-                <div class="st-row__desc">启用后 HTTP 自动跳转 HTTPS。当前值 {{ httpsCurrentText }}。</div>
-              </div>
-              <UiSwitch v-model="sec.manageHttps" />
-              <span class="st-cur wc-mono">{{ sec.manageHttps ? '启用' : '关闭' }}</span>
-            </div>
+            <dl class="wc-kv">
+              <dt>激活码</dt>
+              <dd>
+                <span class="wc-tag" :class="activationCodeSet ? 'wc-tag--ok' : 'wc-tag--neutral'" data-testid="activation-code-state">
+                  {{ activationCodeSet === null ? '—' : activationCodeSet ? '已设置' : '未设置' }}
+                </span>
+                <span class="pt-dd-hint">激活码本体不下发，只回布尔位。</span>
+              </dd>
+              <dt>管理用户</dt>
+              <dd>
+                <template v-if="mgmtUsers.length">
+                  <span v-for="u in mgmtUsers" :key="u.name" class="wc-tag wc-tag--info st-user-tag">{{ u.name }}（{{ u.role }}）</span>
+                </template>
+                <span v-else>—</span>
+                <span class="pt-dd-hint">只读展示（name / role），口令哈希不下发。</span>
+              </dd>
+            </dl>
 
             <p class="wc-note">
               <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
               <span>
-                上表「当前值」由本界面状态派生（网关未开放 /settings 读端点，无法回读真实运行态），
-                因此<b>不等于网关当前生效值</b> —— 现场核对请以网关启动日志与 mgmt 端点返回为准。
+                原型中的 北向 TLS 强制校验 / mTLS 双向认证 暂无后端设置项（PUT security 白名单仅
+                web_auth_enabled / tls_cert_path / tls_key_path），待端点扩展后接入，此处不做假开关。
               </span>
             </p>
           </div>
@@ -379,7 +383,7 @@
                 <span class="pt-dd-hint">逐点模拟尚未立项，故当前不存在该类事件。</span>
               </dd>
               <dt>授权事件</dt><dd><span class="wc-tag wc-tag--ok">记录</span></dd>
-              <dt>日志保留</dt><dd class="wc-mono">{{ store.logDays }} 天 · 追加不可篡改</dd>
+              <dt>日志保留</dt><dd>追加写入 + 分段校验，不可篡改</dd>
             </dl>
             <p class="wc-note">
               <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
@@ -391,7 +395,7 @@
     </template>
   </div>
 
-  <!-- ===== 配置回滚：危险操作二次确认（原因必填 + 对象名二次校验）===== -->
+  <!-- ===== 配置回滚：危险操作二次确认（原因必填 + 备份文件名二次校验）===== -->
   <DangerConfirmModal
     :open="rollback.open"
     :title="rollback.title"
@@ -399,11 +403,11 @@
     :facts="rollback.facts"
     :reasons="ROLLBACK_REASONS"
     :min-note-length="10"
-    :confirm-value="rollback.snapshotId"
-    confirm-label="快照二次确认（输入快照编号）"
-    confirm-placeholder="输入目标快照编号"
+    :confirm-value="rollback.confirmValue"
+    confirm-label="备份二次确认（输入备份文件名后 8 位）"
+    confirm-placeholder="输入备份文件名去分隔符后的后 8 位"
     confirm-text="确认回滚"
-    @close="closeRollback"
+    @close="rollback.open = false"
     @submit="submitRollback"
   />
 </template>
@@ -414,25 +418,23 @@
  * @module web-console/pages/SettingsPage
  * @description 系统设置：基础 / 网络 / 存储 / 安全四个页签。
  *
- * 诚实边界：网关未开放 settings 写入端点，因此除「配置回滚」外的所有表单/开关均为
- * **本地界面状态**，页首与各卡副标题均已标注；不做「看起来已生效」的假反馈。
+ * real 模式：进页 GET /api/settings 填充 → 保存 PUT /api/settings（白名单三组，写前备份 +
+ * 热重载）→ 备份清单 GET /api/settings/backups 支撑定向回滚。OEM / network 只读组展示原因。
+ * mock 模式：表单为本地默认值，保存仅本机反馈；备份清单诚实空态。
  */
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import {
   PageHeader,
   UiField,
   UiInput,
-  UiSelect,
-  UiRadio,
   UiSwitch,
   RoleGate,
   DangerConfirmModal,
-  type SelectOption,
-  type RadioOption,
   type DangerFact,
 } from '@ui-kit';
 import { session } from '../store/session';
 import { repo } from '@/api/repo';
+import type { SettingsBackupRow, SettingsOutletRow } from '@/api/repo';
 import { API_MODE } from '@/api/client';
 
 /** 页签名（原型 :2143）。 */
@@ -441,163 +443,174 @@ const TABS = ['基础', '网络', '存储', '安全'] as const;
 const activeTab = ref(0);
 
 // ---------------------------------------------------------------------------
-// 网关基础配置
+// 真实设置视图（real：GET /api/settings 填充；mock：本地默认值）
 // ---------------------------------------------------------------------------
 
-/** 当前网关信息（本机视角）。 */
-const gateway = computed(() => repo.getGateway());
+const settingsLoadError = ref('');
+const configVersion = ref('');
+const dataDir = ref('');
+const oemInfo = reactive({ managedBy: '', note: '' });
+const outlets = ref<SettingsOutletRow[]>([]);
+const mgmtUsers = ref<{ name: string; role: string }[]>([]);
+const activationCodeSet = ref<boolean | null>(null);
 
-/** 表单草稿（网关标识）。 */
-const form = reactive({
-  name: gateway.value.name,
-  site: '长沙工厂 / 注塑一车间',
-  timezone: 'Asia/Shanghai',
-  locale: 'zh-CN',
-  ntp: 'ntp.aliyun.com',
-});
+/** 可写表单（与后端白名单一一对应）。 */
+const basicForm = reactive({ gatewayId: repo.getGateway().name });
+const storageForm = reactive({ sqlitePath: 'queue.db', maxSizeMb: '10', retentionDays: '30' });
+const securityForm = reactive({ webAuthEnabled: true, tlsCertPath: '', tlsKeyPath: '' });
 
-/** 网络项。 */
-const net = reactive({
-  listen: '0.0.0.0:8080',
-  https: '自签名证书',
-  sessionMinutes: '30',
-  proxy: '',
-});
+/** 当前角色是否可保存（后端 PUT 仅 system 角色；web-console 侧 system 映射为 admin）。 */
+const canEdit = computed<boolean>(() => session.state.role === 'admin');
 
-/** 存储清理策略。 */
-const store = reactive({
-  telemetryDays: '30',
-  queueGb: '10',
-  queueDays: '7',
-  logDays: '180',
-});
+// ---------------------------------------------------------------------------
+// 保存（PUT /api/settings）
+// ---------------------------------------------------------------------------
 
-/** 安全开关（「当前值」由本状态派生，见页内说明）。 */
-const sec = reactive({
-  northTls: true,
-  mtls: false,
-  manageHttps: true,
-});
-
-/** 是否已保存（显示反馈）。 */
 const saved = ref(false);
-
-/** 是否有未保存修改。 */
 const dirty = ref(false);
+const saving = ref(false);
+const saveResult = ref('');
+const saveResultKind = ref<'ok' | 'warn'>('ok');
 
-/** 任一可编辑项变更即置脏（保存后复位）。 */
-watch([form, net, store, sec], () => {
-  dirty.value = true;
+/** 表单填充期间抑制脏标记（nextTick 后恢复，避免回填被误判为用户修改）。 */
+let suppressDirty = false;
+
+watch([basicForm, storageForm, securityForm], () => {
+  if (!suppressDirty) {
+    dirty.value = true;
+  }
 }, { deep: true });
 
-const timezoneOptions: readonly SelectOption[] = [
-  { value: 'Asia/Shanghai', label: 'Asia/Shanghai（UTC+08:00）' },
-  { value: 'UTC', label: 'UTC（协调世界时）' },
-];
-
-const localeOptions: readonly SelectOption[] = [{ value: 'zh-CN', label: '简体中文' }];
-
-const httpsOptions: readonly SelectOption[] = [
-  { value: '自签名证书', label: '自签名证书' },
-  { value: '上传证书', label: '上传证书' },
-  { value: '关闭', label: '关闭（不推荐）' },
-];
-
-/** 当前时钟文本（网关自检时间，本页只读）。 */
-const clockText = '2026-09-23 13:45:12 (+08:00)';
-
-/** HTTPS 当前值文案（与「网络 · 管理端口」的 HTTPS 保持一致口径）。 */
-const httpsCurrentText = computed(() => (net.https === '关闭' ? '关闭' : net.https));
-
-/** 当前角色是否可编辑设置（仅 admin / engineer）。 */
-const canEdit = computed<boolean>(() => session.state.role === 'admin' || session.state.role === 'engineer');
-
-/** 保存设置（本地界面反馈；真实下发待网关开放写端点）。 */
-function saveSettings(): void {
-  saved.value = true;
-  dirty.value = false;
-  setTimeout(() => {
-    saved.value = false;
-  }, 1600);
-}
-
-// ---------------------------------------------------------------------------
-// 贴牌（OEM）—— 本地界面预览，见页内降级说明
-// ---------------------------------------------------------------------------
-
-const THEME_DEFAULT = '默认';
-const THEME_CUSTOM = 'custom';
-
-const oem = reactive({
-  enabled: false,
-  name: '',
-  logo: '',
-  sub: '',
-  slogan: '',
-  theme: THEME_DEFAULT,
-});
-
-const themeOptions: readonly RadioOption[] = [
-  { value: THEME_DEFAULT, label: '主题色 · 青绿（默认）', desc: '原厂主色，与 ui-kit token 同源（见全局 --brand）' },
-  {
-    value: THEME_CUSTOM,
-    label: '主题色 · 跟随客户 VI',
-    desc: '需在下发牌照时由厂商总后台写入；本机不支持自定义色值输入（避免脱离设计 token）',
-  },
-];
-
-/** 预览取值：未启用贴牌时一律回落原厂标识。 */
-const preview = computed(() => {
-  if (!oem.enabled) {
-    return { logo: 'ID', name: 'IoT-DAQ', sub: 'Edge Gateway', slogan: '让每一条产线数据可信可达' };
+/** 拉取设置视图 + 备份清单并填充表单（real 专用）。 */
+async function loadSettings(): Promise<void> {
+  settingsLoadError.value = '';
+  const result = await repo.settings.get();
+  if (!result.ok || !result.view) {
+    settingsLoadError.value = result.message || '设置读取失败。';
+    return;
   }
-  return {
-    logo: (oem.logo.trim() || oem.name.trim().slice(0, 2) || 'ID').slice(0, 2),
-    name: oem.name.trim() || 'IoT-DAQ',
-    sub: oem.sub.trim() || 'Powered by IoT-DAQ',
-    slogan: oem.slogan.trim() || '让每一条产线数据可信可达',
-  };
-});
+  const view = result.view;
+  suppressDirty = true;
+  configVersion.value = view.configVersion;
+  dataDir.value = view.basic.dataDir;
+  oemInfo.managedBy = view.oem.managedBy;
+  oemInfo.note = view.oem.note;
+  outlets.value = view.network.outlets;
+  mgmtUsers.value = view.security.mgmtUsers;
+  activationCodeSet.value = view.security.activationCodeSet;
+  basicForm.gatewayId = view.basic.gatewayId;
+  storageForm.sqlitePath = view.storage.sqlitePath;
+  storageForm.maxSizeMb = view.storage.maxSizeMb;
+  storageForm.retentionDays = view.storage.retentionDays;
+  securityForm.webAuthEnabled = view.security.webAuthEnabled;
+  securityForm.tlsCertPath = view.security.tlsCertPath;
+  securityForm.tlsKeyPath = view.security.tlsKeyPath;
+  dirty.value = false;
+  void nextTick(() => {
+    suppressDirty = false;
+  });
 
-// ---------------------------------------------------------------------------
-// 配置回滚
-// ---------------------------------------------------------------------------
-
-/** 历史快照。 */
-interface Snapshot {
-  /** 快照编号（版本号） */
-  readonly id: string;
-  /** 生成时间 */
-  readonly at: string;
-  /** 说明 */
-  readonly note: string;
-  /** 操作者 */
-  readonly operator: string;
+  const backupsResult = await repo.settings.backups();
+  if (backupsResult.ok) {
+    backups.value = backupsResult.rows;
+    backupsError.value = '';
+  } else {
+    backups.value = [];
+    backupsError.value = backupsResult.message;
+  }
 }
 
-/** 当前配置版本。 */
-const currentVersion = 'v20260923-1341';
+onMounted(() => {
+  if (API_MODE === 'real') {
+    void loadSettings();
+  }
+});
 
-/** 历史快照列表。 */
-const history: readonly Snapshot[] = [
-  { id: 'v20260923-0200', at: '2026-09-23 02:00', note: '自动备份', operator: 'system' },
-  { id: 'v20260922-1745', at: '2026-09-22 17:45', note: '北向出口参数调整', operator: 'admin' },
-  { id: 'v20260921-1030', at: '2026-09-21 10:30', note: '点位死区批量更新', operator: 'eng01' },
-];
+/** 保存设置：real → PUT /api/settings（三组白名单）；mock → 本机反馈（不下发）。 */
+async function saveSettings(): Promise<void> {
+  if (API_MODE !== 'real') {
+    saved.value = true;
+    dirty.value = false;
+    setTimeout(() => {
+      saved.value = false;
+    }, 1600);
+    return;
+  }
+  saving.value = true;
+  saveResult.value = '';
+  const result = await repo.settings.update({
+    actor: session.state.displayName,
+    basic: { gatewayId: basicForm.gatewayId },
+    storage: {
+      sqlitePath: storageForm.sqlitePath,
+      maxSizeMb: storageForm.maxSizeMb,
+      retentionDays: storageForm.retentionDays,
+    },
+    security: {
+      webAuthEnabled: securityForm.webAuthEnabled,
+      tlsCertPath: securityForm.tlsCertPath,
+      tlsKeyPath: securityForm.tlsKeyPath,
+    },
+  });
+  saving.value = false;
+  saveResult.value = result.ok
+    ? `${result.message}（配置版本 ${result.configVersion ?? '—'} · 写前备份 ${result.backup ?? '—'}）`
+    : result.message;
+  saveResultKind.value = result.ok ? 'ok' : 'warn';
+  if (result.ok) {
+    dirty.value = false;
+    await loadSettings();
+  }
+}
 
-/** 当前角色是否可执行回滚（仅 admin）。 */
+// ---------------------------------------------------------------------------
+// 配置回滚（真实备份清单 + 定向回滚）
+// ---------------------------------------------------------------------------
+
+/** 当前角色是否可执行回滚（仅 admin；后端 device.write / system）。 */
 const canRollback = computed<boolean>(() => session.state.role === 'admin');
 
-/** 回滚确认弹窗状态。 */
+const backups = ref<SettingsBackupRow[]>([]);
+const backupsError = ref('');
+
+/** 备份大小（字节字符串 → 人类可读；解析失败原样展示）。 */
+function formatBytes(sizeBytes: string): string {
+  const n = Number(sizeBytes);
+  if (!Number.isFinite(n) || n < 0) {
+    return sizeBytes;
+  }
+  if (n >= 1024 * 1024) {
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+  if (n >= 1024) {
+    return `${(n / 1024).toFixed(1)} KB`;
+  }
+  return `${n} B`;
+}
+
+/** 备份时刻（epoch 毫秒字符串 → 本地时间文本；非法值原样展示）。 */
+function formatMtime(mtimeMs: string): string {
+  const ms = Number(mtimeMs);
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return '—';
+  }
+  const d = new Date(ms);
+  const p = (v: number): string => String(v).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 回滚确认弹窗状态（file 为空 = 回滚到最新备份）。 */
 const rollback = reactive<{
   open: boolean;
-  snapshotId: string;
+  file: string;
+  confirmValue: string;
   title: string;
   impacts: readonly string[];
   facts: readonly DangerFact[];
 }>({
   open: false,
-  snapshotId: '',
+  file: '',
+  confirmValue: '',
   title: '',
   impacts: [],
   facts: [],
@@ -611,30 +624,32 @@ const ROLLBACK_REASONS: readonly string[] = [
   '其它（请在补充说明中描述）',
 ];
 
-/** 打开回滚二次确认。 */
-function openRollback(snap: Snapshot): void {
+/** 打开回滚二次确认（row 缺省 = 最新备份）。 */
+function openRollback(row?: SettingsBackupRow): void {
+  const latest = backups.value.length ? backups.value[backups.value.length - 1] : undefined;
+  const target = row ?? latest;
+  if (!target) {
+    return;
+  }
   rollback.open = true;
-  rollback.snapshotId = snap.id;
-  rollback.title = `配置回滚 · ${snap.id}`;
+  rollback.file = row?.file ?? '';
+  rollback.confirmValue = target.file;
+  rollback.title = `配置回滚 · ${target.file}`;
   rollback.impacts = [
-    `将把当前配置（${currentVersion}）回滚到快照 ${snap.id}。`,
+    `将把当前配置回滚到备份 ${target.file}${row ? '' : '（最新备份）'}。`,
     '仅回滚配置，不回滚采集数据与设备连接状态。',
-    '回滚后网关可能提示需重启才能完全生效。',
-    '回滚前的当前配置会自动留存一份快照，可再次回滚回来。',
+    '回滚前网关会对当前配置自动再备份（可逆），热重载即时生效。',
+    '操作不可撤销；原因与补充说明将写入审计日志。',
+    '需输入备份文件名后 8 位完成二次校验。',
   ];
   rollback.facts = [
-    { label: '目标快照', value: snap.id },
-    { label: '快照时间', value: snap.at },
-    { label: '快照说明', value: snap.note },
-    { label: '当前版本', value: currentVersion },
+    { label: '目标备份', value: target.file },
+    { label: '备份大小', value: formatBytes(target.sizeBytes) },
+    { label: '备份时刻', value: formatMtime(target.mtimeMs) },
+    { label: '当前版本', value: configVersion.value || '—' },
     { label: '操作者', value: session.state.displayName },
     { label: '执行模式', value: API_MODE === 'real' ? 'real（真实下发网关）' : 'mock（演示，无真实动作）' },
   ];
-}
-
-/** 关闭回滚确认。 */
-function closeRollback(): void {
-  rollback.open = false;
 }
 
 /** 回滚结果反馈（后端结果原样呈现，含失败；不伪造成功）。 */
@@ -642,26 +657,29 @@ const rollbackResult = ref('');
 const rollbackResultKind = ref<'ok' | 'warn'>('ok');
 
 /**
- * 提交回滚：real 调 `repo.settings.rollback`（真实 `POST /api/settings/rollback`，
- * body `{reason}`，不传 backup → 网关回滚到 config 目录内最新 `config.toml.bak-*` 备份）；
- * mock 走模拟并在结果区注明「未产生真实动作」。弹窗四要素（影响清单 + 原因必填 +
- * 快照编号二次校验 + 草稿隔离）由 DangerConfirmModal 契约保证。
+ * 提交回滚：real 调 `repo.settings.rollback`（真实 `POST /api/settings/rollback`；
+ * 定向时 body 带 backup，否则缺省回滚到最新备份）；mock 走模拟并注明「未产生真实动作」。
+ * 弹窗四要素（影响清单 + 原因必填 + 备份文件名二次校验 + 草稿隔离）由 DangerConfirmModal 保证。
  */
 async function submitRollback(payload: { reason: string; note: string; tail: string }): Promise<void> {
   rollback.open = false;
   const result = await repo.settings.rollback({
     actor: session.state.displayName,
     reason: `${payload.reason} · ${payload.note}`,
+    backup: rollback.file || undefined,
   });
-  if (API_MODE === 'real') {
-    rollbackResult.value = result.ok
-      ? `${result.message}${result.restoredFrom ? `（恢复自备份 ${result.restoredFrom}${result.version ? `，配置版本 ${result.version}` : ''}）` : ''}`
-      : `回滚未执行：${result.message}`;
-    rollbackResultKind.value = result.ok ? 'ok' : 'warn';
+  if (API_MODE !== 'real') {
+    rollbackResult.value = `${result.message} —— 演示模式未向网关发出任何回滚指令，配置不变。`;
+    rollbackResultKind.value = 'warn';
     return;
   }
-  rollbackResult.value = `${result.message} —— 演示模式未向网关发出任何回滚指令，配置不变。`;
-  rollbackResultKind.value = 'warn';
+  rollbackResult.value = result.ok
+    ? `${result.message}${result.restoredFrom ? `（恢复自备份 ${result.restoredFrom}${result.version ? `，配置版本 ${result.version}` : ''}）` : ''}`
+    : `回滚未执行：${result.message}`;
+  rollbackResultKind.value = result.ok ? 'ok' : 'warn';
+  if (result.ok) {
+    await loadSettings();
+  }
 }
 </script>
 
@@ -671,8 +689,8 @@ async function submitRollback(payload: { reason: string; note: string; tail: str
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px 16px;
 }
-.wc-form.is-off {
-  opacity: 0.55;
+.wc-form--single {
+  grid-template-columns: 1fr;
 }
 .wc-note--warn .wc-note__icon {
   color: var(--warn);
@@ -740,85 +758,43 @@ async function submitRollback(payload: { reason: string; note: string; tail: str
   color: var(--text-2);
 }
 
-/* OEM 实时预览（原型 .oem-pv） */
-.oem-pv {
-  margin-top: 12px;
-  padding: 16px 18px;
-  border: 1px dashed var(--brand);
-  border-radius: var(--radius);
-  background: linear-gradient(135deg, var(--brand-subtle), transparent 70%), var(--bg-hover);
-}
-.oem-pv__brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-}
-.oem-pv__logo {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  background: var(--brand);
-  color: #fff;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: var(--fs-body);
-  font-weight: 700;
-}
-.oem-pv__txt b {
-  display: block;
-  font-size: var(--fs-body);
-  line-height: 1.2;
-}
-.oem-pv__txt span {
-  display: block;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  letter-spacing: 0.04em;
-}
-.oem-pv__slogan {
+/* 回滚到最新备份按钮 */
+.st-latest-btn {
   margin-top: 10px;
-  font-size: var(--fs-caption);
-  color: var(--text-2);
-}
-.oem-pv__cap {
-  margin-top: 10px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
 }
 
-/* 磁盘占用条 */
-.st-prog {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 12px;
-}
-.st-prog__label {
+/* 北向出口只读表（token 化） */
+.st-outlets {
+  width: 100%;
+  border-collapse: collapse;
   font-size: var(--fs-caption);
+}
+.st-outlets th,
+.st-outlets td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--divider);
+  white-space: nowrap;
+}
+.st-outlets th {
   color: var(--text-3);
+  font-weight: 600;
 }
-.st-prog .wc-bar {
-  flex: 1 1 auto;
-  max-width: 240px;
-}
-.st-prog__num {
-  font-size: var(--fs-caption);
-  color: var(--text-2);
+.st-outlets tbody tr:hover {
+  background: var(--bg-hover);
 }
 
-.pt-dd-hint {
-  margin-left: 8px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
+/* 管理用户标签间距 */
+.st-user-tag {
+  margin-right: 6px;
 }
 
-/* 回滚结果反馈（token 化，与 StartupPage 结果区同一口径） */
-.st-rollback-result {
+/* 操作结果反馈（保存 / 回滚共用，token 化） */
+.st-result {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  margin-top: 12px;
+  margin: 12px 0;
   padding: 10px 12px;
   border-radius: var(--radius-sm);
   font-size: var(--fs-caption);
@@ -827,9 +803,15 @@ async function submitRollback(payload: { reason: string; note: string; tail: str
   background: var(--ok-bg);
   color: var(--ok-fg);
 }
-.st-rollback-result.is-warn {
+.st-result.is-warn {
   border-color: var(--warn-border);
   background: var(--warn-bg);
   color: var(--warn-fg);
+}
+
+.pt-dd-hint {
+  margin-left: 8px;
+  font-size: var(--fs-caption);
+  color: var(--text-3);
 }
 </style>

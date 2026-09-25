@@ -9,10 +9,10 @@
       · 「立即重启服务」走 ui-kit `DangerConfirmModal`：影响清单 + 原因必填（枚举 + 补充说明）+
         **服务名二次校验**；real 模式调真实 `POST /api/ops/restart`，body `{actor, confirm, reason}`，
         `confirm` 由页面自动回显网关标识（/api/overview 的 `name` = gateway_id）；
-      · 「停止服务（不自动启动）」同样走该弹窗并追加**服务名二次校验**；
-        后端当前未提供停止端点（实测 POST /api/ops/stop → 404），确认后诚实告知并给宿主机命令；
-      · 确认后的动作：mock 模式执行既有演示行为（`repo.ops.restart`），结果区标注「未产生真实动作」；
-        real 模式后端返回的结果（含 403 / 400 confirm_mismatch）原样呈现。
+      · 「停止服务（不自动启动）」走同一弹窗并追加**服务名二次校验**；real 模式调真实
+        `POST /api/ops/stop`（契约与 restart 一致，200 mode=graceful_stop——优雅停机，
+        是否拉起由 Supervisor 决定）；mock 模式模拟并注明「未产生真实动作」；
+      · 确认后的动作：后端返回的结果（含 403 / 400 confirm_mismatch）原样呈现。
 
     其它硬性约定：
       · 部署形态「自动识别」：二者并列展示并高亮当前形态，绝不让用户手动二选一；
@@ -313,7 +313,8 @@ systemctl enable --now {{ runtime.native.serviceName }}</pre>
  * @description 启动与自启：部署形态识别 / 启动策略 / 计划重启 / 高危运维动作。
  *
  * 危险动作一律经 `DangerConfirmModal`（影响清单 + 原因必填 + 服务名二次校验），
- * 确认后：mock 走既有演示行为并在结果区注明「未产生真实动作」；real 调用 `repo.ops.restart`。
+ * 确认后：mock 走演示行为并在结果区注明「未产生真实动作」；real 调用 `repo.ops.restart`
+ * / `repo.ops.stop`（body {actor, confirm, reason}，confirm 自动回显网关标识）。
  * 未实现的能力（计划重启、异常重启计数）一律显式留空说明，**不给假数据**。
  */
 import { computed, reactive, ref } from 'vue';
@@ -507,15 +508,16 @@ function openRestart(): void {
 function openStop(): void {
   stopModal.impacts = [
     '北向转发立即中断，客户 Broker 不再收到数据。',
-    '本地采集也会停止；服务不会自动重新启动（除非再次手动启动）。',
-    '重启主机时若开机自启开启，服务仍会被拉起。',
-    '需输入服务名 ' + SERVICE_KEY + ' 完成二次校验。',
+    '本地采集也会停止；停机为优雅停机（先 flush 队列再退出）。',
+    '是否再次拉起由 Supervisor / 服务管理器决定（本端点不承诺自动重启）。',
+    '操作不可撤销；需输入服务名 ' + SERVICE_KEY + ' 完成二次校验。',
   ];
   stopModal.facts = [
     { label: '作用对象', value: unitName.value },
+    { label: '网关标识', value: gateway.value.name },
     { label: '部署形态', value: formCn.value },
     { label: '操作者', value: session.state.displayName },
-    { label: '后端端点', value: '未提供（本次不会下发停止指令）' },
+    { label: '执行模式', value: API_MODE === 'real' ? 'real（真实下发网关）' : 'mock（演示，无真实动作）' },
   ];
   stopModal.open = true;
 }
@@ -541,18 +543,32 @@ async function confirmRestart(payload: { reason: string; note: string }): Promis
   note(`${result.message} ${tail} —— 演示模式未向网关发出任何重启信号，服务状态不变。`, 'warn');
 }
 
-/** 确认停止：后端无停止端点，因此诚实告知「仅记下意图 + 给宿主机命令」，不假装已停止。 */
-function confirmStop(payload: { reason: string; note: string }): void {
+/**
+ * 确认停止：real 走 `repo.ops.stop`（真实 `POST /api/ops/stop`，契约与 restart 一致——
+ * body `{actor, confirm, reason}`，confirm 回显 gateway_id；200 mode=graceful_stop，
+ * 后端 note 已说明是否拉起由 Supervisor 决定）；mock 模式模拟并诚实注明「未产生真实动作」。
+ */
+async function confirmStop(payload: { reason: string; note: string }): Promise<void> {
   stopModal.open = false;
-  const cmd =
-    detectedForm.value === 'docker'
-      ? `docker compose -f ${runtime.docker.composeFile} stop`
-      : `systemctl stop ${runtime.native.serviceName}`;
-  note(
-    `已记录停止意图并通过二次校验（原因：${payload.reason} · ${payload.note}）。` +
-      `网关当前未提供停止服务端点，因此【未执行任何真实动作】，服务仍在运行 —— 请在宿主机执行：${cmd}`,
-    'warn',
-  );
+  const tail = `原因：${payload.reason} · ${payload.note}`;
+  if (API_MODE !== 'real') {
+    const cmd =
+      detectedForm.value === 'docker'
+        ? `docker compose -f ${runtime.docker.composeFile} stop`
+        : `systemctl stop ${runtime.native.serviceName}`;
+    note(
+      `已记录停止意图并通过二次校验（${tail}）。` +
+        `演示模式未向网关发出任何停止信号，服务仍在运行 —— 现场请执行：${cmd}`,
+      'warn',
+    );
+    return;
+  }
+  const result = await repo.ops.stop({
+    actor: session.state.displayName,
+    confirm: gateway.value.name,
+    reason: `${payload.reason} · ${payload.note}`,
+  });
+  note(result.ok ? `${result.message} ${tail}` : `停止未成功：${result.message} ${tail}`, result.ok ? 'ok' : 'warn');
 }
 </script>
 
