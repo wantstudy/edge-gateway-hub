@@ -481,6 +481,18 @@ async fn main() -> ExitCode {
         config.outlets.len(),
     );
 
+    // ②-b 授权生产装配（task 22/23 上岗；在 config 被 MgmtState 取走之前完成）。
+    //     读 [gateway.licensing]——
+    //     - 未配置（无 cloud_url 且无 activation_code）→ 行为与既往完全一致；
+    //     - 已配置 → 构造 MachineIdentity + 设备签名密钥 + LicensingClient +
+    //       LicenseRuntimeConfig，走 with_license_runtime 上岗；
+    //     - 装配失败 → fail-closed：daemon 照常启动（本地采集不受影响），北向闸门
+    //       保持关闭，可解释原因（含恢复路径）落入共享态。
+    let licensing_outcome = daemon::auth::assembly::assemble_production(
+        &config.gateway.licensing,
+        &config.gateway.data_dir,
+    );
+
     // ③ 共享状态 + 管理面：与 bootstrap 共用同一 DaemonShared（状态/热重载/事件）。
     let shared = DaemonShared::default();
     shared.set_config(Arc::new(ConfigShared::new(config.clone())));
@@ -504,11 +516,26 @@ async fn main() -> ExitCode {
     });
 
     // ④ bootstrap 全权接管：信号处理 / 热重载 / 调度 / 看门狗 / 优雅停机。
-    match BootstrapBuilder::new(&args.config_path)
-        .with_shared(shared)
-        .run()
-        .await
-    {
+    let mut builder = BootstrapBuilder::new(&args.config_path).with_shared(shared);
+    match licensing_outcome {
+        daemon::auth::assembly::AssemblyOutcome::Assembled(rt_cfg) => {
+            eprintln!(
+                "[iot-daq-daemon] 授权运行期装配完成（cloud={}，心跳 {}s）",
+                rt_cfg.cloud_url.as_deref().unwrap_or(""),
+                rt_cfg.heartbeat_interval.as_secs(),
+            );
+            builder = builder.with_license_runtime(rt_cfg);
+        }
+        daemon::auth::assembly::AssemblyOutcome::NotConfigured => {
+            eprintln!("[iot-daq-daemon] 未配置云授权（[gateway.licensing]），授权编排跳过");
+        }
+        daemon::auth::assembly::AssemblyOutcome::Failed(reason) => {
+            // reason 只含环境变量名 / 路径 / 数量——激活码与密钥材料绝不进日志。
+            eprintln!("[iot-daq-daemon] [ERROR] 授权装配失败（fail-closed）：{reason}");
+            builder = builder.with_license_assembly_failed(reason);
+        }
+    }
+    match builder.run().await {
         Ok(_shared) => {
             eprintln!("[iot-daq-daemon] 已优雅停机");
             ExitCode::SUCCESS

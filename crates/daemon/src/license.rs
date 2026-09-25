@@ -110,6 +110,10 @@ pub struct LicenseRuntimeConfig {
     pub data_dir: PathBuf,
     /// 激活码（**不得硬编码**；装配方从 env `IOTDAQ_ACTIVATION_CODE` 或 UI 注入）。
     pub activation_code: Option<String>,
+    /// 试用到期审计（task 23 接线：`Trial` → `Degraded` 跃迁时记录
+    /// [`crate::audit::AuditEventType::TrialExpired`]；`None` = 审计缺席容忍。
+    /// bootstrap 在装配期从 `DaemonShared::audit_logger()` 挂载）。
+    pub audit: Option<Arc<crate::audit::AuditLogger>>,
     /// 可注入时间源（Unix 毫秒）；生产传墙钟，测试传虚拟时钟。
     pub now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -126,6 +130,7 @@ impl LicenseRuntimeConfig {
             tick: DEFAULT_TICK,
             data_dir: data_dir.into(),
             activation_code: None,
+            audit: None,
             now_ms: Arc::new(wall_clock_ms),
         }
     }
@@ -449,9 +454,28 @@ impl LicenseRuntime {
             TrialVerdict::Active { expires_at_ms } => self.transition(LicenseState::Trial {
                 days_left: Self::days_left_ceil(expires_at_ms, now),
             }),
-            TrialVerdict::ExpiredDegrade => self.transition(LicenseState::Degraded {
-                reason: "trial marker invalid or expired (fail-closed)".to_string(),
-            }),
+            TrialVerdict::ExpiredDegrade => {
+                self.transition(LicenseState::Degraded {
+                    reason: "trial marker invalid or expired (fail-closed)".to_string(),
+                });
+                self.audit_trial_expired("trial marker invalid or expired (fail-closed)");
+            }
+        }
+    }
+
+    /// 试用到期降级的审计接线（task 23 最小一行）：经注入的
+    /// [`crate::audit::AuditLogger`]（`Option` 容忍缺席）记录 `TrialExpired`；
+    /// 审计失败只 warn，**绝不阻断授权状态机**（「降级 ≠ 停用」同样适用于审计）。
+    fn audit_trial_expired(&self, reason: &str) {
+        if let Some(logger) = &self.cfg.audit {
+            if let Err(err) = logger.record(
+                "license-runtime",
+                crate::audit::AuditEventType::TrialExpired,
+                "degraded",
+                reason,
+            ) {
+                warn!(error = %err, "license runtime: trial-expired audit record failed");
+            }
         }
     }
 
@@ -605,15 +629,19 @@ impl LicenseRuntime {
                     self.transition(LicenseState::Degraded {
                         reason: "trial expired".to_string(),
                     });
+                    self.audit_trial_expired("trial expired");
                 } else {
                     self.renew_marker_from_disk(now, RENEW_INTERVAL_MS);
                     self.transition(LicenseState::Trial { days_left });
                 }
             }
             // 标记损坏 / 到期 / 被篡改 ⇒ fail-closed 降级（绝不重置为 3 天）。
-            TrialVerdict::ExpiredDegrade => self.transition(LicenseState::Degraded {
-                reason: "trial expired or marker invalid (fail-closed)".to_string(),
-            }),
+            TrialVerdict::ExpiredDegrade => {
+                self.transition(LicenseState::Degraded {
+                    reason: "trial expired or marker invalid (fail-closed)".to_string(),
+                });
+                self.audit_trial_expired("trial expired or marker invalid (fail-closed)");
+            }
             // 传入 Some 标记时不会返回 Fresh；防御式保持现状。
             TrialVerdict::Fresh { .. } => {}
         }

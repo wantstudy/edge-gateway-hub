@@ -5,6 +5,7 @@
 //!
 //! 后续任务填充：授权状态机与本地租约校验（Wave 6）。
 
+pub mod assembly;
 pub mod client;
 pub mod clock;
 pub mod keyprovider;

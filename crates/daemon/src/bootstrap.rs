@@ -54,7 +54,7 @@ use tracing::{error, info, warn};
 use crate::config::{ConfigHotReloader, ConfigShared, GatewayConfig, ReloadGate};
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
-use crate::license::{LicenseRuntime, LicenseRuntimeConfig};
+use crate::license::{LicenseRuntime, LicenseRuntimeConfig, LICENSE_RECOVERY_HINT};
 use crate::north::runtime::{NorthForwardGate, NorthRuntime, NorthRuntimeConfig};
 use crate::ota::OtaBootDecision;
 use crate::scheduler::{GroupConfig, GroupScheduler, PollHandler, RunningScheduler};
@@ -125,6 +125,12 @@ struct DaemonSharedInner {
     /// 采集侧 / mgmt / 测试据此在运行期读取授权状态（[`LicenseRuntime::state`]）与
     /// 北向转发判据（[`LicenseRuntime::north_forward_allowed`]）。
     license: RwLock<Option<Arc<LicenseRuntime>>>,
+    /// 授权装配失败原因（fail-closed 装配；`None` = 装配成功 / 未配置授权）。
+    ///
+    /// 生产 bin 在 [`crate::auth::assembly::assemble_production`] 返回 `Failed` 时
+    /// 经 `BootstrapBuilder::with_license_assembly_failed` 传入；run 据此关闭北向
+    /// 闸门并把可解释原因（含恢复路径）落到共享态供 mgmt / 诊断读取。
+    license_assembly_error: RwLock<Option<String>>,
     /// 安全审计记录器（task 26 最小接线；`None` = 未挂载，mgmt 审计端点 503）。
     audit: RwLock<Option<Arc<crate::audit::AuditLogger>>>,
 }
@@ -154,6 +160,7 @@ impl DaemonShared {
                 shutdown_timed_out: AtomicBool::new(false),
                 north: RwLock::new(None),
                 license: RwLock::new(None),
+                license_assembly_error: RwLock::new(None),
                 audit: RwLock::new(None),
             }),
         }
@@ -308,6 +315,26 @@ impl DaemonShared {
             .clone()
     }
 
+    /// 记录授权装配失败原因（fail-closed 装配；run 内调用一次，重复调用覆盖旧值）。
+    pub fn set_license_assembly_error(&self, reason: String) {
+        let mut guard = self
+            .inner
+            .license_assembly_error
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(reason);
+    }
+
+    /// 授权装配失败原因（`None` = 装配成功 / 未配置授权；mgmt / 诊断据此解释
+    /// 「为何授权运行期缺席且北向被闸门关闭」）。
+    pub fn license_assembly_error(&self) -> Option<String> {
+        self.inner
+            .license_assembly_error
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// 挂载安全审计记录器（task 26 最小接线；bootstrap 装配期调用一次）。
     ///
     /// 照 [`Self::set_license_runtime`] 的「注入后只读共享」范式：
@@ -352,6 +379,10 @@ impl std::fmt::Debug for DaemonShared {
             .field(
                 "license_state",
                 &self.license_runtime().map(|rt| rt.state().name()),
+            )
+            .field(
+                "license_assembly_error",
+                &self.license_assembly_error().is_some(),
             )
             .finish()
     }
@@ -406,6 +437,8 @@ pub struct BootstrapBuilder {
     north: Option<NorthRuntimeConfig>,
     /// 授权运行期装配输入（task 22/23/24；`None` = 未接线，跳过授权编排）。
     license: Option<LicenseRuntimeConfig>,
+    /// 授权装配失败原因（生产 bin 装配失败时传入；`None` = 正常）。
+    license_assembly_failed: Option<String>,
     /// 安全审计记录器（task 26；`None` = run 内按默认路径 audit.db 自建）。
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
 }
@@ -428,6 +461,7 @@ impl BootstrapBuilder {
             ota_boot_check: None,
             north: None,
             license: None,
+            license_assembly_failed: None,
             audit_logger: None,
         }
     }
@@ -514,6 +548,19 @@ impl BootstrapBuilder {
         self
     }
 
+    /// 注入授权装配失败原因（task 22/23 bootstrap 生产装配的 fail-closed 分支）。
+    ///
+    /// 生产 bin 在 [`crate::auth::assembly::assemble_production`] 返回 `Failed`
+    /// （指纹 key 缺失 / 锚点 quorum 不足 / 设备密钥持久化失败等）时调用：
+    /// daemon 照常启动（本地采集不受影响），但 run 会 ① 把原因落入
+    /// [`DaemonShared::license_assembly_error`]；② 北向出口挂
+    /// [`AssemblyFailedGate`]（恒拒绝 + 恢复路径）。与 `with_license_runtime`
+    /// 同时注入时以运行期为准并忽略本标记（warn）。
+    pub fn with_license_assembly_failed(mut self, reason: impl Into<String>) -> Self {
+        self.license_assembly_failed = Some(reason.into());
+        self
+    }
+
     /// 注入离线队列 flush 钩子（缺省 no-op + TODO，见模块注释限制 3）。
     pub fn with_offline_flusher(mut self, hook: StopHook) -> Self {
         self.offline_flusher = Some(hook);
@@ -583,7 +630,10 @@ impl BootstrapBuilder {
         //     确定初始状态（Trial / Licensed / Degraded）；随后 step 循环照常由
         //     [`LicenseRuntime::spawn`] 驱动。未注入时跳过（行为与既往一致）。
         let license_runtime: Option<Arc<LicenseRuntime>> = match self.license.take() {
-            Some(cfg) => {
+            Some(mut cfg) => {
+                // 试用到期审计接线（task 23）：把共享态审计器挂进运行期配置
+                //（①-a2 已挂载 → 此处可取；缺席容忍，`Option` 透传）。
+                cfg.audit = shared.audit_logger();
                 let runtime = Arc::new(LicenseRuntime::new(cfg));
                 // 装配期步进一次：启动阶段（试用判定）+ 激活恢复 + 心跳/倒计时，
                 // 让后续的配额闸门读到真实初始状态而非占位 Unlicensed。
@@ -601,6 +651,26 @@ impl BootstrapBuilder {
                 None
             }
         };
+
+        // ①-c2 授权装配失败（fail-closed，可解释）：运行期缺席时把原因落共享态。
+        //     daemon 照常启动（本地采集不受影响）；北向闸门在 ④ 关闭（见下）。
+        if let Some(reason) = self.license_assembly_failed.take() {
+            if license_runtime.is_some() {
+                warn!(
+                    "bootstrap: license assembly failure reported but a license runtime was \
+                     injected; ignoring the assembly-failure flag (runtime takes precedence)"
+                );
+            } else {
+                error!(
+                    reason = %reason,
+                    "bootstrap: [ERROR] license assembly failed; license runtime NOT started \
+                     and northbound forwarding stays closed until the cause is fixed and the \
+                     daemon restarts (local capture is unaffected; northbound resumes \
+                     automatically after license activation — {LICENSE_RECOVERY_HINT})"
+                );
+                shared.set_license_assembly_error(reason);
+            }
+        }
 
         // ② 配置热重载：初始加载失败直接返回错误（绝不静默空配置）。
         //     热重载准入闸门（免费版配额，fail-closed）：Degraded 期间设备数 /
@@ -692,8 +762,18 @@ impl BootstrapBuilder {
             Some(mut cfg) => {
                 // 北向转发授权闸门：把授权状态真相源接到每个出口的驱动任务
                 //（Degraded / Unlicensed ⇒ 跳过发送；恢复后下一拍自动继续）。
+                // 授权装配失败（运行期缺席）时挂 AssemblyFailedGate：恒拒绝 +
+                // 装配原因与恢复路径（fail-closed：装配失败绝不等价于「无闸门恒放行」）。
                 if let Some(license) = &license_runtime {
                     cfg.set_gate(Arc::clone(license) as Arc<dyn NorthForwardGate>);
+                } else if let Some(reason) = shared.license_assembly_error() {
+                    cfg.set_gate(
+                        Arc::new(AssemblyFailedGate { reason }) as Arc<dyn NorthForwardGate>
+                    );
+                    warn!(
+                        "bootstrap: north runtime wired with the license assembly-failure \
+                         deny gate (northbound stays closed)"
+                    );
                 }
                 let snapshot = config_shared.snapshot();
                 let runtime = Arc::new(NorthRuntime::start(
@@ -990,6 +1070,31 @@ async fn wait_for_signal(shared: &DaemonShared) {
             }
             _ = shutdown_rx.changed() => {}
         }
+    }
+}
+
+/// 授权装配失败期间的北向闸门（恒拒绝；`deny_reason` 携带装配原因与恢复路径）。
+///
+/// 语义对齐 [`crate::license::LicenseRuntime`] 的闸门实现：装配失败 ≠「无闸门」，
+/// 北向必须保持关闭（Unlicensed），本地采集不受影响；修复装配原因并重启、
+/// 激活成功后北向自动恢复。
+struct AssemblyFailedGate {
+    /// 装配失败原因（已含可解释上下文，来自 [`crate::auth::assembly::AssemblyOutcome::Failed`]）。
+    reason: String,
+}
+
+impl NorthForwardGate for AssemblyFailedGate {
+    fn north_forward_allowed(&self) -> bool {
+        false
+    }
+
+    fn deny_reason(&self) -> Option<String> {
+        Some(format!(
+            "license assembly failed: {reason}; northbound forwarding is suspended, local \
+             capture continues; fix the cause and restart — northbound resumes automatically \
+             after license activation ({LICENSE_RECOVERY_HINT})",
+            reason = self.reason
+        ))
     }
 }
 
