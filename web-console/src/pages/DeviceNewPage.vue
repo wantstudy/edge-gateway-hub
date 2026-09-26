@@ -15,9 +15,9 @@
       · 提交只把配置交给 `repo.createDevice`（内存态 + 写审计），授权判定一律在网关侧。
   -->
   <PageHeader
-    crumb="接入 / 新增设备"
-    title="新增设备"
-    desc="单页四步：选设备类型 → 填连接参数 → 配点表映射 → 测试并保存。连接参数字段随协议整块替换；「下一步」不落库，最后一步才保存。"
+    :crumb="pageCrumb"
+    :title="pageTitle"
+    :desc="pageDescription"
   >
     <template #actions>
       <button type="button" class="wc-btn" @click="go('devices')">返回设备列表</button>
@@ -25,27 +25,40 @@
   </PageHeader>
 
   <div class="wc-content">
-    <!-- 步骤指示器：已到达的步骤可点回退，未到达的锁定 -->
-    <div class="wc-card">
-      <ol class="dv-steps">
-        <li
-          v-for="(step, i) in STEPS"
-          :key="step"
-          class="dv-steps__item"
-          :class="{
-            'is-on': currentStep === i + 1,
-            'is-done': currentStep > i + 1,
-            'is-clickable': i + 1 <= maxReached,
-            'is-lock': i + 1 > maxReached,
-          }"
-          :role="i + 1 <= maxReached ? 'button' : undefined"
-          :tabindex="i + 1 <= maxReached ? 0 : undefined"
-          @click="gotoStep(i + 1)"
-        >
-          <span class="dv-steps__num">{{ i + 1 < currentStep ? '✓' : i + 1 }}</span>
-          <span class="dv-steps__label">{{ step }}</span>
-        </li>
-      </ol>
+    <!-- 编辑态但设备不存在：诚实空态（不静默降级成新增） -->
+    <div v-if="isEdit && !editDevice" class="wc-banner wc-banner--danger">
+      <span aria-hidden="true">!</span>
+      <span>未找到设备「{{ editId }}」，可能已被删除或设备标识有误。</span>
+      <span class="wc-banner__ops">
+        <button type="button" class="wc-btn wc-btn--sm" @click="go('devices')">返回设备列表</button>
+      </span>
+    </div>
+
+    <template v-else>
+    <!-- 步骤指示器：已到达的步骤可点回退，未到达的锁定（原型 wizardBar :1203 / .wz 样式 :531） -->
+    <div class="wc-card dv-wz">
+      <div class="dv-wz__row">
+        <template v-for="(step, i) in STEPS" :key="step">
+          <div
+            class="dv-wz__item"
+            :class="{
+              'is-run': currentStep === i + 1,
+              'is-done': currentStep > i + 1,
+              'is-clickable': i + 1 <= maxReached,
+              'is-lock': i + 1 > maxReached,
+            }"
+            :role="i + 1 <= maxReached ? 'button' : undefined"
+            :tabindex="i + 1 <= maxReached ? 0 : undefined"
+            @click="gotoStep(i + 1)"
+            @keydown.enter.prevent="gotoStep(i + 1)"
+            @keydown.space.prevent="gotoStep(i + 1)"
+          >
+            <span class="dv-wz__num" aria-hidden="true">{{ currentStep > i + 1 ? '✓' : i + 1 }}</span>
+            <span class="dv-wz__label">{{ step }}</span>
+          </div>
+          <span v-if="i < STEPS.length - 1" class="dv-wz__line" aria-hidden="true" />
+        </template>
+      </div>
     </div>
 
     <!-- 步骤上下文：当前设备类型 + 回到第 1 步改类型（原型 :1546-1549） -->
@@ -123,9 +136,31 @@
     <section v-show="currentStep === 2" class="wc-card">
       <div class="wc-card__head">
         <h3>② 连接参数</h3>
-        <span class="wc-card__sub">{{ protocolLabel }} · 共 {{ currentProtoFields.length }} 个字段</span>
+        <span v-if="isEdit && !protocolChanged" class="wc-card__sub">沿用设备记录中的连接参数</span>
+        <span v-else class="wc-card__sub">{{ protocolLabel }} · 共 {{ currentProtoFields.length }} 个字段</span>
       </div>
       <div class="wc-card__body">
+        <!--
+          编辑态且未改协议：`GET /api/devices` 只回传连接摘要，不包含逐字段连接参数。
+          此处如实按摘要展示已知信息，不摆一排空输入框假装「已回显」。
+        -->
+        <template v-if="isEdit && !protocolChanged">
+          <dl class="wc-kv">
+            <dt>设备名称</dt>
+            <dd>{{ editDevice?.name ?? '—' }}</dd>
+            <dt>协议</dt>
+            <dd><span class="wc-tag wc-tag--info">{{ protocolLabel }}</span></dd>
+            <dt>连接摘要</dt>
+            <dd class="wc-mono">{{ editDevice?.connectionSummary || '—' }}</dd>
+            <dt>采集频率</dt>
+            <dd class="wc-mono">{{ intervalMs }} ms</dd>
+          </dl>
+          <p class="wc-note">
+            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+            <span>连接参数以设备记录中的摘要为准；本页编辑更新设备名称与协议，连接参数保持不变。</span>
+          </p>
+        </template>
+        <template v-else>
         <div v-if="protocol === ''" class="wc-note">
           <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
           <span>请回到第 1 步选择设备类型。</span>
@@ -163,6 +198,7 @@
           <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
           <span>「下一步」不落库，第 4 步才一次性保存；已填的值在步骤间来回切换<b>不会丢</b>。</span>
         </p>
+        </template>
       </div>
     </section>
 
@@ -282,8 +318,8 @@
                 <UiInput v-model="name" placeholder="如 5#注塑机" />
               </UiField>
 
-              <UiField label="设备 ID" hint="默认取当前时间戳字符串，可更改；设备 ID 是北向报文里 device_mid 的取值">
-                <UiInput v-model="deviceId" class="wc-mono" />
+              <UiField label="设备 ID" :hint="isEdit ? '设备 ID 是北向报文里 device_mid 的取值，编辑时不可更改' : '默认取当前时间戳字符串，可更改；设备 ID 是北向报文里 device_mid 的取值'">
+                <UiInput v-model="deviceId" class="wc-mono" :disabled="isEdit" />
               </UiField>
 
               <UiField
@@ -314,7 +350,7 @@
                 label="变更原因"
                 required
                 full
-                hint="写入审计日志。新增设备属配置变更，必须留痕。"
+                :hint="isEdit ? '写入审计日志。编辑设备属配置变更，必须留痕。' : '写入审计日志。新增设备属配置变更，必须留痕。'"
                 :error="saveTouched && !reasonValid ? '必填，请说明本次接入背景（≥ 4 字）' : ''"
               >
                 <UiInput v-model="changeReason" placeholder="例：5# 机新接入，按厂家点表配置" />
@@ -347,7 +383,8 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>最后一步：核对后保存</h3>
-          <span class="wc-card__sub">未勾选则「保存并开始采集」不可点</span>
+          <span v-if="isEdit && !protocolChanged" class="wc-card__sub">未改协议，无需重新核对点表</span>
+          <span v-else class="wc-card__sub">未勾选则「{{ isEdit ? '保存修改' : '保存并开始采集' }}」不可点</span>
         </div>
         <div class="wc-card__body">
           <div class="dv-confirm">
@@ -373,18 +410,21 @@
       <span>{{ createdNote }}</span>
       <span class="wc-banner__ops">
         <button type="button" class="wc-btn wc-btn--sm" @click="go('devices')">查看设备列表</button>
-        <button type="button" class="wc-btn wc-btn--sm" @click="go('points')">去点位与映射</button>
-        <button type="button" class="wc-btn wc-btn--sm" @click="resetWizard">继续新增</button>
+        <button v-if="!isEdit" type="button" class="wc-btn wc-btn--sm" @click="go('points')">去点位与映射</button>
+        <button v-if="!isEdit" type="button" class="wc-btn wc-btn--sm" @click="resetWizard">继续新增</button>
       </span>
     </div>
 
     <!-- 底部操作条（原型 actbar :1634-1645） -->
     <div class="dv-foot dv-foot--bar">
-      <RoleGate :allowed="canWrite" mode="disable" fallback-label="仅工程师及以上可新增">
+      <RoleGate :allowed="canWrite" mode="disable" :fallback-label="isEdit ? '仅工程师及以上可编辑' : '仅工程师及以上可新增'">
         <div class="dv-foot__ops">
           <span class="dv-foot__txt">
             第 <b>{{ currentStep }}</b> / {{ STEPS.length }} 步 · {{ STEPS[currentStep - 1] }}
-            <span v-if="currentStep === 4 && !canSaveAndStart" class="dv-foot__warn">
+            <span v-if="isEdit && currentStep === 4 && !canSubmitEdit" class="dv-foot__warn">
+              需完成设备名称 + 变更原因{{ protocolChanged ? '，并勾选「我已逐点核对地址与字节序」' : '' }}才能保存修改
+            </span>
+            <span v-else-if="!isEdit && currentStep === 4 && !canSaveAndStart" class="dv-foot__warn">
               需完成名称 + 变更原因，并勾选「我已逐点核对地址与字节序」才能保存并开始采集
             </span>
           </span>
@@ -392,6 +432,16 @@
           <button type="button" class="wc-btn" :disabled="currentStep === 1" @click="prev">上一步</button>
           <button v-if="currentStep < 4" type="button" class="wc-btn wc-btn--primary" :disabled="!stepValid" @click="next">
             下一步
+          </button>
+          <button
+            v-else-if="isEdit"
+            type="button"
+            class="wc-btn wc-btn--primary"
+            data-test="device-save-edit"
+            :disabled="!canSubmitEdit || !!createdName"
+            @click="submit('saveAndStart')"
+          >
+            保存修改
           </button>
           <template v-else>
             <button type="button" class="wc-btn" :disabled="!nameValid" @click="submit('save')">
@@ -409,6 +459,7 @@
         </div>
       </RoleGate>
     </div>
+    </template>
   </div>
 </template>
 
@@ -426,7 +477,7 @@
  * · 提交只把配置交给 `repo.createDevice`，写失败时如实呈现原因。
  */
 import { computed, reactive, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import {
   PageHeader,
   UiField,
@@ -444,13 +495,49 @@ import {
   BYTE_ORDER_OPTIONS,
   type ProtocolType,
   type DeviceDraft,
+  type DeviceRecord,
 } from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();
+const route = useRoute();
 
 /** 步骤标题（原型 WZ_NAMES :1204）。 */
 const STEPS = ['选择设备类型', '连接参数', '点表映射', '测试并保存'] as const;
+
+// ---------------------------------------------------------------------------
+// 编辑态（`/device-new?device=<id>`，设备列表「编辑」入口）
+// ---------------------------------------------------------------------------
+
+/** 路由 query 中的设备 id（空串 = 新增模式）。 */
+const editId = computed<string>(() => {
+  const raw = route.query.device;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === 'string' ? value.trim() : '';
+});
+
+/** 是否处于编辑态。 */
+const isEdit = computed(() => editId.value !== '');
+
+/** 编辑态设备记录（`repo.getDevice`）；查不到时为 `null`，页面给出诚实空态。 */
+const editDevice = ref<DeviceRecord | null>(null);
+
+/** 进入编辑态时的原始协议（用于判断用户是否改了协议 —— 改协议等于点表失效）。 */
+const originalProtocol = ref<ProtocolType | ''>('');
+
+/** 用户是否改过协议。 */
+const protocolChanged = computed(
+  () => isEdit.value && protocol.value !== '' && protocol.value !== originalProtocol.value,
+);
+
+/** 页面头部（新增 / 编辑两态）。 */
+const pageCrumb = computed(() => (isEdit.value ? '接入 / 编辑设备' : '接入 / 新增设备'));
+const pageTitle = computed(() => (isEdit.value ? '编辑设备' : '新增设备'));
+const pageDescription = computed(() =>
+  isEdit.value
+    ? `正在编辑「${editDevice.value?.name ?? editId.value}」：可修改设备名称与协议；改协议后需重新核对点表。`
+    : '单页四步：选设备类型 → 填连接参数 → 配点表映射 → 测试并保存。连接参数字段随协议整块替换；「下一步」不落库，最后一步才保存。',
+);
 
 // ---------------------------------------------------------------------------
 // 协议元数据（原型 PROTOCOLS :766-809 / PROTO_KEY_FIELD :906-909）
@@ -799,6 +886,51 @@ const saveTouched = ref(false);
 const createdName = ref('');
 const createdNote = ref('');
 
+/**
+ * 编辑态回填：读取设备记录并填充**可回填字段**。
+ *
+ * 诚实边界：`GET /api/devices` 只回传设备名称 / 协议 / 连接摘要 / 采集频率等，
+ * 不包含逐字段连接参数，故不向 `conn` 塞空值假装；第 2 步以「连接摘要」形式
+ * 展示已知信息（见模板 `isEdit && !protocolChanged` 分支）。
+ */
+watch(
+  editId,
+  (id) => {
+    if (!id) {
+      // 从编辑态切回新增态：向导进度与表单必须回到初始状态，
+      // 否则 maxReached 仍是 4，未到达的步骤会被误判为「已到达」而可点。
+      editDevice.value = null;
+      originalProtocol.value = '';
+      currentStep.value = 1;
+      maxReached.value = 1;
+      protocol.value = '';
+      name.value = '';
+      deviceId.value = `dev-${String(Date.now())}`;
+      intervalMs.value = '200';
+      changeReason.value = '';
+      connTouched.value = false;
+      saveTouched.value = false;
+      createdName.value = '';
+      createdNote.value = '';
+      return;
+    }
+    const found = repo.getDevice(id);
+    editDevice.value = found;
+    if (!found) {
+      return;
+    }
+    name.value = found.name;
+    deviceId.value = found.id;
+    intervalMs.value = String(found.intervalMs);
+    originalProtocol.value = found.protocol;
+    // 变更协议会触发 `watch(protocol)` 清空连接字段，这是预期行为（新协议要重填）。
+    protocol.value = found.protocol;
+    // 记录已存在，四步均可直达（回退/跳转不再受 maxReached 限制）。
+    maxReached.value = STEPS.length;
+  },
+  { immediate: true },
+);
+
 /** 协议中文名。 */
 const protocolLabel = computed(
   () => PROTOCOL_OPTIONS.find((p) => p.value === protocol.value)?.label ?? '未选择',
@@ -920,9 +1052,13 @@ function fieldError(field: ProtoField): string {
   return field.kind === 'number' ? '需为 ≥ 0 的数值' : '';
 }
 
-const step2Valid = computed(
-  () => currentProtoFields.value.length > 0 && currentProtoFields.value.every(isFieldValid),
-);
+const step2Valid = computed(() => {
+  // 编辑态且未改协议：连接参数沿用设备记录既有值（第 2 步只读展示摘要，无需重填）。
+  if (isEdit.value && !protocolChanged.value) {
+    return true;
+  }
+  return currentProtoFields.value.length > 0 && currentProtoFields.value.every(isFieldValid);
+});
 
 /** ③ 有默认选项，永远可继续。 */
 const step3Valid = computed(() => true);
@@ -938,6 +1074,17 @@ const reasonValid = computed(() => changeReason.value.trim().length >= 4);
 const canSaveAndStart = computed(
   () => nameValid.value && intervalValid.value && reasonValid.value && checked.value && step2Valid.value,
 );
+
+/**
+ * 编辑态提交条件：名称 + 变更原因；若改了协议，还需重填连接参数并重新勾选点表核对。
+ * 未改协议时不必再走点表核对（点表与连接参数均未变更）。
+ */
+const canSubmitEdit = computed(() => {
+  if (!nameValid.value || !reasonValid.value) {
+    return false;
+  }
+  return protocolChanged.value ? step2Valid.value && checked.value : true;
+});
 
 const stepValid = computed(() => {
   if (currentStep.value === 1) {
@@ -1171,22 +1318,47 @@ async function submit(mode: 'save' | 'saveAndStart'): Promise<void> {
   if (!nameValid.value || !protocol.value) {
     return;
   }
-  if (mode === 'saveAndStart' && !canSaveAndStart.value) {
-    return;
-  }
-  if (mode === 'save' && !intervalValid.value) {
-    return;
+  if (isEdit.value) {
+    if (!canSubmitEdit.value) {
+      return;
+    }
+  } else {
+    if (mode === 'saveAndStart' && !canSaveAndStart.value) {
+      return;
+    }
+    if (mode === 'save' && !intervalValid.value) {
+      return;
+    }
   }
 
   const draft: DeviceDraft = {
     name: name.value,
     protocol: protocol.value,
-    connectionSummary: connectionSummary.value,
+    // 未改协议时沿用设备记录里的连接摘要（逐字段值本就不可得，不伪造）。
+    connectionSummary:
+      isEdit.value && !protocolChanged.value ? (editDevice.value?.connectionSummary ?? '') : connectionSummary.value,
     intervalMs: Number(intervalMs.value),
     timeoutMs: Number((conn.timeout ?? '') || 1000),
     retryTimes: Number((conn.retry ?? '') || 3),
     actor: session.state.displayName,
   };
+
+  if (isEdit.value) {
+    const result = await repo.updateDevice({ ...draft, id: editId.value });
+    if (!result.ok || !result.data) {
+      // 写失败：如实呈现后端原因，绝不报告成功。
+      createdName.value = '';
+      createdNote.value = `设备未更新：${result.message}`;
+      return;
+    }
+    const updated = result.data;
+    createdName.value = updated.name;
+    createdNote.value = protocolChanged.value
+      ? `设备「${updated.name}」已更新（变更原因：${changeReason.value.trim()}）。协议已变更，请到「点位与映射」重新校准点表。`
+      : `设备「${updated.name}」已更新（变更原因：${changeReason.value.trim()}）。`;
+    return;
+  }
+
   const result = await repo.createDevice(draft);
   if (!result.ok || !result.data) {
     // 写失败：如实呈现后端原因，绝不报告成功。
@@ -1246,67 +1418,72 @@ resetTestSteps();
 </script>
 
 <style scoped>
-.dv-steps {
+/* ══ 向导条（原型 .wz :531）：4 步 + 连接线，撑满整张卡片 ══ */
+.dv-wz {
+  padding: 14px 18px;
+}
+.dv-wz__row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  list-style: none;
-  margin: 0;
-  padding: 14px 16px;
   flex-wrap: wrap;
 }
-.dv-steps__item {
+.dv-wz__item {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   font-size: var(--fs-table);
   color: var(--text-3);
-  transition: all 160ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-.dv-steps__item.is-clickable {
-  cursor: pointer;
-}
-.dv-steps__item.is-clickable:hover {
-  color: var(--text-1);
-  border-color: var(--brand);
-  background: var(--brand-subtle);
-}
-.dv-steps__item.is-lock {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.dv-steps__item.is-on {
-  border-color: var(--brand);
-  background: var(--brand-subtle);
-  color: var(--brand);
   font-weight: 600;
+  transition: color 160ms cubic-bezier(0.16, 1, 0.3, 1);
 }
-.dv-steps__item.is-done {
-  border-color: var(--ok-border);
-  color: var(--ok-fg);
-}
-.dv-steps__num {
-  width: 20px;
-  height: 20px;
+.dv-wz__num {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
   border-radius: 50%;
-  background: var(--divider);
-  color: var(--text-2);
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 600;
+  background: var(--divider);
+  color: var(--text-3);
 }
-.dv-steps__item.is-on .dv-steps__num {
+.dv-wz__item.is-clickable {
+  cursor: pointer;
+}
+.dv-wz__item.is-clickable:hover {
+  color: var(--text-1);
+}
+.dv-wz__item.is-clickable:hover .dv-wz__num {
+  background: var(--brand-subtle);
+  color: var(--brand-hover);
+}
+.dv-wz__item.is-lock {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.dv-wz__item.is-run {
+  color: var(--text-1);
+}
+.dv-wz__item.is-run .dv-wz__num {
   background: var(--brand);
   color: #fff;
 }
-.dv-steps__item.is-done .dv-steps__num {
-  background: var(--ok);
-  color: #fff;
+.dv-wz__item.is-done {
+  color: var(--brand-hover);
+}
+.dv-wz__item.is-done .dv-wz__num {
+  background: var(--brand-subtle);
+  color: var(--brand-hover);
+}
+/* 连接线：flex 撑满剩余宽度（原型 .wz-line） */
+.dv-wz__line {
+  flex: 1 1 24px;
+  height: 1px;
+  min-width: 16px;
+  margin: 0 12px;
+  background: #e4e9f2;
 }
 
 /* 步骤上下文（原型 .wz-ctx） */

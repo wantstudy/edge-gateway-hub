@@ -91,10 +91,10 @@
             <span class="wc-tag wc-tag--info">{{ row.protocolLabel }}</span>
           </template>
           <template #cell-runStatus="{ row }">
-            <div class="dv-run">
-              <StatusTag :status="runStatusOf(row)" />
+            <div class="dv-run" :title="runReason(row)">
+              <StatusTag :status="runStatusOf(row)" variant="icon" />
               <span class="dv-run__meta wc-mono">{{ row.lastSampleAt }}</span>
-              <span v-if="runReason(row)" class="dv-run__reason">{{ runReason(row) }}</span>
+              <span v-if="runReason(row)" class="dv-run__flag" :title="runReason(row)">!</span>
             </div>
           </template>
           <template #cell-pointCount="{ row }">
@@ -904,21 +904,35 @@ async function confirmDelete(): Promise<void> {
 .dv-rate.is-danger {
   color: var(--danger);
 }
-/* 运行状态单元格：状态标签 + 最后采集 + 真实原因 */
+/* 运行状态单元格：状态**符号** + 最后采集时间**同一行**排在前面；
+   原因走 title（不再渲染成第二/三行把行撑高） */
 .dv-run {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
+  white-space: nowrap;
 }
 .dv-run__meta {
   font-size: var(--fs-caption);
   color: var(--text-3);
+  font-variant-numeric: tabular-nums;
 }
-.dv-run__reason {
-  font-size: var(--fs-caption);
+.dv-run__flag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 1px solid var(--warn-border);
+  background: var(--warn-bg);
   color: var(--warn-fg);
-  word-break: break-all;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
 }
 
 /* ══ 分组管理弹窗 ══ */
