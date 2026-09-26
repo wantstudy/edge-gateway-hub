@@ -198,6 +198,96 @@ impl Permission {
     }
 }
 
+// ---- 权限「端」维度（网关侧 / 厂商侧隔离） ----
+
+/// 权限所属的「端」：网关侧（客户端）vs 厂商侧（服务端）。
+///
+/// ## 为什么要分端（task 57 收口后新增）
+/// 网关 daemon 与厂商 licensing-server 长期共用同一套权限 id 字符串，导致
+/// 网关侧账号/角色编辑器把**厂商侧权限**（激活码 / 租户 / 密钥 / 回执 / 换机 /
+/// 授权设备台账）也整体渲染出来——两端权限没有隔离。本枚举把「端」显式建模：
+/// - [`PermissionScope::Gateway`]：网关自身能力（现场设备/点位、网关审计、
+///   网关运维、网关账号）；
+/// - [`PermissionScope::Licensing`]：厂商侧能力（激活码、租户、密钥、回执、
+///   换机、授权设备台账标记）。
+///
+/// ⚠️ **不重命名任何权限 id / 枚举变体**：`Permission::as_str` 字面量保持稳定，
+/// 老 JWT 的 `perms` claim 仍可解析（JWT 兼容红线）。本维度只做**目录过滤与
+/// 提交校验**，不改授权判定语义（判定仍由 [`authorize`] / [`AuthedRole::ensure`]
+/// 按权限集成员完成）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PermissionScope {
+    /// 网关侧（客户端）：现场设备与点位、网关审计、网关运维、网关账号。
+    Gateway,
+    /// 厂商侧（服务端）：激活码、租户、密钥、回执、换机、授权设备台账。
+    Licensing,
+}
+
+impl PermissionScope {
+    /// 「端」字面量（`/api/permissions` 行内 `scope` 字段取值）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionScope::Gateway => "gateway",
+            PermissionScope::Licensing => "licensing",
+        }
+    }
+}
+
+impl Permission {
+    /// 权限所属的「端」（[`Permission::ALL`] 的完整划分：Gateway ∪ Licensing，
+    /// 二者不重叠、并集完备——由 `permission_scope_partition_covers_all` 测试守护）。
+    ///
+    /// 分端依据（厂商侧证据：`crates/licensing-server/src/{http,keys}.rs` 的角色判定域）：
+    /// - 激活码 `code.*`、租户 `tenant.*`、密钥 `key.*`、回执 `receipt.*`、
+    ///   换机 `transfer.*`、授权设备台账标记 `device.mark_anomaly` → 厂商侧；
+    /// - 现场设备/点位配置 `device.view` / `device.write` / `point.write`、
+    ///   网关审计 `audit.*`、网关账号 `account.*`、网关运维 `ops.*` → 网关侧。
+    ///
+    /// ⚠️ `device.view` / `device.write` / `point.write` **两端同名不同义**：厂商侧
+    /// 指「授权绑定的在线设备台账」，网关侧指「网关采集的现场设备与点位」。本枚举
+    /// 按**网关侧语义**归类（daemon 即网关），厂商侧的设备台账能力另由
+    /// `device.mark_anomaly`（厂商侧）承担，二者不再混用同一档位。
+    pub fn scope(self) -> PermissionScope {
+        match self {
+            // —— 厂商侧（14 项）——
+            Permission::CodeView
+            | Permission::CodeIssue
+            | Permission::CodeRevoke
+            | Permission::CodeReissue
+            | Permission::CodeReveal
+            | Permission::DeviceMarkAnomaly
+            | Permission::TenantView
+            | Permission::TenantPolicyUpdate
+            | Permission::ReceiptView
+            | Permission::ReceiptMark
+            | Permission::TransferView
+            | Permission::TransferProcess
+            | Permission::KeyView
+            | Permission::KeyRotate => PermissionScope::Licensing,
+            // —— 网关侧（10 项）——
+            Permission::DeviceView
+            | Permission::DeviceWrite
+            | Permission::PointWrite
+            | Permission::AuditView
+            | Permission::AuditExport
+            | Permission::AccountView
+            | Permission::AccountUpdate
+            | Permission::OpsRestart
+            | Permission::OpsCollectors
+            | Permission::OpsLogsRead => PermissionScope::Gateway,
+        }
+    }
+}
+
+/// 指定「端」的全部权限（顺序镜像 [`Permission::ALL`]；目录过滤 / 测试用）。
+pub fn permissions_of_scope(scope: PermissionScope) -> Vec<Permission> {
+    Permission::ALL
+        .iter()
+        .copied()
+        .filter(|p| p.scope() == scope)
+        .collect()
+}
+
 // ---- 权限矩阵（唯一真源；两端同步点） ----
 
 /// ⚠️ **与 web-console `ui-kit/src/rbac.ts` 的 `ACTION_MATRIX` 对齐，改动须两端同步。**
@@ -697,6 +787,94 @@ mod tests {
             assert!(!authorize(Role::LicOps, permission));
             assert!(!authorize(Role::Risk, permission));
         }
+    }
+
+    /// QA 红线（两端隔离）: `PermissionScope` 对 [`Permission::ALL`] 构成完备划分
+    /// （Gateway ∪ Licensing = ALL，二者不重叠），且成员与设计清单逐项一致。
+    #[test]
+    fn permission_scope_partition_covers_all() {
+        let gateway = permissions_of_scope(PermissionScope::Gateway);
+        let licensing = permissions_of_scope(PermissionScope::Licensing);
+
+        // 划分完备：并集 = ALL，无重叠，长度守恒。
+        assert_eq!(
+            gateway.len() + licensing.len(),
+            Permission::ALL.len(),
+            "scope partition must cover every permission"
+        );
+        for p in Permission::ALL {
+            let hit = gateway.contains(p) as usize + licensing.contains(p) as usize;
+            assert_eq!(hit, 1, "permission {:?} must be in exactly one scope", p.as_str());
+        }
+
+        // 成员逐项核对（顺序镜像 Permission::ALL，防分端被误改）。
+        let expected_gateway: &[Permission] = &[
+            Permission::DeviceView,
+            Permission::AuditView,
+            Permission::AuditExport,
+            Permission::AccountView,
+            Permission::AccountUpdate,
+            Permission::OpsRestart,
+            Permission::OpsCollectors,
+            Permission::OpsLogsRead,
+            Permission::DeviceWrite,
+            Permission::PointWrite,
+        ];
+        let expected_licensing: &[Permission] = &[
+            Permission::CodeView,
+            Permission::CodeIssue,
+            Permission::CodeRevoke,
+            Permission::CodeReissue,
+            Permission::CodeReveal,
+            Permission::DeviceMarkAnomaly,
+            Permission::TenantView,
+            Permission::TenantPolicyUpdate,
+            Permission::ReceiptView,
+            Permission::ReceiptMark,
+            Permission::TransferView,
+            Permission::TransferProcess,
+            Permission::KeyView,
+            Permission::KeyRotate,
+        ];
+        assert_eq!(gateway, expected_gateway);
+        assert_eq!(licensing, expected_licensing);
+
+        // 字面量稳定性（scope.as_str 供 `/api/permissions` 行内 scope 字段）。
+        assert_eq!(PermissionScope::Gateway.as_str(), "gateway");
+        assert_eq!(PermissionScope::Licensing.as_str(), "licensing");
+    }
+
+    /// QA（JWT 兼容红线）: 老 token 的 `perms` 里含**厂商侧**权限 id 仍可被
+    /// extractor / `verify` 接受（不得因分端而拒绝历史签发）。
+    #[tokio::test]
+    async fn licensing_perm_ids_still_parse_in_jwt() {
+        let state = test_state();
+        let now = now_unix_secs();
+        let claims = Claims {
+            sub: "user-legacy".to_string(),
+            role: "lic_ops".to_string(),
+            perms: Some(vec![
+                Permission::CodeView,
+                Permission::CodeIssue,
+                Permission::ReceiptView,
+                Permission::KeyRotate,
+            ]),
+            exp: now + 600,
+            iat: now,
+            nbf: None,
+            jti: "jti-legacy".to_string(),
+        };
+        let token = sign(&claims, TEST_KEY).expect("sign");
+        let authed = AuthedRole::from_request_parts(&mut parts_with(Some(&token)), &state)
+            .await
+            .expect("legacy token with licensing perms must still parse");
+        assert_eq!(authed.role, Some(Role::LicOps));
+        authed
+            .ensure(Permission::ReceiptView)
+            .expect("licensing perm in token must remain honored at authorization layer");
+        authed
+            .ensure(Permission::CodeIssue)
+            .expect("licensing perm in token must remain honored at authorization layer");
     }
 
     // ---- JWT 守卫 extractor ----

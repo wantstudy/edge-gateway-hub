@@ -453,6 +453,13 @@ export interface PermissionRecord {
   label: string;
   /** 所属分组（如 `数据接入`） */
   group: string;
+  /**
+   * 权限所属「端」（`gateway` = 网关侧 / `licensing` = 厂商侧）。
+   *
+   * 后端 `GET /api/permissions` 默认只返回网关侧权限，此字段供前端**兜底过滤**：
+   * 即便后端误把厂商侧权限透出，网关控制台也不渲染。缺省（老后端未返回）为空串。
+   */
+  scope?: string;
 }
 
 /** 账号记录（`/api/accounts` 的前端镜像）。 */

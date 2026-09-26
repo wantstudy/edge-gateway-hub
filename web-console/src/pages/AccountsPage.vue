@@ -469,10 +469,12 @@ const roles = ref<RoleRecord[]>([]);
 /** 角色清单不可得原因。 */
 const rolesNotice = ref('');
 
-/** 权限清单。 */
+/** 权限清单（**仅网关侧**；已剔除厂商侧 `scope=licensing` 行）。 */
 const permissions = ref<PermissionRecord[]>([]);
 /** 权限清单不可得原因。 */
 const permissionsNotice = ref('');
+/** 厂商侧（licensing）权限 id 集合（从原始目录提取，供编辑草稿剔除）。 */
+const licensingPermIds = ref<ReadonlySet<string>>(new Set<string>());
 
 /** 拉取账号清单。 */
 async function loadAccounts(): Promise<void> {
@@ -490,9 +492,13 @@ async function loadRoles(): Promise<void> {
   rolesNotice.value = repo.actions.notices().roles;
 }
 
-/** 拉取权限清单。 */
+/** 拉取权限清单（两端隔离兜底：即便后端误透出厂商侧 `scope=licensing` 权限，也不渲染）。 */
 async function loadPermissions(): Promise<void> {
-  permissions.value = await repo.permissions();
+  const rows = await repo.permissions();
+  licensingPermIds.value = new Set(
+    rows.filter((p) => p.scope === 'licensing').map((p) => p.id),
+  );
+  permissions.value = rows.filter((p) => p.scope !== 'licensing');
   permissionsNotice.value = repo.actions.notices().permissions;
 }
 
@@ -809,7 +815,9 @@ function openEditRole(row: RoleRecord): void {
   roleEditorOpen.value = true;
   roleEditorId.value = row.id;
   roleEditorName.value = row.name;
-  roleEditorPerms.value = [...row.permissions];
+  // 两端隔离：厂商侧权限不在网关侧呈现，编辑草稿一并剔除
+  // （否则提交时会被后端 `validate_permissions` fail-closed 拒绝为 400）。
+  roleEditorPerms.value = row.permissions.filter((id) => !licensingPermIds.value.has(id));
   roleEditorError.value = '';
   roleEditorBuiltin.value = row.builtin;
 }

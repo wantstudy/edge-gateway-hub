@@ -1,7 +1,11 @@
 /**
  * @file session.ts
  * @module admin-console/store/session
- * @description 管理员会话与全局运营状态（登录态、角色、双人复核开关、回执告警计数）。
+ * @description 管理员会话与全局运营状态（登录态、角色、双人复核开关）。
+ *
+ * 注：顶栏「待处理 / 回执」计数**不再由本模块持有**——历史实现曾硬编码演示常量
+ * （`receiptOk: 398` / `receiptTotal: 412` / `pendingCount: 9`），已移除；真实计数
+ * 一律来自 `repo.overview()`（`GET /admin/overview`），缺失维度展示诚实空态 `—`。
  *
  * 会话策略（real 模式已接入后端鉴权，契约 = crates/licensing-server/src/admin_auth.rs）：
  *  · `POST /admin/auth/login` 返回 `{token, role}`（HS256 JWT，1h TTL）；
@@ -38,11 +42,6 @@ interface SessionState {
   tenantId: string;
   /** 是否开启双人复核（开启后废弃 / 重发必须填写第二审批人） */
   dualApproval: boolean;
-  /** 待处理项计数（顶栏徽标） */
-  pendingCount: number;
-  /** 回执健康台数 / 总台数（顶栏胶囊） */
-  receiptOk: number;
-  receiptTotal: number;
 }
 
 /** 可变状态对象（模块内可直接写，对外只读）。 */
@@ -52,9 +51,6 @@ const state: SessionState = reactive<SessionState>({
   role: 'system',
   tenantId: '',
   dualApproval: false,
-  pendingCount: 9,
-  receiptOk: 398,
-  receiptTotal: 412,
 });
 
 /** 是否为后端签发的规范角色（后端只发四个规范 id，别名一律拒绝）。 */

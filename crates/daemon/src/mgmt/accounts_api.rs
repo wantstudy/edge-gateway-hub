@@ -32,12 +32,14 @@
 //! （`auth_login::sync_users` 仅接受内置四角色字面量）——自定义角色的运行时
 //! 授权融合需要 `rbac::Role` 扩展 + 前端 `ACTION_MATRIX` 两端同步，属后续任务。
 
-use axum::extract::{Path as AxumPath, State};
+use std::collections::HashMap;
+
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::{json, Value};
 
-use super::rbac::{AuthedRole, Permission, Role};
+use super::rbac::{AuthedRole, Permission, PermissionScope, Role};
 use super::remote_ops::{OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED};
 use super::writeapi::{audit, validation_error, write_guard};
 use super::MgmtState;
@@ -55,6 +57,10 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
 
 /// 权限目录（`GET /api/permissions`；label / group 为展示文案，id 即
 /// [`Permission::as_str`]——前端弹窗据此渲染权限编辑器）。
+///
+/// ⚠️ 目录含**两端**权限，是否对网关侧暴露由 [`catalog_rows`] 按
+/// [`Permission::scope`] 过滤：默认只返回网关侧（`scope=gateway`），
+/// 厂商侧（licensing）仅 `?scope=all` 时透出（后端内部 / 测试用）。
 const PERMISSION_CATALOG: &[(Permission, &str, &str)] = &[
     (Permission::CodeView, "激活码查看", "激活码"),
     (Permission::CodeIssue, "激活码发放", "激活码"),
@@ -82,11 +88,33 @@ const PERMISSION_CATALOG: &[(Permission, &str, &str)] = &[
     (Permission::OpsLogsRead, "运维日志查询", "运维"),
 ];
 
-/// 权限 id 字面量全集中表（校验用；从 [`PERMISSION_CATALOG`] 派生，单一真源）。
-fn all_permission_ids() -> Vec<&'static str> {
+/// 网关侧权限 id 全集（提交校验的 allowed 提示 + 目录过滤参照；从
+/// [`PERMISSION_CATALOG`] 按 [`Permission::scope`] 派生，单一真源）。
+fn gateway_permission_ids() -> Vec<&'static str> {
     PERMISSION_CATALOG
         .iter()
+        .filter(|(p, _, _)| p.scope() == PermissionScope::Gateway)
         .map(|(p, _, _)| p.as_str())
+        .collect()
+}
+
+/// 组装 `GET /api/permissions` 的目录行（`{id, label, group, scope}`）。
+///
+/// - `include_all == false` → **只**返回网关侧权限（默认；网关控制台据此渲染，
+///   厂商侧权限不下发）；
+/// - `include_all == true` → 返回全量两端权限（`?scope=all`；后端内部 / 测试用）。
+fn catalog_rows(include_all: bool) -> Vec<Value> {
+    PERMISSION_CATALOG
+        .iter()
+        .filter(|(p, _, _)| include_all || p.scope() == PermissionScope::Gateway)
+        .map(|(p, label, group)| {
+            json!({
+                "id": p.as_str(),
+                "label": label,
+                "group": group,
+                "scope": p.scope().as_str(),
+            })
+        })
         .collect()
 }
 
@@ -298,16 +326,21 @@ fn section_or_empty(config: &crate::config::GatewayConfig) -> crate::config::Mgm
 // ---- 端点：权限目录 ----
 
 /// `GET /api/permissions` → 权限目录（裸数组；前端权限编辑器数据源）。
-pub async fn permissions_list(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
+///
+/// **默认只返回网关侧权限**（两端隔离：厂商侧 `code.*` / `tenant.*` / `key.*` /
+/// `receipt.*` / `transfer.*` / `device.mark_anomaly` 不下发）；`?scope=all`
+/// 返回全量两端权限（后端内部 / 测试用）。
+pub async fn permissions_list(
+    State(state): State<MgmtState>,
+    Query(params): Query<HashMap<String, String>>,
+    authed: AuthedRole,
+) -> Response {
     if let Err(resp) = ensure_account_view(&authed) {
         return resp;
     }
     let _ = state; // 目录静态，不读配置；State 仅为了与路由签名统一
-    let rows: Vec<Value> = PERMISSION_CATALOG
-        .iter()
-        .map(|(p, label, group)| json!({ "id": p.as_str(), "label": label, "group": group }))
-        .collect();
-    Json(Value::Array(rows)).into_response()
+    let include_all = params.get("scope").map(|s| s == "all").unwrap_or(false);
+    Json(Value::Array(catalog_rows(include_all))).into_response()
 }
 
 // ---- 端点：角色 ----
@@ -1092,17 +1125,35 @@ fn internal(message: &str) -> Response {
         .into_response()
 }
 
-/// `permissions` 取值域校验（逐项必须命中权限目录；结构化 400）。
+/// `permissions` 取值域校验（逐项必须命中**网关侧**权限目录；结构化 400）。
+///
+/// 两端隔离（fail-closed）：
+/// - 未知 id → 400（原语义）；
+/// - 命中目录但属**厂商侧**（[`PermissionScope::Licensing`]）→ 400 + 明确 reason
+///   （网关角色不得被授予厂商侧权限，杜绝两端权限串味）；
+/// - 仅网关侧权限放行。
 #[allow(clippy::result_large_err)]
 fn validate_permissions(perms: &[String]) -> Result<(), Response> {
-    let catalog = all_permission_ids();
+    let catalog = gateway_permission_ids();
     for raw in perms {
-        if permission_from_str(raw).is_none() {
-            return Err(validation_error(
-                "permissions",
-                &format!("unknown permission {raw:?}"),
-                &catalog.join(" | "),
-            ));
+        match permission_from_str(raw) {
+            None => {
+                return Err(validation_error(
+                    "permissions",
+                    &format!("unknown permission {raw:?}"),
+                    &catalog.join(" | "),
+                ));
+            }
+            Some(p) if p.scope() != PermissionScope::Gateway => {
+                return Err(validation_error(
+                    "permissions",
+                    &format!(
+                        "permission {raw:?} belongs to the licensing (vendor) side and cannot be granted to a gateway role"
+                    ),
+                    &catalog.join(" | "),
+                ));
+            }
+            Some(_) => {}
         }
     }
     Ok(())
@@ -1148,4 +1199,124 @@ fn persist(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 厂商侧（licensing）权限 id ——**绝不**出现在网关侧目录里（两端隔离核心断言）。
+    const LICENSING_IDS: &[&str] = &[
+        "code.view",
+        "code.issue",
+        "code.revoke",
+        "code.reissue",
+        "code.reveal",
+        "tenant.view",
+        "tenant.policy_update",
+        "key.view",
+        "key.rotate",
+        "receipt.view",
+        "receipt.mark",
+        "transfer.view",
+        "transfer.process",
+        "device.mark_anomaly",
+    ];
+
+    /// 网关侧权限 id —— 网关侧目录必须完整包含。
+    const GATEWAY_IDS: &[&str] = &[
+        "device.view",
+        "device.write",
+        "point.write",
+        "audit.view",
+        "audit.export",
+        "account.view",
+        "account.update",
+        "ops.restart",
+        "ops.collectors",
+        "ops.logs_read",
+    ];
+
+    /// 目录行的 id 列表（保序）。
+    fn ids_of(include_all: bool) -> Vec<String> {
+        catalog_rows(include_all)
+            .iter()
+            .map(|row| row["id"].as_str().expect("id string").to_string())
+            .collect()
+    }
+
+    /// QA 红线（两端隔离）: 默认网关侧目录**不含**任何厂商侧权限，且完整包含网关侧权限。
+    #[test]
+    fn gateway_catalog_excludes_licensing_ids() {
+        let ids = ids_of(false);
+        for licensing in LICENSING_IDS {
+            assert!(
+                !ids.iter().any(|id| id == licensing),
+                "licensing permission {licensing:?} must NOT be exposed to the gateway side: {ids:?}"
+            );
+        }
+        for gateway in GATEWAY_IDS {
+            assert!(
+                ids.iter().any(|id| id == gateway),
+                "gateway permission {gateway:?} must be present: {ids:?}"
+            );
+        }
+        // 厂商侧 14 + 网关侧 10 = 24；网关侧目录恰为 10 项。
+        assert_eq!(ids.len(), GATEWAY_IDS.len());
+    }
+
+    /// QA（后端内部）: `?scope=all` 全量目录逐项覆盖 `Permission::ALL`（无遗漏/无多余）。
+    #[test]
+    fn scope_all_catalog_covers_every_permission() {
+        let ids = ids_of(true);
+        assert_eq!(ids.len(), Permission::ALL.len(), "全量目录项数须等于 ALL");
+        for permission in Permission::ALL {
+            assert!(
+                ids.iter().any(|id| id == permission.as_str()),
+                "permission {:?} missing from full catalog",
+                permission.as_str()
+            );
+        }
+        // 行内 scope 字段与 `Permission::scope()` 一致（前端据此兜底过滤）。
+        for row in catalog_rows(true) {
+            let id = row["id"].as_str().expect("id string");
+            let scope = row["scope"].as_str().expect("scope string");
+            let expected = Permission::from_id(id).expect("known id").scope().as_str();
+            assert_eq!(scope, expected, "scope mismatch for {id:?}");
+        }
+    }
+
+    /// QA 红线（fail-closed）: 网关角色提交厂商侧权限 → 400 + 明确 reason；
+    /// 网关侧权限放行；未知 id 仍 400。
+    #[tokio::test]
+    async fn validate_permissions_rejects_licensing_and_unknown() {
+        // 网关侧权限放行。
+        assert!(validate_permissions(&["device.view".to_string(), "account.view".to_string()]).is_ok());
+
+        // 厂商侧任一权限被拒（逐项覆盖，防漏）。
+        for licensing in LICENSING_IDS {
+            let resp = validate_permissions(&[(*licensing).to_string()])
+                .expect_err("licensing permission must be rejected");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{licensing}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let value: Value = serde_json::from_slice(&bytes).expect("json body");
+            assert_eq!(value["field"], "permissions");
+            let reason = value["reason"].as_str().expect("reason string");
+            assert!(
+                reason.contains("licensing"),
+                "reason must name the licensing side: {reason}"
+            );
+        }
+
+        // 未知 id → 400（原语义不回退）。
+        let resp = validate_permissions(&["nuke.all".to_string()]).expect_err("unknown id rejected");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 混合提交：网关侧 + 厂商侧 → 仍被拒（不接受部分合法）。
+        let resp = validate_permissions(&["device.view".to_string(), "code.view".to_string()])
+            .expect_err("mixed submission must be rejected");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

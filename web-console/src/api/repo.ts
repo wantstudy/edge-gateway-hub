@@ -726,6 +726,7 @@ function mapPermission(raw: Record<string, unknown>, idx: number): PermissionRec
     id: pickStr(raw, 'id', `perm-${idx}`),
     label: pickStr(raw, 'label', pickStr(raw, 'id', `权限-${idx + 1}`)),
     group: pickStr(raw, 'group', pickStr(raw, 'group_label', '其他')),
+    scope: pickStr(raw, 'scope', ''),
   };
 }
 

@@ -27,10 +27,10 @@
       </select>
 
       <span class="ac-pill ac-pill--warn" title="点击进入待处理总览" @click="go('overview')">
-        ⚠ 待处理 {{ session.state.pendingCount }} 项
+        ⚠ 待处理 {{ overview.pendingAnomalies }} 项
       </span>
-      <span class="ac-pill ac-pill--ok">
-        ● 回执健康 {{ session.state.receiptOk }}/{{ session.state.receiptTotal }}
+      <span class="ac-pill ac-pill--ok" title="回执正常台数（后端未提供该维度时显示 —）">
+        ● 回执健康 {{ overview.receiptOk }}
       </span>
 
       <!--
@@ -119,13 +119,21 @@ import { useRoute, useRouter } from 'vue-router';
 import { PAGES, ROLE_META, ROLES, canSeePage, firstAllowedPage, type PageId, type Role } from '@ui-kit';
 import { session } from './store/session';
 import { accountInitial } from './store/session';
-import { adminNotices, dismissNotice } from './api/repo';
+import { adminNotices, dismissNotice, repo } from './api/repo';
 
 const route = useRoute();
 const router = useRouter();
 
 /** 顶栏头像字符。 */
 const initial = accountInitial;
+
+/**
+ * 总览真实聚合（顶栏计数唯一来源）。
+ *
+ * real 模式为 `GET /admin/overview` 的 reactive 快照，未提供的维度为诚实空态 `—`；
+ * mock 模式为 mock 聚合。**绝不**在组件内硬编码演示计数。
+ */
+const overview = computed(() => repo.overview());
 
 /** 当前角色可见且非详情页的页面清单（导航只列主页面）。 */
 const visiblePages = computed(() => PAGES.filter((p) => !p.detailOnly && canSeePage(session.state.role, p.id)));
@@ -163,15 +171,14 @@ function isActive(id: PageId): boolean {
   return name === id;
 }
 
-/** 导航徽标（真实待处理计数）。 */
-function badgeOf(id: PageId): number | null {
-  if (id === 'transfers') {
-    return 2;
+/** 导航徽标（真实待处理计数；后端未提供 / 为 0 / 诚实空态时**不显示**，绝不编造）。 */
+function badgeOf(id: PageId): string | null {
+  const ov = overview.value;
+  const raw = id === 'transfers' ? ov.pendingTransfers : id === 'receipts' ? ov.pendingAnomalies : null;
+  if (raw === null || raw === undefined || raw === '' || raw === '—' || raw === '0') {
+    return null;
   }
-  if (id === 'receipts') {
-    return 2;
-  }
-  return null;
+  return raw;
 }
 
 /** 跳转。 */

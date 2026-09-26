@@ -110,23 +110,31 @@ const state: SessionState = reactive<SessionState>({
 });
 
 /**
- * 后端角色 → 前端 Role 映射（仅控制 RoleGate **可见性**，非授权判定）。
+ * 后端账号角色 → 网关控制台**可见性**角色（仅控制 `RoleGate` 可见性，非授权判定）。
  *
- * 假设（本地联调约定）：`ops` / `system` → admin（运维主账号，全页可验收）；
- * `lic_ops` → operator；`risk` → viewer；未知 → viewer（最保守）。
+ * ── 两端角色模型**互不映射**（task：权限两端隔离）────────────────────────────
+ * 这里产出的是**网关侧自有**的 4 个 UI 角色（`admin` / `engineer` / `operator` /
+ * `viewer`），它与厂商侧（licensing-server / admin-console）的角色模型
+ * （`ops` / `lic_ops` / `risk` / `system`）**不是同一套东西**，也不做语义对齐：
+ *  · 网关控制台**不消费**任何厂商侧权限（`code.*` / `tenant.*` / `key.*` /
+ *    `receipt.*` / `transfer.*` / `device.mark_anomaly`，见 `rbac::PermissionScope`）；
+ *  · 厂商侧运营角色（`ops` / `lic_ops` / `risk`）**不下放**任何网关侧写权限——
+ *    一律收敛为只读档 `viewer`（服务端角色 → 网关侧只读）；
+ *  · 仅网关自身的系统管理员档 `system`（即引导账号 `root` 所在档）映射为
+ *    `admin`，否则配置端将被锁死（网关账号/角色管理入口不可达）。
+ *
+ * ⚠️ 历史实现把 `system/ops → admin`、`lic_ops → operator`、`risk → viewer`
+ * 「强行压平」，使**厂商侧运营角色**获得了网关侧管理/配置权限——这是两端权限
+ * 串味的根因之一。现已按上述隔离语义收口。
+ *
+ * 授权判定一律在 Rust 侧按 token 的权限集（gateway scope）执行，本映射仅影响
+ * 按钮可见性。
  */
 export function mapBackendRole(backendRole: string): Role {
-  switch (backendRole) {
-    case 'system':
-    case 'ops':
-      return 'admin';
-    case 'lic_ops':
-      return 'operator';
-    case 'risk':
-      return 'viewer';
-    default:
-      return 'viewer';
+  if (backendRole === 'system') {
+    return 'admin';
   }
+  return 'viewer';
 }
 
 /** 登录：记录账号；可选覆盖角色与后端角色原文（由 LoginPage 传入）。 */

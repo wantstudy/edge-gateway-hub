@@ -40,6 +40,18 @@ import {
   IconUserGroup,
 } from '@arco-design/web-vue/es/icon';
 
+/**
+ * 本模块所属的「端」——**厂商侧（licensing / 服务端）**。
+ *
+ * 这里定义的 `Role` / `Action` / `ACTION_MATRIX` / `PAGES` 只描述厂商侧
+ * （admin-console / licensing-server）的角色与操作级权限；**网关侧**
+ * （daemon / web-console）的权限模型与之**互不映射**（网关侧见 daemon
+ * `rbac::PermissionScope`）。两端存在同名 id（如 `device.view` / `account.view`），
+ * 但语义不同：厂商侧指「授权绑定的在线设备台账 / 厂商运营账号」，网关侧指
+ * 「现场采集设备与点位 / 网关账号」。**禁止**跨端复用同一套权限判定。
+ */
+export const RBAC_SIDE = 'licensing' as const;
+
 /** 四角色（对应 licensing-api.md §4 / task 57）。 */
 export const ROLES = ['ops', 'lic_ops', 'risk', 'system'] as const;
 

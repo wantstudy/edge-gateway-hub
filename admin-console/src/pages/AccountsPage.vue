@@ -191,7 +191,15 @@ const ALL_ACTIONS = computed<Action[]>(() => {
   return out;
 });
 
-/** 操作中文名映射（矩阵表展示）。 */
+/**
+ * 操作中文名映射（矩阵表展示）。
+ *
+ * ⚠️ 两端隔离：本表（及 `@ui-kit` 的 `Action` / `ACTION_MATRIX`）描述的是
+ * **厂商侧（licensing / 服务端）**的操作级权限语义（激活码 / 租户 / 密钥 /
+ * 回执 / 换机 / 授权设备台账）。它与**网关侧（daemon / web-console）**的
+ * 权限模型**互不映射**（网关侧权限见 daemon `rbac::PermissionScope::Gateway`）。
+ * 同名 id（如 `device.view` / `account.view`）两端含义不同，切勿交叉复用。
+ */
 const ACTION_LABEL: Readonly<Record<Action, string>> = Object.freeze({
   'code.view': '查看激活码',
   'code.issue': '发放激活码',
