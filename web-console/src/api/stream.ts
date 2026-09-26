@@ -31,7 +31,7 @@
  * 从缓存读取 —— 上游推送频率与渲染频率解耦（设计系统 §4.2 硬约束）。
  */
 import { reactive } from 'vue';
-import { getStoredToken, handleUnauthorized } from './client';
+import { apiUrl, getStoredToken, handleUnauthorized } from './client';
 
 /** SSE 帧内单点形状（与后端 `LivePoint` 字段名一一对应，蛇形命名直通）。 */
 export interface TelemetryPointFrame {
@@ -174,7 +174,9 @@ export function connectStream(): void {
   }
   streamStatus.value = 'connecting';
   // EventSource 无法带 header → 鉴权走 ?token= 查询参数（后端显式支持）
-  es = new EventSource(`/api/stream?token=${encodeURIComponent(token)}`);
+  // 与 HTTP 层同基址：必须绝对 URL，否则打包版（origin http://tauri.localhost）
+  // 会命中 Tauri 资产回退拿到 index.html。
+  es = new EventSource(`${apiUrl('/api/stream')}?token=${encodeURIComponent(token)}`);
 
   es.addEventListener('telemetry', (event: Event) => {
     // 自定义事件名不在 EventSourceEventMap 中，回调形参按基类 Event 收敛后取 data
@@ -243,7 +245,7 @@ async function probeUnauthorizedOnce(): Promise<void> {
   probeInFlight = true;
   try {
     const token = getStoredToken();
-    const res = await fetch('/api/stream', {
+    const res = await fetch(apiUrl('/api/stream'), {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (res.status === 401) {

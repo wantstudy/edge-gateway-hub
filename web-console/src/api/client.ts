@@ -33,6 +33,35 @@ export type ApiMode = 'real';
  */
 export const API_MODE: ApiMode = 'real';
 
+/**
+ * 管理面 API 的**绝对基址**（默认 `http://127.0.0.1:8080`，与 daemon
+ * `DEFAULT_MGMT_BIND`（`crates/daemon/src/bin/iot-daq-daemon.rs:143`）对齐）。
+ *
+ * ★ 为什么必须显式绝对（P0「响应不是合法 JSON」根因）：
+ * Tauri 打包版页面 origin 在 Windows 上是 `http://tauri.localhost`（见
+ * tauri-2.11.6 `src/manager/mod.rs` 的 `get_app_url` 断言：
+ * `if cfg!(windows) || cfg!(target_os = "android") { "http://tauri.localhost/" }`）。
+ * 沿用相对路径 `/api/...` 时，请求会被 Tauri 的资产协议接管，而它对**任何未命中
+ * 资产的路径一律回退 index.html**（同文件 `get_asset` 的
+ * `log::debug!("Asset `{path}` not found; fallback to index.html")` 分支）→
+ * 前端拿到 HTTP 200 + `text/html` 的 index.html → `JSON.parse` 失败 →
+ * 本文件 `apiRequest` 抛出「响应不是合法 JSON」。
+ * dev 之所以正常：vite dev server 把 `/api` 代理到 `http://127.0.0.1:8080`
+ * （`web-console/vite.config.ts` 的 `server.proxy`），相对路径解析到
+ * `http://localhost:5274/api/...` 后被正确转发；打包后没有这层代理，缺陷才暴露。
+ *
+ * 端口可配置：构建期用 `VITE_API_BASE` 覆盖（如 `VITE_API_BASE=http://127.0.0.1:9090`），
+ * 未设置则用默认值。
+ */
+export const API_BASE: string =
+  ((import.meta.env.VITE_API_BASE as string | undefined) ?? '').replace(/\/+$/, '') ||
+  'http://127.0.0.1:8080';
+
+/** 把 `/api/...` 路径拼成**绝对** URL（供 fetch / EventSource 使用）。 */
+export function apiUrl(path: string): string {
+  return path.startsWith('/') ? `${API_BASE}${path}` : `${API_BASE}/${path}`;
+}
+
 /** token 在 localStorage 的键名（会话状态同源于此，刷新不丢）。 */
 const TOKEN_KEY = 'iot-daq.wc.token';
 
@@ -168,11 +197,16 @@ export function handleUnauthorized(): void {
 /**
  * 通用请求函数。
  *
- * @param path 以 `/api` 开头的同源路径（dev 下经 vite proxy 转发）
+ * 请求一律打到**绝对地址** `API_BASE + path`（绝不依赖页面 URL 的相对解析——
+ * Tauri 打包页 origin 为 `http://tauri.localhost`，相对路径会命中资产回退，见
+ * `API_BASE` 注释）。
+ *
+ * @param path 以 `/api` 开头的路径
  * @param init 可选 fetch 初始化参数（method / body 等）
  * @throws `ApiError`（401 已在函数内处理跳转；其余状态码与网络错误抛给调用方）
  */
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const url = apiUrl(path);
   const headers = new Headers(init.headers ?? {});
   if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
@@ -184,7 +218,7 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
 
   let res: Response;
   try {
-    res = await fetchWithTimeout(path, { ...init, headers });
+    res = await fetchWithTimeout(url, { ...init, headers });
   } catch (cause) {
     // 网络错误 / 超时不崩：包装为 status=0 的 rejected promise，调用方降级
     const aborted = cause instanceof Error && cause.name === 'AbortError';
@@ -193,7 +227,8 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
       : cause instanceof Error
         ? cause.message
         : String(cause);
-    throw new ApiError(0, `网络请求失败：${reason}`);
+    // 诚实降级：把**目标地址**与「服务未就绪」这一真实原因一并给出，便于现场排障
+    throw new ApiError(0, `无法连接网关服务 ${url}（${reason}）：本地 daemon 未启动、端口被占用或尚未就绪`, url);
   }
 
   if (res.status === 401) {
@@ -217,8 +252,19 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new ApiError(res.status, '响应不是合法 JSON');
+    // 典型成因：请求被打到页面自身（拿到 index.html）或被代理拦截。
+    // 带上 URL / Content-Type / 响应体前缀，让「响应不是合法 JSON」可诊断。
+    throw new ApiError(
+      res.status,
+      `响应不是合法 JSON（${url}，HTTP ${res.status}，Content-Type: ${res.headers.get('Content-Type') ?? '未知'}）：${describeBodyHead(text)}`,
+      text,
+    );
   }
+}
+
+/** 取响应体前 120 个字符（单行压缩空白），用于失败诊断文案。 */
+function describeBodyHead(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 120) || '（空响应体）';
 }
 
 /**
@@ -228,6 +274,7 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
  * @throws `ApiError`（语义与 `apiRequest` 完全一致）
  */
 export async function apiRequestText(path: string, init: RequestInit = {}): Promise<string> {
+  const url = apiUrl(path);
   const headers = new Headers(init.headers ?? {});
   const token = getStoredToken();
   if (token) {
@@ -236,7 +283,7 @@ export async function apiRequestText(path: string, init: RequestInit = {}): Prom
 
   let res: Response;
   try {
-    res = await fetchWithTimeout(path, { ...init, headers });
+    res = await fetchWithTimeout(url, { ...init, headers });
   } catch (cause) {
     const aborted = cause instanceof Error && cause.name === 'AbortError';
     const reason = aborted
@@ -244,7 +291,7 @@ export async function apiRequestText(path: string, init: RequestInit = {}): Prom
       : cause instanceof Error
         ? cause.message
         : String(cause);
-    throw new ApiError(0, `网络请求失败：${reason}`);
+    throw new ApiError(0, `无法连接网关服务 ${url}（${reason}）：本地 daemon 未启动、端口被占用或尚未就绪`, url);
   }
 
   if (res.status === 401) {
