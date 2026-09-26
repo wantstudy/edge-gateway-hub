@@ -26,7 +26,6 @@
     ],
     "resources": {
       "resources/iot-daq-daemon.exe": "iot-daq-daemon.exe",
-      "resources/config.example.toml": "config.example.toml",
       "resources/WebView2Loader.dll": "WebView2Loader.dll"
     },
     "category": "Utility",
@@ -37,7 +36,8 @@
           "displayLanguageSelector": false,
           "languages": ["SimpChinese"],
           "installerIcon": "icons/icon.ico",
-          "installMode": "perMachine"
+          "installMode": "perMachine",
+          "installerHooks": "nsis-hooks.nsh"
         }
     }
   }

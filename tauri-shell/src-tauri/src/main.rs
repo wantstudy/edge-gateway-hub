@@ -11,6 +11,21 @@ const DAEMON_EXE: &str = if cfg!(windows) {
     "iot-daq-daemon"
 };
 
+/// 首次运行就地生成的**最小配置**。
+///
+/// daemon 的默认配置路径是 `./config.toml`，而 `GatewayConfig::load` 对「文件不存在」
+/// 是 fail-fast（退出码 1），因此该文件**必须存在**；但 `GatewayConfig` 全字段带
+/// `#[serde(default)]` + `Default`，最小内容即可正常启动（实测 `/api/overview` 200）。
+/// 故安装包不再随包分发 `config.example.toml`——模板只作为开发参考留在仓库根目录。
+const MINIMAL_CONFIG: &str = "\
+# 本文件由 IoT-DAQ Gateway 桌面端首次运行时自动生成（已存在则绝不会被覆盖）。
+# 采集点位 / 北向出口 / 告警 / 管理面账号均可在本文件中配置，改后重启程序生效。
+# 完整字段示例见仓库根目录 config.example.toml。
+
+[gateway]
+gateway_id = \"gw-local\"
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 fn main() {
     tauri::Builder::default()
@@ -72,18 +87,13 @@ fn spawn_daemon_sidecar(app: &tauri::AppHandle) {
         }
     };
 
-    // 首次运行：若数据目录里没有 config.toml，用随包分发的示例配置初始化一份
-    // （用户手写资产，之后由用户自行维护；已存在则绝不覆盖）。
+    // 首次运行：数据目录里没有 config.toml 时，就地生成一份**最小配置**（见 MINIMAL_CONFIG）。
+    // 用户手写资产，之后由用户自行维护；已存在则绝不覆盖。
     let config_path = data_dir.join("config.toml");
     if !config_path.exists() {
-        let template = resource_dir.join("config.example.toml");
-        if template.exists() {
-            match std::fs::copy(&template, &config_path) {
-                Ok(_) => eprintln!("[tauri-shell] 已用示例配置初始化：{config_path:?}"),
-                Err(e) => eprintln!("[tauri-shell] 初始化配置失败（{template:?}）：{e}"),
-            }
-        } else {
-            eprintln!("[tauri-shell] 未找到示例配置模板（{template:?}），由 daemon 自行处理缺省配置。");
+        match std::fs::write(&config_path, MINIMAL_CONFIG) {
+            Ok(()) => eprintln!("[tauri-shell] 已生成最小配置：{config_path:?}"),
+            Err(e) => eprintln!("[tauri-shell] 生成配置失败（{config_path:?}）：{e}"),
         }
     }
 
