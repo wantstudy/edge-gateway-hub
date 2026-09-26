@@ -11,24 +11,19 @@
    授权判定全部在 Rust 侧 —— 前端只做展示，改前端不影响授权结果。
 -->
 <template>
-  <PageHeader
-    crumb="系统 / 授权与激活"
-    title="授权与激活"
-    desc="机器码指纹、租约状态、激活与换机申请。客户端不具备任何解绑或重置能力。"
-  >
-    <template #actions>
-      <button type="button" class="wc-btn wc-btn--sm" @click="refresh">刷新状态</button>
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
-    <!-- ===== 全局授权横幅（优先级见 §4.6；本页只呈现授权类横幅）===== -->
-    <div v-if="banner" class="wc-banner" :class="`wc-banner--${banner.tone}`" data-testid="license-banner">
-      <span aria-hidden="true">{{ banner.icon }}</span>
-      <span>
-        <b>{{ banner.title }}</b>
-        <span v-if="banner.text"> · {{ banner.text }}</span>
+    <!-- 工具条：授权状态标签（chip，点击进本页；真实原因在悬浮说明）+ 刷新状态 -->
+    <div class="pg-toolbar">
+      <span
+        class="wc-tag"
+        :class="`wc-tag--${statusChip.tone}`"
+        :title="statusChip.reason"
+        data-testid="license-banner"
+      >
+        <span aria-hidden="true">●</span>{{ statusChip.label }}
       </span>
+      <span class="wc-spacer" />
+      <button type="button" class="wc-btn wc-btn--sm" data-testid="license-refresh" @click="refresh">刷新状态</button>
     </div>
 
     <!-- ===== KPI 区：授权状态一眼可见 ===== -->
@@ -48,7 +43,7 @@
       <div class="wc-kpi">
         <span class="wc-kpi__label">授权到期时间</span>
         <span class="wc-kpi__value wc-kpi__value--sm" data-testid="kpi-validUntil">{{ license.validUntil }}</span>
-        <span class="wc-kpi__sub">{{ license.status === 'active' ? `剩余 ${license.remainingDays} 天` : '到期后按下方规则降级' }}</span>
+        <span class="wc-kpi__sub">{{ license.status === 'active' ? `剩余 ${license.remainingDays} 天` : '到期后降级' }}</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">上次心跳</span>
@@ -60,34 +55,30 @@
     <!-- ===== 降级/异常可解释区（状态 ∈ 离线宽限 / 已降级 时显示：原因 + 恢复路径）===== -->
     <div
       v-if="license.degradeReason"
-      class="wc-banner wc-banner--danger wc-banner--block"
+      class="lic-degrade"
       data-testid="degrade-explain"
     >
       <span aria-hidden="true">⚠</span>
-      <span class="wc-banner__stack">
-        <span class="wc-banner__line">
+      <span class="lic-degrade__stack">
+        <span class="lic-degrade__line">
           <b>当前状态：{{ statusText }}</b>
         </span>
-        <span class="wc-banner__line" data-testid="degrade-reason">
+        <span class="lic-degrade__line" data-testid="degrade-reason">
           原因：{{ license.degradeReason }}
         </span>
-        <span class="wc-banner__line" data-testid="degrade-recovery">
-          恢复路径：{{ recoveryPath }}（本地采集持续，数据留在本地可导出，恢复联网后自动恢复转发）
+        <span class="lic-degrade__line" data-testid="degrade-recovery">
+          恢复路径：{{ recoveryPath }}
         </span>
       </span>
     </div>
 
-    <!-- ===== 网关实时授权状态（real 模式：`GET /api/license/status`）===== -->
-    <section v-if="IS_REAL" class="wc-card">
+    <!-- ===== 网关实时授权状态（`GET /api/license/status`）===== -->
+    <section class="wc-card">
       <div class="wc-card__head">
         <h3>网关授权状态</h3>
-        <span class="wc-card__sub">GET /api/license/status · 判定在 Rust 侧，前端只做展示</span>
       </div>
       <div class="wc-card__body">
-        <div v-if="licenseNotice" class="wc-banner wc-banner--warn" data-testid="license-status-notice">
-          <span aria-hidden="true">!</span>
-          <span>{{ licenseNotice }}</span>
-        </div>
+        <p v-if="licenseNotice" class="lic-inline" data-testid="license-status-notice">{{ licenseNotice }}</p>
         <template v-else-if="realLicense">
           <dl class="wc-kv">
             <dt>状态</dt>
@@ -102,16 +93,9 @@
             <dd>{{ realLicense.northForwardAllowed ? '已放行' : '已停用（免费版 / 未授权）' }}</dd>
             <dt v-if="realLicense.degradeReason">降级原因</dt>
             <dd v-if="realLicense.degradeReason">{{ realLicense.degradeReason }}</dd>
-            <dt v-if="realLicense.note">后端附注</dt>
-            <dd v-if="realLicense.note" class="wc-mono">{{ realLicense.note }}</dd>
+            <dt v-if="realLicense.note">说明</dt>
+            <dd v-if="realLicense.note">{{ realLicense.note }}</dd>
           </dl>
-          <p class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>
-              剩余天数 / 到期时间均为后端<b>字符串原样透传</b>（不做数值换算）；
-              `lease.raw`（签名租约原文）不在任何接口中回显。
-            </span>
-          </p>
         </template>
       </div>
     </section>
@@ -122,7 +106,6 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>机器码指纹</h3>
-          <span class="wc-card__sub">多源锚点 + HMAC · 一机一码</span>
         </div>
         <div class="wc-card__body">
           <MachineCodeDisplay
@@ -130,17 +113,10 @@
             :anchors="anchorList"
             data-testid="machine-code"
           />
-          <p class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>
-              容器部署时锚点取自宿主机，容器重建不改变机器码；
-              N-of-M 容错：替换任一易变锚点仍判为同机，整机更换则判为异机。
-            </span>
-          </p>
           <!-- 机器码锚点明细（原型 :1805-1812）：锚点来源 / 脱敏值 / 稳定性 -->
           <UiTable
             :columns="anchorColumns"
-            :rows="anchorRows"
+            :rows="pagedAnchorRows"
             row-key-field="source"
             :footer="anchorFoot"
             data-testid="anchor-table"
@@ -153,14 +129,13 @@
             </template>
           </UiTable>
 
-          <p v-if="IS_REAL" class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>
-              网关未提供锚点明细接口：上表来源取自本页授权快照（现有来源），脱敏值与稳定性<b>未上报</b>，
-              前端<b>不做推断</b>（稳定性权重见 `docs/design/machine-fingerprint.md` §1，仅用于诊断排序，
-              不改变 N-of-M 判定阈值）。
-            </span>
-          </p>
+          <UiPager
+            v-if="anchorRows.length > ANCHOR_PAGE_SIZE"
+            :page="anchorPage"
+            :total="anchorRows.length"
+            :page-size="ANCHOR_PAGE_SIZE"
+            @update:page="onAnchorPage"
+          />
 
           <dl class="wc-kv">
             <dt>设备名称</dt>
@@ -179,7 +154,6 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>授权操作</h3>
-          <span class="wc-card__sub">客户端仅此三项</span>
         </div>
         <div class="wc-card__body">
           <!-- 触点 1：复制机器码 -->
@@ -230,7 +204,6 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>授权详情</h3>
-          <span class="wc-card__sub">激活码默认脱敏</span>
         </div>
         <div class="wc-card__body">
           <dl class="wc-kv">
@@ -264,16 +237,9 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>换机申请</h3>
-          <span class="wc-card__sub">客户侧仅提交申请</span>
         </div>
         <div class="wc-card__body">
-          <p class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>
-              设备硬件更换或系统重装导致机器码变化时，需厂商在后台重新发放激活码。
-              本页面仅提交申请，不具备任何自助处理能力。
-            </span>
-          </p>
+          <p v-if="transferError" class="lic-inline lic-inline--danger" data-testid="transfer-error">{{ transferError }}</p>
 
           <!-- 已有申请：展示受理状态 -->
           <div v-if="transferTicket" class="wc-ticket" data-testid="transfer-ticket">
@@ -301,7 +267,7 @@
           <EmptyState
             v-else
             title="尚未提交换机申请"
-            desc="机器码已变化或计划更换主机时，提交申请后由厂商在总管理后台处理并重新发放激活码。"
+            desc="机器码变化后需厂商重新发放激活码；提交申请由厂商后台处理。"
           >
             <template #actions>
               <button type="button" class="wc-btn wc-btn--primary" data-testid="btn-open-transfer-2" @click="openTransfer">
@@ -338,10 +304,6 @@
           <h3 class="wc-modal__title">输入激活码</h3>
         </div>
         <div class="wc-modal__body">
-          <p class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>激活需联网（约 3 秒），一个激活码只能激活一台设备。若本机已更换硬件，请改点「申请换机」。</span>
-          </p>
           <UiField
             label="激活码"
             required
@@ -356,9 +318,6 @@
             />
           </UiField>
           <p v-if="activateResult" class="wc-modal__result" data-testid="activate-result">{{ activateResult }}</p>
-          <p v-else class="wc-modal__hint" data-testid="activate-format">
-            提交后由网关联网完成校验；真实授权判定在网关（Rust）侧执行。
-          </p>
         </div>
         <div class="wc-modal__foot">
           <button type="button" class="wc-btn" @click="activateOpen = false">取消</button>
@@ -417,7 +376,6 @@
  */
 import { computed, onMounted, ref } from 'vue';
 import {
-  PageHeader,
   StatusTag,
   EmptyState,
   MachineCodeDisplay,
@@ -427,16 +385,14 @@ import {
   UiField,
   UiInput,
   UiTable,
+  UiPager,
   formatMachineCode,
   type DangerFact,
   type TableColumn,
 } from '@ui-kit';
-import { API_MODE, repo, DEFAULT_ACTOR } from '@/api/repo';
+import { repo, DEFAULT_ACTOR } from '@/api/repo';
 import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
-
-/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
-const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 展示态
@@ -500,12 +456,12 @@ const remainingValue = computed<string>(() => {
 const remainingSub = computed<string>(() => {
   const lic = license.value;
   if (lic.status === 'trial') {
-    return '试用期 3 天（云端首次激活时间判定）';
+    return '试用期 3 天';
   }
   if (lic.status === 'active') {
-    return '24h 自动心跳续期';
+    return '24h 心跳续期';
   }
-  return '恢复联网/重新激活后自动恢复';
+  return '重新激活后自动恢复';
 });
 
 /** 详情区剩余天数文本。 */
@@ -560,24 +516,34 @@ const anchorColumns: readonly TableColumn[] = [
 ];
 
 /**
- * 演示态锚点明细（原型 :1808-1811 四行）。
+ * 锚点明细行。
  *
- * 仅 mock 模式使用；real 模式下网关未提供锚点明细接口，稳定性一律展示「—」，
- * **前端不做推断**（见下方 note）。
+ * 网关未提供锚点明细接口：来源取自本页授权快照（现有来源），脱敏值与稳定性
+ * **未上报**，一律展示「—」，前端**不做推断**。
  */
-const DEMO_ANCHOR_ROWS: readonly AnchorRow[] = [
-  { source: '主板序列号', value: 'MB-****-4471', stability: '高' },
-  { source: 'CPU 标识', value: 'BFEBFBFF****', stability: '高' },
-  { source: '系统盘序列号', value: 'WD-****-9C21', stability: '高' },
-  { source: '物理网卡 MAC', value: '3C:7C:****:A2', stability: '中' },
-];
-
-/** 锚点明细行（mock = 原型四行；real = 网关上报的锚点来源，脱敏值与稳定性未上报时为「—」）。 */
 const anchorRows = computed<readonly AnchorRow[]>(() =>
-  IS_REAL
-    ? anchorList.value.map((src) => ({ source: src, value: '—', stability: '—' }))
-    : DEMO_ANCHOR_ROWS,
+  anchorList.value.map((src) => ({ source: src, value: '—', stability: '—' })),
 );
+
+/**
+ * 锚点明细分页（切片留在页面级 computed；UiTable 纯展示）。
+ *
+ * 现状：网关未上报锚点明细（来源取自授权快照、值/稳定性一律 '—'），通常只有 1~3 行，
+ * 此处仍按真实分页接好 —— 若后端未来补全多锚点明细，换页即可生效，不必再改结构。
+ */
+const ANCHOR_PAGE_SIZE = 4;
+const anchorPage = ref(1);
+
+/** 当前页锚点明细（由 `anchorPage` 驱动的真实切片）。 */
+const pagedAnchorRows = computed<readonly AnchorRow[]>(() => {
+  const start = (anchorPage.value - 1) * ANCHOR_PAGE_SIZE;
+  return anchorRows.value.slice(start, start + ANCHOR_PAGE_SIZE);
+});
+
+/** 换页（由 UiPager 驱动）。 */
+function onAnchorPage(next: number): void {
+  anchorPage.value = next;
+}
 
 /** 锚点表 foot（原型 :1806）。 */
 const anchorFoot =
@@ -595,32 +561,29 @@ function stabilityTagClass(stability: string): string {
 }
 
 /**
- * 全局横幅（授权类，优先级最高；见设计 §4.6）。
+ * 授权状态标签（chip；真实原因放在 `title` 悬浮说明，不再占用整条横幅）。
  * 文案与色调与降级原因严格对应，禁止「只说降级不说原因」。
  */
-const banner = computed<{ tone: 'ok' | 'warn' | 'danger'; icon: string; title: string; text: string } | null>(() => {
+const statusChip = computed<{ tone: 'ok' | 'warn' | 'danger'; label: string; reason: string }>(() => {
   const lic = license.value;
   if (lic.status === 'grace' || lic.status === 'stopped') {
     return {
       tone: 'danger',
-      icon: '⚠',
-      title: lic.status === 'grace' ? '授权已降级（离线宽限）' : '授权已停用',
-      text: lic.degradeReason || '北向转发已停用，本地采集继续。',
+      label: lic.status === 'grace' ? '授权已降级（离线宽限）' : '授权已停用',
+      reason: lic.degradeReason || '北向转发已停用，本地采集继续。',
     };
   }
   if (lic.status === 'trial') {
     return {
       tone: 'warn',
-      icon: '⚠',
-      title: `试用剩余 ${lic.remainingText}`,
-      text: '到期后降级为免费基础版（8 设备 / ≥1s / 无北向转发 / 无 OTA）。',
+      label: `试用剩余 ${lic.remainingText}`,
+      reason: '到期后降级为免费基础版（8 设备 / ≥1s / 无北向转发 / 无 OTA）。',
     };
   }
   return {
     tone: 'ok',
-    icon: '●',
-    title: `授权正常 · ${lic.tierName}`,
-    text: `租约有效期至 ${lic.validUntil}，上次心跳 ${lic.lastHeartbeatAt}（正常）。`,
+    label: `授权正常 · ${lic.tierName}`,
+    reason: `租约有效期至 ${lic.validUntil}，上次心跳 ${lic.lastHeartbeatAt}（正常）。`,
   };
 });
 
@@ -704,10 +667,10 @@ function openActivate(): void {
 }
 
 /** 提交激活码：先本地格式校验，再调用仓库（不做授权判定）。 */
-function submitActivate(): void {
+async function submitActivate(): Promise<void> {
   activateError.value = '';
   activateResult.value = '';
-  const result = repo.activate({ code: activateCode.value, actor: DEFAULT_ACTOR });
+  const result = await repo.activate({ code: activateCode.value, actor: DEFAULT_ACTOR });
   if (!result.ok) {
     activateError.value = result.message;
     return;
@@ -723,7 +686,7 @@ function submitActivate(): void {
 /** 换机弹窗开关。 */
 const transferOpen = ref(false);
 
-/** 已提交的换机受理单（本会话内存态，演示用）。 */
+/** 已提交的换机受理单（本会话内存态）。 */
 const transferTicket = ref<{ id: string; at: string; reason: string } | null>(null);
 
 /** 换机原因枚举（必选；**不含**任何「废弃/解绑」字样，避免误导客户以为客户端可执行）。 */
@@ -756,17 +719,23 @@ const transferFacts = computed<readonly DangerFact[]>(() => [
   { label: '当前授权', value: `${license.value.tierName} · ${statusText.value}` },
 ]);
 
-/** 提交换机申请，成功后展示受理编号与「待厂商处理」状态。 */
-function onTransferSubmit(payload: { reason: string; note: string; tail: string }): void {
-  const result = repo.submitTransferRequest({
+/** 换机申请提交后的真实失败原因（不静默吞错）。 */
+const transferError = ref('');
+
+/** 提交换机申请，成功后展示受理编号；失败展示后端真实 message。 */
+async function onTransferSubmit(payload: { reason: string; note: string; tail: string }): Promise<void> {
+  transferError.value = '';
+  // reason（原因枚举）与 note（补充说明）各自独立下发，不拼进同一字段。
+  const result = await repo.submitTransferRequest({
     oldMachineCode: formatMachineCode(gateway.value.machineCode),
     newMachineCode: '',
-    reason: `${payload.reason}；${payload.note}`,
+    reason: payload.reason,
     contact: DEFAULT_ACTOR,
     actor: DEFAULT_ACTOR,
   });
   transferOpen.value = false;
   if (!result.ok) {
+    transferError.value = result.message;
     return;
   }
   const now = new Date();
@@ -785,8 +754,8 @@ function onTransferSubmit(payload: { reason: string; note: string; tail: string 
 /** 档位能力弹窗开关。 */
 const showCapabilities = ref(false);
 
-/** 激活码展示值：已激活态由厂商发放（演示用固定值），否则空。 */
-const activationCode = computed<string>(() => (license.value.status === 'active' || license.value.status === 'trial' ? 'IOT-2026-8C3F-1234-ABCD-A1' : ''));
+/** 激活码展示值：网关未上报明文，诚实展示为空（`MaskedCode` 渲染为 —）。 */
+const activationCode = computed<string>(() => '');
 
 /** 揭示激活码明文（记录审计；前端仅控制可见性）。 */
 function onRevealCode(): void {
@@ -874,9 +843,6 @@ function epochToDateText(value: string): string {
  * 不可得时**不静默吞错**：给出原因与恢复路径，沿用页面现有来源展示。
  */
 async function loadLicenseStatus(): Promise<void> {
-  if (!IS_REAL) {
-    return;
-  }
   try {
     const raw = await apiRequest<Record<string, unknown>>('/api/license/status');
     const status = typeof raw['status'] === 'string' ? raw['status'] : 'unlicensed';
@@ -909,22 +875,47 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.pg-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+}
 .wc-btn--wide {
   width: 100%;
 }
 .wc-kpi__value--sm {
   font-size: 15px;
 }
-.wc-banner--block {
+/* 降级/异常可解释块（原因 + 恢复路径，保留真实信息，不再用整条横幅） */
+.lic-degrade {
+  display: flex;
+  gap: 8px;
   align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--danger-border);
+  background: var(--danger-bg);
+  border-radius: var(--radius-sm);
+  color: var(--danger-fg);
+  font-size: var(--fs-table);
 }
-.wc-banner__stack {
+.lic-degrade__stack {
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
-.wc-banner__line {
+.lic-degrade__line {
   line-height: 1.6;
+}
+/* 行内状态/错误提示（单行，非横幅） */
+.lic-inline {
+  margin: 0 0 10px;
+  font-size: var(--fs-table);
+  color: var(--text-2);
+}
+.lic-inline--danger {
+  color: var(--danger-fg);
 }
 /* 能力边界说明：文字性说明，**不含**任何可点元素 */
 .wc-impact {
@@ -1006,7 +997,7 @@ onMounted(() => {
 .wc-modal__mask {
   position: fixed;
   inset: 0;
-  background: rgba(29, 33, 41, 0.45);
+  background: var(--mask);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1014,7 +1005,7 @@ onMounted(() => {
   padding: 24px;
 }
 .wc-modal {
-  background: #fff;
+  background: var(--bg-card);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   width: 520px;
@@ -1036,12 +1027,6 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
-}
-.wc-modal__hint {
-  margin: 0;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  line-height: 1.6;
 }
 .wc-modal__result {
   margin: 0;

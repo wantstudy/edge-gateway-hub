@@ -47,27 +47,14 @@
     <!-- 右：登录卡（纯白大圆角） -->
     <main class="wc-login__side">
       <div class="wc-login__card">
-        <div v-if="authState === 'initialized'" class="wc-login__head">
-          <h1 class="wc-login__title">登录控制台</h1>
-          <p class="wc-login__sub">使用网关账号登录以继续</p>
-        </div>
-
-        <!-- 未初始化：首个管理员入口（由 `GET /api/auth/state` 的 initialized === false 驱动） -->
-        <div v-if="authState === 'uninitialized'" class="wc-login__head">
-          <h1 class="wc-login__title">初始化网关</h1>
-          <p class="wc-login__sub">本机尚无任何账号，请先创建首个管理员</p>
-        </div>
-
-        <!-- 接口未就绪 / 查询中 / 已初始化：主标题 + 可选说明 -->
-        <div v-else class="wc-login__head">
-          <h1 class="wc-login__title">
-            {{ authState === 'loading' ? '正在查询初始化状态…' : authState === 'unavailable' ? '登录控制台' : '登录控制台' }}
-          </h1>
-          <p v-if="authState === 'unavailable'" class="wc-login__sub">
-            网关未提供初始化状态查询接口
-            <code class="wc-mono">GET /api/auth/state</code>
-            ，无法判断本机是否需要先创建首个管理员；可直接用已有账号登录。
-          </p>
+        <!--
+          页头**唯一来源**：三种形态（查询中 / 已初始化 / 未初始化）此前各写一个
+          `v-if` 分支，其中 `initialized` 与 `v-else` 会同时命中 → 页面出现两个标题。
+          现统一由 `headTitle` / `headSub` 计算属性产出，结构上不可能重复。
+        -->
+        <div class="wc-login__head">
+          <h1 class="wc-login__title" data-testid="login-head-title">{{ headTitle }}</h1>
+          <p v-if="headSub" class="wc-login__sub">{{ headSub }}</p>
           <p
             v-if="authNote"
             class="wc-login__note"
@@ -78,11 +65,13 @@
         </div>
 
         <a-form
+          ref="formRef"
           :model="form"
+          :rules="formRules"
           layout="vertical"
           class="wc-login__form"
         >
-          <a-form-item field="username" label="账号" required>
+          <a-form-item field="username" label="账号">
             <a-input
               v-model="form.username"
               placeholder="请输入账号"
@@ -91,7 +80,7 @@
               @keyup.enter="onSubmit"
             />
           </a-form-item>
-          <a-form-item field="password" label="密码" required>
+          <a-form-item field="password" label="密码">
             <a-input-password
               v-model="form.password"
               placeholder="请输入密码"
@@ -150,8 +139,9 @@
  * @module web-console/pages/login
  * @description 登录页：real 模式下 401 / 未登录跳转至此；成功后写 session + 预取真实数据并回跳。
  */
-import { onMounted, reactive, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import type { FieldRule, FormInstance } from '@arco-design/web-vue';
 import { ApiError, apiLogin, setStoredBackendRole, setStoredToken } from '@/api/client';
 import { dataVersion, preloadRealData, repo } from '@/api/repo';
 import { mapBackendRole, session } from '@/store/session';
@@ -161,6 +151,20 @@ const router = useRouter();
 
 /** 表单草稿（正式环境：不预填任何账号）。 */
 const form = reactive({ username: '', password: '' });
+
+/** 表单实例（用于提交前做一次统一的必填校验）。 */
+const formRef = ref<FormInstance>();
+
+/**
+ * 必填校验规则：**显式中文文案**。
+ *
+ * Arco 的默认规则文案是 `#{field} 是必填项`（`#{field}` 是字段路径，不是 label），
+ * 故不加 rules 时页面会显示英文键名「password 是必填项」——必须显式覆盖。
+ */
+const formRules: Record<string, FieldRule[]> = {
+  username: [{ required: true, message: '请输入账号' }],
+  password: [{ required: true, message: '请输入密码' }],
+};
 
 /** 提交中状态（按钮 loading + 防重复提交）。 */
 const loading = ref(false);
@@ -179,8 +183,8 @@ const errorMsg = ref('');
  * `GET /api/auth/state` 响应（免认证、无副作用；字段语义与 daemon
  * `crates/daemon/src/mgmt/auth_login.rs` 的 `auth_state` 一致）。
  *
- * `note` 仅在上游拿不到授权运行期时附带如实原因（如
- * `license runtime not assembled; trial state unknown`），前端只原样透出，不翻译、不编造。
+ * `note` 仅在上游拿不到授权运行期时附带如实原因（中文如实说明，如
+ * 「网关授权模块未就绪，试用状态暂不可判定」），前端只原样透出，不翻译、不编造。
  */
 interface AuthStateResponse {
   initialized?: boolean;
@@ -208,6 +212,32 @@ const authState = ref<AuthState>('loading');
 
 /** `GET /api/auth/state` 附带的如实说明（无 note 字段时为空串）。 */
 const authNote = ref('');
+
+/** 页头主标题（三种形态唯一来源，保证只渲染一个标题）。 */
+const headTitle = computed<string>(() => {
+  switch (authState.value) {
+    case 'loading':
+      return '正在查询初始化状态…';
+    case 'uninitialized':
+      return '初始化网关';
+    default:
+      return '登录控制台';
+  }
+});
+
+/** 页头副标题（`loading` 无副标题；`unavailable` 说明原因但**不暴露内部接口路径**）。 */
+const headSub = computed<string>(() => {
+  switch (authState.value) {
+    case 'loading':
+      return '';
+    case 'uninitialized':
+      return '本机尚无任何账号，请先创建首个管理员';
+    case 'unavailable':
+      return '网关初始化状态暂不可查询，可直接用已有账号登录。';
+    default:
+      return '使用网关账号登录以继续';
+  }
+});
 
 /** 网关名（真实值；探测失败时显示「网关标识取得中」，绝不写死演示名）。 */
 const gatewayName = ref<string>('网关标识取得中');
@@ -250,6 +280,29 @@ function refreshGatewayName(): void {
 }
 
 /**
+ * 提交前统一做一次必填校验。
+ *
+ * 返回 `true` 表示**通过**。失败时由 Arco 在对应 `a-form-item` 下渲染**中文**提示，
+ * 不再另弹一条重复的整表提示。兜底 `trim()` 判空：`required` 规则认为全空白字符串
+ * 非空，而空白账号在后端同样会被拒（口径一致）。
+ */
+async function validateForm(): Promise<boolean> {
+  const errors = await formRef.value?.validate();
+  if (errors) {
+    return false;
+  }
+  if (!form.username.trim()) {
+    errorMsg.value = '请输入账号';
+    return false;
+  }
+  if (!form.password) {
+    errorMsg.value = '请输入密码';
+    return false;
+  }
+  return true;
+}
+
+/**
  * 创建首个管理员（`POST /api/auth/bootstrap`）。
  *
  * 后端契约（`auth_login.rs` 的 `bootstrap`）的关键分支 → 前端如实呈现，不重试、不兜底：
@@ -264,9 +317,12 @@ async function onBootstrap(): Promise<void> {
   if (bootstrapLoading.value || loading.value) {
     return;
   }
+  if (!(await validateForm())) {
+    return;
+  }
   const username = form.username.trim();
-  if (!username || form.password.length < 8) {
-    errorMsg.value = '首个管理员需要账号，以及至少 8 位口令';
+  if (form.password.length < 8) {
+    errorMsg.value = '首个管理员口令至少 8 位';
     return;
   }
   bootstrapLoading.value = true;
@@ -337,8 +393,7 @@ async function onSubmit(): Promise<void> {
   if (loading.value) {
     return;
   }
-  if (!form.username.trim() || !form.password) {
-    errorMsg.value = '请输入账号与密码';
+  if (!(await validateForm())) {
     return;
   }
   loading.value = true;

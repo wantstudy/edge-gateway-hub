@@ -5,31 +5,14 @@
     结构（`docs/design/prototype/gateway-v2a-glacier.html` :1090-1184 / :1655-1660）：
       纯主从（master-detail）—— 左列「找到设备」，右面板「维护这张点表」，职责不混。
 
-    硬性约定遵守情况：
+    约定：
       · 点位数**派生**自各设备（单一数据源），未配点表的设备不假装有数据；
-      · 右侧四个页签：**点表 / 点表信息** 为已实现内容，**映射链路 / 点位模拟** 只给骨架与
-        诚实空态（P0-4 未立项，不伪造链路图与模拟值）；
-      · 模拟列在模拟策略立项前一律显示占位「—」，不做假开关；
+      · 点位「推送」开关默认开，切换走 `PUT /api/points/:device_id/:point_id`（真实落库）；
       · 批量导入 / 导出 CSV（校验给「行号 + 原因 + 允许值」，导出即可当导入模板）；
-      · 导入经 `repo.replacePointsOfDevice` 落库 + 审计（按设备覆盖，写明提示）；
-      · 写操作（导入 / 模板 / 新增 / 编辑 / 删除）受 RoleGate 控制；删除走 DangerConfirmModal。
+      · 写操作（导入 / 模板 / 新增 / 编辑 / 删除 / 推送）受 RoleGate 控制；删除走 DangerConfirmModal。
   -->
-  <PageHeader
-    crumb="接入 / 点位与映射"
-    title="点位与映射"
-    desc="左侧设备列表（搜索 + 分页），右侧是该设备的点表 / 点表信息 / 映射链路 / 点位模拟。没有点表的设备采不到任何数据。"
-  >
-    <template #actions>
-      <RoleGate :allowed="canWrite">
-        <button type="button" class="wc-btn" @click="triggerImport">导入 CSV</button>
-      </RoleGate>
-      <button type="button" class="wc-btn" @click="exportTemplate">导出点表 CSV</button>
-      <input ref="fileInput" type="file" accept=".csv,text/csv" class="pt-hidden" @change="onFile" />
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
-    <!-- 工具行：原「筛选 + 台账」能力收编于此（类型 / 质量 / 关键字 / 重置），作用于当前选中设备 -->
+    <!-- 工具行：类型 / 质量 / 关键字 / 重置，作用于当前选中设备 -->
     <section class="wc-card">
       <div class="wc-card__body">
         <div class="wc-filters">
@@ -49,6 +32,17 @@
             <label>&nbsp;</label>
             <button type="button" class="wc-btn" @click="resetFilters">重置</button>
           </div>
+          <div class="wc-filters__item">
+            <label>&nbsp;</label>
+            <RoleGate :allowed="canWrite">
+              <button type="button" class="wc-btn" @click="triggerImport">导入 CSV</button>
+            </RoleGate>
+          </div>
+          <div class="wc-filters__item">
+            <label>&nbsp;</label>
+            <button type="button" class="wc-btn" @click="exportTemplate">导出点表 CSV</button>
+          </div>
+          <input ref="fileInput" type="file" accept=".csv,text/csv" class="pt-hidden" @change="onFile" />
         </div>
       </div>
     </section>
@@ -58,7 +52,6 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>设备列表</h3>
-          <span class="wc-card__sub">搜索后点选，右侧维护该设备</span>
         </div>
         <div class="wc-card__body">
           <UiInput v-model="deviceKw" placeholder="搜索设备名称 / 协议 / 地址…" />
@@ -87,9 +80,7 @@
                 <span class="pt-dev__pts wc-mono">{{ pointCountOf(d.id) }} 点</span>
               </div>
             </div>
-            <p v-if="filteredDevices.length === 0" class="pt-list__empty">
-              没有匹配的设备（关键词「{{ deviceKw }}」）。
-            </p>
+            <p v-if="filteredDevices.length === 0" class="pt-list__empty">没有匹配的设备。</p>
           </div>
 
           <UiPager :page="devPage" :total="filteredDevices.length" :page-size="DEV_PAGE_SIZE" numeric jump @update:page="devPage = $event" />
@@ -151,79 +142,8 @@
             </div>
           </div>
 
-          <!-- ── 点位表单（新增 / 编辑共用；写操作一律 RoleGate 已在按钮侧控制）── -->
-          <div v-if="pointForm" class="pt-form">
-            <p class="pt-form__title">
-              {{ pointForm.id ? `编辑点位：${pointForm.id}` : `为「${selected.name}」新增点位` }}
-            </p>
-            <div class="dv-form">
-              <UiField label="点位类型">
-                <UiSelect v-model="pointForm.pointType" :options="pointTypeOptions" />
-              </UiField>
-              <UiField label="点位名" required :error="formTouched && !formValid.name ? '必填' : ''">
-                <UiInput v-model="pointForm.name" placeholder="如 料筒温度1" />
-              </UiField>
-              <UiField
-                label="地址"
-                :required="pointForm.pointType === 'physical'"
-                :hint="pointForm.pointType === 'physical' ? addrStyleText : '计算点无 PLC 地址'"
-                :error="formTouched && !formValid.address ? '物理点地址必填' : ''"
-              >
-                <UiInput v-model="pointForm.address" :disabled="pointForm.pointType === 'derived'" placeholder="如 40001 / DB1.0" />
-              </UiField>
-              <UiField label="数据类型" :error="formTouched && !formValid.dataType ? `须为 ${DATA_TYPE_OPTIONS.join(' / ')}` : ''">
-                <UiSelect v-model="pointForm.dataType" :options="dataTypeOptions" />
-              </UiField>
-              <UiField
-                label="字节序"
-                :hint="pointForm.pointType === 'derived' ? '计算点无字节序' : ''"
-                :error="formTouched && !formValid.byteOrder ? `须为 ${BYTE_ORDER_OPTIONS.join(' / ')}` : ''"
-              >
-                <UiSelect v-model="pointForm.byteOrder" :options="byteOrderOptions" :disabled="pointForm.pointType === 'derived'" />
-              </UiField>
-              <UiField label="单位" :error="formTouched && !formValid.unit ? '必填' : ''">
-                <UiInput v-model="pointForm.unit" placeholder="如 ℃ / MPa" />
-              </UiField>
-              <UiField label="死区" hint="≥ 0" :error="formTouched && !formValid.deadband ? '须为 ≥ 0 的数值' : ''">
-                <UiInput v-model="pointForm.deadband" type="number" />
-              </UiField>
-              <UiField
-                label="北向目标点名"
-                required
-                hint="同一设备内必须唯一"
-                :error="formTouched && !formValid.targetKey ? '必填且设备内唯一' : ''"
-              >
-                <UiInput v-model="pointForm.targetKey" placeholder="如 M_Temp1" />
-              </UiField>
-              <UiField
-                v-if="pointForm.pointType === 'derived'"
-                label="公式"
-                full
-                required
-                hint="本页只做原文保存；公式的权威校验与求值在网关侧，不通过会以质量码 CalcFailed 体现"
-                :error="formTouched && !formValid.formula ? '计算点公式必填' : ''"
-              >
-                <UiInput v-model="pointForm.formula" placeholder="如 M_Good / M_Count * 100" />
-              </UiField>
-            </div>
-            <p class="wc-note">
-              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-              <span>
-                {{
-                  pointForm.id
-                    ? '编辑以「删除 + 重建」落到数据层（现有数据层未开放按字段更新的写接口），点位标识会变化并写入审计。'
-                    : '保存后立即对该设备生效；北向字段同步使用该「目标点名」。'
-                }}
-              </span>
-            </p>
-            <div class="dv-foot">
-              <button type="button" class="wc-btn wc-btn--primary wc-btn--sm" @click="submitPointForm">保存点位</button>
-              <button type="button" class="wc-btn wc-btn--sm" @click="pointForm = null">取消</button>
-            </div>
-          </div>
-
           <!-- ── 操作反馈 ── -->
-          <div v-if="lastNote" class="pt-note">
+          <div v-if="lastNote" class="pt-note" :class="lastNoteKind === 'warn' ? 'is-warn' : 'is-ok'">
             <span aria-hidden="true">{{ lastNoteKind === 'warn' ? '⚠' : '✓' }}</span>
             <span>{{ lastNote }}</span>
           </div>
@@ -233,7 +153,7 @@
             <EmptyState
               v-if="selectedPoints.length === 0"
               :title="`${selected.name} 尚未配置点表`"
-              :desc="`设备已保存，但还没有点位映射 —— 没有点表，这台设备采不到任何数据。可导入 CSV，或用 ${selected.protocolLabel} 协议模板先生成、再逐点校准地址。`"
+              :desc="`可导入 CSV，或用 ${selected.protocolLabel} 协议模板生成起点点位。`"
             >
               <template #actions>
                 <RoleGate :allowed="canWrite">
@@ -251,18 +171,18 @@
                     {{ row.pointType === 'derived' ? '计算点' : '物理点' }}
                   </span>
                 </template>
+                <template #cell-push="{ row }">
+                  <UiSwitch
+                    :model-value="pushValue(row)"
+                    :disabled="!canWrite || !!pushBusy[row.id]"
+                    on-text="推送"
+                    off-text="不推送"
+                    :data-testid="`point-push-${row.id}`"
+                    @update:model-value="(v) => togglePush(row, v)"
+                  />
+                </template>
                 <template #cell-quality="{ row }">
                   <span class="wc-tag" :class="qualityTagClass(row.quality)">{{ row.quality }}</span>
-                </template>
-                <template #cell-sim="{ row }">
-                  <span v-if="row.pointType === 'derived'" class="pt-dim">—</span>
-                  <span v-else class="pt-dim">未启用</span>
-                </template>
-                <template #cell-simRange>
-                  <span class="pt-dim">—</span>
-                </template>
-                <template #cell-simDec>
-                  <span class="pt-dim">—</span>
                 </template>
                 <template #cell-value="{ row }">
                   <span class="wc-mono">{{ row.valueText }}</span>
@@ -279,51 +199,23 @@
                 </template>
               </UiTable>
               <UiPager :page="page" :total="total" :page-size="PAGE_SIZE" numeric jump @update:page="onPage" />
-              <p class="pt-foot-note">
-                模拟 / 模拟范围 / 小数位三列在<b>模拟策略（P0-4）立项前为占位</b>，统一显示「—」；
-                当前值为网关真实采集值（换算与质量判定在网关侧）。
-              </p>
             </template>
           </template>
 
           <!-- ── 页签 1：点表信息 ── -->
           <div v-else-if="paneTab === 1" class="pt-pad">
-            <p v-if="selectedPoints.length === 0" class="wc-note">
-              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-              <span>该设备尚未配置点表，暂无点表信息。可先导入点表或使用协议模板生成。</span>
-            </p>
-            <template v-else>
-              <dl class="wc-kv">
-                <dt>地址风格</dt><dd class="wc-mono">{{ addrStyleText }}</dd>
-                <dt>点表来源</dt>
-                <dd>
-                  <span class="wc-tag wc-tag--info">未记录</span>
-                  <span class="pt-dd-hint">当前数据层不保存点表来源（CSV 导入 / 协议模板 / 手动新增），因此此处不猜测。</span>
-                </dd>
-                <dt>点位数量</dt><dd class="wc-mono">{{ selectedPoints.length }} 个（含 {{ calcCount }} 个公式点）</dd>
-                <dt>地址区间</dt><dd class="wc-mono">{{ addrRangeText }}</dd>
-                <dt>target 前缀</dt><dd class="wc-mono">{{ targetPrefixText }}</dd>
-                <dt>改点表影响</dt><dd>同步更新设备点位数与北向转发字段</dd>
-              </dl>
-              <p class="wc-note">
-                <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-                <span>本页所有信息均由<b>现有点位记录</b>派生，不另设第二套元数据，避免两处口径打架。</span>
-              </p>
-            </template>
+            <dl v-if="selectedPoints.length > 0" class="wc-kv">
+              <dt>地址风格</dt><dd class="wc-mono">{{ addrStyleText }}</dd>
+              <dt>点表来源</dt><dd><span class="wc-tag wc-tag--info">未记录</span></dd>
+              <dt>点位数量</dt><dd class="wc-mono">{{ selectedPoints.length }} 个（含 {{ calcCount }} 个公式点）</dd>
+              <dt>地址区间</dt><dd class="wc-mono">{{ addrRangeText }}</dd>
+              <dt>target 前缀</dt><dd class="wc-mono">{{ targetPrefixText }}</dd>
+              <dt>改点表影响</dt><dd>同步更新设备点位数与北向转发字段</dd>
+            </dl>
           </div>
 
-          <!-- ── 页签 2：映射链路（骨架 + 诚实空态）── -->
+          <!-- ── 页签 2：映射链路 ── -->
           <div v-else-if="paneTab === 2" class="pt-pad">
-            <p class="pt-sub-h">设备 → 地址区间 → 点位 → 北向 target key</p>
-            <EmptyState
-              title="映射链路可视化：规划中"
-              desc="「设备 / 点位 / 北向出口」的三段链路尚未立项（当前也没有可供绘制的结构化映射关系），因此这里不画示意链路图。现已确认的两段事实如下，可作核对依据。"
-            >
-              <template #actions>
-                <button type="button" class="wc-btn" @click="paneTab = 0">回到点表</button>
-                <button type="button" class="wc-btn" @click="go('rules')">查看转发规则</button>
-              </template>
-            </EmptyState>
             <dl class="wc-kv">
               <dt>设备</dt><dd class="wc-mono">{{ selected.name }} · {{ selected.id }}</dd>
               <dt>地址区间</dt><dd class="wc-mono">{{ addrRangeText }}</dd>
@@ -332,69 +224,63 @@
             </dl>
           </div>
 
-          <!-- ── 页签 3：点位模拟（诚实占位）── -->
+          <!-- ── 页签 3：点位模拟 ── -->
           <div v-else class="pt-pad">
-            <EmptyState
-              title="点位模拟：P0-4 尚未立项"
-              desc="逐点模拟（模式 / 范围 / 小数位 / 开关）属于待立项能力，未提供任何入口，也不可能伪造模拟值。当前可看真实采集值：实时数据页按 1s 节流渲染各点位曲线。"
-            >
-              <template #actions>
-                <button type="button" class="wc-btn wc-btn--primary" @click="goLive(selected.id)">看真实采集值</button>
-                <button type="button" class="wc-btn" @click="go('northbound')">看北向转发口径</button>
-              </template>
-            </EmptyState>
             <dl class="wc-kv">
               <dt>当前数据量</dt><dd class="wc-mono">{{ selectedPoints.length }} 点</dd>
-              <dt>模拟配置</dt><dd><span class="wc-tag wc-tag--unknown">无（未启用模拟）</span></dd>
             </dl>
           </div>
         </template>
       </section>
     </div>
 
-    <!-- 导入校验结果 -->
-    <section v-if="importResult" class="wc-card">
-      <div class="wc-card__head">
-        <h3>导入校验结果 · {{ importDeviceName }}</h3>
-        <span class="wc-card__sub">合法 {{ importResult.validRows.length }} 条 · 异常 {{ importResult.errors.length }} 条</span>
+    <!-- 导入校验结果（弹窗，不在列表页内联展示） -->
+    <Teleport to="body">
+      <div v-if="importResult" class="wc-modal__mask" @click.self="clearImport">
+        <div class="wc-modal wc-modal--wide" role="dialog" aria-modal="true" aria-label="导入校验结果">
+          <div class="wc-modal__head">
+            <h3 class="wc-modal__title">导入校验结果 · {{ importDeviceName }}</h3>
+          </div>
+          <div class="wc-modal__body">
+            <div v-if="importResult.errors.length" class="wc-banner wc-banner--danger">
+              <span aria-hidden="true">!</span>
+              <span>存在 {{ importResult.errors.length }} 条异常行，整批拒绝（一条都不写）。请按行号与原因修正后重新导入。</span>
+            </div>
+
+            <div v-if="importResult.errors.length" class="pt-err-wrap">
+              <table class="wc-table pt-err">
+                <thead>
+                  <tr><th>行号</th><th>原因</th><th>允许值</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="e in importResult.errors" :key="`${e.line}-${e.reason}`">
+                    <td class="wc-mono">{{ e.line }}</td>
+                    <td>{{ e.reason }}</td>
+                    <td class="wc-mono">{{ e.allowed }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p v-else class="pt-import-ok">
+              校验通过：合法 <b class="wc-mono">{{ importResult.validRows.length }}</b> 条，导入后按设备**覆盖**原有点表。
+            </p>
+          </div>
+          <div class="wc-modal__foot">
+            <button type="button" class="wc-btn" @click="clearImport">取消</button>
+            <button
+              type="button"
+              class="wc-btn wc-btn--primary"
+              :disabled="importBusy || importResult.validRows.length === 0 || importResult.errors.length > 0"
+              @click="commitImport"
+            >
+              {{ importBusy ? '导入中…' : `导入合法行（${importResult.validRows.length} 条，覆盖原有点表）` }}
+            </button>
+          </div>
+        </div>
       </div>
-      <div class="wc-card__body">
-        <div v-if="importResult.errors.length" class="wc-banner wc-banner--danger">
-          <span aria-hidden="true">!</span>
-          <span>存在 {{ importResult.errors.length }} 条异常行，整批拒绝（一条都不写）。请按行号与原因修正后重新导入。</span>
-        </div>
+    </Teleport>
 
-        <div v-if="importResult.errors.length" class="pt-err-wrap">
-          <table class="wc-table pt-err">
-            <thead>
-              <tr><th>行号</th><th>原因</th><th>允许值</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="e in importResult.errors" :key="`${e.line}-${e.reason}`">
-                <td class="wc-mono">{{ e.line }}</td>
-                <td>{{ e.reason }}</td>
-                <td class="wc-mono">{{ e.allowed }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="dv-foot">
-          <button
-            type="button"
-            class="wc-btn wc-btn--primary"
-            :disabled="importResult.validRows.length === 0 || importResult.errors.length > 0"
-            @click="commitImport"
-          >
-            导入合法行（{{ importResult.validRows.length }} 条）
-          </button>
-          <button type="button" class="wc-btn" @click="clearImport">取消</button>
-          <span class="dv-foot__hint">导入将按设备覆盖其原有全部点表（先删后写）。</span>
-        </div>
-      </div>
-    </section>
-
-    <div v-if="importDone" class="wc-banner wc-banner--ok">
+    <div v-if="importDone > 0" class="wc-banner wc-banner--ok">
       <span aria-hidden="true">✓</span>
       <span>已按设备覆盖导入 {{ importDone }} 个点位。</span>
     </div>
@@ -413,6 +299,101 @@
     @close="cancelDelete"
     @submit="confirmDelete"
   />
+
+  <!-- ================= 点位新增 / 编辑弹窗 ================= -->
+  <Teleport to="body">
+    <div v-if="pointForm" class="wc-modal__mask" @click.self="closePointForm">
+      <div
+        class="wc-modal"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="pointForm.id ? '编辑点位' : '新增点位'"
+        data-testid="point-modal"
+      >
+        <div class="wc-modal__head">
+          <h3 class="wc-modal__title">
+            {{ pointForm.id ? `编辑点位：${pointForm.id}` : `为「${selected?.name ?? ''}」新增点位` }}
+          </h3>
+        </div>
+        <div class="wc-modal__body">
+          <div class="dv-form">
+            <UiField label="点位类型">
+              <UiSelect v-model="pointForm.pointType" :options="pointTypeOptions" data-testid="point-modal-type" />
+            </UiField>
+            <UiField label="点位名" required :error="formTouched && !formValid.name ? '必填' : ''">
+              <UiInput v-model="pointForm.name" placeholder="如 料筒温度1" data-testid="point-modal-name" />
+            </UiField>
+            <UiField
+              label="地址"
+              :required="pointForm.pointType === 'physical'"
+              :hint="pointForm.pointType === 'physical' ? addrStyleText : '计算点无 PLC 地址'"
+              :error="formTouched && !formValid.address ? '物理点地址必填' : ''"
+            >
+              <UiInput
+                v-model="pointForm.address"
+                :disabled="pointForm.pointType === 'derived'"
+                placeholder="如 40001 / DB1.0"
+                data-testid="point-modal-address"
+              />
+            </UiField>
+            <UiField label="数据类型" :error="formTouched && !formValid.dataType ? `须为 ${DATA_TYPE_OPTIONS.join(' / ')}` : ''">
+              <UiSelect v-model="pointForm.dataType" :options="dataTypeOptions" />
+            </UiField>
+            <UiField
+              label="字节序"
+              :error="formTouched && !formValid.byteOrder ? `须为 ${BYTE_ORDER_OPTIONS.join(' / ')}` : ''"
+            >
+              <UiSelect v-model="pointForm.byteOrder" :options="byteOrderOptions" :disabled="pointForm.pointType === 'derived'" />
+            </UiField>
+            <UiField label="单位" :error="formTouched && !formValid.unit ? '必填' : ''">
+              <UiInput v-model="pointForm.unit" placeholder="如 ℃ / MPa" />
+            </UiField>
+            <UiField label="死区" hint="≥ 0" :error="formTouched && !formValid.deadband ? '须为 ≥ 0 的数值' : ''">
+              <UiInput v-model="pointForm.deadband" type="number" />
+            </UiField>
+            <UiField
+              label="北向目标点名"
+              required
+              hint="同一设备内必须唯一"
+              :error="formTouched && !formValid.targetKey ? '必填且设备内唯一' : ''"
+            >
+              <UiInput v-model="pointForm.targetKey" placeholder="如 M_Temp1" data-testid="point-modal-target" />
+            </UiField>
+            <UiField
+              v-if="pointForm.pointType === 'derived'"
+              label="公式"
+              full
+              required
+              :error="formTouched && !formValid.formula ? '计算点公式必填' : ''"
+            >
+              <UiInput v-model="pointForm.formula" placeholder="如 M_Good / M_Count * 100" />
+            </UiField>
+            <UiField label="北向推送" hint="关闭后该点位不进入北向转发">
+              <UiSwitch
+                v-model="pointForm.push"
+                on-text="推送"
+                off-text="不推送"
+                :disabled="formBusy"
+                data-testid="point-modal-push"
+              />
+            </UiField>
+          </div>
+        </div>
+        <div class="wc-modal__foot">
+          <button type="button" class="wc-btn" @click="closePointForm">取消</button>
+          <button
+            type="button"
+            class="wc-btn wc-btn--primary"
+            :disabled="formBusy"
+            data-testid="point-modal-save"
+            @click="submitPointForm"
+          >
+            {{ formBusy ? '保存中…' : '保存点位' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
@@ -421,22 +402,20 @@
  * @module web-console/pages/PointsPage
  * @description 点位与映射：主从布局（左设备列表 / 右四页签）。
  *
- * · 左列表：仅搜索框筛选 + 固定高度滚动 + 分页；点即切换右侧；
- * · 右页签：**点表**（12 列 + 行内操作）、**点表信息**（由现有点位派生）、
- *   **映射链路 / 点位模拟**（骨架 + 诚实空态 —— 未立项，不伪造）；
- * · 未配点表的设备给设备级空态 + 三个入口（导入 / 协议模板 / 手动新增）；
- * · CSV 导入：校验到「行号 + 原因 + 允许值」，fail-closed（有错整批不写）；
- * · 写操作全部走既有 `repo.*`（内存态 / 本地覆盖层 + 审计），签名不变。
+ * · 左列表：搜索 + 固定高度滚动 + 分页；点即切换右侧；
+ * · 右页签：**点表**（含北向推送开关）、**点表信息**、**映射链路**、**点位模拟**；
+ * · 写操作全部走既有 `repo.*`（真实 HTTP + 刷新），返回 `WriteResult`，失败展示真实原因；
+ * · CSV 导入：校验到「行号 + 原因 + 允许值」，fail-closed（有错整批不写）。
  */
 import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
-  PageHeader,
   UiTable,
   UiPager,
   UiSelect,
   UiInput,
   UiField,
+  UiSwitch,
   EmptyState,
   DangerConfirmModal,
   RoleGate,
@@ -445,7 +424,6 @@ import {
   type DangerFact,
 } from '@ui-kit';
 import {
-  API_MODE,
   dataVersion,
   repo,
   DATA_TYPE_OPTIONS,
@@ -472,7 +450,7 @@ const DEV_PAGE_SIZE = 8;
 /** 删除原因。 */
 const deleteReasons = ['误添加', '点位已废弃', '重复录入', '其他'];
 
-/** 表格列（12 列：对齐原型 :1077-1083；原型的首列勾选框因无批量能力实现，换成「类型」）。 */
+/** 表格列（对齐原型 :1077-1083，新增北向「推送」开关列）。 */
 const columns: readonly TableColumn[] = [
   { key: 'pointType', label: '类型' },
   { key: 'name', label: '点位名称' },
@@ -481,15 +459,13 @@ const columns: readonly TableColumn[] = [
   { key: 'byteOrder', label: '字节序', mono: true },
   { key: 'unit', label: '单位' },
   { key: 'targetKey', label: '目标点位', mono: true },
+  { key: 'push', label: '推送' },
   { key: 'sim', label: '模拟', align: 'right' },
   { key: 'simRange', label: '模拟范围' },
   { key: 'simDec', label: '小数位', align: 'right' },
   { key: 'value', label: '当前值' },
   { key: 'quality', label: '质量' },
 ];
-
-/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式完全不发请求。 */
-const IS_REAL = API_MODE === 'real';
 
 /** 是否可写（工程师及以上）。 */
 const canWrite = computed(() => session.state.role === 'admin' || session.state.role === 'engineer');
@@ -527,7 +503,7 @@ const selected = computed<DeviceRecord | null>(
   () => devices.value.find((d) => d.id === selectedDeviceId.value) ?? null,
 );
 
-/** 设备状态中文（列表行内小字；与 status-map 的 online / offline / error 文案保持一致）。 */
+/** 设备状态中文（列表行内小字）。 */
 function statusLabel(status: DeviceRecord['status']): string {
   if (status === 'online') {
     return '在线';
@@ -608,15 +584,10 @@ const filteredPoints = computed<readonly PointRecord[]>(() => {
   });
 });
 
-/** 当前页点位（补出模拟三列占位，避免 UI 里做假数据）。 */
-const items = computed(() => {
+/** 当前页点位。 */
+const items = computed<readonly PointRecord[]>(() => {
   const start = (page.value - 1) * PAGE_SIZE;
-  return filteredPoints.value.slice(start, start + PAGE_SIZE).map((p) => ({
-    ...p,
-    sim: '',
-    simRange: '',
-    simDec: '',
-  }));
+  return filteredPoints.value.slice(start, start + PAGE_SIZE);
 });
 const total = computed(() => filteredPoints.value.length);
 
@@ -655,12 +626,29 @@ watch([typeFilter, qualityFilter, keyword], () => {
   page.value = 1;
 });
 
+/**
+ * 整页刷新（深链 `#/points?device=…`）时 repo 设备清单往往尚未就绪，
+ * 先记住深链目标，待清单到位后再选中，避免刷新后丢失选中的设备。
+ */
+let pendingDeviceId = '';
+
+watch(devices, (list) => {
+  if (pendingDeviceId && list.some((d) => d.id === pendingDeviceId)) {
+    selectedDeviceId.value = pendingDeviceId;
+    pendingDeviceId = '';
+  } else if (!selectedDeviceId.value && list.length > 0) {
+    selectedDeviceId.value = list[0].id;
+  }
+});
+
 onMounted(() => {
   reload();
   const fromDevice = route.query.device;
   const devicesSnapshot = devices.value;
   if (typeof fromDevice === 'string' && fromDevice && devicesSnapshot.some((d) => d.id === fromDevice)) {
     selectedDeviceId.value = fromDevice;
+  } else if (typeof fromDevice === 'string' && fromDevice) {
+    pendingDeviceId = fromDevice;
   } else if (devicesSnapshot.length > 0) {
     selectedDeviceId.value = devicesSnapshot[0].id;
   }
@@ -722,7 +710,7 @@ const targetPrefixText = computed(() => {
 });
 
 // ---------------------------------------------------------------------------
-// 协议模板（第 3 动作的起点，务必再校准）
+// 协议模板（起点点位，务必再校准）
 // ---------------------------------------------------------------------------
 
 interface TemplateRow {
@@ -777,21 +765,21 @@ const PT_TEMPLATE: Readonly<Record<ProtocolType, readonly TemplateRow[]>> = Obje
 const lastNote = ref('');
 const lastNoteKind = ref<'ok' | 'warn'>('ok');
 
-/** 结果区提示（保留一小段时间后自动收起）。 */
+/** 结果区提示（写操作的真实反馈）。 */
 function note(text: string, kind: 'ok' | 'warn' = 'ok'): void {
   lastNote.value = text;
   lastNoteKind.value = kind;
 }
 
 /** 按协议模板生成起点点位（追加，不覆盖现有点表）。 */
-function applyProtocolTemplate(): void {
+async function applyProtocolTemplate(): Promise<void> {
   const dev = selected.value;
   if (!dev) {
     return;
   }
   const rows = PT_TEMPLATE[dev.protocol] ?? [];
   if (rows.length === 0) {
-    note(`${dev.protocolLabel} 暂无协议模板（P0 未覆盖该协议的起始点表）。`, 'warn');
+    note(`${dev.protocolLabel} 暂无协议模板。`, 'warn');
     return;
   }
   let created = 0;
@@ -806,18 +794,20 @@ function applyProtocolTemplate(): void {
       unit: '',
       deadband: 0,
       targetKey: `${dev.id}_${row.addr.replace(/[^A-Za-z0-9.]/g, '_')}`,
+      pushEnabled: true,
       formula: null,
       actor: session.state.displayName,
     };
-    repo.createPoint(draft);
+    const res = await repo.createPoint(draft);
+    if (!res.ok) {
+      reload();
+      note(`已写入 ${created} 个点位后停止：${res.message}`, 'warn');
+      return;
+    }
     created += 1;
   }
   reload();
-  note(
-    `已按 ${dev.protocolLabel} 模板追加 ${created} 个起点点位（单位为空、目标点名由设备 ID + 地址生成）。` +
-      '模板只解决「地址风格」，数量与含义必须对照手册逐条校准后才能上线。',
-    'warn',
-  );
+  note(`已按 ${dev.protocolLabel} 模板追加 ${created} 个起点点位。`);
 }
 
 // ---------------------------------------------------------------------------
@@ -836,10 +826,13 @@ interface PointForm {
   deadband: string;
   targetKey: string;
   formula: string;
+  /** 北向推送开关（弹窗内可改；新增默认开） */
+  push: boolean;
 }
 
 const pointForm = ref<PointForm | null>(null);
 const formTouched = ref(false);
+const formBusy = ref(false);
 
 /** 表单校验结果（逐字段，实时驱动 saves）。 */
 const formValid = computed(() => {
@@ -877,7 +870,26 @@ const formOk = computed(() => {
   return v.name && v.address && v.dataType && v.byteOrder && v.unit && v.deadband && v.targetKey && v.formula;
 });
 
-/** 打开表单（row 为空 = 新增）。 */
+/** 由表单草稿构造点位草稿（pushEnabled 由调用方决定）。 */
+function draftFromForm(f: PointForm, deviceId: string, pushEnabled: boolean): PointDraft {
+  const isPhysical = f.pointType === 'physical';
+  return {
+    deviceId,
+    name: f.name.trim(),
+    pointType: f.pointType,
+    address: isPhysical ? f.address.trim() : '',
+    dataType: f.dataType,
+    byteOrder: isPhysical ? (f.byteOrder as PointDraft['byteOrder']) : '—',
+    unit: f.unit.trim(),
+    deadband: Number(f.deadband),
+    targetKey: f.targetKey.trim(),
+    pushEnabled,
+    formula: isPhysical ? null : f.formula.trim(),
+    actor: session.state.displayName,
+  };
+}
+
+/** 打开表单弹窗（row 为空 = 新增）。 */
 function openPointForm(row: PointRecord | null): void {
   formTouched.value = false;
   pointForm.value = row
@@ -892,6 +904,7 @@ function openPointForm(row: PointRecord | null): void {
         deadband: String(row.deadband),
         targetKey: row.targetKey,
         formula: row.formula ?? '',
+        push: pushValue(row),
       }
     : {
         id: '',
@@ -904,47 +917,54 @@ function openPointForm(row: PointRecord | null): void {
         deadband: '0',
         targetKey: '',
         formula: '',
+        push: true,
       };
 }
 
-/** 保存点位：新增走 `createPoint`；编辑 = 删除 + 重建（数据层无按字段更新接口）。 */
-function submitPointForm(): void {
+/** 关闭弹窗并丢弃草稿。 */
+function closePointForm(): void {
+  pointForm.value = null;
+}
+
+/** 保存点位：新增走 `createPoint`，编辑走 `updatePoint`（真实 PUT）。 */
+async function submitPointForm(): Promise<void> {
   formTouched.value = true;
   const f = pointForm.value;
   const dev = selected.value;
-  if (!f || !dev || !formOk.value) {
+  if (!f || !dev || !formOk.value || formBusy.value) {
     return;
   }
-  const isPhysical = f.pointType === 'physical';
-  const draft: PointDraft = {
-    deviceId: dev.id,
-    name: f.name.trim(),
-    pointType: f.pointType,
-    address: isPhysical ? f.address.trim() : '',
-    dataType: f.dataType,
-    byteOrder: isPhysical ? (f.byteOrder as PointDraft['byteOrder']) : '—',
-    unit: f.unit.trim(),
-    deadband: Number(f.deadband),
-    targetKey: f.targetKey.trim(),
-    formula: isPhysical ? null : f.formula.trim(),
-    actor: session.state.displayName,
-  };
-  if (f.id) {
-    repo.deletePoint({ id: f.id, actor: session.state.displayName });
+  formBusy.value = true;
+  try {
+    if (f.id) {
+      const res = await repo.updatePoint({
+        ...draftFromForm(f, dev.id, f.push),
+        id: f.id,
+      });
+      if (!res.ok) {
+        note(`点位更新失败：${res.message}`, 'warn');
+        return;
+      }
+      pointForm.value = null;
+      reload();
+      note(`点位「${f.name.trim()}」已更新。`);
+      return;
+    }
+    const res = await repo.createPoint(draftFromForm(f, dev.id, f.push));
+    if (!res.ok) {
+      note(`点位新增失败：${res.message}`, 'warn');
+      return;
+    }
+    pointForm.value = null;
+    reload();
+    note(`点位「${res.data?.name ?? f.name.trim()}」已新增到「${dev.name}」。`);
+  } finally {
+    formBusy.value = false;
   }
-  const created = repo.createPoint(draft);
-  pointForm.value = null;
-  reload();
-  note(
-    f.id
-      ? `点位已更新为新记录 ${created.id}（删除 + 重建，审计两条记录）；原记录的北向映射请同步核对。`
-      : `点位「${created.name}」已新增到「${dev.name}」。`,
-    f.id ? 'warn' : 'ok',
-  );
 }
 
-/** 复制点位（除名称与目标点名外照搬，需二次确认落南向前的语义）。 */
-function copyPoint(row: PointRecord): void {
+/** 复制点位（除名称与目标点名外照搬）。 */
+async function copyPoint(row: PointRecord): Promise<void> {
   const dev = selected.value;
   if (!dev) {
     return;
@@ -965,29 +985,72 @@ function copyPoint(row: PointRecord): void {
     unit: row.unit,
     deadband: row.deadband,
     targetKey,
+    pushEnabled: pushValue(row),
     formula: row.formula,
     actor: session.state.displayName,
   };
-  const created = repo.createPoint(draft);
-  reload();
-  note(`已复制为「${created.name}」（目标点名 ${created.targetKey}）。复制点是起点，请改掉地址与目标点名后再用。`, 'warn');
-}
-
-/** 公式入口：公式编辑器尚未立项，给出诚实说明而不是假装已实现校验。 */
-function openFormula(row: PointRecord): void {
-  if (row.pointType === 'derived') {
-    note(
-      `「${row.name}」当前公式：${row.formula || '（空）'}。公式编辑器（语法校验 / 变量联想 / 试算）规划中，` +
-        '可用「编辑」直接改原文，权威校验与求值在网关侧（不通过会呈现 CalcFailed）。',
-      'warn',
-    );
+  const res = await repo.createPoint(draft);
+  if (!res.ok) {
+    note(`复制失败：${res.message}`, 'warn');
     return;
   }
-  note(
-    `「${row.name}」是物理点，本身不带公式。若需派生量，请把新点位建成「计算点」再写公式；` +
-      '公式编辑器规划中，当前仅支持原文录入。',
-    'warn',
-  );
+  reload();
+  note(`已复制为「${res.data?.name ?? draft.name}」（目标点名 ${res.data?.targetKey ?? targetKey}）。`, 'warn');
+}
+
+/**
+ * 推送开关当前显示值：优先取本次会话内 **PUT 成功确认** 的值；
+ * 无确认值时回落到后端行（缺失字段由 repo 按需求默认「开」）。
+ */
+function pushValue(row: PointRecord): boolean {
+  const confirmed = pushConfirmed.value[row.id];
+  return confirmed === undefined ? row.pushEnabled : confirmed;
+}
+
+/** 北向推送开关：真实 PUT；失败不改变开关状态并展示真实原因。 */
+async function togglePush(row: PointRecord, next: boolean): Promise<void> {
+  if (pushBusy.value[row.id]) {
+    return;
+  }
+  pushBusy.value = { ...pushBusy.value, [row.id]: true };
+  try {
+    const res = await repo.updatePoint({
+      id: row.id,
+      deviceId: row.deviceId,
+      name: row.name,
+      pointType: row.pointType,
+      address: row.address === '—' ? '' : row.address,
+      dataType: row.dataType,
+      byteOrder: row.byteOrder,
+      unit: row.unit,
+      deadband: row.deadband,
+      targetKey: row.targetKey,
+      pushEnabled: next,
+      formula: row.formula,
+      actor: session.state.displayName,
+    });
+    if (!res.ok) {
+      note(`推送开关更新失败：${res.message}`, 'warn');
+      return;
+    }
+    // 更新成功：记录后端已确认的值，再刷新列表（避免被默认值覆盖回原值）。
+    pushConfirmed.value = { ...pushConfirmed.value, [row.id]: next };
+    reload();
+    note(`点位「${row.name}」已${next ? '开启' : '关闭'}北向推送。`);
+  } finally {
+    const rest = { ...pushBusy.value };
+    delete rest[row.id];
+    pushBusy.value = rest;
+  }
+}
+
+/** 公式入口：展示当前公式原文（公式编辑器未落地）。 */
+function openFormula(row: PointRecord): void {
+  if (row.pointType === 'derived') {
+    note(`「${row.name}」当前公式：${row.formula || '（空）'}。`);
+    return;
+  }
+  note(`「${row.name}」是物理点，本身不带公式。如需派生量，请新建「计算点」并填写公式。`, 'warn');
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,7 +1063,7 @@ const CSV_HEADER = ['地址', '点位名', '数据类型', '字节序', '单位'
 const CSV_HEADER_LEGACY = ['设备', '点位名', '类型', '地址', '数据类型', '字节序', '单位', '死区', '北向目标点名', '公式'];
 
 interface ImportError {
-  /** 行号（表体行号或后端物理行号字符串；大数红线：字符串透传，绝不 parseInt） */
+  /** 行号（字符串透传，绝不 parseInt） */
   line: string;
   /** 原因 */
   reason: string;
@@ -1019,6 +1082,7 @@ interface ImportResult {
 const fileInput = ref<HTMLInputElement | null>(null);
 const importResult = ref<ImportResult | null>(null);
 const importDone = ref(0);
+const importBusy = ref(false);
 
 const importDeviceName = computed(
   () => devices.value.find((d) => d.id === importResult.value?.deviceId)?.name ?? '—',
@@ -1034,7 +1098,7 @@ function triggerImport(): void {
   fileInput.value?.click();
 }
 
-/** 解析 CSV 为二维数组（按行、按逗号；不处理引号内逗号，原型足够）。 */
+/** 解析 CSV 为二维数组（按行、按逗号）。 */
 function parseCsv(text: string): string[][] {
   return text
     .split(/\r?\n/)
@@ -1137,6 +1201,7 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
       unit,
       deadband,
       targetKey,
+      pushEnabled: true,
       formula: pointType === 'derived' ? formula : null,
       actor: session.state.displayName,
     });
@@ -1146,19 +1211,16 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
 }
 
 /**
- * 提交导入：real 走 `repo.actions.importPoints`（`POST /api/points/import`，
- * 后端 fail-closed：任一坏行整批拒绝、零落盘，错误体 `{line, reason, allowed}`）；
- * mock 落本地覆盖层（`repo.replacePointsOfDevice`，语义一致）。
+ * 提交导入：真实走 `repo.replacePointsOfDevice`（按设备覆盖；任一步失败即展示真实原因）。
  *
- * 无论哪种模式，凡存在异常行都**整批拒绝**（`fail-closed`），与页面提示一致。
+ * 存在异常行时**整批拒绝**（`fail-closed`），与页面提示一致。
  */
 async function commitImport(): Promise<void> {
   const result = importResult.value;
-  if (!result || result.validRows.length === 0) {
+  if (!result || result.validRows.length === 0 || importBusy.value) {
     return;
   }
   if (result.errors.length > 0) {
-    // 整批拒绝：一条都不写（与导入校验结果横幅文案一致）。
     note('存在异常行，整批拒绝：请按「行号 + 原因 + 允许值」修正后重新导入。', 'warn');
     return;
   }
@@ -1166,70 +1228,33 @@ async function commitImport(): Promise<void> {
   if (!dev) {
     return;
   }
-
-  if (IS_REAL) {
-    // 后端契约 CSV：device_id,point_id,protocol,address,frequency_ms
-    // （page 的 dataType/字节序/单位/死区/目标点名/公式 后端暂未建模，落盘后不保留）。
-    const csv = buildBackendCsv(dev, result.validRows);
-    const res = await repo.actions.importPoints({ csv, deviceId: dev.id, replace: true });
-    if (!res.ok) {
-      // 回填后端结构化错误（line/reason/allowed），横幅与错误表复用同一渲染。
-      importResult.value = { deviceId: result.deviceId, validRows: result.validRows, errors: res.errors };
-      importDone.value = 0;
-      note(`导入被整批拒绝（零落盘）：${res.message}`, 'warn');
-      return;
-    }
-    importResult.value = null;
-    importDone.value = Number(res.imported) || result.validRows.length;
-    page.value = 1;
-    reload();
-    note(`后端已落盘并热生效：${res.message}`, 'ok');
-  } else {
-    const count = repo.replacePointsOfDevice({
+  importBusy.value = true;
+  try {
+    const res = await repo.replacePointsOfDevice({
       deviceId: result.deviceId,
       rows: result.validRows,
       actor: session.state.displayName,
     });
+    if (!res.ok) {
+      importDone.value = 0;
+      note(`导入失败（未落盘）：${res.message}`, 'warn');
+      return;
+    }
     importResult.value = null;
-    importDone.value = count;
+    importDone.value = res.data?.imported ?? result.validRows.length;
     page.value = 1;
     reload();
+    note(`已覆盖导入 ${importDone.value} 个点位。`);
+  } finally {
+    importBusy.value = false;
   }
-}
-
-/**
- * 把页面点位草稿映射为后端契约 CSV（`device_id,point_id,protocol,address,frequency_ms`）。
- *
- * 字段对齐（后端 `config.rs::PointConfig`，见 pages.rs 注释）：
- *  · `point_id` = 点位的**地址**（寄存器号 / 端点式，如 `40001` / `DB1.0`）；
- *  · `address`   = 设备的**连接端点**（取 `connectionSummary` 首段，去掉「 · 」分隔的
- *    从站 / 槽位等可读后缀，避免逗号污染 CSV 该列）；
- *  · `protocol` / `frequency_ms` = 设备级配置（后端按设备聚合，逐点不重复存）。
- *
- * 注意：后端 PointConfig 仅持久化这 5 个字段；计算点（derived）无 PLC 地址，其
- * `point_id` 会被后端以「非法地址」整批拒绝（诚实限制，不伪造落盘）。
- */
-function buildBackendCsv(dev: DeviceRecord, rows: PointDraft[]): string {
-  const endpoint = (dev.connectionSummary.split(' · ')[0] ?? '').trim() || dev.connectionSummary;
-  const header = 'device_id,point_id,protocol,address,frequency_ms';
-  const lines = [header];
-  for (const r of rows) {
-    const pointId = r.pointType === 'derived' ? (r.formula ?? '') : r.address.trim();
-    lines.push([dev.id, pointId, dev.protocol, endpoint, String(dev.intervalMs)].join(','));
-  }
-  return lines.join('\n');
 }
 
 function clearImport(): void {
   importResult.value = null;
 }
 
-/**
- * 导出点表 CSV（real：`repo.actions.downloadPointsCsv` → `GET /api/points/export`；
- * mock：repo 本地生成）。后端导出列即导入模板（`device_id,point_id,protocol,
- * address,frequency_ms`），因此「导出即可当导入模板」由后端契约保证，前端不再
- * 自行拼装 Chinese-header CSV。
- */
+/** 导出点表 CSV（real：`repo.actions.downloadPointsCsv` → `GET /api/points/export`）。 */
 async function exportTemplate(): Promise<void> {
   const dev = selected.value;
   const result = await repo.actions.downloadPointsCsv(dev?.id);
@@ -1237,7 +1262,7 @@ async function exportTemplate(): Promise<void> {
     note(`点表导出失败：${result.message}`, 'warn');
     return;
   }
-  note(result.message || '已导出点表 CSV（可直接当导入模板）。', 'ok');
+  note(result.message || '已导出点表 CSV（可直接当导入模板）。');
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,6 +1270,18 @@ async function exportTemplate(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const pendingDelete = ref<PointRecord | null>(null);
+/** 北向推送开关的逐行提交中标记（禁用重复点击）。 */
+const pushBusy = ref<Record<string, boolean>>({});
+/**
+ * 推送开关的本地已确认值（key = 点位 id）。
+ *
+ * `GET /api/points` 目前**不回填 `push_enabled`**（缺失即按需求 6 取默认「开」），
+ * 若开关更新成功后直接 `reload()`，界面会被默认值覆盖回「开」，与刚才的
+ * 「已关闭」反馈自相矛盾（把用户的真实变更静默吞掉）。因此把 **PUT 成功**的
+ * 值在此保留为会话内权威值，直到列表读到后端真实字段为止；更新失败则不写入
+ * （界面保持原值 + 展示真实失败原因）。
+ */
+const pushConfirmed = ref<Record<string, boolean>>({});
 
 const deleteImpacts = computed<string[]>(() =>
   pendingDelete.value
@@ -1271,11 +1308,17 @@ function askDelete(row: PointRecord): void {
 function cancelDelete(): void {
   pendingDelete.value = null;
 }
-function confirmDelete(): void {
-  if (!pendingDelete.value) {
+async function confirmDelete(): Promise<void> {
+  const target = pendingDelete.value;
+  if (!target) {
     return;
   }
-  repo.deletePoint({ id: pendingDelete.value.id, actor: session.state.displayName });
+  const res = await repo.deletePoint({ id: target.id, actor: session.state.displayName });
+  if (!res.ok) {
+    pendingDelete.value = null;
+    note(`删除失败：${res.message}`, 'warn');
+    return;
+  }
   pendingDelete.value = null;
   reload();
 }
@@ -1283,10 +1326,6 @@ function confirmDelete(): void {
 // ---------------------------------------------------------------------------
 // 导航
 // ---------------------------------------------------------------------------
-
-function go(name: string): void {
-  void router.push({ name });
-}
 
 /** 查看该设备的实时数据。 */
 function goLive(deviceId: string): void {
@@ -1299,9 +1338,31 @@ watch(selectedDeviceId, () => {
   lastNote.value = '';
 });
 
-// real 模式：后端写操作（导入 / 删除）经 repo.actions 热生效并自增 dataVersion，
-// 此处响应式刷新列表 / 点表，使真实落盘即时可见（不依赖重新进入页面）。
+// real 模式：后端写操作经 repo 热生效并自增 dataVersion，此处响应式刷新列表 / 点表。
 watch(dataVersion, reload);
+
+// 弹窗打开期间按 Esc 关闭（遮罩点击同样关闭）；置尾避免引用后面声明的 importResult（TDZ）。
+function onModalKeydown(event: KeyboardEvent): void {
+  if (event.key !== 'Escape') {
+    return;
+  }
+  if (pointForm.value) {
+    closePointForm();
+  } else if (importResult.value) {
+    clearImport();
+  }
+}
+
+watch(
+  () => Boolean(pointForm.value) || Boolean(importResult.value),
+  (open) => {
+    if (open) {
+      window.addEventListener('keydown', onModalKeydown);
+    } else {
+      window.removeEventListener('keydown', onModalKeydown);
+    }
+  },
+);
 </script>
 
 <style scoped>
@@ -1322,7 +1383,7 @@ watch(dataVersion, reload);
   }
 }
 
-/* 左列：固定高度滚动 + 分页（原型 :620-621） */
+/* 左列：固定高度滚动 + 分页 */
 .pt-list {
   height: 520px;
   overflow-y: auto;
@@ -1480,18 +1541,7 @@ watch(dataVersion, reload);
   font-weight: 600;
 }
 
-/* 点位表单 */
-.pt-form {
-  padding: 16px 18px;
-  border-bottom: 1px solid var(--divider);
-  background: var(--bg-hover);
-}
-.pt-form__title {
-  margin: 0 0 12px;
-  font-size: var(--fs-body);
-  font-weight: 600;
-  color: var(--text-1);
-}
+/* 点位表单（弹窗内复用） */
 .dv-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1504,10 +1554,6 @@ watch(dataVersion, reload);
   gap: 12px;
   flex-wrap: wrap;
   margin-top: 10px;
-}
-.dv-foot__hint {
-  font-size: var(--fs-caption);
-  color: var(--text-3);
 }
 
 /* 操作反馈 */
@@ -1524,37 +1570,20 @@ watch(dataVersion, reload);
   font-size: var(--fs-caption);
   line-height: 1.6;
 }
+.pt-note.is-warn {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
 
 /* 页签内容容器 */
 .pt-pad {
   padding: 16px 18px;
 }
-.pt-sub-h {
-  margin: 0 0 10px;
-  font-size: var(--fs-caption);
-  font-weight: 600;
-  color: var(--text-3);
-}
-.pt-dim {
-  color: var(--text-3);
-  opacity: 0.6;
-  font-size: var(--fs-caption);
-}
-.pt-dd-hint {
-  margin-left: 8px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-}
 .pt-ops {
   display: inline-flex;
   gap: 6px;
   white-space: nowrap;
-}
-.pt-foot-note {
-  margin: 8px 16px 14px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  line-height: 1.6;
 }
 
 /* 导入错误表 */
@@ -1564,6 +1593,57 @@ watch(dataVersion, reload);
   border: 1px solid var(--divider);
   border-radius: var(--radius-sm);
   margin-bottom: 12px;
+}
+.pt-import-ok {
+  margin: 0;
+  font-size: var(--fs-body);
+  color: var(--text-2);
+}
+
+/* 弹窗（与 AccountsPage 同一套 token） */
+.wc-modal__mask {
+  position: fixed;
+  inset: 0;
+  background: var(--mask);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  padding: 24px;
+}
+.wc-modal {
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  width: 560px;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.wc-modal--wide {
+  width: 760px;
+}
+.wc-modal__head {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--divider);
+}
+.wc-modal__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+.wc-modal__body {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.wc-modal__foot {
+  padding: 14px 20px;
+  border-top: 1px solid var(--divider);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 .pt-err th,
 .pt-err td {

@@ -2,41 +2,27 @@
   =============================================================================
   UpdatePage —— 系统更新（设计 §3.7 / 原型 gateway-v2a-glacier「update」）
   =============================================================================
-  更新通道 / 包校验 / 备份 / 回滚 / 离线包上传 / 维护窗口；更新历史列表分页。
-  · 免费基础版无远程更新能力 —— 显示升级引导而非报错，**不提供任何绕过入口**。
-  · 回滚为危险操作（DangerConfirmModal：影响清单 + 原因必填 + 对象二次校验）。
-  · 离线包上传：.tar.zst + 签名清单，校验逻辑与在线一致；上传固件走危险确认。
+  真实能力边界（不许造数）：
+    · 后端**没有**更新检查 / 下载 / 应用 / 回滚 / 离线包上传端点，`GET /api/overview`
+      仅提供当前版本；因此「当前版本」为真实值，其余版本类指标诚实留空（`—`）；
+    · 通道与策略开关为**本机界面状态**（网关未开放写端点），显式标注，不伪装成已落库；
+    · 回滚 / 离线包为高危动作，仍走 DangerConfirmModal 四要素确认（影响清单 + 原因必填 +
+      对象二次校验），确认后按真实结果反馈（当前为「无端点」的诚实失败）。
 -->
 <template>
-  <PageHeader
-    crumb="运维 / 系统更新"
-    title="系统更新"
-    desc="远程更新：检查、下载、校验、应用与回滚。离线现场支持导入离线更新包（.tar.zst + 签名清单）。"
-  >
-    <template #actions>
-      <span style="display: inline-flex; gap: 8px">
-        <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色无权执行系统更新">
-          <button type="button" class="wc-btn" data-testid="update-check" @click="checkUpdate">检查更新</button>
-        </RoleGate>
-        <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色无权导入离线包">
-          <button type="button" class="wc-btn" data-testid="update-offline" @click="openOffline">导入离线包</button>
-        </RoleGate>
-      </span>
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
-    <!-- ══ 更新可用横幅 ════════════════════════════════════════════════ -->
-    <div v-if="hasUpdate" class="wc-banner wc-banner--info" data-testid="update-banner">
-      <span>有可用更新 {{ latestVersion }}</span>
-      <span class="wc-banner__ops">
-        <button type="button" class="wc-btn wc-btn--primary wc-btn--sm" :disabled="!canEdit" @click="startUpdate">
-          立即更新
+    <!-- 工具条：检查更新 / 导入离线包（原页头右侧按钮迁入） -->
+    <div class="pg-toolbar">
+      <span class="wc-tag" :class="updateBannerClass" data-testid="update-banner">{{ updateBanner }}</span>
+      <span class="wc-spacer" />
+      <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色无权执行系统更新">
+        <button type="button" class="wc-btn wc-btn--sm" :disabled="checking" data-testid="update-check" @click="checkUpdate">
+          {{ checking ? '检查中…' : '检查更新' }}
         </button>
-      </span>
-    </div>
-    <div v-else class="wc-banner wc-banner--ok" data-testid="update-banner">
-      <span>当前已是最新版本（{{ currentVersion }}），无需更新。</span>
+      </RoleGate>
+      <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色无权导入离线包">
+        <button type="button" class="wc-btn wc-btn--sm" data-testid="update-offline" @click="openOffline">导入离线包</button>
+      </RoleGate>
     </div>
 
     <p v-if="actionMessage" class="wc-hint" data-testid="update-message">{{ actionMessage }}</p>
@@ -45,18 +31,18 @@
     <div class="wc-grid wc-grid--4">
       <div class="wc-kpi">
         <span class="wc-kpi__label">当前版本</span>
-        <span class="wc-kpi__value">{{ currentVersion }}</span>
-        <span class="wc-kpi__sub">构建 a91f3c7</span>
+        <span class="wc-kpi__value" data-testid="kpi-current-version">{{ currentVersion }}</span>
+        <span class="wc-kpi__sub">GET /api/overview</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">最新可用</span>
-        <span class="wc-kpi__value">{{ latestVersion }}</span>
-        <span class="wc-kpi__sub wc-kpi__sub--ok">{{ hasUpdate ? '有更新' : '已最新' }}</span>
+        <span class="wc-kpi__value" data-testid="kpi-latest-version">{{ latestVersion || '—' }}</span>
+        <span class="wc-kpi__sub">{{ latestVersionSub }}</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">更新包签名</span>
-        <span class="wc-kpi__value">已通过</span>
-        <span class="wc-kpi__sub">Ed25519 + 代码签名</span>
+        <span class="wc-kpi__value">—</span>
+        <span class="wc-kpi__sub">无更新包可校验</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">更新通道</span>
@@ -70,6 +56,7 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>更新通道与策略</h3>
+          <span class="wc-tag wc-tag--info">本机界面状态 · 网关未开放写端点</span>
         </div>
         <div class="wc-card__body">
           <UiRadio v-model="channel" :options="channelOptions" :disabled="!canEdit" />
@@ -83,27 +70,17 @@
               <UiSwitch v-model="toggle.on" :disabled="!canEdit" />
             </div>
           </div>
-
-          <dl class="wc-kv">
-            <dt>维护窗口</dt>
-            <dd class="wc-mono">{{ maintenanceWindow }}</dd>
-            <dt>更新包来源</dt>
-            <dd class="wc-mono">官方源 + 内网镜像</dd>
-            <dt>签名校验</dt>
-            <dd><StatusTag status="success" text="强制" /> 失败即拒绝安装</dd>
-            <dt>回滚保留</dt>
-            <dd class="wc-mono">保留上一版本（1 份）</dd>
-          </dl>
         </div>
       </section>
 
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>更新进度</h3>
+          <span class="wc-card__sub">—（网关未提供更新执行接口）</span>
         </div>
         <div class="wc-card__body">
           <ol class="up-steps">
-            <li v-for="(step, i) in steps" :key="step.n" class="up-step" :class="`up-step--${stepState(i)}`">
+            <li v-for="step in steps" :key="step.n" class="up-step up-step--todo">
               <span class="up-step__n">{{ step.n }}</span>
               <div class="up-step__body">
                 <span class="up-step__label">{{ step.label }}</span>
@@ -114,10 +91,10 @@
           <div style="margin-top: 12px">
             <div class="up-prog-head">
               <span class="wc-card__sub">总进度</span>
-              <span class="wc-mono" data-testid="update-progress-text">{{ progress }}%</span>
+              <span class="wc-mono" data-testid="update-progress-text">—</span>
             </div>
             <div class="wc-bar">
-              <div class="wc-bar__fill" :style="{ width: `${progress}%` }" data-testid="update-progress-bar" />
+              <div class="wc-bar__fill" :style="{ width: '0%' }" data-testid="update-progress-bar" />
             </div>
           </div>
           <div style="display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap">
@@ -144,78 +121,32 @@
       </section>
     </div>
 
-    <!-- ══ 更新历史（分页）+ 离线现场说明 ══════════════════════════════ -->
+    <!-- ══ 更新历史 + 离线更新要求 ══════════════════════════════════════ -->
     <div class="wc-grid wc-grid--2">
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>更新历史</h3>
-          <span class="wc-card__sub">共 {{ historyTotal }} 条</span>
         </div>
-
         <EmptyState
-          v-if="historyTotal === 0"
-          title="还没有更新记录"
-          desc="本机尚未执行过远程更新。首次更新前的自动备份会出现在「备份与恢复」。"
+          title="暂无更新记录"
+          desc="网关未提供更新历史接口，无法列出历史版本。"
         >
           <template #actions>
-            <button type="button" class="wc-btn wc-btn--primary" @click="startUpdate">开始更新</button>
+            <button type="button" class="wc-btn wc-btn--sm" data-testid="update-check-empty" @click="checkUpdate">检查更新</button>
           </template>
         </EmptyState>
-
-        <template v-else>
-          <UiTable :columns="historyColumns" :rows="pagedHistory" row-key-field="version">
-            <template #cell-version="{ row }">
-              <span class="wc-mono">{{ row.version }}</span>
-            </template>
-            <template #cell-time="{ row }">
-              <span class="wc-mono">{{ row.time }}</span>
-            </template>
-            <template #cell-result="{ row }">
-              <StatusTag :status="row.result" :text="resultLabel(row)" />
-            </template>
-            <template #cell-duration="{ row }">
-              <span class="wc-mono">{{ row.duration }}</span>
-            </template>
-            <template #actions="{ row }">
-              <button
-                v-if="row.result === 'success'"
-                type="button"
-                class="wc-btn wc-btn--sm"
-                :disabled="!canEdit"
-                :data-testid="`history-rollback-${row.version}`"
-                @click="openRollback(row.version)"
-              >
-                回滚
-              </button>
-              <button v-else type="button" class="wc-btn wc-btn--sm" @click="showDetail(row)">详情</button>
-            </template>
-          </UiTable>
-
-          <UiPager :page="historyPage" :total="historyTotal" :page-size="HISTORY_PAGE_SIZE" @update:page="onHistoryPage" />
-        </template>
       </section>
 
       <section class="wc-card">
         <div class="wc-card__head">
-          <h3>离线现场与降级说明</h3>
+          <h3>离线更新要求</h3>
         </div>
         <div class="wc-card__body">
-          <div class="wc-banner wc-banner--warn">
-            <span class="wc-banner__icon">!</span>
-            <span>远程更新必须考虑的三件事</span>
-          </div>
           <ul class="up-impact">
             <li>工业现场常<b>无外网</b>：必须支持导入离线更新包（.tar.zst + 签名清单），且校验逻辑与在线一致。</li>
             <li>更新会重启服务 → 必须<b>优雅停机</b>：队列 flush 完成后再退出，否则正在补发的数据会丢。</li>
-            <li>免费基础版<b>无远程更新能力</b>，此处显示升级引导而非报错。</li>
+            <li>免费基础版<b>无远程更新能力</b>，此处显示能力边界而非报错，<b>不提供任何绕过入口</b>。</li>
           </ul>
-          <p class="wc-note">
-            <span class="wc-note__icon">i</span>
-            <span>
-              若当前为免费基础版，本页顶部横幅替换为「当前版本不含远程更新」并给出升级路径，
-              <b>不提供任何绕过入口</b>。
-            </span>
-          </p>
           <button type="button" class="wc-btn" :disabled="!canEdit" data-testid="update-offline-2" @click="openOffline">
             导入离线更新包
           </button>
@@ -239,7 +170,7 @@
     @submit="onRollbackSubmit"
   />
 
-  <!-- 离线包上传（危险：上传固件） -->
+  <!-- 离线包导入（危险：上传固件） -->
   <DangerConfirmModal
     :open="offlineOpen"
     title="导入离线更新包"
@@ -259,42 +190,86 @@
 /**
  * @file UpdatePage.vue
  * @module web-console/pages/UpdatePage
- * @description 系统更新页（通道策略 + 进度 + 历史分页 + 回滚/离线包危险确认）。
+ * @description 系统更新页（当前版本取自网关；其余版本类指标无端点 → 诚实留空）。
  */
-import { computed, reactive, ref } from 'vue';
+import { computed, reactive, ref, watch } from 'vue';
 import {
-  PageHeader,
-  UiTable,
-  UiPager,
   UiRadio,
   UiSwitch,
-  StatusTag,
   EmptyState,
   RoleGate,
   DangerConfirmModal,
-  type TableColumn,
   type RadioOption,
   type DangerFact,
 } from '@ui-kit';
+import { dataVersion, repo, type UpdateCheckInfo } from '@/api/repo';
 import { session } from '../store/session';
 
 /** 当前角色是否可执行更新（更新属高危，仅 admin）。 */
 const canEdit = computed<boolean>(() => session.state.role === 'admin');
 
-/** 每页条数（更新历史）。 */
-const HISTORY_PAGE_SIZE = 5;
+/** 当前版本（真实：`GET /api/overview` 的 version）。 */
+const currentVersion = ref(repo.getGateway().version || '—');
+watch(dataVersion, () => {
+  currentVersion.value = repo.getGateway().version || '—';
+});
 
-/** 当前版本 / 最新版本。 */
-const currentVersion = 'v1.4.2';
-const latestVersion = 'v1.5.0';
-
-/** 是否有可用更新。 */
-const hasUpdate = ref(true);
-
-/** 操作提示。 */
+/** 操作提示（结果区，真实结果原文）。 */
 const actionMessage = ref('');
 
-// ---------- 通道策略 ----------
+// ---------- 更新检查（真实：GET /api/updates/check） ----------
+/** 是否正在检查（避免重复下发）。 */
+const checking = ref(false);
+
+/** 最近一次检查结果（未检查 = null）。 */
+const lastCheck = ref<UpdateCheckInfo | null>(null);
+
+/** 最新可用版本（未检查 / 无更新 → 空串，页面显示 —）。 */
+const latestVersion = computed<string>(() => {
+  const info = lastCheck.value;
+  if (!info || !info.checkSupported) {
+    return '';
+  }
+  return info.updateAvailable ? info.availableVersion || '' : info.currentVersion || '';
+});
+
+/** 最新可用副文案（诚实：未检查 / 无更新 / 有更新各一句）。 */
+const latestVersionSub = computed<string>(() => {
+  const info = lastCheck.value;
+  if (!info) {
+    return '尚未检查更新';
+  }
+  if (!info.checkSupported) {
+    return info.reason || '网关未开启更新检查';
+  }
+  return info.updateAvailable ? `来自 ${info.source || '配置的更新源'}` : '当前已是最新版本';
+});
+
+/** 顶部条：真实状态（无端点时不再谎称「未提供接口」）。 */
+const updateBanner = computed<string>(() => {
+  const info = lastCheck.value;
+  if (checking.value) {
+    return '正在检查更新…';
+  }
+  if (!info) {
+    return '尚未检查更新';
+  }
+  if (!info.checkSupported) {
+    return info.reason || '网关未开启更新检查';
+  }
+  return info.updateAvailable ? `发现新版本 ${info.availableVersion || ''}` : '当前无可用更新';
+});
+
+/** 顶部条色调（有更新 = 提示色，无更新 = 正常色，未检查 = 中性）。 */
+const updateBannerClass = computed<string>(() => {
+  const info = lastCheck.value;
+  if (!info || !info.checkSupported) {
+    return 'wc-tag--neutral';
+  }
+  return info.updateAvailable ? 'wc-tag--info' : 'wc-tag--ok';
+});
+
+// ---------- 通道策略（本机界面状态） ----------
 const channel = ref<'stable' | 'beta' | 'lock'>('stable');
 
 /** 通道选项。 */
@@ -310,125 +285,58 @@ const channelLabel = computed<string>(() => {
   return map[channel.value] ?? channel.value;
 });
 
-/** 策略开关（可切换）。 */
+/** 策略开关（本机界面状态）。 */
 const toggles = reactive([
-  { label: '自动检查更新', on: true, desc: '每日 08:00 检查一次，仅在界面提示，不自动安装。' },
+  { label: '自动检查更新', on: true, desc: '每日检查一次，仅提示，不自动安装。' },
   { label: '自动安装', on: false, desc: '关闭时需人工点击安装；工业现场建议保持关闭。' },
-  { label: '维护窗口内自动安装', on: true, desc: '仅在下列窗口内允许自动安装，避免占用产线时段。' },
+  { label: '维护窗口内自动安装', on: true, desc: '仅在维护窗口内允许自动安装，避免占用产线时段。' },
   { label: '安装前自动备份配置', on: true, desc: '升级前自动导出配置快照，失败可回滚。' },
 ]);
 
-/** 维护窗口。 */
-const maintenanceWindow = '每日 02:00 – 04:00';
-
-// ---------- 进度 ----------
-/** 更新步骤。 */
+// ---------- 进度（无端点 → 不做假进度） ----------
+/** 更新步骤（流程说明，不含具体包体数据）。 */
 const steps = [
-  { n: '1', label: '下载更新包', desc: '42.6 MB' },
+  { n: '1', label: '下载更新包', desc: '来自官方源或内网镜像' },
   { n: '2', label: '校验签名与完整性', desc: 'Ed25519 + SHA-256 清单' },
-  { n: '3', label: '备份当前版本与配置', desc: '→ rollback/v1.4.2' },
+  { n: '3', label: '备份当前版本与配置', desc: '写入 rollback 目录' },
   { n: '4', label: '应用并重启服务', desc: '优雅停机，队列 flush 完成后重启' },
   { n: '5', label: '健康自检', desc: '采集 / 转发 / 授权 三项连通性' },
 ];
 
-/** 进度百分比。 */
-const progress = ref(0);
-
-/** 已完成步骤索引（-1 未开始）。 */
-const activeStep = ref(-1);
-
-/** 步骤状态。 */
-function stepState(index: number): string {
-  if (index < activeStep.value) {
-    return 'done';
-  }
-  if (index === activeStep.value) {
-    return 'run';
-  }
-  return 'todo';
-}
-
-/** 开始更新（演示：立即置为进行中并给出提示）。 */
+/** 开始更新：网关无执行端点，如实告知。 */
 function startUpdate(): void {
-  activeStep.value = 2;
-  progress.value = 45;
-  actionMessage.value = `已开始更新到 ${latestVersion}：正在备份当前版本并校验签名（Ed25519 + SHA-256）。`;
+  actionMessage.value = '更新未开始：网关未提供更新执行接口，本次未下发任何更新指令。';
 }
 
-/** 检查更新。 */
-function checkUpdate(): void {
-  hasUpdate.value = true;
-  actionMessage.value = `检查完成：发现新版本 ${latestVersion}（发布于 2h 前），签名主体 IoT-DAQ Release Signing。`;
-}
-
-/** 显示历史详情。 */
-function showDetail(row: UpdateHistoryRow): void {
-  actionMessage.value = `历史记录 ${row.version}（${row.time}）：结果 ${resultLabel(row)}，操作人 ${row.actor}，耗时 ${row.duration}。`;
-}
-
-/** 结果文案。 */
-function resultLabel(row: UpdateHistoryRow): string {
-  if (row.result === 'success') {
-    return '成功';
+/**
+ * 检查更新：真实 `GET /api/updates/check`。
+ *
+ * 后端未配置更新源时返回 `checkSupported:false` + `reason`，页面照实展示
+ * （诚实降级，绝不伪造「已是最新」）。失败时展示真实 HTTP 原因。
+ */
+async function checkUpdate(): Promise<void> {
+  if (checking.value) {
+    return;
   }
-  if (row.result === 'warn') {
-    return '回滚';
+  checking.value = true;
+  actionMessage.value = '';
+  try {
+    const info = await repo.ops.checkUpdates();
+    lastCheck.value = info;
+    if (!info.checkSupported) {
+      actionMessage.value = `未执行检查：${info.reason || '网关未开启更新检查'}`;
+    } else if (info.updateAvailable) {
+      actionMessage.value = `发现新版本 ${info.availableVersion || ''}（当前 ${info.currentVersion}，来源 ${info.source || '—'}）。`;
+    } else {
+      actionMessage.value = `当前 ${info.currentVersion} 已是最新版本（来源 ${info.source || '—'}）。`;
+    }
+  } catch (cause) {
+    lastCheck.value = null;
+    const raw = cause instanceof Error ? cause.message : String(cause);
+    actionMessage.value = `检查未成功：${raw}`;
+  } finally {
+    checking.value = false;
   }
-  return '失败';
-}
-
-// ---------- 更新历史 ----------
-/** 更新历史行。 */
-interface UpdateHistoryRow {
-  /** 版本 */
-  version: string;
-  /** 时间 */
-  time: string;
-  /** 操作人 */
-  actor: string;
-  /** 结果 */
-  result: string;
-  /** 耗时 */
-  duration: string;
-}
-
-/** 更新历史（照搬原型）。 */
-const history = ref<UpdateHistoryRow[]>([
-  { version: 'v1.4.2', time: '2026-09-05 06:12', actor: 'admin', result: 'success', duration: '3m 12s' },
-  { version: 'v1.4.1', time: '2026-08-11 06:08', actor: 'admin', result: 'success', duration: '2m 58s' },
-  { version: 'v1.4.0', time: '2026-07-20 02:30', actor: 'auto', result: 'warn', duration: '—' },
-  { version: 'v1.3.9', time: '2026-06-28 02:30', actor: 'auto', result: 'success', duration: '3m 01s' },
-  { version: 'v1.3.8', time: '2026-05-30 02:30', actor: 'auto', result: 'success', duration: '2m 47s' },
-  { version: 'v1.3.7', time: '2026-05-02 06:05', actor: 'admin', result: 'success', duration: '3m 20s' },
-  { version: 'v1.3.6', time: '2026-04-11 02:30', actor: 'auto', result: 'success', duration: '2m 39s' },
-  { version: 'v1.3.5', time: '2026-03-22 02:30', actor: 'auto', result: 'failed', duration: '0m 48s' },
-  { version: 'v1.3.4', time: '2026-02-28 06:10', actor: 'admin', result: 'success', duration: '3m 05s' },
-  { version: 'v1.3.3', time: '2026-02-01 02:30', actor: 'auto', result: 'success', duration: '2m 51s' },
-]);
-
-/** 历史总数（分页条唯一口径）。 */
-const historyTotal = computed<number>(() => history.value.length);
-
-const historyPage = ref(1);
-
-/** 当前页历史。 */
-const pagedHistory = computed<UpdateHistoryRow[]>(() => {
-  const start = (historyPage.value - 1) * HISTORY_PAGE_SIZE;
-  return history.value.slice(start, start + HISTORY_PAGE_SIZE);
-});
-
-/** 列定义。 */
-const historyColumns: readonly TableColumn[] = [
-  { key: 'version', label: '版本' },
-  { key: 'time', label: '时间', mono: true },
-  { key: 'actor', label: '操作人' },
-  { key: 'result', label: '结果' },
-  { key: 'duration', label: '耗时' },
-];
-
-/** 换页。 */
-function onHistoryPage(next: number): void {
-  historyPage.value = next;
 }
 
 // ---------- 回滚危险确认 ----------
@@ -444,7 +352,7 @@ const rollbackImpacts: readonly string[] = [
 
 /** 回滚对象摘要。 */
 const rollbackFacts = computed<readonly DangerFact[]>(() => [
-  { label: '当前版本', value: currentVersion },
+  { label: '当前版本', value: currentVersion.value },
   { label: '目标版本', value: rollbackTarget.value || '—' },
   { label: '签名校验', value: '强制（失败即拒绝）' },
 ]);
@@ -461,16 +369,18 @@ function openRollback(version: string): void {
   rollbackOpen.value = true;
 }
 
-/** 回滚提交。 */
+/** 回滚提交：网关无版本回滚端点，如实告知（不伪造成功）。 */
 function onRollbackSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): void {
   rollbackOpen.value = false;
-  actionMessage.value = `已回滚到 ${rollbackTarget.value}（原因：${payload.reason}），服务将重启，操作已写入审计。`;
+  actionMessage.value =
+    `回滚未执行：网关未提供版本回滚接口（原因：${payload.reason}）。` +
+    '如需回退配置，请到「备份与恢复」或「系统设置 · 配置回滚」。';
 }
 
-// ---------- 离线包上传（危险） ----------
+// ---------- 离线包导入（危险） ----------
 const offlineOpen = ref(false);
 
-/** 离线包上传影响清单。 */
+/** 离线包导入影响清单。 */
 const offlineImpacts: readonly string[] = [
   '上传并安装离线更新包会替换当前运行版本，服务将重启，采集中断约 5–15 秒。',
   '离线包必须带签名清单（.tar.zst + 签名），校验逻辑与在线一致，校验失败即拒绝安装。',
@@ -480,14 +390,13 @@ const offlineImpacts: readonly string[] = [
 /** 离线包对象摘要。 */
 const offlineFacts: readonly DangerFact[] = [
   { label: '离线包文件名', value: 'iot-daq-offline.tar.zst' },
-  { label: '包大小', value: '42.6 MB' },
   { label: '签名清单', value: 'iot-daq-offline.tar.zst.sig' },
 ];
 
 /** 离线包导入原因枚举（必选）。 */
 const OFFLINE_REASONS: readonly string[] = ['现场无外网', '内网安全策略', '指定版本部署', '灾备恢复'];
 
-/** 打开离线包上传确认。 */
+/** 打开离线包导入确认。 */
 function openOffline(): void {
   if (!canEdit.value) {
     return;
@@ -495,14 +404,21 @@ function openOffline(): void {
   offlineOpen.value = true;
 }
 
-/** 离线包提交。 */
+/** 离线包提交：网关无导入端点，如实告知（不伪造成功）。 */
 function onOfflineSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): void {
   offlineOpen.value = false;
-  actionMessage.value = `离线包已导入（原因：${payload.reason}）：签名校验通过，正在按在线一致的流程应用。`;
+  actionMessage.value = `导入未执行：网关未提供离线包导入接口（原因：${payload.reason}）。`;
 }
 </script>
 
 <style scoped>
+.pg-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+}
 .up-toggle {
   display: flex;
   align-items: flex-start;
@@ -586,9 +502,5 @@ function onOfflineSubmit(payload: { reason: string; note: string; tail: string; 
   font-size: var(--fs-table);
   line-height: 1.8;
   color: var(--text-2);
-}
-.wc-banner__icon {
-  flex: 0 0 auto;
-  font-weight: 700;
 }
 </style>

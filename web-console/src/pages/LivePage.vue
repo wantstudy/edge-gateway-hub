@@ -3,7 +3,7 @@
     LivePage —— 实时数据（数据接入分组第 4 页，路由 `/live`）。
 
     结构对齐原型 `live`（:1666-1678）：
-      ① 设备查询框（input + datalist，:1261-1272）替代铺开全部设备的 chips；
+      ① 设备查询框（input + datalist，:1261-1272）+ 暂停 / 刷新 / 连接态；
       ② 4 张 KPI（点位数 / 采集频率 / 连接状态 / 曲线窗口 55s·12 采样点，:1670-1675）；
       ③ 点位**面积曲线卡**（12 点 55s 窗口，:1278-1297），替代原数值卡 + sparkline。
 
@@ -12,27 +12,11 @@
       · 暂停 / 继续刷新；「最后更新 HH:mm:ss」；
       · 曲线窗口语义：每 5 拍（≈5s）采样一次、保留 12 点 → 窗口跨度 55s；
       · 陈旧数据（>1s）整卡转灰，质量非 Good 的角标转警示色；
+      · 曲线只由 `GET /api/stream`（SSE）实际帧推进，**绝不预填随机窗口**；
       · 不暴露内部 id；授权判定不在前端。
   -->
-  <PageHeader
-    crumb="数据接入 / 实时数据"
-    title="实时数据"
-    desc="选中设备各点位的实时曲线，1s 节流刷新；顶部查询框切换设备。曲线窗口 55 秒 · 12 个采样点。"
-  >
-    <template #actions>
-      <span
-        class="wc-tag"
-        :class="IS_REAL ? 'wc-tag--ok' : 'wc-tag--info'"
-        :title="IS_REAL ? '已接入网关真实接口：GET /api/stream（SSE 实时遥测）' : '当前为内嵌演示数据源，未接入真实后端'"
-      >
-        {{ IS_REAL ? '实时数据' : '演示数据' }}
-      </span>
-      <button type="button" class="wc-btn" @click="togglePause">{{ paused ? '继续刷新' : '暂停刷新' }}</button>
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
-    <!-- ① 设备查询框（原型 :1266-1271）+ 采集状态 -->
+    <!-- ① 设备查询框（原型 :1266-1271）+ 采集状态 + 刷新控制 -->
     <div class="wc-card">
       <div class="wc-card__body">
         <div class="live-q">
@@ -55,6 +39,9 @@
             <i>{{ curDeviceMeta }}</i>
           </span>
           <span class="wc-spacer" />
+          <button type="button" class="wc-btn" data-testid="live-pause" @click="togglePause">
+            {{ paused ? '继续刷新' : '暂停刷新' }}
+          </button>
           <span class="wc-conn" :class="streamConnClass">
             <span class="wc-conn__dot">●</span>
             <span>{{ streamConnLabel }} · 最后更新 {{ lastTickText }}</span>
@@ -83,7 +70,7 @@
     <EmptyState
       v-if="scopedPoints.length === 0"
       title="没有可展示的实时曲线"
-      :desc="`「${curDeviceName}」尚未配置点表。实时数据来自已配置的点位 —— 没有点表就没有可展示的曲线。`"
+      desc="当前设备尚未配置点表。"
     >
       <template #actions>
         <button type="button" class="wc-btn wc-btn--primary" @click="go('points')">前往点位与映射</button>
@@ -154,9 +141,8 @@
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { EmptyState, PageHeader, StatCard, UiPager } from '@ui-kit';
+import { EmptyState, StatCard, UiPager } from '@ui-kit';
 import {
-  API_MODE,
   dataVersion,
   repo,
   type DeviceRecord,
@@ -165,9 +151,6 @@ import {
 import { pointSnapshots, snapshotKey, streamStatus, wireQualityToDataQuality } from '@/api/stream';
 
 const router = useRouter();
-
-/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
-const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -243,9 +226,9 @@ interface PointRuntime {
   /** 曲线窗口序列（12 点 / 55s） */
   window: number[];
   tsMs: number;
-  /** 采样时间戳（**纳秒字符串**，real 模式由 SSE 帧透传，绝不 parseInt） */
+  /** 采样时间戳（**纳秒字符串**，由 SSE 帧透传，绝不 parseInt） */
   tsRaw: string;
-  /** 质量码整数（real 模式由 SSE 帧透传；缺失为 null） */
+  /** 质量码整数（由 SSE 帧透传；缺失为 null） */
   qualityCode: number | null;
 }
 
@@ -254,97 +237,32 @@ const series = reactive<Record<string, PointRuntime>>({});
 /** 质量（可被推流改写，这里沿用初始）。 */
 const runtimeQuality = reactive<Record<string, PointRecord['quality']>>({});
 
-/** 振幅（按量纲）。 */
-function amplitudeOf(point: PointRecord): number {
-  if (point.value === null) {
-    return 0;
-  }
-  const u = point.unit;
-  if (u === '℃') return 0.8;
-  if (u === 'MPa') return 0.06;
-  if (u === 'V' || u === 'A') return 0.9;
-  if (u === 'kW') return 0.12;
-  if (u === '%' || u === '%RH') return 0.4;
-  if (u === 's') return 0.06;
-  if (u === 'kWh') return 4;
-  return Math.max(Math.abs(point.value) * 0.0005, 0.5);
-}
-function decimalsOf(point: PointRecord): number {
-  if (point.value === null) return 2;
-  const t = String(point.value);
-  const dot = t.indexOf('.');
-  return dot < 0 ? 0 : Math.min(t.length - dot - 1, 2);
-}
-
-/** 以基线初始化运行时（含 12 点窗口序列，首帧即有形状；real 模式不伪造历史）。 */
+/**
+ * 以基线初始化运行时。曲线窗口恒从空开始（**绝不预填演示历史**），
+ * 后续只由 `/api/stream` 的实际帧推进。
+ */
 function seed(): void {
   const nowMs = Date.now();
   for (const point of scopedPoints.value) {
     runtimeQuality[point.id] = point.quality;
-    const base = point.value;
-    const amp = amplitudeOf(point);
-    const win: number[] = [];
-    if (!IS_REAL && base !== null) {
-      // mock：首帧即填满 12 点窗口，保留既有演示形状
-      for (let i = WINDOW_POINTS - 1; i >= 0; i -= 1) {
-        win.push(
-          Number((base + Math.sin(i / 3) * amp * 0.8 + (Math.random() * 2 - 1) * amp * 0.6).toFixed(decimalsOf(point))),
-        );
-      }
-    }
     series[point.id] = {
-      value: base,
+      value: point.value,
       delta: 0,
-      window: win,
-      tsMs: point.stale ? nowMs - 187_000 : nowMs,
+      window: [],
+      tsMs: nowMs,
       tsRaw: '',
       qualityCode: null,
     };
   }
 }
 
-/** 1s 节拍（唯一写入点）：按模式分发。 */
+/** 1s 节拍（唯一写入点）。 */
 function tick(): void {
-  if (IS_REAL) {
-    tickReal();
-  } else {
-    tickMock();
-  }
-}
-
-/** mock 模式节拍（内嵌演示推流，行为与原版一致）。 */
-function tickMock(): void {
-  const nowMs = Date.now();
-  const sampleWindow = tickCount.value % WINDOW_STEP_TICKS === 0;
-  for (const point of scopedPoints.value) {
-    const state = series[point.id];
-    if (!state) continue;
-    const quality = runtimeQuality[point.id] ?? point.quality;
-    if (quality === 'Bad' || quality === 'Timeout' || quality === 'CalcFailed') {
-      state.value = null;
-      state.delta = 0;
-      state.tsMs = nowMs;
-      continue;
-    }
-    const amp = amplitudeOf(point);
-    const base = point.value ?? 0;
-    const prev = state.value ?? base;
-    const next = Number((prev + (Math.random() * 2 - 1) * amp).toFixed(decimalsOf(point)));
-    state.delta = Number((next - prev).toFixed(decimalsOf(point)));
-    state.value = next;
-    state.tsMs = nowMs;
-    // 仅每 5 拍入窗一次 → 窗口跨度 55s
-    if (sampleWindow) {
-      state.window.push(next);
-      if (state.window.length > WINDOW_POINTS) state.window.shift();
-    }
-  }
-  lastTickMs.value = nowMs;
-  tickCount.value += 1;
+  tickReal();
 }
 
 /**
- * real 模式节拍：消费 SSE 逐点快照（key = `${device_id}/${point_id}`）。
+ * 节拍实现：消费 SSE 逐点快照（key = `${device_id}/${point_id}`）。
  *
  * · 快照存在 → 以流帧为准：值 / 质量（wire 枚举映射到前端 5 值枚举）/
  *   纳秒 ts 原文透传；每 5 拍（窗口采样点）且取到数值时才推进曲线窗口；
@@ -394,17 +312,15 @@ const tickCount = ref(0);
 const paused = ref(false);
 let timer: ReturnType<typeof setInterval> | null = null;
 
-/** 顶栏连接指示：real 模式反映 SSE 通道状态，mock 模式恒「采集中」。 */
+/** 顶栏连接指示：反映 SSE 通道状态。 */
 const streamConnClass = computed<string>(() => {
   if (paused.value) return 'wc-conn--degraded';
-  if (!IS_REAL) return 'wc-conn--connected';
   const s = streamStatus.value;
   if (s === 'open') return 'wc-conn--connected';
   return 'wc-conn--degraded'; // connecting / idle / unauthorized → 链路降级
 });
 const streamConnLabel = computed<string>(() => {
   if (paused.value) return '已暂停';
-  if (!IS_REAL) return '采集中';
   const s = streamStatus.value;
   if (s === 'open') return '实时流已连接';
   if (s === 'connecting') return '实时流连接中…';
@@ -611,12 +527,11 @@ const pagedRows = computed<readonly CardRow[]>(() => {
       line: linePathOf(win),
       quality,
       qualityClass: qualityTagClass(quality),
-      tsText:
-        IS_REAL && tsRaw
-          ? tsRaw
-          : stale
-            ? `${ageSec.toFixed(0)}s 前（陈旧）`
-            : `${(tsMs / 1000).toFixed(3)}`,
+      tsText: tsRaw
+        ? tsRaw
+        : stale
+          ? `${ageSec.toFixed(0)}s 前（陈旧）`
+          : `${(tsMs / 1000).toFixed(3)}`,
       stale,
     };
   });

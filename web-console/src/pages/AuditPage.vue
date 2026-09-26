@@ -9,12 +9,12 @@
   · 日志追加写入不可篡改；导出为 CSV。
 -->
 <template>
-  <PageHeader
-    crumb="运维 / 日志与审计"
-    title="日志与审计"
-    desc="登录、配置变更、授权事件、模拟开关变更均留痕，追加写入不可篡改。保留 180 天。"
-  >
-    <template #actions>
+  <div class="wc-content">
+    <!-- 工具条：刷新 + 导出（原页头右侧按钮迁入） -->
+    <div class="pg-toolbar">
+      <span class="wc-tag wc-tag--ok">实时数据</span>
+      <span class="wc-spacer" />
+      <button type="button" class="wc-btn wc-btn--sm" data-testid="audit-refresh" @click="refreshLogs">刷新</button>
       <!-- 导出 = audit.export，仅 system（= admin）角色可见 -->
       <RoleGate
         :allowed="canExport"
@@ -22,12 +22,10 @@
         deny-text="当前角色只有审计只读权限，导出记录（数据出境）仅限系统管理员"
         fallback-label="无权导出"
       >
-        <button type="button" class="wc-btn" data-testid="audit-export" @click="exportCsv">导出审计记录</button>
+        <button type="button" class="wc-btn wc-btn--sm" data-testid="audit-export" @click="exportCsv">导出审计记录</button>
       </RoleGate>
-    </template>
-  </PageHeader>
+    </div>
 
-  <div class="wc-content">
     <!-- ══ 筛选 ════════════════════════════════════════════════════════ -->
     <section class="wc-card">
       <div class="wc-card__body">
@@ -71,11 +69,11 @@
 
       <EmptyState
         v-if="auditTotal === 0"
-        title="没有符合条件的审计记录"
-        desc="可能是筛选条件过窄或时间区间内无操作。清空筛选可查看全部审计记录。"
+        title="暂无审计记录"
+        :desc="auditNotice || '当前筛选条件下没有审计记录。'"
       >
         <template #actions>
-          <button type="button" class="wc-btn" @click="resetFilters">清空筛选</button>
+          <button type="button" class="wc-btn" data-testid="audit-reset-empty" @click="resetFilters">清空筛选</button>
         </template>
       </EmptyState>
 
@@ -84,7 +82,6 @@
           :columns="columns"
           :rows="pagedLogs"
           row-key-field="id"
-          footer="保留 180 天 · 每日 03:00 归档，归档后仍可检索"
         >
           <template #cell-ts="{ row }">
             <span class="wc-mono">{{ row.ts }}</span>
@@ -109,14 +106,6 @@
         <UiPager :page="page" :total="auditTotal" :page-size="PAGE_SIZE" @update:page="onPage" />
       </template>
     </section>
-
-    <p class="wc-note">
-      <span class="wc-note__icon">i</span>
-      <span>
-        审计日志追加写入、不可修改；导出会把全量操作记录（含 actor / IP / 原因明细）落盘为可外传文件，
-        属高敏感数据外带面，因此收敛到系统管理员单一角色（`audit.export`）。
-      </span>
-    </p>
   </div>
 </template>
 
@@ -125,10 +114,12 @@
  * @file AuditPage.vue
  * @module web-console/pages/AuditPage
  * @description 日志与审计页（actor / action / 时间范围筛选 + 分页 + 导出角色门控）。
+ *
+ * 数据源：`repo.queryAudit`（真实审计缓存，由预取 / `GET /api/ops/logs` 填充）；
+ * 取全量后做页面级筛选（后端查询参数不支持 actor 与时间范围），保证「条数只有分页条一个口径」。
  */
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import {
-  PageHeader,
   UiTable,
   UiPager,
   UiInput,
@@ -140,7 +131,7 @@ import {
   type TableColumn,
   type SelectOption,
 } from '@ui-kit';
-import { repo, type AuditEntry } from '@/api/repo';
+import { dataVersion, repo, type AuditEntry, type NoticeKey } from '@/api/repo';
 import { session } from '../store/session';
 
 /** 每页条数。 */
@@ -183,54 +174,78 @@ const resultOptions: readonly SelectOption[] = [
   { value: 'failed', label: '失败' },
 ];
 
-/**
- * 拉取全量审计（应用本地筛选），再本地分页。
- *
- * mock 的 `queryAudit` 只支持 actorType / action / entityType / result，
- * 不支持 actor（操作人）与时间范围，因此此处取全量后用页面级筛选补足，
- * 保持「条数只有分页条一个口径」。
- */
-const allLogs = ref<AuditEntry[]>(fetchAll());
+/** 数据源不可得原因（诚实空态文案；空串 = 正常）。 */
+const noticesState = ref<Record<NoticeKey, string>>(repo.actions.notices());
 
-/** mock 全量审计（pageSize 取大值拿全量）。 */
-function fetchAll(): AuditEntry[] {
-  return repo.queryAudit({ actorType: '', action: '', entityType: '', result: '', page: 1, pageSize: 100000 }).items;
+/** 审计不可得原因（仅取 error / 失败类，避免把「本就为空」说成故障）。 */
+const auditNotice = computed<string>(() => noticesState.value.audit ?? '');
+
+/**
+ * 筛选后总数（分页条唯一口径，来自 `queryAudit` 的 `total`）。
+ *
+ * ⚠️ 必须先于 `pagedLogs` 声明：`pagedLogs` 的初值由 `queryPage()` 计算，
+ * 而 `queryPage()` 会写 `auditTotal` —— 顺序颠倒会触发 TDZ
+ * （`ReferenceError: Cannot access 'auditTotal' before initialization`），
+ * setup 抛错 → 整页空白（曾真实发生过）。
+ */
+const auditTotal = ref<number>(0);
+
+/** 按当前筛选 + 页码拉取本页。 */
+function queryPage(): AuditEntry[] {
+  const res = repo.queryAudit({
+    actorType: '',
+    actor: filters.actor,
+    action: filters.action,
+    entityType: '',
+    result: filters.result,
+    from: filters.from,
+    to: filters.to,
+    page: page.value,
+    pageSize: PAGE_SIZE,
+  });
+  auditTotal.value = res.total;
+  return res.items;
 }
 
-/** 筛选后的全量日志。 */
-const filteredLogs = computed<AuditEntry[]>(() => {
-  const actor = filters.actor.trim();
-  const action = filters.action.trim();
-  const from = filters.from.trim();
-  const to = filters.to.trim();
-  return allLogs.value.filter((log) => {
-    if (actor && !log.actor.includes(actor)) {
-      return false;
-    }
-    if (action && !log.action.includes(action)) {
-      return false;
-    }
-    if (filters.result && log.result !== filters.result) {
-      return false;
-    }
-    if (from && log.ts < from) {
-      return false;
-    }
-    if (to && log.ts > to) {
-      return false;
-    }
-    return true;
+/**
+ * 当前页审计（真实分页：直接传 `page` / `PAGE_SIZE` 给 `repo.queryAudit`，
+ * 由它在缓存上做筛选 + 分页后只回本页数据，不再以 `pageSize: 100000` 兜底全量）。
+ * 筛选条件（actor / action / 时间范围 / result）也一并交给 `queryAudit`，保证总数与分页一致。
+ */
+const pagedLogs = ref<AuditEntry[]>(queryPage());
+
+/** 重新读取（筛选/页码/缓存变化后刷新当前页）。 */
+function reload(): void {
+  pagedLogs.value = queryPage();
+  noticesState.value = repo.actions.notices();
+}
+
+/** 导出用：取当前筛选条件下的全量（不走分页条，仅导出上下文）。 */
+function exportAllFiltered(): AuditEntry[] {
+  const res = repo.queryAudit({
+    actorType: '',
+    actor: filters.actor,
+    action: filters.action,
+    entityType: '',
+    result: filters.result,
+    from: filters.from,
+    to: filters.to,
+    page: 1,
+    pageSize: Number.MAX_SAFE_INTEGER,
   });
-});
+  return res.items;
+}
 
-/** 筛选后总数（分页条唯一口径）。 */
-const auditTotal = computed<number>(() => filteredLogs.value.length);
+/** 刷新：先向网关拉一次运行日志，再重读缓存。 */
+async function refreshLogs(): Promise<void> {
+  await repo.ops.logs();
+  reload();
+}
 
-/** 当前页日志。 */
-const pagedLogs = computed<AuditEntry[]>(() => {
-  const start = (page.value - 1) * PAGE_SIZE;
-  return filteredLogs.value.slice(start, start + PAGE_SIZE);
-});
+/** 缓存填充（预取完成）后刷新列表。 */
+watch(dataVersion, reload);
+
+onMounted(reload);
 
 /** 筛选口径摘要。 */
 const rangeSummary = computed<string>(() => {
@@ -254,9 +269,10 @@ const columns: readonly TableColumn[] = [
   { key: 'result', label: '结果' },
 ];
 
-/** 换页。 */
+/** 换页（由 UiPager 驱动，触发真实分页查询）。 */
 function onPage(next: number): void {
   page.value = next;
+  reload();
 }
 
 /** 清空筛选。 */
@@ -268,9 +284,9 @@ function resetFilters(): void {
   filters.result = '';
 }
 
-/** 导出审计 CSV（按当前筛选结果；IP 掩码）。 */
+/** 导出审计 CSV（按当前筛选条件下的全量；IP 掩码）。 */
 function exportCsv(): void {
-  const rows = filteredLogs.value;
+  const rows = exportAllFiltered();
   const header = '时间,操作人,操作者类型,动作,对象类型,对象标识,变更详情,来源IP,结果';
   const body = rows
     .map((r) =>
@@ -285,10 +301,14 @@ function exportCsv(): void {
   a.click();
   URL.revokeObjectURL(url);
 }
-
-/** 初始加载（保留引用，便于刷新）。 */
-void fetchAll;
 </script>
 
 <style scoped>
+.pg-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+}
 </style>

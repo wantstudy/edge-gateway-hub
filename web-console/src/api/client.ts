@@ -4,9 +4,9 @@
  * @description 原生 fetch 封装（**零新增依赖**，不引入 axios）。
  *
  * ── 模式判定 ────────────────────────────────────────────────────────────────
- * `VITE_API_MODE === 'real'` 时页面数据层（`repo.ts`）走真实后端（经 vite proxy
- * 转发到 `http://127.0.0.1:8080`）；默认 `mock` 时完全不发请求，页面照常使用
- * `mock-data.ts`，保证无后端环境可独立演示与测试。
+ * **演示模式已废除**：页面数据层（`repo.ts`）一律走真实后端（经 vite proxy
+ * 转发到 `http://127.0.0.1:8080`）。`API_MODE` 常量保留供页面判断，取值恒为
+ * `'real'`（见下）。
  *
  * ── 认证约定（对齐后端契约）──────────────────────────────────────────────────
  *  · `POST /api/auth/login` body `{username, password}` → 200 `{token, role}` | 401；
@@ -14,19 +14,24 @@
  *  · 401 → 清空本地会话并跳转 `/login`（hash 路由，直接改 `location.hash`，
  *    避免 client → router 的循环依赖）；
  *  · 403 → 透传给调用方展示「权限不足」；
- *  · 网络错误 → 抛 `ApiError(status=0)` 的 rejected promise，由调用方降级
- *    （repo 层会回退 mock 数据，页面不崩）。
+ *  · 网络错误 → 抛 `ApiError(status=0)` 的 rejected promise，由调用方以
+ *    **诚实空态 / 结构化失败**兜底（绝不回退演示数据，页面不崩）。
  *
  * ── 大数红线 ────────────────────────────────────────────────────────────────
  * 响应体一律按 JSON 文本解析，**不做任何数值转换**；整数字段（纳秒时间戳 /
  * 序列号 / 累计计数器）由后端以字符串返回，repo 层原样透传展示，绝不 parseFloat。
  */
 
-/** API 模式：`mock`（默认，纯前端演示）/ `real`（经代理访问本机 daemon）。 */
-export type ApiMode = 'mock' | 'real';
+/** API 模式：仅 `real`（经代理访问本机 daemon）；演示模式已废除。 */
+export type ApiMode = 'real';
 
-/** 当前 API 模式（构建期由 `VITE_API_MODE` 决定，默认 `mock`）。 */
-export const API_MODE: ApiMode = import.meta.env.VITE_API_MODE === 'real' ? 'real' : 'mock';
+/**
+ * 当前 API 模式（**恒为 `'real'`**）。
+ *
+ * 历史 `VITE_API_MODE` 分流与演示数据回退已随演示数据模块一并删除；
+ * 本常量保留（类型收窄为 `'real'`）以兼容仍引用它的页面代码。
+ */
+export const API_MODE: ApiMode = 'real';
 
 /** token 在 localStorage 的键名（会话状态同源于此，刷新不丢）。 */
 const TOKEN_KEY = 'iot-daq.wc.token';

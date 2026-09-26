@@ -46,17 +46,10 @@
       <span>有未保存的修改。保存后网关自动生成写前备份，可在此页「基础 · 配置回滚」中回退。</span>
     </div>
 
-    <!-- real：读取失败；mock：演示态说明 -->
-    <div v-if="API_MODE === 'real' && settingsLoadError" class="wc-banner wc-banner--danger" data-testid="settings-load-error">
+    <!-- 读取失败：如实呈现原因 + 恢复路径，绝不回退演示数据 -->
+    <div v-if="settingsLoadError" class="wc-banner wc-banner--danger" data-testid="settings-load-error">
       <span aria-hidden="true">⚠</span>
       <span>设置读取失败：{{ settingsLoadError }}（请检查网关连接后刷新页面重试。）</span>
-    </div>
-    <div v-else-if="API_MODE !== 'real'" class="wc-banner wc-banner--info">
-      <span aria-hidden="true">ⓘ</span>
-      <span>
-        mock 演示态：下方表单为本地默认值，「保存」只更新本机界面状态、不向网关发送任何请求。
-        real 模式下基础 / 存储 / 安全三组真实读写并持久化到网关。
-      </span>
     </div>
 
     <!-- 保存结果（后端结果原样呈现，含 400 字段级原因） -->
@@ -87,11 +80,11 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>网关标识</h3>
-            <span class="wc-card__sub">real：真实读写（PUT basic）· mock：本地默认值</span>
+            <span class="wc-card__sub" data-testid="basic-mode-hint">真实读写（写前自动备份 + 热重载生效）</span>
           </div>
           <div class="wc-card__body">
             <div class="wc-form">
-              <UiField label="网关标识（gateway_id）" required hint="重启 / 停止等运维操作需回显该标识；保存后热重载生效">
+              <UiField label="网关标识" required hint="重启 / 停止等运维操作需回显该标识；保存后热重载生效">
                 <UiInput v-model="basicForm.gatewayId" data-testid="set-gateway-id" />
               </UiField>
               <UiField label="数据目录" hint="网关运行期数据根目录（只读）">
@@ -136,7 +129,7 @@
             </p>
             <template v-else>
               <div class="wc-list">
-                <div v-for="bak in backups" :key="bak.file" class="wc-list__item">
+                <div v-for="bak in pagedBackups" :key="bak.file" class="wc-list__item">
                   <div>
                     <div class="wc-list__title wc-mono">{{ bak.file }}</div>
                     <div class="wc-list__desc">{{ formatBytes(bak.sizeBytes) }} · {{ formatMtime(bak.mtimeMs) }}</div>
@@ -155,6 +148,13 @@
                   </div>
                 </div>
               </div>
+              <UiPager
+                v-if="backups.length > BACKUP_PAGE_SIZE"
+                :page="backupPage"
+                :total="backups.length"
+                :page-size="BACKUP_PAGE_SIZE"
+                @update:page="onBackupPage"
+              />
               <RoleGate
                 :allowed="canRollback"
                 mode="disable"
@@ -235,14 +235,15 @@
               <code>&lt;redacted&gt;</code>，前端不还原明文。
             </span>
           </p>
-          <table v-if="outlets.length" class="st-outlets" data-testid="outlets-table">
+          <template v-if="outlets.length">
+          <table class="st-outlets" data-testid="outlets-table">
             <thead>
               <tr>
                 <th>名称</th><th>Broker</th><th>Topic 前缀</th><th>QoS</th><th>TLS</th><th>编码</th><th>用户名</th><th>密码</th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="o in outlets" :key="o.id">
+              <tr v-for="o in pagedOutlets" :key="o.id">
                 <td class="wc-mono">{{ o.name || o.id }}</td>
                 <td class="wc-mono">{{ o.broker }}</td>
                 <td class="wc-mono">{{ o.topicPrefix }}</td>
@@ -256,6 +257,14 @@
               </tr>
             </tbody>
           </table>
+          <UiPager
+            v-if="outlets.length > OUTLET_PAGE_SIZE"
+            :page="outletPage"
+            :total="outlets.length"
+            :page-size="OUTLET_PAGE_SIZE"
+            @update:page="onOutletPage"
+          />
+          </template>
           <p v-else class="wc-note" data-testid="outlets-empty">
             <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
             <span>当前配置没有北向出口。出口登记在「北向转发」页进行。</span>
@@ -286,17 +295,17 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>存储参数</h3>
-            <span class="wc-card__sub">real：真实读写（PUT storage）· mock：本地默认值</span>
+            <span class="wc-card__sub" data-testid="storage-mode-hint">真实读写（写前自动备份 + 热重载生效）</span>
           </div>
           <div class="wc-card__body">
             <div class="wc-form wc-form--single">
-              <UiField label="SQLite 队列库文件（sqlite_path）" hint="相对数据目录的库文件名；保存后热重载生效">
+              <UiField label="SQLite 队列库文件" hint="相对数据目录的库文件名；保存后热重载生效">
                 <UiInput v-model="storageForm.sqlitePath" data-testid="set-sqlite-path" />
               </UiField>
-              <UiField label="队列环形覆盖上限（max_size_mb，MB）" hint="达到上限后覆盖最旧数据">
+              <UiField label="队列环形覆盖上限（MB）" hint="达到上限后覆盖最旧数据">
                 <UiInput v-model="storageForm.maxSizeMb" type="number" data-testid="set-max-size-mb" />
               </UiField>
-              <UiField label="遥测数据保留（retention_days，天）" hint="超期由网关后台线程清理">
+              <UiField label="遥测数据保留（天）" hint="超期由网关后台线程清理">
                 <UiInput v-model="storageForm.retentionDays" type="number" data-testid="set-retention-days" />
               </UiField>
             </div>
@@ -319,7 +328,7 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>安全设置</h3>
-            <span class="wc-card__sub">real：真实读写（PUT security）· mock：本地默认值</span>
+            <span class="wc-card__sub" data-testid="security-mode-hint">真实读写（写前自动备份 + 热重载生效）</span>
           </div>
           <div class="wc-card__body">
             <div class="st-row">
@@ -332,10 +341,10 @@
             </div>
 
             <div class="wc-form wc-form--single">
-              <UiField label="TLS 证书路径（tls_cert_path）" hint="管理端 HTTPS 证书 PEM；留空表示未配置">
+              <UiField label="TLS 证书路径" hint="管理端 HTTPS 证书 PEM；留空表示未配置">
                 <UiInput v-model="securityForm.tlsCertPath" placeholder="/pem/cert.pem" data-testid="set-tls-cert-path" />
               </UiField>
-              <UiField label="TLS 私钥路径（tls_key_path）" hint="仅存路径，内容不回显">
+              <UiField label="TLS 私钥路径" hint="仅存路径，内容不回显">
                 <UiInput v-model="securityForm.tlsKeyPath" placeholder="/pem/key.pem" data-testid="set-tls-key-path" />
               </UiField>
             </div>
@@ -420,7 +429,7 @@
  *
  * real 模式：进页 GET /api/settings 填充 → 保存 PUT /api/settings（白名单三组，写前备份 +
  * 热重载）→ 备份清单 GET /api/settings/backups 支撑定向回滚。OEM / network 只读组展示原因。
- * mock 模式：表单为本地默认值，保存仅本机反馈；备份清单诚实空态。
+ * 写失败（400 / 403 / 网络错误）一律原样呈现，绝不回退演示数据或「本地假成功」。
  */
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import {
@@ -428,6 +437,7 @@ import {
   UiField,
   UiInput,
   UiSwitch,
+  UiPager,
   RoleGate,
   DangerConfirmModal,
   type DangerFact,
@@ -435,7 +445,6 @@ import {
 import { session } from '../store/session';
 import { repo } from '@/api/repo';
 import type { SettingsBackupRow, SettingsOutletRow } from '@/api/repo';
-import { API_MODE } from '@/api/client';
 
 /** 页签名（原型 :2143）。 */
 const TABS = ['基础', '网络', '存储', '安全'] as const;
@@ -443,7 +452,7 @@ const TABS = ['基础', '网络', '存储', '安全'] as const;
 const activeTab = ref(0);
 
 // ---------------------------------------------------------------------------
-// 真实设置视图（real：GET /api/settings 填充；mock：本地默认值）
+// 真实设置视图（GET /api/settings 填充；取不到即诚实空态 + 错误横幅）
 // ---------------------------------------------------------------------------
 
 const settingsLoadError = ref('');
@@ -451,6 +460,24 @@ const configVersion = ref('');
 const dataDir = ref('');
 const oemInfo = reactive({ managedBy: '', note: '' });
 const outlets = ref<SettingsOutletRow[]>([]);
+
+/**
+ * 网络出口列表分页（切片留在页面级 computed；原生 table 纯展示）。
+ * 出口来自真实 `GET /api/settings` 的 network.outlets，是可增长列表，按页渲染。
+ */
+const OUTLET_PAGE_SIZE = 5;
+const outletPage = ref(1);
+
+/** 当前页出口（由 `outletPage` 驱动的真实切片）。 */
+const pagedOutlets = computed<SettingsOutletRow[]>(() => {
+  const start = (outletPage.value - 1) * OUTLET_PAGE_SIZE;
+  return outlets.value.slice(start, start + OUTLET_PAGE_SIZE);
+});
+
+/** 换页（由 UiPager 驱动）。 */
+function onOutletPage(next: number): void {
+  outletPage.value = next;
+}
 const mgmtUsers = ref<{ name: string; role: string }[]>([]);
 const activationCodeSet = ref<boolean | null>(null);
 
@@ -496,6 +523,7 @@ async function loadSettings(): Promise<void> {
   oemInfo.managedBy = view.oem.managedBy;
   oemInfo.note = view.oem.note;
   outlets.value = view.network.outlets;
+  outletPage.value = 1;
   mgmtUsers.value = view.security.mgmtUsers;
   activationCodeSet.value = view.security.activationCodeSet;
   basicForm.gatewayId = view.basic.gatewayId;
@@ -513,29 +541,21 @@ async function loadSettings(): Promise<void> {
   const backupsResult = await repo.settings.backups();
   if (backupsResult.ok) {
     backups.value = backupsResult.rows;
+    backupPage.value = 1;
     backupsError.value = '';
   } else {
     backups.value = [];
+    backupPage.value = 1;
     backupsError.value = backupsResult.message;
   }
 }
 
 onMounted(() => {
-  if (API_MODE === 'real') {
-    void loadSettings();
-  }
+  void loadSettings();
 });
 
-/** 保存设置：real → PUT /api/settings（三组白名单）；mock → 本机反馈（不下发）。 */
+/** 保存设置：`PUT /api/settings`（三组白名单；写前备份 + 热重载）。 */
 async function saveSettings(): Promise<void> {
-  if (API_MODE !== 'real') {
-    saved.value = true;
-    dirty.value = false;
-    setTimeout(() => {
-      saved.value = false;
-    }, 1600);
-    return;
-  }
   saving.value = true;
   saveResult.value = '';
   const result = await repo.settings.update({
@@ -573,19 +593,47 @@ const canRollback = computed<boolean>(() => session.state.role === 'admin');
 const backups = ref<SettingsBackupRow[]>([]);
 const backupsError = ref('');
 
-/** 备份大小（字节字符串 → 人类可读；解析失败原样展示）。 */
+/**
+ * 配置回滚列表分页（切片留在页面级 computed，UiTable / 列表只做纯展示，不在组件内做局部 slice）。
+ * 备份清单来自真实 `GET /api/settings/backups`，可有多份，按页渲染。
+ */
+const BACKUP_PAGE_SIZE = 4;
+const backupPage = ref(1);
+
+/** 当前页备份（由 `backupPage` 驱动的真实切片）。 */
+const pagedBackups = computed<SettingsBackupRow[]>(() => {
+  const start = (backupPage.value - 1) * BACKUP_PAGE_SIZE;
+  return backups.value.slice(start, start + BACKUP_PAGE_SIZE);
+});
+
+/** 换页（由 UiPager 驱动）。 */
+function onBackupPage(next: number): void {
+  backupPage.value = next;
+}
+
+/**
+ * 备份大小（字节字符串 → 人类可读；解析失败原样展示）。
+ *
+ * 大数红线：`size_bytes` 是 JSON **字符串**编码的 uint64，绝不可 `Number()` / `parseInt`
+ * （> 2^53−1 静默丢精度）。这里全程用 `BigInt` 做整数除法，仅在最后一步转小数。
+ */
 function formatBytes(sizeBytes: string): string {
-  const n = Number(sizeBytes);
-  if (!Number.isFinite(n) || n < 0) {
+  const text = sizeBytes.trim();
+  if (!/^\d+$/.test(text)) {
     return sizeBytes;
   }
-  if (n >= 1024 * 1024) {
-    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  const bytes = BigInt(text);
+  if (bytes < 1024n) {
+    return `${bytes} B`;
   }
-  if (n >= 1024) {
-    return `${(n / 1024).toFixed(1)} KB`;
+  const kb = bytes / 1024n;
+  if (kb < 1024n) {
+    return `${kb} KB`;
   }
-  return `${n} B`;
+  const mb = kb / 1024n;
+  return mb < 1024n
+    ? `${(Number(mb) / 1024).toFixed(1)} MB`
+    : `${(Number(mb / 1024n) / 1024).toFixed(1)} GB`;
 }
 
 /** 备份时刻（epoch 毫秒字符串 → 本地时间文本；非法值原样展示）。 */
@@ -648,7 +696,7 @@ function openRollback(row?: SettingsBackupRow): void {
     { label: '备份时刻', value: formatMtime(target.mtimeMs) },
     { label: '当前版本', value: configVersion.value || '—' },
     { label: '操作者', value: session.state.displayName },
-    { label: '执行模式', value: API_MODE === 'real' ? 'real（真实下发网关）' : 'mock（演示，无真实动作）' },
+    { label: '回滚范围', value: '仅配置文件（采集数据与设备连接状态不受影响）' },
   ];
 }
 
@@ -657,22 +705,19 @@ const rollbackResult = ref('');
 const rollbackResultKind = ref<'ok' | 'warn'>('ok');
 
 /**
- * 提交回滚：real 调 `repo.settings.rollback`（真实 `POST /api/settings/rollback`；
- * 定向时 body 带 backup，否则缺省回滚到最新备份）；mock 走模拟并注明「未产生真实动作」。
+ * 提交回滚：调 `repo.settings.rollback`（真实 `POST /api/settings/rollback`；
+ * 定向时 body 带 backup，否则缺省回滚到最新备份）。
  * 弹窗四要素（影响清单 + 原因必填 + 备份文件名二次校验 + 草稿隔离）由 DangerConfirmModal 保证。
  */
 async function submitRollback(payload: { reason: string; note: string; tail: string }): Promise<void> {
   rollback.open = false;
+  // 危险三要素：reason（原因枚举）与 note（补充说明）**各自独立下发**，禁止拼接进同一个字段。
   const result = await repo.settings.rollback({
     actor: session.state.displayName,
-    reason: `${payload.reason} · ${payload.note}`,
+    reason: payload.reason,
+    note: payload.note,
     backup: rollback.file || undefined,
   });
-  if (API_MODE !== 'real') {
-    rollbackResult.value = `${result.message} —— 演示模式未向网关发出任何回滚指令，配置不变。`;
-    rollbackResultKind.value = 'warn';
-    return;
-  }
   rollbackResult.value = result.ok
     ? `${result.message}${result.restoredFrom ? `（恢复自备份 ${result.restoredFrom}${result.version ? `，配置版本 ${result.version}` : ''}）` : ''}`
     : `回滚未执行：${result.message}`;

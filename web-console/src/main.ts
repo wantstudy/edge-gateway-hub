@@ -20,7 +20,7 @@ import './styles/global.css';
 import { watch } from 'vue';
 import App from './App.vue';
 import { router } from './router';
-import { API_MODE, getStoredToken } from './api/client';
+import { getStoredToken } from './api/client';
 import { preloadRealData } from './api/repo';
 import { closeStream, connectStream, streamStatus } from './api/stream';
 import { session } from './store/session';
@@ -39,43 +39,40 @@ app.use(router);
  * （**无限 SSE 流**，`res.text()` 永不 resolve）→ 带 token 刷新时**永久白屏**。
  * 现改为：preload **后台触发**（内部另有 8s 超时护栏），`app.mount` 不再等待它；
  * 缓存填充完成后由 `dataVersion`（响应式）驱动页面刷新（总览页 1s tick 亦会
- * 自动取到最新缓存）。mock 模式与未登录场景不发任何网络请求。
+ * 自动取到最新缓存）。未登录场景不发任何网络请求。
  */
 async function bootstrap(): Promise<void> {
-  if (API_MODE === 'real' && getStoredToken()) {
-    // 后台预取：失败 / 超时均由 repo 层回退 mock 或诚实空态，不影响首屏挂载
+  if (getStoredToken()) {
+    // 后台预取：失败 / 超时均由 repo 层按诚实空态处理，不影响首屏挂载
     void preloadRealData().catch((cause: unknown) => {
-      console.warn('[web-console] bootstrap 预取真实数据失败，页面回退 mock / 诚实空态', cause);
+      console.warn('[web-console] bootstrap 预取真实数据失败，页面按诚实空态展示', cause);
     });
   }
-  // real 模式：SSE 生命周期由登录态驱动（刷新 / 登录 / 登出三态全覆盖）；
-  // SSE 通道状态同步到顶栏连接指示（open→connected，connecting→degraded，
-  // unauthorized / idle→disconnected）。mock 模式不建连、不改连接指示。
-  if (API_MODE === 'real') {
-    watch(
-      () => session.state.loggedIn,
-      (loggedIn) => {
-        if (loggedIn && getStoredToken()) {
-          connectStream();
-        } else {
-          closeStream();
-        }
-      },
-      { immediate: true },
-    );
-    watch(
-      () => streamStatus.value,
-      (status) => {
-        if (status === 'open') {
-          session.setConnection('connected');
-        } else if (status === 'connecting') {
-          session.setConnection('degraded');
-        } else {
-          session.setConnection('disconnected');
-        }
-      },
-    );
-  }
+  // SSE 生命周期由登录态驱动（刷新 / 登录 / 登出三态全覆盖）；SSE 通道状态同步到
+  // 顶栏连接指示（open→connected，connecting→degraded，unauthorized / idle→disconnected）。
+  watch(
+    () => session.state.loggedIn,
+    (loggedIn) => {
+      if (loggedIn && getStoredToken()) {
+        connectStream();
+      } else {
+        closeStream();
+      }
+    },
+    { immediate: true },
+  );
+  watch(
+    () => streamStatus.value,
+    (status) => {
+      if (status === 'open') {
+        session.setConnection('connected');
+      } else if (status === 'connecting') {
+        session.setConnection('degraded');
+      } else {
+        session.setConnection('disconnected');
+      }
+    },
+  );
   app.mount('#app');
 }
 

@@ -4,9 +4,10 @@
  * @description 网关控制台会话与全局运行状态（当前用户、角色、授权状态、连接状态）。
  *
  * ── 边界（红线）─────────────────────────────────────────────────────────────
- *  · 本原型不接后端，会话仅存在于内存（刷新即回登录态）；
+ *  · 会话以 localStorage 中的 JWT 为准（未登录 → 登录页）；
  *  · **授权判定一律在 Rust 侧**，本模块只持有「用于展示」的授权快照，
- *    不得作为任何授权/放行依据；
+ *    不得作为任何授权/放行依据；快照来源于 `GET /api/license/status`（经 repo 映射），
+ *    未取到真实快照时展示诚实空值（绝不掺演示数据）。
  *  · 角色枚举仅用于 `RoleGate` 的**可见性**控制（`ui-design-system.md` §3）。
  *
  * ── 为什么角色枚举是 4 个（admin / engineer / operator / viewer）────────────
@@ -18,15 +19,10 @@
  * 设计文档 §2 写的是 3 角色（admin/operator/viewer），本骨架按团队约定细分出
  * `engineer`，并在 README 中记录该偏差（对设计文档为「细化」而非「变更」）。
  */
-import { reactive, readonly, computed } from 'vue';
-import { licenseSnapshot, type MockLicense } from '../mock/mock-data';
-import {
-  API_MODE,
-  clearAuth,
-  getStoredBackendRole,
-  getStoredToken,
-  onUnauthorized,
-} from '../api/client';
+import { reactive, readonly, computed, watch } from 'vue';
+import { licenseSnapshot, type MockLicense } from '../api/model';
+import { dataVersion, repo } from '../api/repo';
+import { clearAuth, getStoredBackendRole, getStoredToken, onUnauthorized } from '../api/client';
 
 /** 网关控制台四角色。 */
 export const ROLES = ['admin', 'engineer', 'operator', 'viewer'] as const;
@@ -85,11 +81,11 @@ interface SessionState {
   account: string;
   /** 当前用户显示名 */
   displayName: string;
-  /** 当前角色（顶栏可切换，用于演示 RoleGate 与权限矩阵真实生效） */
+  /** 当前角色（登录后由后端角色映射而来，仅控制 `RoleGate` 可见性） */
   role: Role;
-  /** 后端角色原文（real 模式登录后由 `/api/auth/login` 返回；mock 模式为空串） */
+  /** 后端角色原文（登录后由 `/api/auth/login` 返回；未登录为空串） */
   backendRole: string;
-  /** 展示用授权快照（**非**授权判定，判定在 Rust 侧） */
+  /** 展示用授权快照（**非**授权判定，判定在 Rust 侧；真实值来自 `/api/license/status`） */
   license: MockLicense;
   /** 顶栏连接状态指示 */
   connection: ConnectionState;
@@ -99,15 +95,15 @@ interface SessionState {
 
 /** 可变状态对象（模块内可直接写，对外只读）。
  *
- * real 模式：登录态以 localStorage token 为准（未登录 → 登录页）；
- * mock 模式：保持原型行为，默认已登录。
+ * 登录态以 localStorage token 为准（未登录 → 登录页）；授权快照初始为诚实空值，
+ * 待 `preloadRealData()` 填充后由 `dataVersion` 驱动刷新为真实值。
  */
 const state: SessionState = reactive<SessionState>({
-  loggedIn: API_MODE === 'real' ? Boolean(getStoredToken()) : true,
-  account: API_MODE === 'real' ? '' : 'field.zhang',
-  displayName: API_MODE === 'real' ? '' : '张工',
-  role: API_MODE === 'real' ? 'viewer' : 'admin',
-  backendRole: API_MODE === 'real' ? getStoredBackendRole() : '',
+  loggedIn: Boolean(getStoredToken()),
+  account: '',
+  displayName: '',
+  role: 'viewer',
+  backendRole: getStoredBackendRole(),
   license: licenseSnapshot,
   connection: 'connected',
   sidebarCollapsed: false,
@@ -133,35 +129,26 @@ export function mapBackendRole(backendRole: string): Role {
   }
 }
 
-/** 登录：记录账号；可选覆盖角色与后端角色原文（real 模式由 LoginPage 传入）。 */
+/** 登录：记录账号；可选覆盖角色与后端角色原文（由 LoginPage 传入）。 */
 function login(account: string, opts?: { role?: Role; backendRole?: string }): void {
   state.loggedIn = true;
-  state.account = account || 'field.zhang';
-  state.displayName = account || '张工';
-  state.role = opts?.role ?? 'admin';
+  state.account = account;
+  state.displayName = account;
+  state.role = opts?.role ?? 'viewer';
   if (opts?.backendRole !== undefined) {
     state.backendRole = opts.backendRole;
   }
 }
 
-/** 登出：清空会话并清除本地 token（mock 模式无 token，调用无副作用）。 */
+/** 登出：清空会话并清除本地 token。 */
 function logout(): void {
   state.loggedIn = false;
   state.account = '';
   state.displayName = '';
   state.role = 'viewer';
   state.backendRole = '';
+  state.license = licenseSnapshot;
   clearAuth();
-}
-
-/**
- * 切换角色（顶栏下拉）——用于验证 `RoleGate` 的可见性控制真实生效。
- *
- * ⚠️ 切换角色**不会**改变任何授权状态：授权快照来自 Rust 侧的租约校验，
- *    与前端角色无关（红线 3）。
- */
-function setRole(role: Role): void {
-  state.role = role;
 }
 
 /** 设置顶栏连接状态指示。 */
@@ -184,12 +171,19 @@ onUnauthorized(() => {
   state.loggedIn = false;
 });
 
+/** 授权快照刷新：读取 repo 映射的真实授权状态（缓存未就绪时为诚实空值）。 */
+function refreshLicense(): void {
+  state.license = repo.getLicense();
+}
+
+/** 缓存填充 / 写操作刷新后，由 `dataVersion` 驱动同步顶栏授权快照。 */
+watch(dataVersion, refreshLicense, { immediate: true });
+
 /** 会话 API（对组件暴露只读状态 + 动作）。 */
 export const session = {
   state: readonly(state),
   login,
   logout,
-  setRole,
   setConnection,
   toggleSidebar,
   setLicense,

@@ -2,95 +2,89 @@
   <!--
     StartupPage —— 启动与自启（运维分组，路由 `/startup`）。
 
-    结构（`docs/design/prototype/gateway-v2a-glacier.html` :1985-2045 + :3345-3358 + :3131-3143）：
-      KPI 四卡 → 启动策略 / 启动方式识别 → 计划重启 / 危险操作。
-
-    危险操作契约（本次修复重点）：
-      · 「立即重启服务」走 ui-kit `DangerConfirmModal`：影响清单 + 原因必填（枚举 + 补充说明）+
-        **服务名二次校验**；real 模式调真实 `POST /api/ops/restart`，body `{actor, confirm, reason}`，
-        `confirm` 由页面自动回显网关标识（/api/overview 的 `name` = gateway_id）；
-      · 「停止服务（不自动启动）」走同一弹窗并追加**服务名二次校验**；real 模式调真实
-        `POST /api/ops/stop`（契约与 restart 一致，200 mode=graceful_stop——优雅停机，
-        是否拉起由 Supervisor 决定）；mock 模式模拟并注明「未产生真实动作」；
-      · 确认后的动作：后端返回的结果（含 403 / 400 confirm_mismatch）原样呈现。
-
-    其它硬性约定：
-      · 部署形态「自动识别」：二者并列展示并高亮当前形态，绝不让用户手动二选一；
-      · 系统级自启变更受 RoleGate 控制（仅管理员可改）；
-      · 所有系统操作只给真实结果或明确标注的演示反馈，不伪造后端落地。
+    真实能力边界（不许造数）：
+      · 运行信息取自 `GET /api/overview`（部署形态 / 主机名 / 端口 / 版本 / 标识）；
+      · 网关**未提供**容器 / 原生形态识别、启动策略写、计划重启端点，
+        这些一律诚实留空或标注为「本机界面状态」；
+      · 危险动作契约不变（P0-6）：重启 / 停止走 ui-kit `DangerConfirmModal`
+        —— 影响清单 + 原因必填 + **服务名二次校验**；real 模式调真实
+        `POST /api/ops/restart` / `POST /api/ops/stop`，body `{actor, confirm, reason}`，
+        `confirm` 由页面自动回显网关标识（`/api/overview` 的 `name` = gateway_id）。
   -->
-  <PageHeader
-    crumb="运维 / 启动与自启"
-    title="启动与自启"
-    desc="服务生命周期：开机自启、崩溃重启、看门狗与计划重启。部署形态自动识别；重启与停止服务为高危操作，需填原因并写入审计。"
-  />
-
   <div class="wc-content">
-    <!-- KPI 四卡（原型 :1991-1996） -->
+    <!-- KPI 四卡 -->
     <div class="wc-grid wc-grid--4">
       <StatCard label="服务状态" :value="serviceStatusText" :sub="serviceStatusSub" icon-tone="teal">
         <template #icon>▶</template>
       </StatCard>
-      <StatCard label="已运行" :value="gateway.uptimeText" sub="来自网关自检" icon-tone="ink">
+      <StatCard label="已运行" :value="gateway.uptimeText" sub="GET /api/overview" icon-tone="ink">
         <template #icon>◷</template>
       </StatCard>
-      <StatCard label="上次启动" :value="gateway.startedAt" sub="随网关进程启动" icon-tone="amber">
+      <StatCard label="上次启动" :value="startedAtText" sub="随网关进程启动" icon-tone="amber">
         <template #icon>↻</template>
       </StatCard>
-      <StatCard label="异常重启" value="—" unit="次" sub="后端未统计（不伪造 0）" tone="warn" icon-tone="violet">
+      <StatCard label="异常重启" value="—" sub="后端未提供统计字段（不伪造 0）" tone="warn" icon-tone="violet">
         <template #icon>!</template>
       </StatCard>
     </div>
 
-    <p class="su-kpi-note">
-      <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-      <span>
-        口径说明：「已运行」与「上次启动」取自网关自检（real 模式为 <code>/api/overview</code>，
-        mock 模式为演示数据）；「服务状态」以<b>最近一次网关应答是否正常</b>为准；
-        <b>异常重启次数后端尚未提供统计字段</b>，因此显示「—」而不是假的「0」。
-      </span>
-    </p>
+    <!-- 运行信息（真实字段）+ 参考命令 -->
+    <section class="wc-card">
+      <div class="wc-card__head">
+        <h3>运行信息</h3>
+        <span class="wc-tag wc-tag--info">容器 / 原生形态识别：网关未提供该接口</span>
+      </div>
+      <div class="wc-card__body">
+        <dl class="wc-kv">
+          <dt>网关标识</dt>
+          <dd class="wc-mono">{{ gateway.name || '—' }}</dd>
+          <dt>部署形态</dt>
+          <dd class="wc-mono">{{ gateway.deployMode || '—' }}</dd>
+          <dt>主机名</dt>
+          <dd class="wc-mono">{{ gateway.hostname || '—' }}</dd>
+          <dt>管理端口</dt>
+          <dd class="wc-mono">{{ gateway.port || '—' }}</dd>
+          <dt>版本</dt>
+          <dd class="wc-mono">{{ gateway.version || '—' }}</dd>
+        </dl>
+        <div class="su-cmd">
+          <span class="su-cmd__title">参考命令（按实际部署方式选用）</span>
+          <pre class="wc-mono">docker compose -f deploy/docker/docker-compose.yml ps
+docker compose -f deploy/docker/docker-compose.yml logs -f
+docker compose -f deploy/docker/docker-compose.yml restart
 
-    <!-- 识别结果横幅 -->
-    <section class="wc-card su-banner">
-      <div class="su-banner__main">
-        <div class="su-banner__label">当前部署形态（自动识别）</div>
-        <div class="su-banner__form">
-          <StatusTag :status="detectedForm" />
-          <span class="su-banner__form-cn">{{ formCn }}</span>
+systemctl status iot-daq-gateway.service
+journalctl -u iot-daq-gateway.service -f</pre>
         </div>
       </div>
-      <button type="button" class="wc-btn wc-btn--sm" @click="showDetect = !showDetect">
-        {{ showDetect ? '收起识别依据' : '识别依据' }}
-      </button>
-      <p v-if="showDetect" class="su-banner__note">
-        识别逻辑：运行体启动后探测 <code>/.dockerenv</code> 是否存在，并判断 PID 1 是否由
-        <code>systemd</code> 托管（<code>/run/systemd/system</code> 存在且被接管）。命中容器特征即判定为
-        <b>Docker</b> 形态，否则判定为 <b>systemd</b> 原生服务形态。前端仅展示该识别结果，真实判定在 Rust 侧。
-      </p>
     </section>
 
     <div class="wc-grid wc-grid--2">
-      <!-- 启动策略（原型 :1998-2005） -->
+      <!-- 启动策略（本机界面状态） -->
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>启动策略</h3>
-          <span class="wc-card__sub">本地界面状态 · 网关未开放写端点</span>
+          <span class="wc-tag wc-tag--info">本机界面状态 · 网关未开放写端点</span>
         </div>
         <div class="wc-card__body">
           <div class="su-row">
             <div class="su-row__text">
-              <div class="su-row__title">开机自启</div>
+              <div class="su-row__title">
+                开机自启
+                <span class="wc-tag wc-tag--neutral" data-testid="autostart-state">{{ autostartStateText }}</span>
+              </div>
               <div class="su-row__desc">
-                {{
-                  detectedForm === 'docker'
-                    ? '对应 compose 的 restart: unless-stopped，宿主重启/断电后自动拉起。'
-                    : '对应 systemctl enable，宿主开机时由 systemd 自动拉起。'
-                }}
+                {{ autostartDesc }}
               </div>
             </div>
             <RoleGate :allowed="canManage">
-              <UiSwitch v-model="autostartEnabled" on-text="已启用" off-text="已关闭" @update:model-value="onAutostart" />
+              <UiSwitch
+                v-model="autostartEnabled"
+                on-text="已启用"
+                off-text="已关闭"
+                :disabled="autostartBusy || !autostartWritable"
+                @update:model-value="onAutostart"
+              />
             </RoleGate>
             <span v-if="!canManage" class="wc-tag wc-tag--neutral">仅管理员可改</span>
           </div>
@@ -105,10 +99,7 @@
 
           <div class="su-row">
             <div class="su-row__text">
-              <div class="su-row__title">
-                看门狗
-                <span class="su-badge">需重启生效</span>
-              </div>
+              <div class="su-row__title">看门狗</div>
               <div class="su-row__desc">心跳超时 90s 判定为假死，自动重启进程（panic 隔离）。</div>
             </div>
             <UiSwitch v-model="watchdog" on-text="已启用" off-text="已关闭" />
@@ -117,108 +108,25 @@
           <div class="su-row">
             <div class="su-row__text">
               <div class="su-row__title">启动失败保护</div>
-              <div class="su-row__desc">连续 5 次启动失败后自动暂停自启并触发告警，避免反复重启拖垮主机。</div>
+              <div class="su-row__desc">连续 5 次启动失败后暂停自启并触发告警，避免无限重启循环。</div>
             </div>
             <UiSwitch v-model="bootFailureGuard" on-text="已启用" off-text="已关闭" />
           </div>
-
-          <p class="wc-note wc-note--warn">
-            <span class="wc-note__icon" aria-hidden="true">⚠</span>
-            <span>
-              「启动失败保护」是必须项：配置写错导致启动即崩时，若无此保护会形成无限重启循环，
-              在工控机上表现为整机变卡。上述开关当前<b>只改本机界面状态</b> —— 网关未开放对应写端点，
-              真实生效依赖后续版本与部署侧 unit 文件。
-            </span>
-          </p>
         </div>
       </section>
 
-      <!-- 启动方式识别（原型 :2007-2017） -->
-      <section class="wc-card">
-        <div class="wc-card__head">
-          <h3>启动方式识别</h3>
-          <span class="wc-card__sub">随部署形态自动判定</span>
-        </div>
-        <div class="wc-card__body">
-          <dl class="wc-kv">
-            <dt>部署形态</dt>
-            <dd>
-              <span class="wc-tag wc-tag--info">{{ formCn }}</span>
-            </dd>
-            <template v-if="detectedForm === 'docker'">
-              <dt>容器名</dt><dd class="wc-mono">{{ runtime.docker.containerName }}</dd>
-              <dt>镜像</dt><dd class="wc-mono">{{ runtime.docker.imageDigest }}</dd>
-              <dt>自启机制</dt><dd class="wc-mono">restart: {{ runtime.docker.restartPolicy }}</dd>
-              <dt>健康检查</dt><dd><StatusTag :status="runtime.docker.health" /></dd>
-              <dt>编排文件</dt><dd class="wc-mono">{{ runtime.docker.composeFile }}</dd>
-            </template>
-            <template v-else>
-              <dt>服务单元</dt><dd class="wc-mono">{{ runtime.native.serviceName }}</dd>
-              <dt>运行状态</dt><dd class="wc-mono">{{ runtime.native.active }}</dd>
-              <dt>开机自启</dt><dd class="wc-mono">{{ runtime.native.bootEnable ? 'enabled' : 'disabled' }}</dd>
-              <dt>重启策略</dt><dd class="wc-mono">on-failure · 退避 5s</dd>
-              <dt>资源限制</dt><dd class="wc-mono">CPU 400% · 内存 2G</dd>
-            </template>
-            <dt>数据目录</dt><dd class="wc-mono">/var/lib/iot-daq</dd>
-          </dl>
-          <p class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>
-              两种形态的识别与命令均为<b>并列展示</b>，互不干扰；当前形态由网关自检高亮，另一形态标注「未采用」。
-            </span>
-          </p>
-        </div>
-      </section>
-    </div>
-
-    <!-- 双形态卡片：配置与命令并列 -->
-    <div class="wc-grid wc-grid--2">
-      <section class="wc-card su-form" :class="{ 'is-active': detectedForm === 'docker' }">
-        <div class="wc-card__head">
-          <h3>Docker 容器形态</h3>
-          <span v-if="detectedForm === 'docker'" class="wc-tag wc-tag--info">当前形态</span>
-          <span v-else class="wc-tag wc-tag--neutral">未采用</span>
-        </div>
-        <div class="wc-card__body">
-          <div class="su-cmd">
-            <span class="su-cmd__title">常用命令</span>
-            <pre class="wc-mono">docker compose -f {{ runtime.docker.composeFile }} ps
-docker compose -f {{ runtime.docker.composeFile }} logs -f
-docker compose -f {{ runtime.docker.composeFile }} restart</pre>
-          </div>
-        </div>
-      </section>
-
-      <section class="wc-card su-form" :class="{ 'is-active': detectedForm === 'native' }">
-        <div class="wc-card__head">
-          <h3>systemd 服务形态</h3>
-          <span v-if="detectedForm === 'native'" class="wc-tag wc-tag--info">当前形态</span>
-          <span v-else class="wc-tag wc-tag--neutral">未采用</span>
-        </div>
-        <div class="wc-card__body">
-          <div class="su-cmd">
-            <span class="su-cmd__title">常用命令</span>
-            <pre class="wc-mono">systemctl status {{ runtime.native.serviceName }}
-journalctl -u {{ runtime.native.serviceName }} -f
-systemctl enable --now {{ runtime.native.serviceName }}</pre>
-          </div>
-        </div>
-      </section>
-    </div>
-
-    <div class="wc-grid wc-grid--2-1">
-      <!-- 计划重启（原型 :2020-2031） -->
+      <!-- 计划重启（无端点） -->
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>计划重启</h3>
-          <span class="wc-card__sub">避开产线时段</span>
+          <span class="wc-tag wc-tag--info">网关未提供计划重启端点</span>
         </div>
         <div class="wc-card__body">
           <div class="su-form-grid">
             <UiField label="启用计划重启">
               <UiSelect v-model="plan.enabled" :options="planEnabledOptions" />
             </UiField>
-            <UiField label="执行时间" hint="建议避开产线交接班时段">
+            <UiField label="执行时间">
               <UiInput v-model="plan.at" placeholder="03:00" />
             </UiField>
             <UiField label="执行周期">
@@ -230,76 +138,72 @@ systemctl enable --now {{ runtime.native.serviceName }}</pre>
           </div>
           <dl class="wc-kv">
             <dt>下次执行</dt>
-            <dd class="wc-mono">{{ planNextText }}</dd>
+            <dd class="wc-mono">—（网关未提供计划重启端点，本表单不生效）</dd>
             <dt>上次执行</dt>
             <dd class="wc-mono">—（网关未提供计划重启端点）</dd>
           </dl>
-          <p class="wc-note wc-note--warn">
-            <span class="wc-note__icon" aria-hidden="true">⚠</span>
-            <span>
-              网关当前<b>没有</b>计划重启端点：本表单只保存本机界面状态，<b>不会真的按时重启</b>，
-              因此不给推算出来的「下次执行时间」（那是假数据）。现场需要定时重启请用宿主机 cron / systemd timer。
-            </span>
-          </p>
-        </div>
-      </section>
-
-      <!-- 危险操作（原型 :2032-2042） -->
-      <section class="wc-card">
-        <div class="wc-card__head">
-          <h3>危险操作</h3>
-          <span class="wc-card__sub">需二次确认 + 原因</span>
-        </div>
-        <div class="wc-card__body">
-          <div class="su-impact">
-            <p class="su-impact__title"><span aria-hidden="true">⚠</span>重启与停止服务的影响</p>
-            <ul>
-              <li>重启期间<b>采集暂停约 5–15 秒</b>；已入队数据不会丢失，恢复后自动补发。</li>
-              <li>停止服务后<b>北向转发中断</b>，且不再自动启动（除非自启开启）。</li>
-              <li>操作需二次确认并填写原因，同时写入审计日志。</li>
-            </ul>
-          </div>
-
-          <button type="button" class="wc-btn wc-btn--danger su-wide" @click="openRestart">立即重启服务</button>
-          <button type="button" class="wc-btn wc-btn--danger su-wide" @click="openStop">停止服务（不自动启动）</button>
-          <button type="button" class="wc-btn su-wide" @click="onLogs">查看日志</button>
-
-          <div v-if="lastAction" class="su-result" :class="`is-${lastKind}`">
-            <span aria-hidden="true">{{ lastKind === 'ok' ? '✓' : '⚠' }}</span>
-            <span>{{ lastAction }}</span>
-          </div>
         </div>
       </section>
     </div>
+
+    <!-- 危险操作 -->
+    <section class="wc-card">
+      <div class="wc-card__head">
+        <h3>危险操作</h3>
+        <span class="wc-card__sub">需二次确认 + 原因 + 网关标识校验</span>
+      </div>
+      <div class="wc-card__body">
+        <div class="su-impact">
+          <p class="su-impact__title"><span aria-hidden="true">⚠</span>重启与停止服务的影响</p>
+          <ul>
+            <li>重启期间<b>采集暂停约 5–15 秒</b>；已入队数据不会丢失，恢复后自动补发。</li>
+            <li>停止服务后<b>北向转发中断</b>，且不再自动启动（除非自启开启）。</li>
+            <li>操作需二次确认并填写原因，同时写入审计日志。</li>
+          </ul>
+        </div>
+
+        <div class="su-ops">
+          <button type="button" class="wc-btn wc-btn--danger" data-testid="startup-restart" @click="openRestart">立即重启服务</button>
+          <button type="button" class="wc-btn wc-btn--danger" data-testid="startup-stop" @click="openStop">停止服务（不自动启动）</button>
+        </div>
+
+        <div v-if="lastAction" class="su-result" :class="`is-${lastKind}`">
+          <span aria-hidden="true">{{ lastKind === 'ok' ? '✓' : '⚠' }}</span>
+          <span>{{ lastAction }}</span>
+        </div>
+      </div>
+    </section>
   </div>
 
-  <!-- 重启服务：影响清单 + 原因必填 + 服务名二次校验（原型 confirmRestart :3345-3358） -->
+  <!-- 重启服务：影响清单 + 原因必填 + gateway_id 全名二次校验 -->
   <DangerConfirmModal
     :open="restartModal.open"
-    :title="`重启服务 · ${formCn}`"
+    :title="`重启服务 · ${gateway.name || '网关'}`"
     :impacts="restartModal.impacts"
     :facts="restartModal.facts"
     :reasons="RESTART_REASONS"
     :min-note-length="10"
-    :confirm-value="SERVICE_KEY"
-    confirm-label="风险二次确认（输入服务名）"
-    :confirm-placeholder="`输入 ${SERVICE_KEY} 以确认`"
+    confirm-mode="full"
+    :confirm-value="gatewayId"
+    confirm-label="风险二次确认（输入网关标识全名）"
+    :confirm-placeholder="`输入网关标识 ${gatewayId || '（当前不可得）'} 以确认`"
     confirm-text="确认重启"
     @close="restartModal.open = false"
     @submit="confirmRestart"
   />
 
-  <!-- 停止服务：原因必填 + 服务名二次校验（原型 stopService :3131-3143） -->
+  <!-- 停止服务：原因必填 + gateway_id 全名二次校验 -->
   <DangerConfirmModal
     :open="stopModal.open"
-    :title="`停止服务 · ${formCn}`"
+    :title="`停止服务 · ${gateway.name || '网关'}`"
     :impacts="stopModal.impacts"
     :facts="stopModal.facts"
     :reasons="STOP_REASONS"
     :min-note-length="10"
-    :confirm-value="SERVICE_KEY"
-    confirm-label="风险二次确认（输入服务名）"
-    :confirm-placeholder="`输入 ${SERVICE_KEY} 以确认`"
+    confirm-mode="full"
+    :confirm-value="gatewayId"
+    confirm-label="风险二次确认（输入网关标识全名）"
+    :confirm-placeholder="`输入网关标识 ${gatewayId || '（当前不可得）'} 以确认`"
     confirm-text="确认停止"
     @close="stopModal.open = false"
     @submit="confirmStop"
@@ -310,18 +214,15 @@ systemctl enable --now {{ runtime.native.serviceName }}</pre>
 /**
  * @file StartupPage.vue
  * @module web-console/pages/StartupPage
- * @description 启动与自启：部署形态识别 / 启动策略 / 计划重启 / 高危运维动作。
+ * @description 启动与自启：运行信息（真实）+ 启动策略 / 计划重启（本机界面状态）+ 高危运维动作。
  *
  * 危险动作一律经 `DangerConfirmModal`（影响清单 + 原因必填 + 服务名二次校验），
- * 确认后：mock 走演示行为并在结果区注明「未产生真实动作」；real 调用 `repo.ops.restart`
- * / `repo.ops.stop`（body {actor, confirm, reason}，confirm 自动回显网关标识）。
- * 未实现的能力（计划重启、异常重启计数）一律显式留空说明，**不给假数据**。
+ * 确认后调真实 `repo.ops.restart` / `repo.ops.stop`（body {actor, confirm, reason}，
+ * confirm 自动回显网关标识），后端结果原样呈现。未落地的能力一律显式留空，不给假数据。
  */
-import { computed, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import {
-  PageHeader,
   StatCard,
-  StatusTag,
   RoleGate,
   UiSwitch,
   UiSelect,
@@ -330,55 +231,53 @@ import {
   DangerConfirmModal,
   type SelectOption,
 } from '@ui-kit';
-import { API_MODE } from '@/api/client';
-import { repo } from '@/api/repo';
+import { dataVersion, repo, type AutostartStatus, type GatewayInfo } from '@/api/repo';
 import { session } from '../store/session';
 
-/** 部署形态。 */
-type RuntimeForm = 'docker' | 'native';
+/** 网关信息（真实：`GET /api/overview`）。 */
+const gateway = ref<GatewayInfo>(repo.getGateway());
+watch(dataVersion, () => {
+  gateway.value = repo.getGateway();
+});
 
-/** 二次校验用的服务名关键字（语原型 :3140「输入 iot-daq 以确认」）。 */
-const SERVICE_KEY = 'iot-daq';
+/**
+ * 二次校验锚点：后端冻结语义为 `confirm === gateway_id`（`remote_ops.rs`），
+ * `/api/overview` 的 `name` 即当前 gateway_id（如 `gw-local-dev`）。
+ * 前端只透传真实值供用户对照输入，**禁止硬编码**。
+ */
+const gatewayId = computed<string>(() => {
+  const id = (gateway.value.name || '').trim();
+  return id && id !== '—' ? id : '';
+});
 
-/** 自动识别出的当前形态（mock：默认 Docker，与 Linux 交付主推形态一致）。 */
-const detectedForm = ref<RuntimeForm>('docker');
-
-/** 形态中文名。 */
-const formCn = computed(() => (detectedForm.value === 'docker' ? 'Docker 容器' : 'systemd 服务'));
-
-/** 两种形态的运行态快照（只读展示）。 */
-const runtime = {
-  docker: {
-    containerName: 'iot-daq-gateway',
-    imageDigest: 'sha256:9f2c4b…a31e',
-    restartPolicy: 'unless-stopped',
-    health: 'healthy',
-    composeFile: 'deploy/docker/docker-compose.yml',
-  },
-  native: {
-    serviceName: 'iot-daq-gateway.service',
-    active: 'active (running)',
-    bootEnable: true,
-  },
-} as const;
-
-/** 网关自检信息（real 模式来自 /api/overview）。 */
-const gateway = computed(() => repo.getGateway());
+/** 上次启动时刻（epoch 秒字符串 → 本地时间文本；非法值原样展示）。 */
+const startedAtText = computed<string>(() => {
+  const raw = (gateway.value.startedAt || '').trim();
+  if (!/^\d{1,15}$/.test(raw)) {
+    return raw || '—';
+  }
+  const ms = Number(raw) * (raw.length <= 10 ? 1000 : 1);
+  if (!Number.isFinite(ms)) {
+    return raw;
+  }
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+});
 
 /** 服务状态文案：以「是否拿到网关自检数据」为准，不假装知道进程状态。 */
-const serviceStatusText = computed(() => (gateway.value.uptimeText && gateway.value.uptimeText !== '—' ? '运行中' : '未知'));
-
-const serviceStatusSub = computed(() =>
-  API_MODE === 'real'
-    ? '最近一次 /api/overview 应答正常'
-    : 'mock 演示态（未发真实请求）',
+const serviceStatusText = computed(() =>
+  gateway.value.uptimeText && gateway.value.uptimeText !== '—' ? '运行中' : '未知',
 );
+
+/** 服务状态副文案。 */
+const serviceStatusSub = computed(() => '最近一次 /api/overview 应答正常');
 
 /** 是否可管理系统级自启（仅管理员）。 */
 const canManage = computed(() => session.state.role === 'admin');
 
 // ---------------------------------------------------------------------------
-// 启动策略（本地界面状态；网关未开放写端点）
+// 启动策略（本机界面状态；网关未开放写端点）
 // ---------------------------------------------------------------------------
 
 const autostartEnabled = ref(true);
@@ -386,8 +285,102 @@ const crashRestart = ref(true);
 const watchdog = ref(true);
 const bootFailureGuard = ref(true);
 
-/** 识别依据展开态。 */
-const showDetect = ref(false);
+// ---------------------------------------------------------------------------
+// 开机自启（真实：GET / PUT /api/service/autostart）
+// ---------------------------------------------------------------------------
+
+/** 自启真实状态（未取到 = null，页面按「未知」呈现，不猜）。 */
+const autostartStatus = ref<AutostartStatus | null>(null);
+
+/** 写入进行中（防重复下发）。 */
+const autostartBusy = ref(false);
+
+/** 后端是否具备写入能力（诚实：`writeSupported:false` → 开关禁用 + 展示原因）。 */
+const autostartWritable = computed<boolean>(() => autostartStatus.value?.writeSupported === true);
+
+/** 自启状态短标签（未注册 / 已注册 / 未知）。 */
+const autostartStateText = computed<string>(() => {
+  const status = autostartStatus.value;
+  if (!status) {
+    return '未知';
+  }
+  if (status.registered === true) {
+    return '已注册';
+  }
+  return status.registered === false ? '未注册' : '未知';
+});
+
+/** 自启说明：优先真实状态与命令，后端不支持写入时展示真实原因。 */
+const autostartDesc = computed<string>(() => {
+  const status = autostartStatus.value;
+  if (!status) {
+    return gateway.value.deployMode === 'docker'
+      ? '对应 compose 的 restart: unless-stopped，宿主重启/断电后自动拉起。'
+      : '对应 systemctl enable，宿主开机时由服务管理器自动拉起。';
+  }
+  const base =
+    gateway.value.deployMode === 'docker'
+      ? '对应 compose 的 restart: unless-stopped，宿主重启/断电后自动拉起。'
+      : '对应系统自启注册表，宿主开机时自动拉起。';
+  const command = status.command.trim();
+  const real = status.registered === null ? '当前平台未提供自启查询。' : `${base} 自启命令：${command || '—'}`;
+  if (!status.writeSupported) {
+    return `${real} ${status.writeReason || '网关未开放自启写入能力'}。`;
+  }
+  return real;
+});
+
+/** 读取真实自启状态。 */
+async function loadAutostart(): Promise<void> {
+  try {
+    const status = await repo.ops.autostartStatus();
+    autostartStatus.value = status;
+    if (status.registered === true || status.registered === false) {
+      autostartEnabled.value = status.registered;
+    }
+  } catch (cause) {
+    autostartStatus.value = null;
+    const raw = cause instanceof Error ? cause.message : String(cause);
+    note(`自启状态读取失败：${raw}`, 'warn');
+  }
+}
+
+/**
+ * 自启开关变更：真实 `PUT /api/service/autostart`。
+ *
+ * 失败时把开关**回滚到变更前的值**（界面不谎称成功），并展示后端真实原因。
+ */
+async function onAutostart(next: boolean): Promise<void> {
+  if (autostartBusy.value) {
+    return;
+  }
+  const previous = !next;
+  autostartBusy.value = true;
+  try {
+    const result = await repo.ops.setAutostart({
+      enable: next,
+      reason: next ? '启用开机自启' : '关闭开机自启',
+      note: '由「启动与自启」页开关下发，写入审计日志。',
+    });
+    if (result.ok) {
+      note(result.message, 'ok');
+      await loadAutostart();
+    } else {
+      autostartEnabled.value = previous;
+      note(`自启未变更：${result.message}`, 'warn');
+    }
+  } catch (cause) {
+    autostartEnabled.value = previous;
+    const raw = cause instanceof Error ? cause.message : String(cause);
+    note(`自启未变更：${raw}`, 'warn');
+  } finally {
+    autostartBusy.value = false;
+  }
+}
+
+onMounted(() => {
+  void loadAutostart();
+});
 
 /** 最近一次操作反馈。 */
 const lastAction = ref('');
@@ -399,28 +392,9 @@ function note(text: string, kind: 'ok' | 'warn' = 'ok'): void {
   lastKind.value = kind;
 }
 
-/** 自启开关变更（沿用既有演示行为：记录反馈，不伪造系统级落地）。 */
-function onAutostart(next: boolean): void {
-  autostartEnabled.value = next;
-  const mechanism = detectedForm.value === 'docker' ? 'compose restart 策略' : 'systemd enable/disable';
-  note(
-    `已${next ? '启用' : '关闭'}开机自启（作用于 ${mechanism}）—— 仅更新本机界面状态与演示反馈，` +
-      '网关未开放 systemd / compose 写端点，未产生任何系统级变更。',
-    'warn',
-  );
-}
-
-/** 查看日志（演示：给真实命令，不伪造日志内容）。 */
-function onLogs(): void {
-  const cmd =
-    detectedForm.value === 'docker'
-      ? `docker compose -f ${runtime.docker.composeFile} logs -f`
-      : `journalctl -u ${runtime.native.serviceName} -f`;
-  note('网关日志拉取受权限限制（ops 侧日志需更高权限），请在宿主机直接查看：' + cmd, 'warn');
-}
 
 // ---------------------------------------------------------------------------
-// 计划重启（本机场无端点 → 表单只保存界面状态，不推算下次执行）
+// 计划重启（本机界面状态；网关无端点，不推算下次执行）
 // ---------------------------------------------------------------------------
 
 const plan = reactive({
@@ -443,13 +417,6 @@ const cycleOptions: readonly SelectOption[] = [
 
 const weekdayOptions: readonly SelectOption[] = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'].map(
   (d) => ({ value: d, label: d }),
-);
-
-/** 下次执行：无端点支撑时给诚实说明，而不是算一个假时间。 */
-const planNextText = computed(() =>
-  plan.enabled === '启用'
-    ? `—（网关无计划重启端点；界面设定为 ${plan.cycle} ${plan.at}）`
-    : '—（已停用）',
 );
 
 // ---------------------------------------------------------------------------
@@ -482,149 +449,89 @@ const stopModal = reactive<{ open: boolean; impacts: readonly string[]; facts: r
   facts: [],
 });
 
-/** 当前形态的服务单元 / 容器名，用于影响清单。 */
-const unitName = computed(() =>
-  detectedForm.value === 'docker' ? runtime.docker.containerName : runtime.native.serviceName,
-);
+/** 危险动作的公共对象摘要（真实字段）。 */
+function actionFacts(): readonly { label: string; value: string }[] {
+  return [
+    { label: '网关标识', value: gateway.value.name || '—' },
+    { label: '部署形态', value: gateway.value.deployMode || '—' },
+    { label: '操作者', value: session.state.displayName || '—' },
+  ];
+}
 
 function openRestart(): void {
+  if (!gatewayId.value) {
+    note('无法二次确认：未取到网关标识（gateway_id），请刷新页面后重试。', 'warn');
+    return;
+  }
   restartModal.impacts = [
     '采集暂停约 5–15 秒；已入队数据不丢，恢复后自动补发。',
     '北向转发短暂中断，客户 Broker 可能出现一个空档。',
     '若队列中有待补发数据，将优先 flush 后再退出（优雅停机）。',
     '操作不可撤销；原因与补充说明将写入审计日志。',
-    `需输入服务名 ${SERVICE_KEY} 完成二次校验。`,
+    `需输入网关标识 ${gatewayId.value || '（当前不可得）'} 完成二次校验。`,
   ];
-  restartModal.facts = [
-    { label: '作用对象', value: unitName.value },
-    { label: '网关标识', value: gateway.value.name },
-    { label: '部署形态', value: formCn.value },
-    { label: '操作者', value: session.state.displayName },
-    { label: '执行模式', value: API_MODE === 'real' ? 'real（真实下发网关）' : 'mock（演示，无真实动作）' },
-  ];
+  restartModal.facts = actionFacts();
   restartModal.open = true;
 }
 
 function openStop(): void {
+  if (!gatewayId.value) {
+    note('无法二次确认：未取到网关标识（gateway_id），请刷新页面后重试。', 'warn');
+    return;
+  }
   stopModal.impacts = [
     '北向转发立即中断，客户 Broker 不再收到数据。',
     '本地采集也会停止；停机为优雅停机（先 flush 队列再退出）。',
     '是否再次拉起由 Supervisor / 服务管理器决定（本端点不承诺自动重启）。',
-    '操作不可撤销；需输入服务名 ' + SERVICE_KEY + ' 完成二次校验。',
+    `操作不可撤销；需输入网关标识 ${gatewayId.value || '（当前不可得）'} 完成二次校验。`,
   ];
-  stopModal.facts = [
-    { label: '作用对象', value: unitName.value },
-    { label: '网关标识', value: gateway.value.name },
-    { label: '部署形态', value: formCn.value },
-    { label: '操作者', value: session.state.displayName },
-    { label: '执行模式', value: API_MODE === 'real' ? 'real（真实下发网关）' : 'mock（演示，无真实动作）' },
-  ];
+  stopModal.facts = actionFacts();
   stopModal.open = true;
 }
 
 /**
- * 确认重启：real 走 `repo.ops.restart`（真实 `POST /api/ops/restart`）；
- * 后端要求 body `{actor, confirm, reason}`，`confirm` 必须回显当前 gateway_id
- * （即 `/api/overview` 的 `name` 字段），此处由页面自动回显，用户弹窗输入的服务名
- * （`payload.tail`）作为前端侧二次校验门槛；mock 走既有演示行为。
+ * 确认重启：真实 `POST /api/ops/restart`。
+ *
+ * 冻结语义：body `confirm` 必须等于当前 gateway_id。弹窗在 `confirmMode="full"`
+ * 下把用户输入**原文**透传给本页，本页经 `WriteMeta` 原样上送（不 trim / 不拼接），
+ * 由服务端比对；失败（400 confirm_mismatch / 403）时弹窗保持打开并把真实原因
+ * 写入对象摘要，不伪造成功。
  */
-async function confirmRestart(payload: { reason: string; note: string }): Promise<void> {
-  restartModal.open = false;
+async function confirmRestart(payload: { reason: string; note: string; confirm: string }): Promise<void> {
   const result = await repo.ops.restart({
     actor: session.state.displayName,
-    confirm: gateway.value.name,
-    reason: `${payload.reason} · ${payload.note}`,
+    confirm: payload.confirm,
+    reason: payload.reason,
+    note: payload.note,
   });
-  const tail = `原因：${payload.reason} · ${payload.note}`;
-  if (API_MODE === 'real') {
-    note(result.ok ? `${result.message} ${tail}` : `重启未成功：${result.message} ${tail}`, result.ok ? 'ok' : 'warn');
-    return;
+  if (result.ok) {
+    restartModal.open = false;
+    note(`${result.message}（原因：${payload.reason} · ${payload.note}）`, 'ok');
+  } else {
+    restartModal.facts = [...actionFacts(), { label: '上次结果', value: result.message }];
+    note(`重启未成功：${result.message}`, 'warn');
   }
-  note(`${result.message} ${tail} —— 演示模式未向网关发出任何重启信号，服务状态不变。`, 'warn');
 }
 
-/**
- * 确认停止：real 走 `repo.ops.stop`（真实 `POST /api/ops/stop`，契约与 restart 一致——
- * body `{actor, confirm, reason}`，confirm 回显 gateway_id；200 mode=graceful_stop，
- * 后端 note 已说明是否拉起由 Supervisor 决定）；mock 模式模拟并诚实注明「未产生真实动作」。
- */
-async function confirmStop(payload: { reason: string; note: string }): Promise<void> {
-  stopModal.open = false;
-  const tail = `原因：${payload.reason} · ${payload.note}`;
-  if (API_MODE !== 'real') {
-    const cmd =
-      detectedForm.value === 'docker'
-        ? `docker compose -f ${runtime.docker.composeFile} stop`
-        : `systemctl stop ${runtime.native.serviceName}`;
-    note(
-      `已记录停止意图并通过二次校验（${tail}）。` +
-        `演示模式未向网关发出任何停止信号，服务仍在运行 —— 现场请执行：${cmd}`,
-      'warn',
-    );
-    return;
-  }
+/** 确认停止：真实 `POST /api/ops/stop`（契约与 restart 一致，confirm 同样透传原文）。 */
+async function confirmStop(payload: { reason: string; note: string; confirm: string }): Promise<void> {
   const result = await repo.ops.stop({
     actor: session.state.displayName,
-    confirm: gateway.value.name,
-    reason: `${payload.reason} · ${payload.note}`,
+    confirm: payload.confirm,
+    reason: payload.reason,
+    note: payload.note,
   });
-  note(result.ok ? `${result.message} ${tail}` : `停止未成功：${result.message} ${tail}`, result.ok ? 'ok' : 'warn');
+  if (result.ok) {
+    stopModal.open = false;
+    note(`${result.message}（原因：${payload.reason} · ${payload.note}）`, 'ok');
+  } else {
+    stopModal.facts = [...actionFacts(), { label: '上次结果', value: result.message }];
+    note(`停止未成功：${result.message}`, 'warn');
+  }
 }
 </script>
 
 <style scoped>
-.su-kpi-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin: 0 0 16px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  line-height: 1.6;
-}
-
-.su-banner {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-.su-banner__main {
-  flex: 1 1 auto;
-  min-width: 220px;
-}
-.su-banner__label {
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  margin-bottom: 6px;
-}
-.su-banner__form {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.su-banner__form-cn {
-  font-size: var(--fs-h3);
-  font-weight: 600;
-  color: var(--text-1);
-}
-.su-banner__note {
-  flex-basis: 100%;
-  margin: 4px 0 0;
-  padding-top: 12px;
-  border-top: 1px dashed var(--border);
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  line-height: 1.7;
-}
-.su-banner__note code {
-  font-family: var(--font-mono);
-  background: var(--bg-hover);
-  padding: 1px 5px;
-  border-radius: var(--radius-sm);
-  color: var(--text-2);
-}
-
 /* 开关行 */
 .su-row {
   display: flex;
@@ -655,29 +562,15 @@ async function confirmStop(payload: { reason: string; note: string }): Promise<v
   margin-top: 4px;
   line-height: 1.6;
 }
-.su-badge {
-  font-size: var(--fs-caption);
-  padding: 1px 8px;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--warn-border);
-  background: var(--warn-bg);
-  color: var(--warn-fg);
-  font-weight: 600;
-}
 
-/* 双形态卡片 */
-.su-form {
-  transition: border-color 0.16s ease, box-shadow 0.16s ease;
-}
-.su-form.is-active {
-  border-color: var(--brand);
-  box-shadow: 0 0 0 1px var(--brand) inset;
-}
 .su-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px 16px;
   margin-bottom: 14px;
+}
+.su-cmd {
+  margin-top: 4px;
 }
 .su-cmd__title {
   display: block;
@@ -720,10 +613,11 @@ async function confirmStop(payload: { reason: string; note: string }): Promise<v
   line-height: 1.75;
 }
 
-/* 宽按钮 + 结果区 */
-.su-wide {
-  width: 100%;
-  margin-bottom: 8px;
+/* 危险动作按钮行 + 结果区 */
+.su-ops {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .su-result {
   display: flex;
@@ -742,8 +636,5 @@ async function confirmStop(payload: { reason: string; note: string }): Promise<v
   border-color: var(--warn-border);
   background: var(--warn-bg);
   color: var(--warn-fg);
-}
-.wc-note--warn .wc-note__icon {
-  color: var(--warn);
 }
 </style>

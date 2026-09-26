@@ -2,43 +2,48 @@
   =============================================================================
   BackupPage —— 备份与恢复（设计 §3.7 / 原型 gateway-v2a-glacier「backup」）
   =============================================================================
-  配置与授权状态的备份、导出与恢复；**恢复不可撤销**，需二次确认
-  （DangerConfirmModal：影响清单 + 原因必填 + 对象名二次校验 + 可选双人复核）。
-  备份列表分页（UiPager，条数只此一个口径）。
-  Docker 部署时备份位置须指向宿主机持久卷（提示）。
+  · 备份清单来自真实 `GET /api/settings/backups`（网关 config 目录写前备份）；
+  · 「恢复」为**不可撤销**危险操作，走 DangerConfirmModal 四要素确认
+    （影响清单 + 原因必填 + **备份文件名后 8 位二次校验**），确认后调真实
+    `POST /api/settings/rollback`，结果按后端返回原样呈现；
+  · 无端点支撑的能力（立即备份 / 下载 / 备份策略写）如实告知，不伪造成功。
 -->
 <template>
-  <PageHeader
-    crumb="运维 / 备份与恢复"
-    title="备份与恢复"
-    desc="配置与授权状态的备份、导出与恢复；每日 02:00 自动备份，最多保留 30 份。恢复不可撤销。"
-  >
-    <template #actions>
+  <div class="wc-content">
+    <!-- 工具条：立即备份 + 刷新清单（原页头右侧按钮迁入） -->
+    <div class="pg-toolbar">
+      <span class="wc-tag wc-tag--info">数据源 GET /api/settings/backups</span>
+      <span class="wc-spacer" />
+      <button type="button" class="wc-btn wc-btn--sm" data-testid="backup-refresh" @click="loadBackups">刷新清单</button>
       <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色为只读，不能立即备份">
-        <button type="button" class="wc-btn wc-btn--primary" data-testid="backup-now" @click="backupNow">
-          立即备份
+        <button
+          type="button"
+          class="wc-btn wc-btn--primary wc-btn--sm"
+          :disabled="backupBusy"
+          data-testid="backup-now"
+          @click="backupNow"
+        >
+          {{ backupBusy ? '备份中…' : '立即备份' }}
         </button>
       </RoleGate>
-    </template>
-  </PageHeader>
+    </div>
 
-  <div class="wc-content">
     <p v-if="actionMessage" class="wc-hint" data-testid="backup-message">{{ actionMessage }}</p>
 
     <!-- ══ 备份列表（分页）═════════════════════════════════════════════ -->
     <section class="wc-card">
       <div class="wc-card__head">
         <h3>备份列表</h3>
-        <span class="wc-card__sub">每日 02:00 自动备份，最多保留 30 份 · 共 {{ backupTotal }} 条</span>
+        <span class="wc-card__sub">共 {{ backupTotal }} 条</span>
       </div>
 
       <EmptyState
         v-if="backupTotal === 0"
         title="还没有备份"
-        desc="备份包含 config.toml、点位表、转发规则与授权状态（不含私钥）。可点击「立即备份」生成第一份。"
+        desc="网关未返回任何备份文件。"
       >
         <template #actions>
-          <button type="button" class="wc-btn wc-btn--primary" @click="backupNow">立即备份</button>
+          <button type="button" class="wc-btn" data-testid="backup-refresh-empty" @click="loadBackups">刷新清单</button>
         </template>
       </EmptyState>
 
@@ -47,7 +52,7 @@
           :columns="columns"
           :rows="pagedBackups"
           row-key-field="id"
-          footer="备份内容：config.toml · 点位表 · 转发规则 · 授权状态（不含私钥）"
+          footer="来源：网关 config 目录写前备份（PUT /api/settings 或回滚前自动生成）"
         >
           <template #cell-time="{ row }">
             <span class="wc-mono">{{ row.time }}</span>
@@ -86,24 +91,28 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>备份策略</h3>
+          <span class="wc-tag wc-tag--info" data-testid="backup-policy-source">数据源 GET|PUT /api/settings/backup-policy</span>
         </div>
         <div class="wc-card__body">
           <div class="bk-form-grid">
-            <UiField label="自动备份">
-              <UiSelect v-model="strategy.mode" :options="modeOptions" :disabled="!canEdit" />
+            <UiField label="写前自动备份" hint="保存配置 / 回滚前自动生成快照">
+              <UiSwitch v-model="policy.autoBeforeWrite" :disabled="!canEdit || policyLoading" on-text="开启" off-text="关闭" />
             </UiField>
-            <UiField label="执行时间">
-              <UiInput v-model="strategy.time" :disabled="!canEdit" placeholder="02:00" />
+            <UiField label="保留份数" hint="超出后自动清理最旧的自产备份">
+              <UiInput v-model="policy.retentionCount" :disabled="!canEdit || policyLoading" placeholder="20" />
             </UiField>
-            <UiField label="保留份数" hint="超出后自动清理最旧的一份">
-              <UiInput v-model="strategy.keep" :disabled="!canEdit" placeholder="7" />
-            </UiField>
-            <UiField label="备份位置" hint="Docker 部署时须指向宿主机持久卷，否则容器重建即丢">
-              <UiInput v-model="strategy.location" :disabled="!canEdit" placeholder="./backup" />
+            <UiField label="周期备份间隔（分钟）" hint="0 = 关闭周期备份">
+              <UiInput v-model="policy.intervalMin" :disabled="!canEdit || policyLoading" placeholder="0" />
             </UiField>
           </div>
-          <button type="button" class="wc-btn" :disabled="!canEdit" data-testid="backup-save-strategy" @click="saveStrategy">
-            保存策略
+          <button
+            type="button"
+            class="wc-btn"
+            :disabled="!canEdit || policyBusy"
+            data-testid="backup-save-strategy"
+            @click="saveStrategy"
+          >
+            {{ policyBusy ? '保存中…' : '保存策略' }}
           </button>
         </div>
       </section>
@@ -113,13 +122,11 @@
           <h3>恢复</h3>
         </div>
         <div class="wc-card__body">
-          <div class="wc-banner wc-banner--danger">
-            <span class="wc-banner__icon">!</span>
-            <span>
-              恢复操作的影响：当前配置与点位表将被<b>完全覆盖</b>且无法撤销；恢复后服务自动重启（采集中断约 5–15 秒）；
-              授权状态随备份回滚，若期间发生过换机或重发，恢复后需重新激活。
-            </span>
-          </div>
+          <ul class="bk-impact">
+            <li>当前配置将被所选备份<b>完全覆盖</b>且无法撤销。</li>
+            <li>恢复后服务自动重启（采集中断约 5–15 秒）；已入队数据不丢失。</li>
+            <li>授权状态随备份回滚；若期间发生过换机或重发，恢复后需重新激活。</li>
+          </ul>
           <button
             type="button"
             class="wc-btn wc-btn--danger"
@@ -135,7 +142,7 @@
     </div>
   </div>
 
-  <!-- 恢复危险二次确认 -->
+  <!-- 恢复危险二次确认（备份文件名后 8 位二次校验） -->
   <DangerConfirmModal
     :open="restoreOpen"
     :title="`从备份恢复：${restoreTarget?.time ?? ''}`"
@@ -155,24 +162,24 @@
 /**
  * @file BackupPage.vue
  * @module web-console/pages/BackupPage
- * @description 备份与恢复页（备份列表分页 + 危险恢复二次确认）。
+ * @description 备份与恢复页（真实备份清单 + 真实定向回滚 + 危险操作二次确认）。
  */
-import { computed, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import {
-  PageHeader,
   UiTable,
   UiPager,
   UiInput,
-  UiSelect,
+  UiSwitch,
   UiField,
   StatusTag,
   EmptyState,
   RoleGate,
   DangerConfirmModal,
   type TableColumn,
-  type SelectOption,
   type DangerFact,
 } from '@ui-kit';
+import { dataVersion, repo, type SettingsBackupRow } from '@/api/repo';
+import { apiRequest } from '@/api/client';
 import { session } from '../store/session';
 
 /** 每页条数。 */
@@ -181,13 +188,13 @@ const PAGE_SIZE = 5;
 /** 当前角色是否可编辑。 */
 const canEdit = computed<boolean>(() => session.state.role === 'admin' || session.state.role === 'engineer');
 
-/** 备份记录。 */
+/** 备份记录（视图模型）。 */
 interface BackupRecord {
-  /** 主键（用于二次校验） */
+  /** 主键 = 备份文件名（用于二次校验） */
   id: string;
   /** 备份时间 */
   time: string;
-  /** 类型：auto / manual / pre_upgrade */
+  /** 类型：config（配置写前备份） */
   kind: string;
   /** 大小 */
   size: string;
@@ -195,18 +202,70 @@ interface BackupRecord {
   location: string;
 }
 
-/** 备份清单（照搬原型）。 */
-const backups = ref<BackupRecord[]>([
-  { id: 'bk-20260923-0200', time: '2026-09-23 02:00', kind: 'auto', size: '1.2 MB', location: './backup/20260923-0200' },
-  { id: 'bk-20260922-0200', time: '2026-09-22 02:00', kind: 'auto', size: '1.2 MB', location: './backup/20260922-0200' },
-  { id: 'bk-20260921-1540', time: '2026-09-21 15:40', kind: 'manual', size: '1.3 MB', location: './backup/20260921-1540' },
-  { id: 'bk-20260921-0200', time: '2026-09-21 02:00', kind: 'auto', size: '1.2 MB', location: './backup/20260921-0200' },
-  { id: 'bk-20260920-0200', time: '2026-09-20 02:00', kind: 'auto', size: '1.1 MB', location: './backup/20260920-0200' },
-  { id: 'bk-rollback-v1.4.1', time: '2026-09-19 18:22', kind: 'pre_upgrade', size: '1.1 MB', location: './backup/rollback-v1.4.1' },
-  { id: 'bk-20260919-0200', time: '2026-09-19 02:00', kind: 'auto', size: '1.1 MB', location: './backup/20260919-0200' },
-  { id: 'bk-20260918-0200', time: '2026-09-18 02:00', kind: 'auto', size: '1.1 MB', location: './backup/20260918-0200' },
-  { id: 'bk-20260917-0200', time: '2026-09-17 02:00', kind: 'auto', size: '1.0 MB', location: './backup/20260917-0200' },
-]);
+/** 备份清单（真实：`GET /api/settings/backups`）。 */
+const backups = ref<BackupRecord[]>([]);
+
+/**
+ * 备份大小（字节字符串 → 人类可读；解析失败原样展示）。
+ *
+ * 大数红线：`size_bytes` 为 JSON **字符串**编码的 uint64，绝不可 `Number()` /
+ * `parseInt`（> 2^53−1 静默丢精度）——全程 `BigInt` 整数除法，末位才转小数。
+ */
+function formatBytes(sizeBytes: string): string {
+  const text = sizeBytes.trim();
+  if (!/^\d+$/.test(text)) {
+    return sizeBytes || '—';
+  }
+  const bytes = BigInt(text);
+  if (bytes < 1024n) {
+    return `${bytes} B`;
+  }
+  const kb = bytes / 1024n;
+  if (kb < 1024n) {
+    return `${kb} KB`;
+  }
+  const mb = kb / 1024n;
+  return mb < 1024n
+    ? `${(Number(mb) / 1024).toFixed(1)} MB`
+    : `${(Number(mb / 1024n) / 1024).toFixed(1)} GB`;
+}
+
+/** 备份时刻（epoch 毫秒字符串 → 本地时间文本；非法值原样展示）。 */
+function formatMtime(mtimeMs: string): string {
+  const ms = Number(mtimeMs);
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return '—';
+  }
+  const d = new Date(ms);
+  const p = (v: number): string => String(v).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 拉取真实备份清单。 */
+async function loadBackups(): Promise<void> {
+  const result = await repo.settings.backups();
+  if (!result.ok) {
+    backups.value = [];
+    actionMessage.value = `备份清单读取失败：${result.message}`;
+    return;
+  }
+  backups.value = result.rows.map((row: SettingsBackupRow): BackupRecord => ({
+    id: row.file,
+    time: formatMtime(row.mtimeMs),
+    kind: 'config',
+    size: formatBytes(row.sizeBytes),
+    location: row.file,
+  }));
+}
+
+watch(dataVersion, () => {
+  void loadBackups();
+});
+
+onMounted(() => {
+  void loadBackups();
+  void loadPolicy();
+});
 
 /** 备份总数（分页条唯一口径）。 */
 const backupTotal = computed<number>(() => backups.value.length);
@@ -221,7 +280,7 @@ const pagedBackups = computed<BackupRecord[]>(() => {
 
 /** 类型文案。 */
 function kindLabel(kind: string): string {
-  const map: Record<string, string> = { auto: '自动', manual: '手动', pre_upgrade: '升级前' };
+  const map: Record<string, string> = { config: '配置写前备份' };
   return map[kind] ?? kind;
 }
 
@@ -238,62 +297,101 @@ function onPage(next: number): void {
   page.value = next;
 }
 
-/** 操作提示。 */
+/** 操作提示（真实结果原文）。 */
 const actionMessage = ref('');
 
-/** 立即备份。 */
-function backupNow(): void {
-  const stamp = compactStamp();
-  const id = `bk-${stamp}`;
-  backups.value.unshift({
-    id,
-    time: displayStamp(),
-    kind: 'manual',
-    size: '1.3 MB',
-    location: `./backup/${stamp}`,
-  });
-  page.value = 1;
-  actionMessage.value = `已生成手动备份 ${id}（${displayStamp()}，1.3 MB）。`;
+/** 备份写入中（防重复下发）。 */
+const backupBusy = ref(false);
+
+/**
+ * 立即备份：真实 `POST /api/settings/backups`（无 body，`device.write` 守卫）。
+ *
+ * 后端按 `config.toml.bak-manual-<epoch_ms>` 落盘，清单接口自动可见，
+ * 成功后重拉清单（不伪造条目）。
+ */
+async function backupNow(): Promise<void> {
+  if (backupBusy.value) {
+    return;
+  }
+  backupBusy.value = true;
+  actionMessage.value = '';
+  try {
+    await apiRequest<unknown>('/api/settings/backups', { method: 'POST' });
+    await loadBackups();
+    actionMessage.value = `已创建备份（${backups.value[0]?.id ?? '最新一份'}）。`;
+  } catch (cause) {
+    const raw = cause instanceof Error ? cause.message : String(cause);
+    actionMessage.value = `备份未创建：${raw}`;
+  } finally {
+    backupBusy.value = false;
+  }
 }
 
-/** 下载备份。 */
+/** 下载备份：网关无下载端点，如实告知。 */
 function download(row: BackupRecord): void {
-  actionMessage.value = `开始下载备份 ${row.id}（${row.size}）。`;
+  actionMessage.value = `下载未执行：网关未提供备份下载接口（${row.id}）。`;
 }
 
-/** 紧凑时间戳（YYYYMMDD-HHmm）。 */
-function compactStamp(): string {
-  const d = new Date();
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
-}
-
-/** 展示时间戳。 */
-function displayStamp(): string {
-  const d = new Date();
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-// ---------- 备份策略 ----------
-/** 策略草稿。 */
-const strategy = reactive({
-  mode: 'daily',
-  time: '02:00',
-  keep: '7',
-  location: './backup',
+// ---------- 备份策略（真实：GET|PUT /api/settings/backup-policy） ----------
+/** 策略草稿（数字一律字符串，禁 parseInt）。 */
+const policy = reactive({
+  autoBeforeWrite: true,
+  retentionCount: '20',
+  intervalMin: '0',
 });
 
-/** 策略模式选项。 */
-const modeOptions: readonly SelectOption[] = [
-  { value: 'daily', label: '每日' },
-  { value: 'weekly', label: '每周' },
-  { value: 'off', label: '关闭' },
-];
+/** 策略读取中 / 写入中。 */
+const policyLoading = ref(false);
+const policyBusy = ref(false);
 
-/** 保存策略。 */
-function saveStrategy(): void {
-  actionMessage.value = `备份策略已保存：${modeOptions.find((o) => o.value === strategy.mode)?.label ?? strategy.mode} / ${strategy.time} / 保留 ${strategy.keep} 份。`;
+/** 读取真实策略（失败时保留草稿并如实提示，不回退假值）。 */
+async function loadPolicy(): Promise<void> {
+  policyLoading.value = true;
+  try {
+    const result = await repo.settings.getBackupPolicy();
+    if (result.ok && result.policy) {
+      policy.autoBeforeWrite = result.policy.autoBeforeWrite;
+      policy.retentionCount = result.policy.retentionCount;
+      policy.intervalMin = result.policy.intervalMin;
+    } else {
+      actionMessage.value = `备份策略读取：${result.message}`;
+    }
+  } catch (cause) {
+    const raw = cause instanceof Error ? cause.message : String(cause);
+    actionMessage.value = `备份策略读取失败：${raw}`;
+  } finally {
+    policyLoading.value = false;
+  }
+}
+
+/** 保存策略：真实 `PUT /api/settings/backup-policy`（reason 必填进审计）。 */
+async function saveStrategy(): Promise<void> {
+  if (policyBusy.value) {
+    return;
+  }
+  policyBusy.value = true;
+  actionMessage.value = '';
+  try {
+    const result = await repo.settings.putBackupPolicy({
+      autoBeforeWrite: policy.autoBeforeWrite,
+      retentionCount: policy.retentionCount,
+      intervalMin: policy.intervalMin,
+      reason: '备份策略调整',
+      note: `写前自动备份=${policy.autoBeforeWrite ? '开启' : '关闭'}；保留份数=${policy.retentionCount}；周期间隔=${policy.intervalMin} 分钟`,
+    });
+    if (result.ok) {
+      actionMessage.value = `备份策略已保存（保留 ${result.policy?.retentionCount ?? policy.retentionCount} 份）。`;
+      await loadPolicy();
+      await loadBackups();
+    } else {
+      actionMessage.value = `策略未保存：${result.message}`;
+    }
+  } catch (cause) {
+    const raw = cause instanceof Error ? cause.message : String(cause);
+    actionMessage.value = `策略未保存：${raw}`;
+  } finally {
+    policyBusy.value = false;
+  }
 }
 
 // ---------- 恢复危险确认 ----------
@@ -302,7 +400,7 @@ const restoreTarget = ref<BackupRecord | null>(null);
 
 /** 恢复影响清单。 */
 const restoreImpacts: readonly string[] = [
-  '当前配置与点位表将被所选备份**完全覆盖**，且无法撤销。',
+  '当前配置将被所选备份**完全覆盖**，且无法撤销。',
   '恢复后服务自动重启，采集中断约 5–15 秒；已入队数据不丢失。',
   '授权状态随备份回滚：若期间发生过换机或重发，恢复后需重新激活。',
 ];
@@ -327,14 +425,37 @@ function openRestore(row: BackupRecord | undefined): void {
   restoreOpen.value = true;
 }
 
-/** 恢复提交。 */
-function onRestoreSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): void {
+/** 恢复提交：真实 `POST /api/settings/rollback`（定向到所选备份文件）。 */
+async function onRestoreSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): Promise<void> {
   restoreOpen.value = false;
-  actionMessage.value = `已从备份 ${restoreTarget.value?.id ?? ''} 恢复（原因：${payload.reason}），服务将自动重启，操作已写入审计。`;
+  const target = restoreTarget.value;
+  if (!target) {
+    return;
+  }
+  // 危险三要素：reason（原因枚举）与 note（补充说明）**各自独立下发**，禁止拼接进同一字段。
+  const result = await repo.settings.rollback({
+    actor: session.state.displayName,
+    reason: payload.reason,
+    note: payload.note,
+    backup: target.id,
+  });
+  actionMessage.value = result.ok
+    ? `已从备份 ${target.id} 恢复${result.version ? `（配置版本 ${result.version}）` : ''}，服务将自动重启。`
+    : `恢复未执行：${result.message}`;
+  if (result.ok) {
+    await loadBackups();
+  }
 }
 </script>
 
 <style scoped>
+.pg-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+}
 .bk-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -345,8 +466,14 @@ function onRestoreSubmit(payload: { reason: string; note: string; tail: string; 
     grid-template-columns: 1fr;
   }
 }
-.wc-banner__icon {
-  flex: 0 0 auto;
-  font-weight: 700;
+.bk-impact {
+  margin: 0 0 12px;
+  padding: 12px 14px 12px 32px;
+  border: 1px solid var(--warn-border);
+  background: var(--warn-bg);
+  border-radius: var(--radius);
+  font-size: var(--fs-caption);
+  color: var(--warn-fg);
+  line-height: 1.75;
 }
 </style>

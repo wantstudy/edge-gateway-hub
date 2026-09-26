@@ -4,7 +4,7 @@
 
     硬性约定：
       1. 顶栏**常驻授权状态徽标**（降级时转琥珀并附「查看原因」）+ 租约剩余环；
-      2. 顶栏右侧：模拟点位指示 + 连接状态指示 + 当前用户 + 角色切换（演示 RoleGate）；
+      2. 顶栏右侧：连接状态指示 + 当前用户 + 角色（real 模式展示后端角色原文）；
       3. 路由高亮跟随当前页；侧栏可折叠（宽度切换，图标/文字同步）；
       4. /login 路由（仅 real 模式可达）走独立全屏布局，不渲染本外壳。
 
@@ -37,22 +37,10 @@
 
       <span class="wc-spacer" />
 
-      <!-- 模拟点位指示（原型 :3387-3391）：后端暂无模拟能力 → 诚实占位，不伪造计数 -->
-      <span
-        class="wc-sim"
-        :class="{ 'wc-sim--on': simPointCount > 0 }"
-        title="后端暂未提供点位模拟能力，当前无模拟点位"
-      >
-        <span class="wc-sim__dot" aria-hidden="true" />
-        <template v-if="simPointCount > 0">模拟中 <b>{{ simPointCount }}</b> 点</template>
-        <template v-else>无模拟点位</template>
-      </span>
-
       <!-- 授权状态徽标（常驻；降级转琥珀 + 查看原因） -->
       <span
         class="wc-license"
         :class="licenseHealthy ? 'wc-license--ok' : 'wc-license--warn'"
-        title="点击进入授权与激活页"
         @click="go('license')"
       >
         <span class="wc-license__dot">●</span>
@@ -66,7 +54,6 @@
       <!-- 记忆点：租约剩余环（原型 :3394） -->
       <span
         class="wc-lic-ring"
-        :title="`租约有效期剩余 ${licenseRemainingText}`"
         role="img"
         :aria-label="`租约有效期剩余 ${licenseRemainingText}`"
         @click="go('license')"
@@ -88,38 +75,34 @@
         </span>
       </span>
 
+      <!-- 主题切换（明暗双主题；状态持久化在 localStorage，缺省回退系统偏好） -->
+      <button
+        type="button"
+        class="wc-icon-btn wc-theme-btn"
+        :title="themeMode === 'dark' ? '切换为浅色主题' : '切换为深色主题'"
+        :aria-label="themeMode === 'dark' ? '切换为浅色主题' : '切换为深色主题'"
+        :data-testid="themeMode === 'dark' ? 'theme-toggle-to-light' : 'theme-toggle-to-dark'"
+        @click="toggleThemeMode"
+      >
+        {{ themeMode === 'dark' ? '☀' : '☾' }}
+      </button>
+
       <!-- 连接状态指示 -->
       <span class="wc-conn" :class="`wc-conn--${session.state.connection}`">
         <span class="wc-conn__dot">●</span>
         <span>{{ connectionLabel }}</span>
       </span>
 
-      <!-- real 模式：角色来自登录接口，展示后端角色原文 + 退出登录 -->
-      <template v-if="API_MODE === 'real'">
-        <span class="wc-topbar__mini">角色</span>
-        <span class="wc-role-badge" :title="`后端角色：${session.state.backendRole}`">
-          {{ session.state.backendRole || '—' }}
-        </span>
-        <button type="button" class="wc-icon-btn" title="退出登录" aria-label="退出登录" @click="onLogout">
-          ⏻
-        </button>
-      </template>
-      <!-- mock 模式：角色切换（演示 RoleGate 可见性控制；不影响授权） -->
-      <template v-else>
-        <span class="wc-topbar__mini">角色</span>
-        <select
-          class="wc-role-select"
-          :value="session.state.role"
-          aria-label="切换当前角色"
-          @change="onRoleChange"
-        >
-          <option v-for="role in ROLES" :key="role" :value="role">
-            {{ ROLE_META[role].fullLabel }}
-          </option>
-        </select>
-      </template>
+      <!-- 角色来自登录接口（后端角色原文），并附退出登录；前端不提供角色切换器 -->
+      <span class="wc-topbar__mini">角色</span>
+      <span class="wc-role-badge">
+        {{ session.state.backendRole || '—' }}
+      </span>
+      <button type="button" class="wc-icon-btn" title="退出登录" aria-label="退出登录" @click="onLogout">
+        ⏻
+      </button>
 
-      <span class="wc-avatar" :title="`当前账号：${session.state.account}`">{{ initial }}</span>
+      <span class="wc-avatar">{{ initial }}</span>
       <span class="wc-user-name">{{ session.state.displayName || session.state.backendRole || '未登录' }}</span>
     </header>
 
@@ -147,9 +130,7 @@
         </template>
 
         <div class="wc-sidebar__foot">
-          <span class="wc-scheme"><span class="wc-scheme__dot" aria-hidden="true" />方案 A · 冰川（已选定）</span><br />
-          亮色洁净派 · 青绿强调<br />
-          v{{ appVersion }} · 网关本机控制台 · 独立构建
+          v{{ appVersion }} · 网关本机控制台
         </div>
       </nav>
 
@@ -170,16 +151,13 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
-  ROLES,
-  ROLE_META,
   session,
   accountInitial,
   licenseHealthy,
   licenseBadgeText,
-  type Role,
 } from './store/session';
-import { API_MODE } from './api/client';
 import { repo, dataVersion } from './api/repo';
+import { themeMode, toggleThemeMode } from '@ui-kit/theme';
 
 const route = useRoute();
 const router = useRouter();
@@ -187,7 +165,7 @@ const router = useRouter();
 /** 顶栏头像字符。 */
 const initial = accountInitial;
 
-/** 侧栏页脚版本号（real 模式随 dataVersion 响应式刷新；挂载早于 preload 时显示诚实空值，绝不定格 mock）。 */
+/** 侧栏页脚版本号（随 dataVersion 响应式刷新；挂载早于 preload 时显示诚实空值）。 */
 const appVersion = ref<string>(repo.getGateway().version);
 watch(dataVersion, () => {
   appVersion.value = repo.getGateway().version;
@@ -293,7 +271,7 @@ function isActive(id: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// 顶栏指示：租约剩余环 / 模拟点位 / 告警徽标
+// 顶栏指示：租约剩余环 / 告警徽标
 // ---------------------------------------------------------------------------
 
 /** 租约总天数基准（环的满圈口径；原型 :3394 以 365d 为满圈）。 */
@@ -320,14 +298,8 @@ const licRingOffset = computed<number>(() => {
 });
 
 /**
- * 模拟中的点位数（原型 :3388）。
- *
- * 后端（`repo` / 各驱动）目前**没有**点位模拟能力，因此恒为 0 —— 顶栏显示
- * 原型同款「无模拟点位」占位态，不伪造计数。后端提供模拟开关后在此接真实数。
+ * 未处置告警数（真实数据源计数；无数据 → 徽标不显示，绝不硬编码）。
  */
-const simPointCount = ref<number>(0);
-
-/** 未处置告警数（真实数据源计数；无数据 → 徽标不显示，绝不硬编码）。 */
 const openAlarmCount = ref<number>(0);
 
 /** 告警计数轮询句柄（repo 缓存非响应式，故按低频轮询对齐处置结果）。 */
@@ -369,17 +341,6 @@ function go(id: string): void {
 /** 折叠 / 展开侧栏。 */
 function onToggleSidebar(): void {
   session.toggleSidebar();
-}
-
-/**
- * 角色切换。
- *
- * 客户端控制台不做路由级 RBAC（红线 3），因此切换角色**不强制跳页**：
- * 仅使页面内 `RoleGate` 的可见性即时变化，便于验收「权限矩阵真实生效」。
- */
-function onRoleChange(event: Event): void {
-  const role = (event.target as HTMLSelectElement).value as Role;
-  session.setRole(role);
 }
 
 /**

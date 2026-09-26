@@ -1,61 +1,52 @@
 <template>
   <!--
-    OverviewPage —— 总览 / 仪表盘（监控分组第 1 页，路由 `/overview`）。
+    OverviewPage —— 总览 / 仪表盘（路由 `/overview`）。
 
-    结构对齐 `docs/design/prototype/gateway-v2a-glacier.html` 的 `overview`（:1384 起）：
-      ① 授权横幅（条件显示，§4.6 优先级）
-      ② KPI 卡片行（在线设备 / 采集点位 / 今日上行 / 端到端延迟）
-      ③ 2:1 栅格：采集吞吐（面积折线，内联 SVG）+ 系统状态（KV）
+    结构（无页头块：顶部只有一条工具条）：
+      ① 工具条：数据源指示 + 真实降级状态标签（chip）+ 立即刷新
+      ② KPI 卡片行（在线设备 / 采集点位 / 当前上行 / 端到端延迟）
+      ③ 2:1 栅格：采集吞吐（历史序列不可得 → 诚实空态）+ 系统状态（KV）
       ④ 3 列栅格：设备健康 / 北向出口 / 待处理
       ⑤ 最近告警列表（分页，UiPager 单一口径）
 
     硬性约定遵守情况：
-      · 只用 ui-kit 组件（`StatCard` / `PageHeader` / `UiTable` / `UiPager` / `StatusTag` / `EmptyState`）；
-      · 图表为内联 SVG，**未引入任何新图表库**；
-      · 实时数值 1s 节流渲染（`setInterval`）；mock 模式为内嵌推流并标注「演示数据」，
-        real 模式读 `GET /api/overview`（5s 轮询）并标注「实时数据」；
-      · 列表条数只有 UiPager 一个口径（表格 `footer` 不重复写「共 N 条」）；
-      · 无解绑 / 重置试用 / revoke 任何入口。
+      · 只用 ui-kit 组件（`StatCard` / `UiTable` / `UiPager` / `StatusTag` / `EmptyState`）；
+      · **无 mock**：所有数值来自 `GET /api/overview`（5s 低频轮询）与各真实清单接口，
+        后端未提供的指标一律诚实留空（`—`），绝不回退演示数据；
+      · 降级 / 异常以**紧凑状态标签**呈现（点击进对应页），不占整行说明块；
+      · 列表条数只有 UiPager 一个口径（表格 `footer` 不重复写「共 N 条」）。
   -->
-  <PageHeader
-    crumb="运行监控 / 总览"
-    title="总览"
-    desc="本机网关运行全景：采集吞吐、设备健康、北向出口与授权状态。聚合数值按 1s 节流刷新，避免高频重绘打满浏览器。"
-  >
-    <template #actions>
-      <span
-        class="wc-tag"
-        :class="IS_REAL ? 'wc-tag--ok' : 'wc-tag--info'"
-        :title="IS_REAL ? '已接入网关真实接口：GET /api/overview（5s 轮询）' : '当前为内嵌演示数据源，未接入真实后端'"
-      >
-        {{ IS_REAL ? '实时数据' : '演示数据' }}
-      </span>
-      <button type="button" class="wc-btn" @click="refreshAll">立即刷新</button>
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
-    <!-- ① 授权横幅：同一时刻只显示最高优先级一条（§4.6） -->
-    <div v-if="banner" class="wc-banner" :class="`wc-banner--${banner.tone}`">
-      <div>
-        <b>{{ banner.title }}</b>
-        <div>{{ banner.detail }}</div>
-      </div>
-      <div class="wc-banner__ops">
-        <button v-for="act in banner.actions" :key="act.label" type="button" class="wc-btn wc-btn--sm" @click="go(act.page)">
-          {{ act.label }}
-        </button>
-      </div>
+    <!-- ① 工具条：数据源指示 + 降级状态标签 + 立即刷新（原页头按钮迁入，功能不丢） -->
+    <div class="ov-toolbar">
+      <span class="wc-tag wc-tag--ok">实时数据</span>
+
+      <span
+        v-for="chip in statusChips"
+        :key="chip.label"
+        class="wc-tag ov-chip"
+        :class="`wc-tag--${chip.tone}`"
+        :title="chip.reason"
+        role="link"
+        tabindex="0"
+        @click="go(chip.page)"
+        @keydown.enter="go(chip.page)"
+      >
+        <span class="ov-chip__dot" aria-hidden="true">●</span>{{ chip.label }}
+      </span>
+
+      <span class="wc-spacer" />
+      <button type="button" class="wc-btn wc-btn--sm" @click="refreshAll">立即刷新</button>
     </div>
 
-    <!-- ② KPI 卡片行：数值来自 mock 聚合 + 1s 节流推流 -->
+    <!-- ② KPI 卡片行（数值来自 GET /api/overview；无数据源者诚实留空） -->
     <div class="wc-grid wc-grid--4">
       <StatCard
         label="设备在线"
-        :value="`${live.onlineCount}`"
+        :value="`${gateway.onlineCount}`"
         :unit="`/ ${gateway.deviceCount}`"
         :sub="onlineSub"
-        :tone="live.onlineCount === gateway.deviceCount ? 'ok' : 'warn'"
+        :tone="gateway.deviceCount > 0 && gateway.onlineCount === gateway.deviceCount ? 'ok' : 'warn'"
         clickable
         @click="go('devices')"
       />
@@ -68,19 +59,12 @@
         @click="go('points')"
       />
       <StatCard
-        label="今日上行"
-        :value="formatMillion(live.forwardRatePerSec)"
+        label="当前上行"
+        :value="formatInt(gateway.forwardRatePerSec)"
         unit="条/秒"
-        :delta="8.4"
-        :sub="`累计 ${formatBig(gateway.totalForwardedRecords)} 条`"
+        :sub="`累计 ${gateway.totalForwardedRecords} 条`"
       />
-      <StatCard
-        label="端到端延迟"
-        :value="`${live.latencyMs}`"
-        unit="ms"
-        :delta="-12"
-        sub="采集 → Broker"
-      />
+      <StatCard label="端到端延迟" value="—" sub="网关未提供该指标" />
     </div>
 
     <!-- ③ 采集吞吐 + 系统状态 -->
@@ -88,85 +72,39 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>采集吞吐</h3>
-          <span class="wc-card__sub">最近 24 小时 · 条/分钟</span>
-          <div class="wc-card__ops">
-            <button
-              v-for="range in RANGES"
-              :key="range.id"
-              type="button"
-              class="wc-btn wc-btn--sm"
-              :class="{ 'wc-btn--primary': range.id === activeRange }"
-              @click="activeRange = range.id"
-            >
-              {{ range.label }}
-            </button>
-          </div>
         </div>
         <div class="wc-card__body">
-          <!-- 面积折线（内联 SVG，零图表依赖） -->
-          <svg
-            class="ov-chart"
-            :viewBox="`0 0 ${CHART_W} ${CHART_H}`"
-            preserveAspectRatio="none"
-            role="img"
-            aria-label="采集吞吐面积折线图：成功采集与补发两条序列"
+          <EmptyState
+            title="暂无吞吐历史数据"
+            desc="网关未提供吞吐历史时间序列（/api/overview 仅返回实时速率）。"
           >
-            <g v-for="g in 4" :key="`grid-${g}`">
-              <line
-                class="ov-grid-line"
-                :x1="0"
-                :y1="gridY(g - 1)"
-                :x2="CHART_W"
-                :y2="gridY(g - 1)"
-              />
-              <text class="ov-grid-text" :x="4" :y="gridY(g - 1) - 4">{{ gridLabel(g - 1) }}</text>
-            </g>
-
-            <!-- 成功采集：面积 + 折线（原型 :1399 主序列 = 强调青绿） -->
-            <path class="ov-area" :d="successArea" />
-            <path class="ov-line" :d="successLine" />
-            <!-- 补发：折线（同为「条/分钟」量纲，共用 Y 轴；原型 :1400 次序列 = 紫） -->
-            <path class="ov-line ov-line--alt" :d="replayLine" />
-
-            <circle
-              v-for="(pt, i) in successPoints"
-              :key="`dot-${i}`"
-              class="ov-dot"
-              :cx="pt.x"
-              :cy="pt.y"
-              r="2"
-            />
-          </svg>
-
-          <div class="ov-legend">
-            <span><i class="ov-legend__swatch ov-legend__swatch--ok" />成功采集（条/分钟）</span>
-            <span><i class="ov-legend__swatch ov-legend__swatch--alt" />补发（条/分钟）</span>
-            <span class="wc-mono">峰值 {{ peakText }}</span>
-          </div>
+            <template #actions>
+              <button type="button" class="wc-btn wc-btn--sm" @click="go('live')">前往实时数据</button>
+            </template>
+          </EmptyState>
         </div>
       </section>
 
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>系统状态</h3>
-          <span class="wc-card__sub">本机采样</span>
         </div>
         <div class="wc-card__body">
           <dl class="wc-kv">
+            <dt>采集速率</dt>
+            <dd class="wc-mono">{{ formatInt(gateway.sampleRatePerSec) }} 点/秒</dd>
             <dt>CPU 占用</dt>
-            <dd class="wc-mono">{{ live.cpuPct.toFixed(1) }} %</dd>
+            <dd class="wc-mono">—</dd>
             <dt>内存占用</dt>
-            <dd class="wc-mono">{{ live.memUsedMb }} MB / 2048 MB</dd>
+            <dd class="wc-mono">—</dd>
             <dt>数据目录占用</dt>
-            <dd class="wc-mono">{{ gateway.queueUsedGb }} GB / {{ gateway.queueCapacityGb }} GB</dd>
-            <dt>离线队列</dt>
-            <dd class="wc-mono">{{ formatInt(live.queueDepth) }} 条</dd>
+            <dd class="wc-mono">{{ hasQueueCapacity ? `${gateway.queueUsedGb} GB / ${gateway.queueCapacityGb} GB` : '—' }}</dd>
             <dt>连续运行</dt>
             <dd class="wc-mono">{{ gateway.uptimeText }}</dd>
             <dt>版本</dt>
             <dd class="wc-mono">{{ gateway.version }}</dd>
           </dl>
-          <div class="ov-meter">
+          <div v-if="hasQueueCapacity" class="ov-meter">
             <div class="ov-meter__head">
               <span>磁盘队列水位</span>
               <span class="wc-mono">{{ queuePct }}% · 可续传 ≈{{ gateway.queueDrainDays }} 天</span>
@@ -184,10 +122,18 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>设备健康</h3>
-          <span class="wc-card__sub">按严重度排序</span>
         </div>
         <div class="wc-card__body wc-card__body--flush">
-          <UiTable :columns="healthColumns" :rows="healthRows">
+          <EmptyState
+            v-if="healthRows.length === 0"
+            title="暂无设备"
+            :desc="notices.devices || '网关未返回任何设备（GET /api/devices 为空）。'"
+          >
+            <template #actions>
+              <button type="button" class="wc-btn wc-btn--sm" @click="go('device-new')">新增设备</button>
+            </template>
+          </EmptyState>
+          <UiTable v-else :columns="healthColumns" :rows="healthRows">
             <template #cell-name="{ row }">
               <span>{{ row.name }}</span>
               <span class="wc-card__sub"> · {{ row.protocolLabel }}</span>
@@ -202,10 +148,18 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>北向出口</h3>
-          <span class="wc-card__sub">每路编码独立</span>
         </div>
         <div class="wc-card__body wc-card__body--flush">
-          <UiTable :columns="forwarderColumns" :rows="forwarders">
+          <EmptyState
+            v-if="forwarders.length === 0"
+            title="暂无北向出口"
+            :desc="notices.forwarders || '网关未返回任何北向出口（GET /api/forwarders 为空）。'"
+          >
+            <template #actions>
+              <button type="button" class="wc-btn wc-btn--sm" @click="go('northbound')">配置北向转发</button>
+            </template>
+          </EmptyState>
+          <UiTable v-else :columns="forwarderColumns" :rows="forwarders">
             <template #cell-name="{ row }">{{ row.name }}</template>
             <template #cell-encoding="{ row }">
               <span class="wc-tag" :class="row.encoding === 'protobuf' ? 'wc-tag--ok' : 'wc-tag--info'">
@@ -216,14 +170,12 @@
               <StatusTag :status="forwarderStatusKey(row.status)" />
             </template>
           </UiTable>
-          <p class="ov-foot-note">断网自动转存本地队列，恢复后按序补发。</p>
         </div>
       </section>
 
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>待处理</h3>
-          <span class="wc-card__sub">按优先级</span>
         </div>
         <div class="wc-card__body">
           <div class="wc-list">
@@ -247,7 +199,7 @@
     <section class="wc-card">
       <div class="wc-card__head">
         <h3>最近告警</h3>
-        <span class="wc-card__sub">按最近触发时间倒序 · 5 分钟自动刷新</span>
+        <span class="wc-card__sub">5 分钟自动刷新</span>
         <div class="wc-card__ops">
           <button type="button" class="wc-btn wc-btn--sm" @click="go('alarms')">前往告警中心</button>
         </div>
@@ -256,7 +208,7 @@
       <EmptyState
         v-if="paged.total === 0"
         title="暂无告警"
-        desc="当前没有产生任何告警记录。若刚完成设备接入，可到「实时监控」确认点位质量，或先配置告警规则以便异常自动上报。"
+        :desc="notices.alerts || '当前没有告警记录。'"
       >
         <template #actions>
           <button type="button" class="wc-btn" @click="go('monitor')">前往实时监控</button>
@@ -288,18 +240,6 @@
         />
       </template>
     </section>
-
-    <p class="wc-note">
-      <span class="wc-note__icon">ⓘ</span>
-      <span v-if="IS_REAL">
-        本页网关信息来自 <span class="wc-mono">GET /api/overview</span>（按 5s 轮询、1s 节流渲染）；
-        实时遥测通道为 <span class="wc-mono">GET /api/stream</span>（SSE）。授权状态一律由网关侧（Rust）判定，前端仅展示。
-      </span>
-      <span v-else>
-        本页所有数值来自内嵌演示数据源并按 1s 节流刷新；真实环境由 <span class="wc-mono">GET /api/overview</span> 与
-        <span class="wc-mono">GET /api/stream</span>（SSE）提供。授权状态一律由网关侧（Rust）判定，前端仅展示。
-      </span>
-    </p>
   </div>
 </template>
 
@@ -307,18 +247,19 @@
 /**
  * @file OverviewPage.vue
  * @module web-console/pages/OverviewPage
- * @description 总览页。数据来自 `repo`（mock 仓库）+ 1s 节流推流模拟。
+ * @description 总览页。全部数值来自真实接口（`/api/overview` + 各清单接口），无 mock。
  *
  * ── 节流契约 ────────────────────────────────────────────────────────────────
- * 真实 WS 会以远高于 1s 的频率推送。这里用一个 **1s 的 `setInterval`** 代表
+ * 真实遥测会以远高于 1s 的频率推送。这里用一个 **1s 的 `setInterval`** 作为
  * 「节流后的渲染节拍」：无论上游多快，Vue 的响应式更新每秒至多一次，
  * 保证 200 设备 × 100ms 场景下浏览器不被重绘打满（设计系统 §4.2 硬约束）。
+ * 累计计数器（`totalForwardedRecords` 等）不在遥测流内，按 5s 低频轮询
+ * `/api/overview` 刷新。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   EmptyState,
-  PageHeader,
   StatCard,
   StatusTag,
   UiPager,
@@ -326,7 +267,6 @@ import {
   type TableColumn,
 } from '@ui-kit';
 import {
-  API_MODE,
   dataVersion,
   repo,
   refreshOverview,
@@ -336,13 +276,11 @@ import {
   type DeviceRecord,
   type ForwarderRecord,
   type GatewayInfo,
+  type NoticeKey,
 } from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();
-
-/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
-const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -351,15 +289,8 @@ const IS_REAL = API_MODE === 'real';
 /** 最近告警每页条数。 */
 const ALARM_PAGE_SIZE = 5;
 
-/** 采集吞吐图表逻辑坐标系（`preserveAspectRatio="none"` 由外层拉伸）。 */
-const CHART_W = 620;
-const CHART_H = 170;
-
-/** 时间范围切换（仅切换演示数据集，真实环境为查询参数）。 */
-const RANGES: readonly { id: '24h' | '7d'; label: string }[] = [
-  { id: '24h', label: '24h' },
-  { id: '7d', label: '7d' },
-];
+/** `/api/overview` 轮询间隔（节拍数）：5s 一次，计数器 / 水位类统计低频即可。 */
+const OVERVIEW_POLL_EVERY_TICKS = 5;
 
 /** 设备健康列定义。 */
 const healthColumns: readonly TableColumn[] = [
@@ -385,43 +316,28 @@ const alarmColumns: readonly TableColumn[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// 静态快照（来自 mock 聚合，非硬编码重复值）
+// 真实快照（`reactive` 数组：real 缓存晚于挂载填充时也能驱动重算）
 // ---------------------------------------------------------------------------
 
-/** 本机网关信息（`GET /api/overview` 镜像；real 模式随 tick 从 repo 缓存同步）。
- *
- * 用 `reactive` 包装：mock 模式为静态快照（行为不变）；real 模式由 `syncGateway()`
- * 在每个节拍从 repo 缓存刷新（uptimeText / totalForwardedRecords 等随轮询演进）。
- */
+/** 本机网关信息（`GET /api/overview` 镜像；随低频轮询刷新）。 */
 const gateway = reactive<GatewayInfo>(repo.getGateway());
 
-/** 从 repo 缓存同步网关信息（real 模式节拍内调用；字段级覆盖保持响应式引用稳定）。 */
+/** 从 repo 缓存同步网关信息（字段级覆盖保持响应式引用稳定）。 */
 function syncGateway(): void {
   Object.assign(gateway, repo.getGateway());
 }
 
-/** 全量设备（用于 KPI 与设备健康排序）。 */
-const devices: DeviceRecord[] = repo.allDevices();
+/** 全量设备（真实缓存；用于 KPI 与设备健康排序）。 */
+const devices = reactive<DeviceRecord[]>(repo.allDevices());
 
 /** 全量北向出口。 */
-const forwarders: ForwarderRecord[] = repo.allForwarders();
+const forwarders = reactive<ForwarderRecord[]>(repo.allForwarders());
 
 /** 全部告警（页面内分页）。 */
-const allAlarms: AlarmRecord[] = repo.allAlarms();
+const allAlarms = reactive<AlarmRecord[]>(repo.allAlarms());
 
-/**
- * 缓存填充完成（dataVersion 自增）→ 原地刷新静态快照。
- *
- * 避免预取晚于挂载时 KPI / 列表停留空态：real 模式下这些列表来自 `preloadRealData`
- * 填好的 `realCache`（设备 / 出口 / 告警），其中告警来自 `GET /api/alerts`、
- * 设备来自 `GET /api/devices`、出口来自 `GET /api/forwarders`；dataVersion 自增即
- * 表示缓存已就绪，此处原地刷新（保持数组引用不变，沿用既有引用型用法）。
- */
-watch(dataVersion, () => {
-  applyInto(devices, repo.allDevices());
-  applyInto(forwarders, repo.allForwarders());
-  applyInto(allAlarms, repo.allAlarms());
-});
+/** 各数据源的「不可得原因」（诚实空态文案来源）。 */
+const notices = ref<Record<NoticeKey, string>>(repo.actions.notices());
 
 /** 把 source 内容覆盖写入 target（原地变更，保持 target 引用 / 响应式不变）。 */
 function applyInto<T>(target: T[], source: readonly T[]): void {
@@ -429,91 +345,59 @@ function applyInto<T>(target: T[], source: readonly T[]): void {
   target.push(...source);
 }
 
-// ---------------------------------------------------------------------------
-// 1s 节流推流（模拟 WS）
-// ---------------------------------------------------------------------------
-
 /**
- * 节流后的实时快照。**每秒最多写一次**，避免每帧 setState。
+ * 缓存填充完成（dataVersion 自增）→ 原地刷新全部快照。
+ *
+ * real 模式下 preload 在后台跑、可能晚于本页挂载：此处由响应式驱动刷新，
+ * 保证「设备 / 出口 / 告警 / 网关信息」在缓存就绪后立即上屏（无 mock 回退）。
  */
-const live = reactive({
-  /** 采集频率（点/秒），围绕 gateway.sampleRatePerSec 抖动 */
-  sampleRatePerSec: gateway.sampleRatePerSec,
-  /** 北向转发速率（条/秒） */
-  forwardRatePerSec: gateway.forwardRatePerSec,
-  /** 端到端延迟（ms） */
-  latencyMs: 86,
-  /** CPU 占用（%） */
-  cpuPct: 18.4,
-  /** 内存占用（MB） */
-  memUsedMb: 412,
-  /** 离线队列深度（条） */
-  queueDepth: 1204,
-  /** 在线设备数（围绕 gateway.onlineCount 抖动） */
-  onlineCount: gateway.onlineCount,
+watch(dataVersion, () => {
+  applyInto(devices, repo.allDevices());
+  applyInto(forwarders, repo.allForwarders());
+  applyInto(allAlarms, repo.allAlarms());
+  syncGateway();
+  notices.value = repo.actions.notices();
 });
 
-/** 上次节拍时间（用于计算「最后更新」与抖动相位）。 */
+// ---------------------------------------------------------------------------
+// 1s 节流节拍（渲染节拍 + 低频轮询）
+// ---------------------------------------------------------------------------
+
+/** 上次节拍时间（用于降级状态标签里的「最后更新」）。 */
 const lastTickAt = ref<number>(Date.now());
 
 /** 节流定时器句柄（组件卸载必须清理）。 */
 let timer: ReturnType<typeof setInterval> | null = null;
 
-/** 有界随机抖动：围绕基准值 ±range，并夹取到 [min, +∞)。 */
-function jitter(base: number, range: number, min: number): number {
-  return Math.max(min, base + (Math.random() * 2 - 1) * range);
-}
-
-/** real 模式节拍计数（用于 5 拍一次的低频轮询 `/api/overview`）。 */
-let realTickCount = 0;
-
-/** `/api/overview` 轮询间隔（节拍数）：5s 一次，计数器/水位类统计低频即可。 */
-const OVERVIEW_POLL_EVERY_TICKS = 5;
+/** 节拍计数（用于 5 拍一次的低频轮询 `/api/overview`）。 */
+let tickCount = 0;
 
 /**
- * 单个节拍：更新 `live` 快照。
+ * 单个节拍：上游再怎么高频，组件每秒只重渲染一次。
  *
- * 该函数由 1s 定时器调用 —— 这**就是**节流点：上游再怎么高频，
- * 组件每秒只重渲染一次。
- *
- * · mock 模式：围绕基准值抖动（演示行为，保持原样）；
- * · real 模式：从 repo 缓存同步 `GET /api/overview` 结果（每 5 拍触发一次
- *   低频轮询刷新缓存），后端未提供的本机指标（CPU / 内存 / 端到端延迟 /
- *   离线队列深度）置 0，不伪造数值。
+ * 每 5 拍触发一次 `/api/overview` 低频刷新（累计计数器 / 磁盘水位），
+ * 然后从 repo 缓存同步网关信息；本机指标（CPU / 内存 / 延迟）后端未提供，
+ * 一律不渲染数值（页面留 `—`），绝不伪造。
  */
 function tick(): void {
-  if (IS_REAL) {
-    if (realTickCount % OVERVIEW_POLL_EVERY_TICKS === 0) {
-      void refreshOverview();
-    }
-    realTickCount += 1;
-    syncGateway();
-    live.sampleRatePerSec = gateway.sampleRatePerSec;
-    live.forwardRatePerSec = gateway.forwardRatePerSec;
-    live.onlineCount = gateway.onlineCount;
-    live.latencyMs = 0;
-    live.cpuPct = 0;
-    live.memUsedMb = 0;
-    live.queueDepth = 0;
-  } else {
-    live.sampleRatePerSec = Math.round(jitter(gateway.sampleRatePerSec, 24, 1));
-    live.forwardRatePerSec = Math.round(jitter(gateway.forwardRatePerSec, 30, 0));
-    live.latencyMs = Math.round(jitter(86, 9, 12));
-    live.cpuPct = Number(jitter(18.4, 3.2, 1).toFixed(1));
-    live.memUsedMb = Math.round(jitter(412, 14, 128));
-    live.queueDepth = Math.round(jitter(1204, 60, 0));
-    live.onlineCount = Math.min(gateway.deviceCount, Math.max(0, Math.round(jitter(gateway.onlineCount, 0.6, 0))));
+  if (tickCount % OVERVIEW_POLL_EVERY_TICKS === 0) {
+    void refreshOverview();
   }
+  tickCount += 1;
+  syncGateway();
   lastTickAt.value = Date.now();
 }
 
-/** 手动刷新（页头按钮）：立即执行一次节拍并复位视图状态。 */
+/** 手动刷新（工具条按钮）：立即拉取一次 `/api/overview` 并同步。 */
 function refreshAll(): void {
-  tick();
-  activeRange.value = '24h';
+  void refreshOverview().then(() => {
+    syncGateway();
+    lastTickAt.value = Date.now();
+  });
 }
 
 onMounted(() => {
+  notices.value = repo.actions.notices();
   tick();
   timer = setInterval(tick, 1000);
 });
@@ -525,7 +409,7 @@ onBeforeUnmount(() => {
   }
 });
 
-/** 最后更新时刻（`HH:mm:ss`，供无障碍与排障）。 */
+/** 最后更新时刻（`HH:mm:ss`，供降级状态标签给出真实依据）。 */
 const lastTickText = computed<string>(() => {
   const d = new Date(lastTickAt.value);
   const p = (n: number): string => String(n).padStart(2, '0');
@@ -533,91 +417,93 @@ const lastTickText = computed<string>(() => {
 });
 
 // ---------------------------------------------------------------------------
-// 授权横幅（§4.6 优先级：废弃 > 心跳超期 > 试用 ≤2 天 > 队列高位 > 通道断开 > 安全模式）
+// 降级 / 异常状态标签（紧凑 chip；点击进对应处理页）
 // ---------------------------------------------------------------------------
 
-/** 横幅视图模型。 */
-interface BannerView {
+/** 状态标签视图模型。 */
+interface StatusChip {
   /** 色调 */
   readonly tone: 'warn' | 'danger' | 'info';
-  /** 标题（一句话结论） */
-  readonly title: string;
-  /** 明细（原因 + 恢复路径） */
-  readonly detail: string;
-  /** 下一步动作 */
-  readonly actions: readonly { label: string; page: string }[];
+  /** 短标签（chip 文案） */
+  readonly label: string;
+  /** 真实原因（悬浮说明，含最后更新 / 恢复路径） */
+  readonly reason: string;
+  /** 点击目标路由 name */
+  readonly page: string;
 }
 
-/** 队列水位百分比。 */
-const queuePct = computed<number>(() => Math.round((gateway.queueUsedGb / gateway.queueCapacityGb) * 100));
+/** 磁盘队列水位百分比（容量缺失时按 0 处理，避免 NaN）。 */
+const queuePct = computed<number>(() => {
+  if (gateway.queueCapacityGb <= 0) {
+    return 0;
+  }
+  return Math.min(100, Math.round((gateway.queueUsedGb / gateway.queueCapacityGb) * 100));
+});
+
+/** 是否具备磁盘队列容量口径（决定水位条与占用行是否可展示）。 */
+const hasQueueCapacity = computed<boolean>(() => gateway.queueCapacityGb > 0);
 
 /**
- * 计算当前应显示的横幅。
+ * 当前应呈现的状态标签（可多条）。
  *
- * 同屏只显示一条（最高优先级）；无异常时返回 `null`（不占位）。
+ * 与旧「整块横幅」的差异：结论压成一行 chip，点击进对应页；真实原因放在
+ * chip 的 `title` 上，不占页面纵向空间。无异常时返回空数组（不占位）。
  */
-const banner = computed<BannerView | null>(() => {
+const statusChips = computed<readonly StatusChip[]>(() => {
+  const chips: StatusChip[] = [];
   const lic = session.state.license;
 
-  // 优先级 1：授权已停用（心跳超期 / 被后台废弃）
-  if (lic.status === 'stopped' || lic.status === 'grace') {
-    return {
-      tone: 'danger',
-      title: lic.degradeReason || '云端心跳超期，北向转发已停用；本地采集继续。',
-      detail: `恢复路径：${lic.onExpireText} 当前版本 ${gateway.version}，授权判定在网关侧完成。`,
-      actions: [
-        { label: '前往授权与激活', page: 'license' },
-        { label: '查看日志', page: 'audit' },
-      ],
-    };
-  }
-
-  // 优先级 2：试用剩余 ≤ 2 天
-  if (lic.status === 'trial' && lic.remainingDays <= 2) {
-    return {
-      tone: 'warn',
-      title: `试用剩余 ${lic.remainingText}，到期后${lic.onExpireText}`,
-      detail: '本地采集不受影响；北向转发到期后停用。可提前输入激活码，激活后能力立即恢复。',
-      actions: [
-        { label: '输入激活码', page: 'license' },
-        { label: '了解差异', page: 'license' },
-      ],
-    };
-  }
-
-  // 优先级 3：磁盘队列高位（≥ 60%）
-  if (queuePct.value >= 60) {
-    return {
-      tone: 'warn',
-      title: `磁盘队列 ${gateway.queueUsedGb} GB / ${gateway.queueCapacityGb} GB，按当前速率可续传 ≈${gateway.queueDrainDays} 天`,
-      detail: '北向出口不可达时数据转入磁盘队列，恢复后按序补发。请检查出口联通性与补发进度。',
-      actions: [
-        { label: '查看北向转发', page: 'northbound' },
-        { label: '查看告警', page: 'alarms' },
-      ],
-    };
-  }
-
-  // 优先级 4：实时通道断开
+  // 实时通道降级 / 断开
   if (session.state.connection !== 'connected') {
-    return {
-      tone: 'warn',
-      title: `实时通道已降级（${session.state.connection === 'disconnected' ? '已断开' : '链路降级'}），页面数值可能停止刷新`,
-      detail: `最后更新 ${lastTickText.value}。本地采集继续运行；请检查网关侧实时通道与网络。`,
-      actions: [{ label: '查看诊断', page: 'diagnose' }],
-    };
+    const disconnected = session.state.connection === 'disconnected';
+    chips.push({
+      tone: disconnected ? 'danger' : 'warn',
+      label: disconnected ? '实时通道已断开' : '链路降级',
+      reason: `${disconnected ? '实时通道已断开' : '实时通道链路降级'}，最后更新 ${lastTickText.value}；本地采集继续运行。点击进入诊断。`,
+      page: 'diagnose',
+    });
   }
 
-  return null;
+  // 授权已停用（心跳超期 / 被后台废弃）
+  if (lic.status === 'stopped' || lic.status === 'grace') {
+    chips.push({
+      tone: 'danger',
+      label: '授权已停用',
+      reason: lic.degradeReason || '云端心跳超期，北向转发已停用；本地采集继续。点击前往授权与激活。',
+      page: 'license',
+    });
+  } else if (lic.status === 'trial' && lic.remainingDays <= 2) {
+    chips.push({
+      tone: 'warn',
+      label: `试用剩余 ${lic.remainingText}`,
+      reason: `试用到期后${lic.onExpireText}。点击输入激活码。`,
+      page: 'license',
+    });
+  }
+
+  // 磁盘队列高位（≥ 60%）
+  if (hasQueueCapacity.value && queuePct.value >= 60) {
+    chips.push({
+      tone: 'warn',
+      label: `磁盘队列 ${queuePct.value}%`,
+      reason: `磁盘队列 ${gateway.queueUsedGb} GB / ${gateway.queueCapacityGb} GB，按当前速率可续传 ≈${gateway.queueDrainDays} 天。点击查看北向转发。`,
+      page: 'northbound',
+    });
+  }
+
+  return chips;
 });
 
 // ---------------------------------------------------------------------------
 // KPI 派生
 // ---------------------------------------------------------------------------
 
-/** 在线设备副标题。 */
+/** 在线设备副标题（诚实：无设备时直说，不粉饰）。 */
 const onlineSub = computed<string>(() => {
-  const offline = gateway.deviceCount - live.onlineCount;
+  if (gateway.deviceCount === 0) {
+    return '未接入设备';
+  }
+  const offline = gateway.deviceCount - gateway.onlineCount;
   return offline > 0 ? `离线 ${offline} 台` : '全部在线';
 });
 
@@ -630,102 +516,6 @@ const queueFillClass = computed<string>(() => {
     return 'wc-bar__fill--warn';
   }
   return 'wc-bar__fill--ok';
-});
-
-// ---------------------------------------------------------------------------
-// 采集吞吐图表（内联 SVG，24h / 7d 两套演示数据）
-// ---------------------------------------------------------------------------
-
-/** 当前时间范围。 */
-const activeRange = ref<'24h' | '7d'>('24h');
-
-/** 24h 数据集（12 个两小时桶，单位：条/分钟）。 */
-const RANGE_24H: readonly { label: string; success: number; replay: number }[] = [
-  { label: '00', success: 8200, replay: 200 },
-  { label: '02', success: 8800, replay: 180 },
-  { label: '04', success: 9100, replay: 260 },
-  { label: '06', success: 8700, replay: 340 },
-  { label: '08', success: 9400, replay: 220 },
-  { label: '10', success: 10200, replay: 180 },
-  { label: '12', success: 11800, replay: 300 },
-  { label: '14', success: 11200, replay: 420 },
-  { label: '16', success: 10900, replay: 280 },
-  { label: '18', success: 11600, replay: 200 },
-  { label: '20', success: 12400, replay: 240 },
-  { label: '22', success: 13000, replay: 320 },
-];
-
-/** 7d 数据集（7 个日桶，单位：条/分钟）。 */
-const RANGE_7D: readonly { label: string; success: number; replay: number }[] = [
-  { label: '09-17', success: 10100, replay: 260 },
-  { label: '09-18', success: 11200, replay: 320 },
-  { label: '09-19', success: 10800, replay: 280 },
-  { label: '09-20', success: 11900, replay: 240 },
-  { label: '09-21', success: 12400, replay: 300 },
-  { label: '09-22', success: 11700, replay: 360 },
-  { label: '09-23', success: 13000, replay: 320 },
-];
-
-/** 当前数据集。 */
-const chartData = computed<readonly { label: string; success: number; replay: number }[]>(() =>
-  activeRange.value === '24h' ? RANGE_24H : RANGE_7D,
-);
-
-/** Y 轴上界（取成功序列峰值 × 1.15，留顶部余量）。 */
-const chartMax = computed<number>(() => {
-  const peak = Math.max(...chartData.value.map((d) => d.success));
-  return Math.max(peak * 1.15, 1);
-});
-
-/** 第 i 个点的 x 坐标。 */
-function xOf(index: number): number {
-  const n = chartData.value.length;
-  return n <= 1 ? 0 : (index / (n - 1)) * CHART_W;
-}
-
-/** 数值 → y 坐标（自底向上）。 */
-function yOf(value: number): number {
-  return CHART_H - (Math.min(value, chartMax.value) / chartMax.value) * CHART_H;
-}
-
-/** 折线路径（`M` + `L`）。 */
-function linePath(pick: (d: { label: string; success: number; replay: number }) => number): string {
-  return chartData.value.map((d, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(pick(d)).toFixed(1)}`).join(' ');
-}
-
-/** 成功采集折线路径。 */
-const successLine = computed<string>(() => linePath((d) => d.success));
-
-/** 补发折线路径。 */
-const replayLine = computed<string>(() => linePath((d) => d.replay));
-
-/** 成功采集面积路径（折线 + 回落到基线闭合）。 */
-const successArea = computed<string>(() => {
-  const top = successLine.value;
-  const lastX = xOf(chartData.value.length - 1).toFixed(1);
-  return `${top} L${lastX},${CHART_H} L0,${CHART_H} Z`;
-});
-
-/** 成功序列折线顶点（用于打点）。 */
-const successPoints = computed<readonly { x: number; y: number }[]>(() =>
-  chartData.value.map((d, i) => ({ x: xOf(i), y: yOf(d.success) })),
-);
-
-/** Y 轴网格线 y 坐标（t: 0 = 顶部）。 */
-function gridY(t: number): number {
-  return (CHART_H * t) / 3;
-}
-
-/** Y 轴刻度文案（k 缩写）。 */
-function gridLabel(t: number): string {
-  const value = chartMax.value * (1 - t / 3);
-  return value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(Math.round(value));
-}
-
-/** 峰值文案。 */
-const peakText = computed<string>(() => {
-  const peak = Math.max(...chartData.value.map((d) => d.success));
-  return `${(peak / 1000).toFixed(1)}k 条/分钟`;
 });
 
 // ---------------------------------------------------------------------------
@@ -750,7 +540,7 @@ const healthRows = computed<readonly DeviceRecord[]>(() =>
 );
 
 // ---------------------------------------------------------------------------
-// 待处理清单（来自真实快照，非硬编码）
+// 待处理清单（来自真实快照推导，非硬编码）
 // ---------------------------------------------------------------------------
 
 /** 待处理项。 */
@@ -767,7 +557,7 @@ interface TodoItem {
   readonly page: string;
 }
 
-/** 待处理清单（由 mock 快照实时推导）。 */
+/** 待处理清单（由真实快照实时推导）。 */
 const todos = computed<readonly TodoItem[]>(() => {
   const items: TodoItem[] = [];
   const lic = session.state.license;
@@ -886,18 +676,6 @@ function formatInt(value: number): string {
   return value.toLocaleString('en-US');
 }
 
-/** 大整数（string 输入）千分位展示。 */
-function formatBig(value: string): string {
-  const num = Number(value);
-  return Number.isFinite(num) ? formatInt(num) : value;
-}
-
-/** 「M 条」量级展示（含 1s 抖动值）。 */
-function formatMillion(perSec: number): string {
-  const perDay = perSec * 3600;
-  return `${(perDay / 1_000_000).toFixed(2)}`;
-}
-
 /** 跳转（路由 name）。 */
 function go(name: string): void {
   void router.push({ name });
@@ -905,59 +683,24 @@ function go(name: string): void {
 </script>
 
 <style scoped>
-/* 采集吞吐图表：随容器拉伸，最小高度保证 1366×768 下仍可读。
-   全部描边 / 填充取自 ui-kit token（SVG 表现属性不支持 var()，故统一下沉到类）。 */
-.ov-chart {
-  width: 100%;
-  height: 190px;
-  display: block;
-}
-.ov-grid-line {
-  stroke: var(--divider);
-  stroke-width: 1;
-}
-.ov-grid-text {
-  font-size: 9px;
-  fill: var(--text-3);
-}
-.ov-area {
-  fill: var(--brand);
-  opacity: 0.12;
-  stroke: none;
-}
-.ov-line {
-  fill: none;
-  stroke: var(--brand);
-  stroke-width: 1.8;
-}
-.ov-line--alt {
-  stroke: var(--series-alt);
-  stroke-width: 1.4;
-  stroke-dasharray: 4 3;
-}
-.ov-dot {
-  fill: var(--brand);
-}
-.ov-legend {
+/* 页级工具条：无边框 / 无底色的一行，避免重新引入「顶部内容框」 */
+.ov-toolbar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
 }
-.ov-legend i {
-  display: inline-block;
-  width: 10px;
-  height: 3px;
-  border-radius: 2px;
-  margin-right: 6px;
-  vertical-align: middle;
+/* 状态标签 chip（紧凑；可点击进对应页） */
+.ov-chip {
+  cursor: pointer;
 }
-.ov-legend__swatch--ok {
-  background: var(--brand);
+.ov-chip:hover {
+  border-color: var(--brand);
 }
-.ov-legend__swatch--alt {
-  background: var(--series-alt);
+.ov-chip__dot {
+  font-size: 9px;
+  line-height: 1;
 }
 .ov-meter {
   display: flex;
@@ -969,13 +712,6 @@ function go(name: string): void {
   justify-content: space-between;
   font-size: var(--fs-caption);
   color: var(--text-3);
-}
-.ov-foot-note {
-  margin: 0;
-  padding: 10px 12px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  border-top: 1px solid var(--divider);
 }
 .ov-dot {
   display: inline-block;

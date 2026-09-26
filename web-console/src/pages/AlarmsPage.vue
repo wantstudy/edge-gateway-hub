@@ -2,38 +2,27 @@
   <!--
     AlarmsPage —— 告警中心（监控分组第 3 页，路由 `/alarms`）。
 
-    结构对齐原型 `alarms`（:1475 起）与设计 §3（告警相关线框）：
-      ① KPI 卡片行（严重 / 重要 / 24h 新增 / 已确认）
-      ② 筛选栏（级别 / 处置状态 / 时间范围 / 关键字）
-      ③ 告警列表（分页，UiPager 单一口径）+ 行内确认
-      ④ 告警详情抽屉
-      ⑤ 告警规则配置区（阈值 / 持续时间 / 抑制；危险操作走 DangerConfirmModal 四要素）
+    结构（对齐原型 `alarms` :1474-1505 + 需求 7「删掉菜单顶部内容框」）：
+      ① KPI 卡片行（严重 / 警告 / 告警总数 / 已确认·已恢复）
+      ② 告警列表卡：卡头工具条（导出 CSV / 告警规则 / 批量确认当前页）+ 筛选行 + 分页表
+      ③ 告警详情抽屉
+      ④ 告警规则弹窗（表单 + 已保存规则；危险操作走 DangerConfirmModal 四要素）
 
     硬性约定遵守情况：
+      · 无页面级标题块 / 无说明性文案块；一切数值来自真实接口（GET /api/alerts）；
       · 列表页必须分页，且条数只有 UiPager 一个口径（表格无 footer「共 N 条」）；
-      · 空态给下一步动作（EmptyState）；
-      · 危险操作（删除规则 / 关闭总开关）= 二次确认 + 原因必填 + 对象名二次校验；
+      · 空态给下一步动作（EmptyState 一句话说明 + 一个动作按钮）；
+      · 危险操作（删除规则）= 二次确认 + 原因必填 + 对象名二次校验；
+      · 规则读取 / 保存 / 启停 / 删除命中不支持端点时**原样呈现真实原因**，
+        绝不静默吞错、绝不伪造「已保存 / 已删除」；
       · 无解绑 / 重置试用 / revoke 任何入口；无 emoji。
   -->
-  <PageHeader
-    crumb="运行监控 / 告警中心"
-    title="告警中心"
-    desc="由阈值与通讯异常产生的告警，支持确认与静默。规则变更与删除为高危操作，需二次确认并填写原因。"
-  >
-    <template #actions>
-      <button type="button" class="wc-btn" @click="exportCsv">导出 CSV</button>
-      <button type="button" class="wc-btn wc-btn--primary" @click="batchAck">批量确认当前页</button>
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
     <!-- KPI：数值由当前告警快照实时推导 -->
     <div class="wc-grid wc-grid--4">
       <StatCard
         label="严重"
         :value="String(kpi.critical)"
-        :delta="kpi.critical > 0 ? 1 : 0"
-        sub="需立即处理"
         :tone="kpi.critical > 0 ? 'danger' : 'default'"
         icon-tone="rose"
       >
@@ -48,7 +37,7 @@
       >
         <template #icon>!</template>
       </StatCard>
-      <StatCard label="24h 新增" :value="String(kpi.total)" sub="近 24 小时产生的告警" icon-tone="ink">
+      <StatCard label="告警总数" :value="String(kpi.total)" sub="当前列表全部" icon-tone="ink">
         <template #icon>◷</template>
       </StatCard>
       <StatCard label="已确认 / 已恢复" :value="String(kpi.closed)" :sub="`待处理 ${kpi.open} 条`" tone="ok" icon-tone="teal">
@@ -56,8 +45,29 @@
       </StatCard>
     </div>
 
-    <!-- 筛选栏 -->
-    <div class="wc-card">
+    <!-- 告警列表卡：工具条 + 搜索 + 列表 -->
+    <section class="wc-card">
+      <div class="wc-card__head">
+        <h3>告警列表</h3>
+        <span v-if="selectedIds.length > 0" class="wc-tag wc-tag--info">已选 {{ selectedIds.length }} 条</span>
+        <div class="wc-card__ops">
+          <button type="button" class="wc-btn wc-btn--sm" data-testid="alarms-export" @click="exportCsv">导出 CSV</button>
+          <button type="button" class="wc-btn wc-btn--sm" data-testid="alarms-rules-open" @click="openRules">
+            告警规则
+          </button>
+          <RoleGate :allowed="canAck" mode="disable" deny-text="当前角色只读，无「批量确认」权限">
+            <button
+              type="button"
+              class="wc-btn wc-btn--sm wc-btn--primary"
+              data-testid="alarms-batch-ack"
+              @click="batchAck"
+            >
+              批量确认当前页
+            </button>
+          </RoleGate>
+        </div>
+      </div>
+
       <div class="wc-card__body">
         <div class="wc-filters">
           <div class="wc-filters__item">
@@ -77,205 +87,176 @@
             <UiInput v-model="filters.keyword" placeholder="输入关键字后自动筛选" />
           </div>
         </div>
-      </div>
-    </div>
 
-    <!-- 告警列表 -->
-    <section class="wc-card">
-      <div class="wc-card__head">
-        <h3>告警列表</h3>
-        <span class="wc-card__sub">按最近触发时间倒序</span>
-        <div class="wc-card__ops">
-          <span v-if="selectedIds.length > 0" class="wc-tag wc-tag--info">已选 {{ selectedIds.length }} 条</span>
-        </div>
-      </div>
-
-      <!-- real 模式：后端无告警引擎（`GET /api/alerts` → source=unsupported）→ 可解释空态 -->
-      <div
-        v-if="alertsUnsupported"
-        class="wc-banner wc-banner--warn wc-banner--block al-unsupported"
-        data-testid="alerts-unsupported"
-      >
-        <span aria-hidden="true">!</span>
-        <span class="wc-banner__stack">
-          <span class="wc-banner__line"><b>当前没有告警数据 · 后端告警引擎未落地</b></span>
-          <span class="wc-banner__line">原因：{{ alertsApiNotice }}</span>
-          <span class="wc-banner__line">
-            恢复路径：告警引擎落地后本页自动展示；在此之前请用「实时监控」观察通讯异常、
-            或用「诊断与自检」排查连通性。本页<b>绝不伪造告警数据</b>。
-          </span>
-        </span>
-      </div>
-
-      <EmptyState
-        v-if="filtered.length === 0"
-        title="没有符合条件的告警"
-        desc="可能是筛选条件过窄（级别 / 状态 / 时间范围 / 关键字）。你可以清空筛选查看全部，或检查阈值规则是否需要调整。"
-      >
-        <template #actions>
-          <button type="button" class="wc-btn" @click="resetFilters">清空筛选</button>
-          <button type="button" class="wc-btn wc-btn--primary" @click="scrollToRules">调整告警规则</button>
-        </template>
-      </EmptyState>
-
-      <template v-else>
-        <UiTable :columns="columns" :rows="paged.items" row-key-field="id">
-          <template #cell-_select="{ row }">
-            <input
-              type="checkbox"
-              :checked="selectedIds.includes(row.id)"
-              :aria-label="`选择告警 ${row.title}`"
-              @change="toggleSelect(row.id)"
-            />
-          </template>
-          <template #cell-level="{ row }">
-            <span class="wc-tag" :class="levelTagClass(row.level)">{{ levelTextOf(row.level) }}</span>
-          </template>
-          <template #cell-lastSeenAt="{ row }">
-            <span class="wc-mono">{{ row.lastSeenAt }}</span>
-          </template>
-          <template #cell-sourceLabel="{ row }">
-            <span>{{ row.sourceLabel }}</span>
-            <span class="al-src">{{ sourceTypeLabel(row.sourceType) }}</span>
-          </template>
-          <template #cell-title="{ row }">
-            <div class="al-title">{{ row.title }}</div>
-            <div class="al-detail">{{ row.detail }}</div>
-          </template>
-          <template #cell-count="{ row }">
-            <span class="wc-mono">{{ row.count }}</span>
-          </template>
-          <template #cell-stateLabel="{ row }">
-            <span class="wc-tag" :class="stateTagClass(row.state)">{{ row.stateLabel }}</span>
-          </template>
-          <template #actions="{ row }">
-            <button type="button" class="wc-btn wc-btn--sm" @click="openDetail(row.id)">详情</button>
-            <RoleGate :allowed="canAck" mode="disable" deny-text="当前角色只读，无「确认告警」权限">
-              <button
-                v-if="row.state === 'open'"
-                type="button"
-                class="wc-btn wc-btn--sm wc-btn--primary"
-                @click="confirmAlarm(row.id)"
-              >
-                确认
-              </button>
-            </RoleGate>
-          </template>
-        </UiTable>
-
-        <UiPager :page="page" :total="filtered.length" :page-size="PAGE_SIZE" @update:page="onPage" />
-      </template>
-    </section>
-
-    <!-- 告警规则配置区 -->
-    <section ref="rulesRef" class="wc-card">
-      <div class="wc-card__head">
-        <h3>告警规则</h3>
-        <span class="wc-card__sub">阈值 / 持续时间 / 抑制</span>
-      </div>
-
-      <div class="wc-card__body">
-        <div class="wc-grid wc-grid--3">
-          <UiField label="阈值条件" required hint="引用点位用 [ ] 包裹，如 [T_Barrel1] > 240">
-            <UiInput v-model="ruleDraft.threshold" placeholder="[T_Barrel1] > 240" />
-          </UiField>
-          <UiField label="持续时间" required hint="条件持续满足多久才产生告警（秒）">
-            <UiInput v-model="ruleDraft.durationSec" type="number" placeholder="10" />
-          </UiField>
-          <UiField label="抑制窗口" required hint="同对象在此窗口内不重复告警（分钟）">
-            <UiInput v-model="ruleDraft.suppressMin" type="number" placeholder="5" />
-          </UiField>
-        </div>
-
-        <UiField label="适用对象" required hint="留空表示全部设备">
-          <UiSelect v-model="ruleDraft.target" :options="targetOptions" />
-        </UiField>
-
-        <p v-if="ruleError" class="al-error" role="alert">{{ ruleError }}</p>
-
-        <p v-if="ruleMessage" class="wc-hint" data-testid="rule-message">{{ ruleMessage }}</p>
-
-        <!-- real 模式：告警规则写接口当前返回 501 —— 诚实告知，不静默吞错 -->
-        <p v-if="IS_REAL" class="wc-note">
-          <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-          <span>
-            规则写入走 <span class="wc-mono">PUT /api/alerts/rules</span>；后端当前返回
-            <b>501 not_implemented</b>（告警引擎未落地，无规则可写）。保存时本页会原样呈现原因与恢复路径，
-            不会显示「已保存」。
-          </span>
+        <!-- 后端无告警引擎 / 请求失败 → 原样呈现真实原因（绝不伪造告警） -->
+        <p v-if="alertsApiNotice" class="al-notice" role="alert" data-testid="alerts-unsupported">
+          <span class="al-notice__text">{{ alertsApiNotice }}</span>
+          <button type="button" class="wc-btn wc-btn--sm" data-testid="alerts-retry" @click="loadAlarms">重试</button>
         </p>
 
-        <div class="al-rule-actions">
-          <button type="button" class="wc-btn" @click="resetRuleDraft">重置草稿</button>
-          <button type="button" class="wc-btn wc-btn--primary" :disabled="ruleError.length > 0" @click="saveRule">
-            保存规则
-          </button>
-        </div>
+        <!-- 单条确认失败的真实原因（后端 400/5xx 原文，绝不静默吞错） -->
+        <p v-if="ackNotice" class="al-notice" role="alert" data-testid="ack-notice">
+          <span class="al-notice__text">{{ ackNotice }}</span>
+        </p>
 
-        <!-- 已保存规则 -->
-        <div v-if="rules.length === 0" class="al-hint-block">
-          <EmptyState
-            title="尚未配置告警规则"
-            desc="没有规则时，只有驱动层通讯异常会产生告警（如离线、采集失败）。建议先为关键点位配置阈值规则。"
-          >
-            <template #actions>
-              <button type="button" class="wc-btn wc-btn--primary" @click="applyPreset">载入推荐模板</button>
+        <EmptyState
+          v-if="filtered.length === 0"
+          :title="alertsUnsupported ? '后端暂无告警数据' : '没有符合条件的告警'"
+          :desc="alertsUnsupported ? '告警引擎落地后本页自动展示。' : '放宽级别 / 状态 / 时间范围，或清空关键字。'"
+        >
+          <template #actions>
+            <button v-if="!alertsUnsupported" type="button" class="wc-btn" @click="resetFilters">清空筛选</button>
+            <button type="button" class="wc-btn wc-btn--primary" data-testid="alarms-rules-open-empty" @click="openRules">
+              配置告警规则
+            </button>
+          </template>
+        </EmptyState>
+
+        <template v-else>
+          <UiTable :columns="columns" :rows="paged.items" row-key-field="id">
+            <template #cell-_select="{ row }">
+              <input
+                type="checkbox"
+                :checked="selectedIds.includes(row.id)"
+                :aria-label="`选择告警 ${row.title}`"
+                @change="toggleSelect(row.id)"
+              />
             </template>
-          </EmptyState>
-        </div>
+            <template #cell-level="{ row }">
+              <span class="wc-tag" :class="levelTagClass(row.level)">{{ levelTextOf(row.level) }}</span>
+            </template>
+            <template #cell-lastSeenAt="{ row }">
+              <span class="wc-mono">{{ row.lastSeenAt }}</span>
+            </template>
+            <template #cell-sourceLabel="{ row }">
+              <span>{{ row.sourceLabel }}</span>
+              <span class="al-src">{{ sourceTypeLabel(row.sourceType) }}</span>
+            </template>
+            <template #cell-title="{ row }">
+              <div class="al-title">{{ row.title }}</div>
+              <div class="al-detail">{{ row.detail }}</div>
+            </template>
+            <template #cell-count="{ row }">
+              <span class="wc-mono">{{ row.count }}</span>
+            </template>
+            <template #cell-stateLabel="{ row }">
+              <span class="wc-tag" :class="stateTagClass(row.state)">{{ row.stateLabel }}</span>
+            </template>
+            <template #actions="{ row }">
+              <button type="button" class="wc-btn wc-btn--sm" @click="openDetail(row.id)">详情</button>
+              <RoleGate :allowed="canAck" mode="disable" deny-text="当前角色只读，无「确认告警」权限">
+                <button
+                  v-if="row.state === 'open'"
+                  type="button"
+                  class="wc-btn wc-btn--sm wc-btn--primary"
+                  @click="confirmAlarm(row.id)"
+                >
+                  确认
+                </button>
+              </RoleGate>
+            </template>
+          </UiTable>
 
-        <div v-else class="wc-table-wrap">
-          <table class="wc-table">
-            <thead>
-              <tr>
-                <th>规则</th>
-                <th>条件</th>
-                <th>持续时间</th>
-                <th>抑制</th>
-                <th>触发</th>
-                <th>状态</th>
-                <th class="is-right">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="rule in rules" :key="rule.id">
-                <td>{{ rule.name }}</td>
-                <td class="wc-mono">{{ rule.condition }}</td>
-                <td class="wc-mono">{{ rule.durationSec }} s</td>
-                <td class="wc-mono">{{ rule.suppressMin }} min</td>
-                <td class="wc-mono">{{ rule.hitCount }}</td>
-                <td>
-                  <span class="wc-tag" :class="rule.enabled ? 'wc-tag--ok' : 'wc-tag--unknown'">
-                    {{ rule.enabled ? '已启用' : '已停用' }}
-                  </span>
-                </td>
-                <td class="is-right">
-                  <div class="al-ops">
-                    <RoleGate :allowed="canEditRules" mode="disable" deny-text="当前角色只读，无「规则编辑」权限">
-                      <button type="button" class="wc-btn wc-btn--sm" @click="toggleRule(rule.id)">
-                        {{ rule.enabled ? '停用' : '启用' }}
-                      </button>
-                    </RoleGate>
-                    <RoleGate :allowed="canEditRules" mode="disable" deny-text="当前角色只读，无「删除规则」权限">
-                      <button type="button" class="wc-btn wc-btn--sm wc-btn--danger" @click="askDelete(rule)">
-                        删除
-                      </button>
-                    </RoleGate>
-                  </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <p class="wc-note">
-          <span class="wc-note__icon">ⓘ</span>
-          <span>
-            规则变更会写入审计日志。删除规则<b>不影响历史告警</b>，但此后不再产生新告警；恢复路径为重新创建同名规则。
-          </span>
-        </p>
+          <UiPager :page="page" :total="filtered.length" :page-size="PAGE_SIZE" @update:page="onPage" />
+        </template>
       </div>
     </section>
+
+    <!-- 告警规则弹窗（表单 + 已保存规则；按钮触发，非常驻区块） -->
+    <Teleport to="body">
+      <div v-if="rulesOpen" class="al-modal__mask" @click.self="closeRules">
+        <div class="al-modal" role="dialog" aria-modal="true" aria-label="告警规则" data-testid="rules-modal">
+          <div class="al-modal__head">
+            <h3>告警规则</h3>
+            <button type="button" class="wc-btn wc-btn--sm" data-testid="rules-close" @click="closeRules">关闭</button>
+          </div>
+
+          <div class="al-modal__body">
+            <div class="wc-grid wc-grid--3">
+              <UiField label="阈值条件" required>
+                <UiInput v-model="ruleDraft.threshold" placeholder="[T_Barrel1] > 240" />
+              </UiField>
+              <UiField label="持续时间（秒）" required>
+                <UiInput v-model="ruleDraft.durationSec" type="number" placeholder="10" />
+              </UiField>
+              <UiField label="抑制窗口（分钟）" required>
+                <UiInput v-model="ruleDraft.suppressMin" type="number" placeholder="5" />
+              </UiField>
+            </div>
+
+            <UiField label="适用对象" required>
+              <UiSelect v-model="ruleDraft.target" :options="targetOptions" />
+            </UiField>
+
+            <p v-if="ruleTouched && ruleError" class="al-error" role="alert">{{ ruleError }}</p>
+            <p v-if="ruleMessage" class="al-notice" role="alert" data-testid="rule-message">
+              <span class="al-notice__text">{{ ruleMessage }}</span>
+            </p>
+            <p v-if="rules.length === 0 && rulesNotice" class="al-notice" role="alert" data-testid="rules-source">
+              <span class="al-notice__text">{{ rulesNotice }}</span>
+            </p>
+
+            <!-- 已保存规则 -->
+            <div v-if="rules.length > 0" class="wc-table-wrap">
+              <table class="wc-table">
+                <thead>
+                  <tr>
+                    <th>规则</th>
+                    <th>条件</th>
+                    <th>持续时间</th>
+                    <th>抑制</th>
+                    <th>触发</th>
+                    <th>状态</th>
+                    <th class="is-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="rule in rules" :key="rule.id">
+                    <td>{{ rule.name }}</td>
+                    <td class="wc-mono">{{ rule.condition }}</td>
+                    <td class="wc-mono">{{ rule.durationSec }} s</td>
+                    <td class="wc-mono">{{ rule.suppressMin }} min</td>
+                    <td class="wc-mono">{{ rule.hitCount }}</td>
+                    <td>
+                      <span class="wc-tag" :class="rule.enabled ? 'wc-tag--ok' : 'wc-tag--unknown'">
+                        {{ rule.enabled ? '已启用' : '已停用' }}
+                      </span>
+                    </td>
+                    <td class="is-right">
+                      <div class="al-ops">
+                        <RoleGate :allowed="canEditRules" mode="disable" deny-text="当前角色只读，无「规则编辑」权限">
+                          <button type="button" class="wc-btn wc-btn--sm" @click="toggleRule">
+                            {{ rule.enabled ? '停用' : '启用' }}
+                          </button>
+                        </RoleGate>
+                        <RoleGate :allowed="canEditRules" mode="disable" deny-text="当前角色只读，无「删除规则」权限">
+                          <button type="button" class="wc-btn wc-btn--sm wc-btn--danger" @click="askDelete(rule)">
+                            删除
+                          </button>
+                        </RoleGate>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="al-modal__foot">
+            <button type="button" class="wc-btn" data-testid="rule-reset" @click="resetRuleDraft">重置</button>
+            <button
+              type="button"
+              class="wc-btn wc-btn--primary"
+              data-testid="rule-save"
+              :disabled="ruleError.length > 0 || !canEditRules"
+              @click="saveRule"
+            >
+              保存规则
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- 危险操作二次确认（删除规则）：四要素 —— 影响清单 + 原因必填 + 对象名二次校验 -->
     <DangerConfirmModal
@@ -295,6 +276,44 @@
       @close="closeDelete"
       @submit="submitDelete"
     />
+
+    <!-- 批量确认弹窗：展示影响条数，用户确认后逐条下发；失败聚合展示真实原因（禁静默吞错） -->
+    <Teleport to="body">
+      <div v-if="batchOpen" class="al-modal__mask" @click.self="closeBatchAck">
+        <div class="al-modal" role="dialog" aria-modal="true" aria-label="批量确认告警" data-testid="batch-ack-modal">
+          <div class="al-modal__head">
+            <h3>批量确认告警</h3>
+            <button type="button" class="wc-btn wc-btn--sm" data-testid="batch-ack-close" @click="closeBatchAck">关闭</button>
+          </div>
+          <div class="al-modal__body">
+            <p v-if="batchTargets.length === 0">当前页没有「待处理」的告警。</p>
+            <template v-else>
+              <p>将确认当前页 <b>{{ batchTargets.length }}</b> 条「待处理」告警，并写入审计日志。</p>
+              <p v-if="batchMessage" class="al-notice" role="alert" data-testid="batch-ack-result">
+                <span class="al-notice__text">{{ batchMessage }}</span>
+              </p>
+              <ul v-if="batchFailures.length > 0" class="al-error" role="alert" data-testid="batch-ack-failures">
+                <li v-for="f in batchFailures" :key="f.id">{{ f.id }}：{{ f.reason }}</li>
+              </ul>
+            </template>
+          </div>
+          <div class="al-modal__foot">
+            <button type="button" class="wc-btn" data-testid="batch-ack-cancel" :disabled="batchRunning" @click="closeBatchAck">
+              取消
+            </button>
+            <button
+              type="button"
+              class="wc-btn wc-btn--primary"
+              data-testid="batch-ack-submit"
+              :disabled="batchRunning || batchTargets.length === 0"
+              @click="runBatchAck"
+            >
+              {{ batchRunning ? '下发中…' : '确认下发' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- 告警详情抽屉 -->
     <Teleport to="body">
@@ -328,9 +347,12 @@
               <dd>{{ detail.note || '—' }}</dd>
             </dl>
 
-            <UiField label="处置说明" required hint="必填，将随处置动作写入审计日志">
+            <UiField label="处置说明" required>
               <UiInput v-model="ackNote" placeholder="如：已联系电气班检查通讯线" />
             </UiField>
+
+            <!-- 处置失败的真实原因（后端 400 confirm_mismatch / reason 校验原文） -->
+            <p v-if="detailAckError" class="al-error" role="alert" data-testid="detail-ack-error">{{ detailAckError }}</p>
 
             <div class="al-drawer__ops">
               <RoleGate :allowed="canAck" mode="disable" deny-text="当前角色只读，无「处置告警」权限">
@@ -344,15 +366,6 @@
         </aside>
       </div>
     </Teleport>
-
-    <p class="wc-note">
-      <span class="wc-note__icon">ⓘ</span>
-      <span>
-        本页数据来自内嵌演示数据源（真实环境为 <span class="wc-mono">GET /api/alerts</span> 与
-        <span class="wc-mono">PUT /api/alerts/rules</span>）。处置告警只改变告警状态，
-        <b>不影响任何授权能力</b>；授权判定一律在网关侧（Rust）完成。
-      </span>
-    </p>
   </div>
 </template>
 
@@ -360,7 +373,7 @@
 /**
  * @file AlarmsPage.vue
  * @module web-console/pages/AlarmsPage
- * @description 告警中心：列表（分页）+ 级别/状态/时间/关键字筛选 + 详情 + 规则配置。
+ * @description 告警中心：列表（分页）+ 级别/状态/时间/关键字筛选 + 详情 + 规则弹窗。
  *
  * ── 草稿隔离 ────────────────────────────────────────────────────────────────
  * 规则草稿（`ruleDraft`）与处置说明草稿（`ackNote`）都**只存在于页面本地**，
@@ -371,7 +384,6 @@ import { useRouter } from 'vue-router';
 import {
   DangerConfirmModal,
   EmptyState,
-  PageHeader,
   RoleGate,
   StatCard,
   UiField,
@@ -383,14 +395,11 @@ import {
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { API_MODE, dataVersion, repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '@/api/repo';
+import { dataVersion, refreshAlerts, repo, type AlarmLevel, type AlarmRecord, type AlarmState } from '@/api/repo';
 import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
 
 const router = useRouter();
-
-/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
-const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -436,14 +445,14 @@ const canEditRules = computed<boolean>(() => session.state.role === 'admin' || s
 const alarms = ref<AlarmRecord[]>(repo.allAlarms());
 
 /**
- * 告警数据源不可得 / 不支持的说明（real 模式：`GET /api/alerts` 的 `reason` 原文）。
+ * 告警数据源不可得 / 不支持的说明（`GET /api/alerts` 的 `reason` 原文 / 真实失败原因）。
  *
- * 非空即表示「后端当前没有真实告警数据源」，页面据此给出可解释空态。
+ * 非空即表示「后端当前没有真实告警数据源」，页面据此给出诚实空态。
  */
 const alertsApiNotice = ref('');
 
-/** real 模式且后端无告警数据源 → 展示可解释空态（绝不伪造告警）。 */
-const alertsUnsupported = computed<boolean>(() => IS_REAL && alarms.value.length === 0 && alertsApiNotice.value !== '');
+/** 后端无告警数据源 → 展示诚实空态（绝不伪造告警）。 */
+const alertsUnsupported = computed<boolean>(() => alarms.value.length === 0 && alertsApiNotice.value !== '');
 
 /** 取字符串字段（数字按字符串透传）。 */
 function pickText(src: Record<string, unknown>, key: string, dflt: string): string {
@@ -457,20 +466,24 @@ function pickText(src: Record<string, unknown>, key: string, dflt: string): stri
   return dflt;
 }
 
+/** 处置状态 → 中文（与数据层口径一致）。 */
+const STATE_TEXT: Record<string, string> = { open: '待处理', acking: '已确认', resolved: '已恢复' };
+
 /** `/api/alerts` 条目 → 告警记录（后端当前恒为空数组；落地后按契约宽容映射）。 */
 function mapAlarmRow(raw: Record<string, unknown>, idx: number): AlarmRecord {
   const level = pickText(raw, 'level', 'minor');
   const state = pickText(raw, 'state', 'open');
+  const levelKey = (['critical', 'major', 'minor', 'warning'].includes(level) ? level : 'minor') as AlarmLevel;
   return {
     id: pickText(raw, 'id', `al-${idx}`),
-    level: (['critical', 'major', 'minor', 'warning'].includes(level) ? level : 'minor') as AlarmLevel,
-    levelLabel: levelTextOf((['critical', 'major', 'minor', 'warning'].includes(level) ? level : 'minor') as AlarmLevel),
+    level: levelKey,
+    levelLabel: levelTextOf(levelKey),
     sourceType: pickText(raw, 'sourceType', pickText(raw, 'source_type', 'system')),
     sourceLabel: pickText(raw, 'sourceLabel', pickText(raw, 'source', '—')),
     title: pickText(raw, 'title', '—'),
     detail: pickText(raw, 'detail', ''),
-    firstSeenAt: pickText(raw, 'firstSeenAt', pickText(raw, 'first_seen_at', '—')),
-    lastSeenAt: pickText(raw, 'lastSeenAt', pickText(raw, 'last_seen_at', '—')),
+    firstSeenAt: alarmTimeText(pickText(raw, 'firstSeenAt', pickText(raw, 'first_seen_at', ''))),
+    lastSeenAt: alarmTimeText(pickText(raw, 'lastSeenAt', pickText(raw, 'last_seen_at', ''))),
     count: 1,
     state: (['open', 'acking', 'resolved'].includes(state) ? state : 'open') as AlarmState,
     stateLabel: STATE_TEXT[state] ?? state,
@@ -479,22 +492,14 @@ function mapAlarmRow(raw: Record<string, unknown>, idx: number): AlarmRecord {
   };
 }
 
-/** 处置状态 → 中文（与数据层口径一致）。 */
-const STATE_TEXT: Record<string, string> = { open: '待处理', acking: '已确认', resolved: '已恢复' };
-
 /**
  * 加载告警。
  *
- * real：以 `GET /api/alerts` 为**唯一**告警数据源（后端无告警引擎 →
- * `{items:[],source:"unsupported",reason}`，页面给出可解释空态，**绝不回退 mock 造假**）；
- * 接口不可得（网络 / 5xx）时沿用现有来源并如实说明。
- * mock：保持原演示数据源。
+ * 以 `GET /api/alerts` 为**唯一**告警数据源（后端无告警引擎 →
+ * `{items:[],source:"unsupported",reason}`，页面原样呈现 reason）；接口不可得
+ * （网络 / 5xx）时如实说明失败原因，**绝不回退演示数据造假**。
  */
 async function loadAlarms(): Promise<void> {
-  if (!IS_REAL) {
-    alarms.value = repo.allAlarms();
-    return;
-  }
   try {
     const raw = await apiRequest<Record<string, unknown>>('/api/alerts');
     const items = Array.isArray(raw['items']) ? raw['items'] : [];
@@ -506,12 +511,9 @@ async function loadAlarms(): Promise<void> {
         ? pickText(raw, 'reason', '后端告警引擎未落地，当前无真实告警数据源')
         : '';
   } catch (cause) {
-    alarms.value = repo.allAlarms();
+    alarms.value = [];
     const code = cause instanceof ApiError ? cause.status : 0;
-    alertsApiNotice.value =
-      code === 0
-        ? 'GET /api/alerts 不可得：网关不可达（网络层失败）；当前展示的是现有来源数据。'
-        : `GET /api/alerts 不可得：HTTP ${code}；当前展示的是现有来源数据。`;
+    alertsApiNotice.value = code === 0 ? 'GET /api/alerts 失败：网关不可达。' : `GET /api/alerts 失败：HTTP ${code}。`;
   }
 }
 
@@ -520,9 +522,8 @@ onMounted(() => {
 });
 
 /**
- * 缓存填充完成（dataVersion 自增）→ 重读告警数据源。
- * · mock：重读 `repo.allAlarms()`（避免预取晚于挂载时停留空态）；
- * · real：重新请求 `GET /api/alerts`（后端告警引擎落地后自动生效，绝不回退 mock）。
+ * 缓存填充完成（dataVersion 自增）→ 重新请求 `GET /api/alerts`
+ * （后端告警引擎落地后自动生效，绝不回退演示数据）。
  */
 watch(dataVersion, () => {
   void loadAlarms();
@@ -608,10 +609,41 @@ const rangeOptions: readonly SelectOption[] = [
 ];
 
 /**
+ * `/api/alerts` 的时间戳（后端 `first_seen_at` / `last_seen_at` 为 13 位毫秒
+ * epoch 字符串，守大数红线按字符串传递）→ `YYYY-MM-DD HH:mm:ss` 展示串。
+ *
+ * 必须格式化后再比较：`new Date('1790900000000')` 在 V8 下是 **Invalid Date**
+ * （纯数字串被当成年份无法解析），实测 `getTime()` 返回 `NaN`；而未格式化的
+ * 毫秒串再和 `YYYY-MM-DD HH:mm:ss` 做字典序比较恒为 `true`（首字符 `'1' < '2'`），
+ * 会把全部记录误剔除。两侧都先过本函数，同一个格式才能比。
+ * 只认 10 位秒 / 13 位毫秒，其余原样透传（与 `repo.ts:formatEpochText` 同口径）。
+ */
+function alarmTimeText(value: string): string {
+  const trimmed = value.trim();
+  if (/^\d{10}$/.test(trimmed)) {
+    return epochToText(Number(trimmed) * 1000);
+  }
+  if (/^\d{13}$/.test(trimmed)) {
+    return epochToText(Number(trimmed));
+  }
+  return trimmed || '—';
+}
+
+/** epoch 毫秒 → `YYYY-MM-DD HH:mm:ss`（走**本地**时区 getters，与展示一致）。 */
+function epochToText(ms: number): string {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) {
+    return '—';
+  }
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
  * 时间范围 → 起始时刻（`YYYY-MM-DD HH:mm:ss`）。
  *
- * 演示数据的时间戳固定在 2026-09-23，因此以数据集内的**最大时间戳**为「现在」，
- * 而不是真实系统时间 —— 否则所有记录都会被 24h 窗口过滤掉（现场演示会看到空列表）。
+ * 以数据集内的**最大时间戳**为「现在」（而非浏览器本地时间）—— 网关与浏览器
+ * 时钟可能存在偏差，用数据自身基准可避免把全部记录过滤掉。
  */
 function rangeStart(range: string): string {
   if (range === 'all') {
@@ -622,8 +654,7 @@ function rangeStart(range: string): string {
   if (!latest) {
     return '';
   }
-  const parts = latest.replace(' ', 'T');
-  const base = new Date(parts);
+  const base = new Date(latest.replace(' ', 'T'));
   if (Number.isNaN(base.getTime())) {
     return '';
   }
@@ -715,33 +746,103 @@ function toggleSelect(id: string): void {
     : [...selectedIds.value, id];
 }
 
-/** 批量确认当前页中处于「待处理」的告警。 */
+/** 批量确认弹窗开关。 */
+const batchOpen = ref<boolean>(false);
+
+/** 批量确认下发中（防重复提交）。 */
+const batchRunning = ref<boolean>(false);
+
+/** 批量确认结果摘要（空 = 无）。 */
+const batchMessage = ref<string>('');
+
+/** 批量确认失败明细（id + 后端真实原因；聚合展示，禁静默吞错）。 */
+const batchFailures = ref<readonly { id: string; reason: string }[]>([]);
+
+/** 批量确认目标快照（打开弹窗时定格当前页「待处理」，避免翻页 / 筛选漂移）。 */
+const batchTargets = ref<AlarmRecord[]>([]);
+
+/** 打开批量确认弹窗（弹窗内展示影响条数，确认后才逐条下发）。 */
 function batchAck(): void {
-  const targets = paged.value.items.filter((a) => a.state === 'open');
-  if (targets.length === 0) {
-    window.alert('当前页没有「待处理」的告警。');
-    return;
-  }
-  const ok = window.confirm(`将确认当前页 ${targets.length} 条待处理告警，并写入审计日志。确认继续？`);
-  if (!ok) {
-    return;
-  }
-  for (const alarm of targets) {
-    repo.resolveAlarm({
-      id: alarm.id,
-      state: 'acking',
-      note: '批量确认（告警中心）',
-      actor: session.state.displayName,
-    });
-  }
-  selectedIds.value = [];
-  alarms.value = repo.allAlarms();
+  batchTargets.value = paged.value.items.filter((a) => a.state === 'open');
+  batchMessage.value = '';
+  batchFailures.value = [];
+  batchOpen.value = true;
 }
 
-/** 单条确认。 */
-function confirmAlarm(id: string): void {
-  repo.resolveAlarm({ id, state: 'acking', note: '确认告警（告警中心）', actor: session.state.displayName });
-  alarms.value = repo.allAlarms();
+/** 关闭批量确认弹窗（下发中不允许关闭）。 */
+function closeBatchAck(): void {
+  if (batchRunning.value) {
+    return;
+  }
+  batchOpen.value = false;
+  batchMessage.value = '';
+  batchFailures.value = [];
+}
+
+/**
+ * 批量确认：逐条下发四要素 `{state, note, reason, confirm}`（confirm = 告警 id 原文，
+ * 后端大小写不敏感精确匹配、空串即 mismatch）；失败**聚合展示真实原因**，绝不静默吞错。
+ * 批量走 `{ refetch: false }`（N 条 = N 次 POST），结束后统一 `refreshAlerts()` 一次重取
+ * （fetch + bump → `watch(dataVersion)` 自动刷新本页，恰好 1 次清单 GET）。
+ */
+async function runBatchAck(): Promise<void> {
+  if (batchRunning.value || batchTargets.value.length === 0) {
+    return;
+  }
+  batchRunning.value = true;
+  batchMessage.value = '';
+  batchFailures.value = [];
+  const failures: { id: string; reason: string }[] = [];
+  let okCount = 0;
+  for (const alarm of batchTargets.value) {
+    const result = await repo.resolveAlarm(
+      {
+        id: alarm.id,
+        state: 'acking',
+        note: '批量确认（告警中心）',
+        reason: '批量确认（告警中心）',
+        confirm: alarm.id,
+        actor: session.state.displayName,
+      },
+      { refetch: false },
+    );
+    if (result.ok) {
+      okCount += 1;
+    } else {
+      failures.push({ id: alarm.id, reason: result.message });
+    }
+  }
+  batchRunning.value = false;
+  await refreshAlerts();
+  if (failures.length === 0) {
+    batchOpen.value = false;
+    selectedIds.value = [];
+    return;
+  }
+  batchFailures.value = failures;
+  batchMessage.value = `下发完成：成功 ${okCount} 条，失败 ${failures.length} 条（真实原因见明细）。`;
+}
+
+/** 单条确认失败的真实原因（空 = 无）。 */
+const ackNotice = ref<string>('');
+
+/** 单条确认（四要素下发；失败在列表卡头展示真实原因）。 */
+async function confirmAlarm(id: string): Promise<void> {
+  ackNotice.value = '';
+  const result = await repo.resolveAlarm({
+    id,
+    state: 'acking',
+    note: '确认告警（告警中心）',
+    reason: '确认告警（告警中心）',
+    confirm: id,
+    actor: session.state.displayName,
+  });
+  if (!result.ok) {
+    ackNotice.value = `确认告警 ${id} 失败：${result.message}`;
+    return;
+  }
+  // 成功刷新交给 repo 默认 refetch + bumpCacheVersion → watch(dataVersion) 自动重取，
+  // 页面不再显式重复 GET。
 }
 
 // ---------------------------------------------------------------------------
@@ -760,10 +861,14 @@ const ackNote = ref<string>('');
 /** 当前详情记录（按 id 取快照）。 */
 const detail = computed<AlarmRecord | null>(() => (detailId.value ? (alarms.value.find((a) => a.id === detailId.value) ?? null) : null));
 
+/** 详情处置失败的真实原因（空 = 无）。 */
+const detailAckError = ref<string>('');
+
 /** 打开详情（重置处置草稿）。 */
 function openDetail(id: string): void {
   detailId.value = id;
   ackNote.value = '';
+  detailAckError.value = '';
   detailOpen.value = true;
 }
 
@@ -772,23 +877,37 @@ function closeDetail(): void {
   detailOpen.value = false;
   detailId.value = '';
   ackNote.value = '';
+  detailAckError.value = '';
 }
 
-/** 从详情处置。 */
-function ackFromDetail(): void {
+/** 从详情处置（四要素下发；confirm = 告警 id 原文；失败就地展示真实原因，不关抽屉）。 */
+async function ackFromDetail(): Promise<void> {
   if (!detailId.value || ackNote.value.trim().length === 0) {
     return;
   }
-  repo.resolveAlarm({ id: detailId.value, state: 'acking', note: ackNote.value.trim(), actor: session.state.displayName });
-  alarms.value = repo.allAlarms();
+  detailAckError.value = '';
+  const result = await repo.resolveAlarm({
+    id: detailId.value,
+    state: 'acking',
+    note: ackNote.value.trim(),
+    reason: '详情处置（告警中心）',
+    confirm: detailId.value,
+    actor: session.state.displayName,
+  });
+  if (!result.ok) {
+    detailAckError.value = `处置失败：${result.message}`;
+    return;
+  }
   closeDetail();
+  // 成功刷新交给 repo 默认 refetch + bumpCacheVersion → watch(dataVersion) 自动重取，
+  // 页面不再显式重复 GET。
 }
 
 // ---------------------------------------------------------------------------
-// 规则配置（阈值 / 持续时间 / 抑制）
+// 规则（阈值 / 持续时间 / 抑制）—— 按钮 + 弹窗
 // ---------------------------------------------------------------------------
 
-/** 已保存规则（页面本地）。 */
+/** 告警规则（来自后端 `GET /api/alerts/rules`）。 */
 interface AlarmRule {
   /** 主键 */
   readonly id: string;
@@ -801,13 +920,19 @@ interface AlarmRule {
   /** 抑制窗口（分钟） */
   readonly suppressMin: number;
   /** 触发次数 */
-  hitCount: number;
+  readonly hitCount: number;
   /** 是否启用 */
   enabled: boolean;
 }
 
-/** 规则表（初始为空 —— 由用户在页面上创建，或载入推荐模板）。 */
+/** 规则表。 */
 const rules = ref<AlarmRule[]>([]);
+
+/** 规则弹窗开关。 */
+const rulesOpen = ref<boolean>(false);
+
+/** 规则清单来源说明（读取接口不可得时的真实原因）。 */
+const rulesNotice = ref('');
 
 /** 规则草稿（页面本地，保存时才提交）。 */
 const ruleDraft = reactive({
@@ -822,6 +947,9 @@ const targetOptions = computed<readonly SelectOption[]>(() => [
   { value: '', label: '全部设备' },
   ...repo.allDevices().map((d) => ({ value: d.id, label: d.name })),
 ]);
+
+/** 规则草稿是否已被用户编辑（编辑前不展示必填错误，避免一打开就报红）。 */
+const ruleTouched = ref(false);
 
 /** 规则草稿校验错误（非空则禁止保存）。 */
 const ruleError = computed<string>(() => {
@@ -843,117 +971,124 @@ const ruleError = computed<string>(() => {
   return '';
 });
 
+/** 用户一旦编辑草稿即进入「已触碰」态（此后才展示必填 / 格式错误）。 */
+watch(ruleDraft, () => {
+  ruleTouched.value = true;
+});
+
 /** 重置规则草稿。 */
 function resetRuleDraft(): void {
   ruleDraft.threshold = '';
   ruleDraft.durationSec = '';
   ruleDraft.suppressMin = '';
   ruleDraft.target = '';
+  ruleTouched.value = false;
 }
 
-/** 规则保存结果提示（real 模式的 501 / 403 等结构化结果写在这里）。 */
+/** 规则操作结果提示（后端 501 / 403 等结构化结果原样写在这里）。 */
 const ruleMessage = ref('');
 
-/** 告警规则写失败的「原因 + 恢复路径」（后端 `PUT /api/alerts/rules` 当前返回 501）。 */
-function ruleWriteFailureText(cause: unknown): string {
-  const code = cause instanceof ApiError ? cause.status : 0;
-  if (code === 501) {
-    return (
-      '规则未保存：后端告警引擎未落地（HTTP 501 not_implemented），无规则可写。' +
-      '恢复路径：告警引擎落地后本表单即可直接保存；在此之前告警只来自驱动层通讯异常。'
-    );
-  }
-  if (code === 403) {
-    return '规则未保存：当前账号无 device.write 权限（HTTP 403）。恢复路径：改用具备该权限的账号登录。';
-  }
-  if (code === 0) {
-    return '规则未保存：网关不可达（网络层失败）。恢复路径：确认网关进程在监听 8080 端口后重试。';
-  }
-  return `规则未保存：HTTP ${code}。恢复路径：查看网关日志定位后重试。`;
+/** `/api/alerts/rules` 条目 → 规则（宽容映射，后端契约落地后自动生效）。 */
+function mapRuleRow(raw: Record<string, unknown>, idx: number): AlarmRule {
+  const condition = pickText(raw, 'condition', pickText(raw, 'threshold', '—'));
+  return {
+    id: pickText(raw, 'id', `rule-${idx}`),
+    name: pickText(raw, 'name', condition),
+    condition,
+    durationSec: Number(pickText(raw, 'duration_sec', pickText(raw, 'durationSec', '0'))) || 0,
+    suppressMin: Number(pickText(raw, 'suppress_min', pickText(raw, 'suppressMin', '0'))) || 0,
+    hitCount: Number(pickText(raw, 'hit_count', pickText(raw, 'hitCount', '0'))) || 0,
+    enabled: raw['enabled'] !== false,
+  };
 }
 
 /**
- * 保存规则（危险操作之外的一般写操作；仍需审计）。
+ * 加载告警规则清单（惰性 —— 仅在打开规则弹窗时触发，避免无谓请求）。
  *
- * real：`PUT /api/alerts/rules` —— 后端当前返回 501，页面**原样呈现原因与恢复路径**，
- * 绝不把 501 吞成「已保存」；
- * mock：保持原本地演示行为。
+ * 后端当前未提供规则读接口 → 原样呈现失败原因，**绝不伪造规则**。
+ */
+async function loadRules(): Promise<void> {
+  try {
+    const raw = await apiRequest<Record<string, unknown>>('/api/alerts/rules');
+    const items = Array.isArray(raw['items']) ? raw['items'] : Array.isArray(raw['rules']) ? raw['rules'] : [];
+    rules.value = items
+      .map((row, i) => (row !== null && typeof row === 'object' && !Array.isArray(row) ? mapRuleRow(row as Record<string, unknown>, i) : null))
+      .filter((r): r is AlarmRule => r !== null);
+    rulesNotice.value = raw['source'] === 'unsupported' ? pickText(raw, 'reason', '后端告警规则引擎未落地，无规则清单') : '';
+  } catch (cause) {
+    rules.value = [];
+    const code = cause instanceof ApiError ? cause.status : 0;
+    rulesNotice.value = code === 0 ? '告警规则清单读取失败：网关不可达。' : `告警规则清单读取失败：HTTP ${code}（后端未提供告警规则读接口）。`;
+  }
+}
+
+/** 打开规则弹窗（顺带拉取规则清单）。 */
+function openRules(): void {
+  rulesOpen.value = true;
+  void loadRules();
+}
+
+/** 关闭规则弹窗（清提示，不清规则清单）。 */
+function closeRules(): void {
+  rulesOpen.value = false;
+  ruleMessage.value = '';
+}
+
+/** 告警规则写失败的「真实原因」。 */
+function ruleWriteFailureText(cause: unknown): string {
+  const code = cause instanceof ApiError ? cause.status : 0;
+  if (code === 501) {
+    return '规则未保存：后端告警引擎未落地（HTTP 501 not_implemented）。';
+  }
+  if (code === 403) {
+    return '规则未保存：当前账号无 device.write 权限（HTTP 403）。';
+  }
+  if (code === 0) {
+    return '规则未保存：网关不可达（网络层失败）。';
+  }
+  return `规则未保存：HTTP ${code}。`;
+}
+
+/**
+ * 保存规则。
+ *
+ * `PUT /api/alerts/rules` —— 后端当前返回 501，页面**原样呈现真实原因**，
+ * 绝不把 501 吞成「已保存」。
  */
 async function saveRule(): Promise<void> {
-  if (ruleError.value.length > 0) {
+  if (ruleError.value.length > 0 || !canEditRules.value) {
     return;
   }
-  const target = ruleDraft.target ? repo.getDevice(ruleDraft.target)?.name ?? '指定设备' : '全部设备';
-  if (IS_REAL) {
-    ruleMessage.value = '';
-    try {
-      await apiRequest<unknown>('/api/alerts/rules', {
-        method: 'PUT',
-        body: JSON.stringify({
-          threshold: ruleDraft.threshold.trim(),
-          duration_sec: ruleDraft.durationSec,
-          suppress_min: ruleDraft.suppressMin,
-          target: ruleDraft.target,
-        }),
-      });
-      ruleMessage.value = `规则「${target} · ${ruleDraft.threshold.trim()}」已保存。`;
-      resetRuleDraft();
-    } catch (cause) {
-      ruleMessage.value = ruleWriteFailureText(cause);
-    }
-    return;
+  const targetName = ruleDraft.target ? repo.getDevice(ruleDraft.target)?.name ?? '指定设备' : '全部设备';
+  const condition = ruleDraft.threshold.trim();
+  ruleMessage.value = '';
+  try {
+    await apiRequest<unknown>('/api/alerts/rules', {
+      method: 'PUT',
+      body: JSON.stringify({
+        rules: [
+          {
+            name: `${targetName} · ${condition}`,
+            condition,
+            duration_sec: Number(ruleDraft.durationSec),
+            suppress_min: Number(ruleDraft.suppressMin),
+            target: ruleDraft.target,
+          },
+        ],
+      }),
+    });
+    ruleMessage.value = `规则「${targetName} · ${condition}」已保存。`;
+    resetRuleDraft();
+    await loadRules();
+  } catch (cause) {
+    ruleMessage.value = ruleWriteFailureText(cause);
   }
-  rules.value = [
-    ...rules.value,
-    {
-      id: `rule-${Date.now()}`,
-      name: `${target} · ${ruleDraft.threshold.trim()}`,
-      condition: ruleDraft.threshold.trim(),
-      durationSec: Number(ruleDraft.durationSec),
-      suppressMin: Number(ruleDraft.suppressMin),
-      hitCount: 0,
-      enabled: true,
-    },
-  ];
-  resetRuleDraft();
 }
 
-/** 载入推荐模板（空态动作）。 */
-function applyPreset(): void {
-  rules.value = [
-    {
-      id: `rule-${Date.now()}-1`,
-      name: '全部设备 · 点位质量 Bad 连续出现',
-      condition: 'quality = Bad',
-      durationSec: 10,
-      suppressMin: 5,
-      hitCount: 0,
-      enabled: true,
-    },
-    {
-      id: `rule-${Date.now()}-2`,
-      name: '全部设备 · 北向出口不可达',
-      condition: 'forwarder.status != connected',
-      durationSec: 30,
-      suppressMin: 10,
-      hitCount: 0,
-      enabled: true,
-    },
-  ];
+/** 启用 / 停用规则（后端无写接口 → 原样呈现真实原因，不改本地状态）。 */
+function toggleRule(): void {
+  ruleMessage.value = '规则启停未生效：后端未提供规则状态写接口（告警引擎未落地）。';
 }
-
-/** 启用 / 停用规则。 */
-function toggleRule(id: string): void {
-  rules.value = rules.value.map((r) => (r.id === id ? { ...r, enabled: !r.enabled } : r));
-}
-
-/** 滚动到规则区（空态动作）。 */
-function scrollToRules(): void {
-  rulesRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-/** 规则区 DOM 引用。 */
-const rulesRef = ref<HTMLElement | null>(null);
 
 // ---------------------------------------------------------------------------
 // 删除规则（★ 危险操作：二次确认 + 原因必填 + 对象名二次校验）
@@ -989,13 +1124,12 @@ function closeDelete(): void {
   deleteTargetId.value = '';
 }
 
-/** 提交删除（四要素已由 DangerConfirmModal 校验通过）。 */
-function submitDelete(payload: { reason: string; note: string }): void {
+/** 提交删除（四要素已由 DangerConfirmModal 校验通过；后端无删除接口 → 诚实告知未生效）。 */
+function submitDelete(): void {
   if (!deleteTargetId.value) {
     return;
   }
-  rules.value = rules.value.filter((r) => r.id !== deleteTargetId.value);
-  window.alert(`已删除告警规则。原因：${payload.reason}；说明：${payload.note}`);
+  ruleMessage.value = `删除规则「${deleteTarget.value?.name ?? ''}」未生效：后端未提供删除告警规则接口（告警引擎未落地）。`;
   closeDelete();
 }
 
@@ -1063,18 +1197,17 @@ function go(name: string): void {
 </script>
 
 <style scoped>
-/* 可解释空态：后端无告警引擎时的「原因 + 恢复路径」块（与 LicensePage 同契约） */
-.al-unsupported {
-  align-items: flex-start;
-  margin: 0 0 12px;
-}
-.wc-banner__stack {
+/* 真实原因 / 结果提示（紧凑单行，非解释性文案块） */
+.al-notice {
+  margin: 0;
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--fs-caption);
+  color: var(--text-2);
 }
-.wc-banner__line {
-  line-height: 1.6;
+.al-notice__text {
+  min-width: 0;
 }
 .al-src {
   margin-left: 6px;
@@ -1097,34 +1230,74 @@ function go(name: string): void {
   gap: 6px;
   justify-content: flex-end;
 }
-.al-rule-actions {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-}
 .al-error {
   margin: 0;
   font-size: var(--fs-caption);
   color: var(--danger);
 }
-.al-hint-block {
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-app);
-}
 .wc-table .is-right {
   text-align: right;
 }
+
+/* ---------- 规则弹窗（自持遮罩 + 面板，与 DangerConfirmModal 同一视觉语言） ---------- */
+.al-modal__mask {
+  position: fixed;
+  inset: 0;
+  background: var(--mask);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2010;
+  padding: 24px;
+}
+.al-modal {
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  width: 720px;
+  max-width: 100%;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+.al-modal__head {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--divider);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.al-modal__head h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+.al-modal__body {
+  padding: 20px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.al-modal__foot {
+  padding: 14px 20px;
+  border-top: 1px solid var(--divider);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ---------- 告警详情抽屉 ---------- */
 .al-mask {
   position: fixed;
   inset: 0;
-  background: rgba(29, 33, 41, 0.45);
+  background: var(--mask);
   display: flex;
   justify-content: flex-end;
   z-index: 2000;
 }
 .al-drawer {
-  background: #fff;
+  background: var(--bg-card);
   width: 560px;
   max-width: 100%;
   height: 100%;

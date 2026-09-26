@@ -1,35 +1,30 @@
-<!--
-  =============================================================================
-  DiagnosePage —— 诊断与自检（设计 §3.7 / 原型 gateway-v2a-glacier「diagnose」）
-  =============================================================================
-  18 项自检覆盖采集、缓存、分发、授权与磁盘，可一键重新自检与导出诊断包。
-  诊断包内容与不包含项必须显式声明（不含私钥 / 激活码原文 / 业务数据值）。
--->
 <template>
-  <PageHeader
-    crumb="运维 / 诊断与自检"
-    title="诊断与自检"
-    desc="18 项自检覆盖配置、存储、采集、分发、授权与磁盘，可一键重新自检并导出诊断包。"
-  >
-    <template #actions>
-      <span style="display: inline-flex; gap: 8px">
-        <button type="button" class="wc-btn wc-btn--primary" data-testid="diagnose-rerun" @click="rerun">
-          重新自检
-        </button>
-        <button type="button" class="wc-btn" data-testid="diagnose-export" @click="exportPack">导出诊断包</button>
-      </span>
-    </template>
-  </PageHeader>
+  <!--
+    DiagnosePage —— 诊断与自检（运维分组，路由 `/diagnose`）。
 
+    真实能力边界（不许造数）：
+      · 后端仅提供 `GET /api/health`（网关健康检查），**没有自检清单 / 诊断包端点**；
+      · 因此本页只跑这一项真实检查，结果如实上屏；缺失的能力诚实留空（`—`）并给一句原因。
+  -->
   <div class="wc-content">
+    <!-- 工具条：自检数据源 + 重新自检 / 导出诊断包 -->
+    <div class="pg-toolbar">
+      <span class="wc-tag wc-tag--ok">实时数据</span>
+      <span class="wc-spacer" />
+      <button type="button" class="wc-btn wc-btn--primary wc-btn--sm" data-testid="diagnose-rerun" @click="rerun">
+        重新自检
+      </button>
+      <button type="button" class="wc-btn wc-btn--sm" data-testid="diagnose-export" @click="exportPack">导出诊断包</button>
+    </div>
+
     <p v-if="lastRunText" class="wc-hint" data-testid="diagnose-lastrun">{{ lastRunText }}</p>
 
-    <!-- ══ KPI ═════════════════════════════════════════════════════════ -->
+    <!-- KPI：仅「网关健康检查」为真实项，其余显式留空 -->
     <div class="wc-grid wc-grid--4">
       <div class="wc-kpi">
         <span class="wc-kpi__label">自检项</span>
-        <span class="wc-kpi__value">18</span>
-        <span class="wc-kpi__sub">全量覆盖</span>
+        <span class="wc-kpi__value">{{ checks.length }}</span>
+        <span class="wc-kpi__sub">仅网关健康检查</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">通过</span>
@@ -39,26 +34,40 @@
       <div class="wc-kpi">
         <span class="wc-kpi__label">警告</span>
         <span class="wc-kpi__value" data-testid="kpi-warn">{{ warnCount }}</span>
-        <span class="wc-kpi__sub wc-kpi__sub--warn">磁盘占用 18%</span>
+        <span class="wc-kpi__sub">—</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">错误</span>
-        <span class="wc-kpi__value" data-testid="kpi-error">0</span>
-        <span class="wc-kpi__sub">无阻断项</span>
+        <span class="wc-kpi__value" data-testid="kpi-error">{{ errorCount }}</span>
+        <span class="wc-kpi__sub">—</span>
       </div>
     </div>
 
-    <!-- ══ 自检结果 ════════════════════════════════════════════════════ -->
+    <!-- 自检结果 -->
     <section class="wc-card">
       <div class="wc-card__head">
         <h3>自检结果</h3>
-        <span class="wc-card__sub">分类：配置 / 存储 / 采集 / 分发 / 授权 / 安全</span>
+        <span class="wc-card__sub">GET /api/health</span>
       </div>
+
+      <EmptyState
+        v-if="checks.length === 0"
+        title="尚未自检"
+        desc="点「重新自检」执行网关健康检查。"
+      >
+        <template #actions>
+          <button type="button" class="wc-btn wc-btn--primary" data-testid="diagnose-rerun-empty" @click="rerun">
+            重新自检
+          </button>
+        </template>
+      </EmptyState>
+
       <UiTable
+        v-else
         :columns="columns"
-        :rows="checks"
+        :rows="pagedChecks"
         row-key-field="name"
-        footer="另有 8 项常规检查全部通过"
+        footer="后端未提供自检清单接口：除网关健康检查外的检查项无法上报，不做显示。"
       >
         <template #cell-category="{ row }">
           <span class="wc-tag wc-tag--unknown">{{ row.category }}</span>
@@ -70,55 +79,37 @@
           <span class="wc-mono">{{ row.detail }}</span>
         </template>
       </UiTable>
+
+      <UiPager
+        v-if="checks.length > CHECK_PAGE_SIZE"
+        :page="checkPage"
+        :total="checks.length"
+        :page-size="CHECK_PAGE_SIZE"
+        @update:page="onCheckPage"
+      />
     </section>
 
-    <!-- ══ 诊断包内容 + 常见故障指引 ═══════════════════════════════════ -->
-    <div class="wc-grid wc-grid--2">
-      <section class="wc-card">
-        <div class="wc-card__head">
-          <h3>诊断包内容</h3>
-        </div>
-        <div class="wc-card__body">
-          <dl class="wc-kv">
-            <dt>配置快照</dt>
-            <dd class="wc-mono">已脱敏（去掉密钥与口令）</dd>
-            <dt>队列与数据库状态</dt>
-            <dd class="wc-mono">仅表结构与计数</dd>
-            <dt>近 1 小时日志</dt>
-            <dd class="wc-mono">tracing 结构化日志</dd>
-            <dt>驱动统计</dt>
-            <dd class="wc-mono">重连次数 / 耗时分布</dd>
-            <dt>授权状态</dt>
-            <dd class="wc-mono">机器码哈希 + 租约状态</dd>
-          </dl>
-          <div class="wc-banner wc-banner--warn">
-            <span class="wc-banner__icon">!</span>
-            <span>
-              诊断包<b>不包含</b>私钥、激活码原文、业务数据值与完整机器码，仅含哈希与状态。
-            </span>
-          </div>
-        </div>
-      </section>
-
-      <section class="wc-card">
-        <div class="wc-card__head">
-          <h3>常见故障指引</h3>
-        </div>
-        <div class="wc-card__body">
-          <div class="wc-list">
-            <div v-for="tip in tips" :key="tip.title" class="wc-list__item">
-              <div>
-                <div class="wc-list__title">{{ tip.title }}</div>
-                <div class="wc-list__desc">{{ tip.desc }}</div>
-              </div>
-              <div class="wc-list__ops">
-                <span class="wc-tag" :class="`wc-tag--${tip.tone}`">指引</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-    </div>
+    <!-- 诊断包内容（只读说明；无导出端点） -->
+    <section class="wc-card">
+      <div class="wc-card__head">
+        <h3>诊断包内容</h3>
+        <span class="wc-tag wc-tag--warn">不含私钥 / 激活码原文 / 业务数据值</span>
+      </div>
+      <div class="wc-card__body">
+        <dl class="wc-kv">
+          <dt>配置快照</dt>
+          <dd class="wc-mono">已脱敏（去掉密钥与口令）</dd>
+          <dt>队列与数据库状态</dt>
+          <dd class="wc-mono">仅表结构与计数</dd>
+          <dt>近 1 小时日志</dt>
+          <dd class="wc-mono">tracing 结构化日志</dd>
+          <dt>驱动统计</dt>
+          <dd class="wc-mono">重连次数 / 耗时分布</dd>
+          <dt>授权状态</dt>
+          <dd class="wc-mono">机器码哈希 + 租约状态</dd>
+        </dl>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -126,10 +117,11 @@
 /**
  * @file DiagnosePage.vue
  * @module web-console/pages/DiagnosePage
- * @description 诊断与自检页（自检结果表 + 诊断包说明 + 故障指引）。
+ * @description 诊断与自检：仅驱动真实 `GET /api/health`，其余能力诚实留空。
  */
-import { computed, ref } from 'vue';
-import { PageHeader, UiTable, StatusTag, type TableColumn } from '@ui-kit';
+import { computed, onMounted, ref } from 'vue';
+import { EmptyState, StatusTag, UiTable, UiPager, type TableColumn } from '@ui-kit';
+import { repo } from '@/api/repo';
 
 /** 自检项。 */
 interface CheckItem {
@@ -137,25 +129,32 @@ interface CheckItem {
   name: string;
   /** 分类 */
   category: string;
-  /** 结果（pass / warn） */
+  /** 结果（pass / warn / error） */
   result: string;
-  /** 详情 */
+  /** 详情（后端原文） */
   detail: string;
 }
 
-/** 自检项清单（照搬原型）。 */
-const checks = ref<CheckItem[]>([
-  { name: '配置可加载', category: '配置', result: 'pass', detail: 'config.toml 语法有效，版本 v7' },
-  { name: 'SQLite 完整性', category: '存储', result: 'pass', detail: 'queue.db / telemetry.db integrity_check ok' },
-  { name: 'SQLCipher 密钥', category: '存储', result: 'pass', detail: 'HKDF(机器码) 派生成功' },
-  { name: '数据目录空间', category: '存储', result: 'warn', detail: '1.8 GB / 10 GB（18%）' },
-  { name: '南向驱动连通', category: '采集', result: 'pass', detail: '12/12 设备可达' },
-  { name: '北向出口连通', category: '分发', result: 'pass', detail: '3/3 出口已连接' },
-  { name: '离线队列积压', category: '分发', result: 'pass', detail: '1,204 条，补发中' },
-  { name: '租约有效性', category: '授权', result: 'pass', detail: '剩余 6d 23h' },
-  { name: '机器码锚点一致', category: '授权', result: 'pass', detail: '4/4 锚点匹配' },
-  { name: '安装包完整性', category: '安全', result: 'pass', detail: '资源清单哈希匹配' },
-]);
+/** 自检结果（来自真实健康检查；未执行时为空）。 */
+const checks = ref<CheckItem[]>([]);
+
+/**
+ * 自检结果分页（切片留在页面级 computed；UiTable 纯展示，不在组件内做局部 slice）。
+ * 当前仅网关健康检查一项，机制仍按真实分页接好——若后端未来补全多检查项，换页即生效。
+ */
+const CHECK_PAGE_SIZE = 5;
+const checkPage = ref(1);
+
+/** 当前页自检项（由 `checkPage` 驱动的真实切片）。 */
+const pagedChecks = computed<CheckItem[]>(() => {
+  const start = (checkPage.value - 1) * CHECK_PAGE_SIZE;
+  return checks.value.slice(start, start + CHECK_PAGE_SIZE);
+});
+
+/** 换页（由 UiPager 驱动）。 */
+function onCheckPage(next: number): void {
+  checkPage.value = next;
+}
 
 /** 通过数。 */
 const passedCount = computed<number>(() => checks.value.filter((c) => c.result === 'pass').length);
@@ -163,11 +162,16 @@ const passedCount = computed<number>(() => checks.value.filter((c) => c.result =
 /** 警告数。 */
 const warnCount = computed<number>(() => checks.value.filter((c) => c.result === 'warn').length);
 
+/** 错误数。 */
+const errorCount = computed<number>(() => checks.value.filter((c) => c.result === 'error').length);
+
 /** 通过率文本。 */
 const passRateText = computed<string>(() => {
   const total = checks.value.length;
-  const rate = total === 0 ? 0 : (passedCount.value / total) * 100;
-  return `${rate.toFixed(1)}%`;
+  if (total === 0) {
+    return '—';
+  }
+  return `${((passedCount.value / total) * 100).toFixed(1)}%`;
 });
 
 /** 结果文案。 */
@@ -183,15 +187,26 @@ const columns: readonly TableColumn[] = [
   { key: 'detail', label: '详情', mono: true },
 ];
 
-/** 重新自检。 */
+/** 最近一次自检结果文案。 */
 const lastRunText = ref('');
-function rerun(): void {
-  lastRunText.value = `自检完成（${nowText()}）：18 项中 17 项通过、1 项警告（磁盘占用 18%）、0 项错误。`;
+
+/** 重新自检：真实调用 `GET /api/health`。 */
+async function rerun(): Promise<void> {
+  const result = await repo.ops.health();
+  checks.value = [
+    {
+      name: '网关健康检查',
+      category: '网关',
+      result: result.ok ? 'pass' : 'error',
+      detail: result.message,
+    },
+  ];
+  lastRunText.value = `自检完成（${nowText()}）：网关健康检查${result.ok ? '通过' : '未通过'}。`;
 }
 
-/** 导出诊断包。 */
+/** 导出诊断包：后端无对应端点，如实告知。 */
 function exportPack(): void {
-  lastRunText.value = `诊断包已生成（${nowText()}）：config-snapshot(已脱敏) + queue-state + logs-1h + driver-stats + license-state，共 2.4 MB。`;
+  lastRunText.value = `导出未执行（${nowText()}）：网关未提供诊断包导出接口。`;
 }
 
 /** 时间短文本。 */
@@ -201,18 +216,17 @@ function nowText(): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** 常见故障指引。 */
-const tips = [
-  { title: '设备连不上', desc: '先查串口权限与网段可达性，再看重连次数', tone: 'warn' },
-  { title: '队列持续增长', desc: '北向出口不可达或 Broker 限流，检查出口连通性', tone: 'warn' },
-  { title: '北向转发忽然停止', desc: '多为授权降级（宽限期超 7 天），查授权与激活页', tone: 'danger' },
-  { title: '配置写错起不来', desc: '自动进入安全模式并回退上次有效配置', tone: 'info' },
-];
+onMounted(() => {
+  void rerun();
+});
 </script>
 
 <style scoped>
-.wc-banner__icon {
-  flex: 0 0 auto;
-  font-weight: 700;
+.pg-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
 }
 </style>

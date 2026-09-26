@@ -3,35 +3,21 @@
     MonitorPage —— 实时监控（监控分组第 2 页，路由 `/monitor`）。
 
     结构对齐原型 `monitor`（:1435 起）与设计 §3.5：
-      ① KPI 卡片行（本周期采样 / 数据质量 / 最慢驱动 / 离线队列）
-      ② 实时点位值表格（1s 合并刷新，含 sparkline 波动可视化）
-      ③ 2 列栅格：设备连接状态 + 质量码汇总（SVG 柱状）
+      ① 顶部状态条（设备/质量筛选 + 仅显示异常 + 暂停 / 立即刷新 / 最后更新）
+      ② KPI 卡片行（本周期采样 / 数据质量 / 最慢驱动 / 离线队列）
+      ③ 实时点位值表格（1s 合并刷新，含 sparkline 波动可视化）
+      ④ 2 列栅格：设备连接状态 + 质量码汇总（SVG 柱状）
 
     硬性约定遵守情况：
       · **1s 节流渲染**：`setInterval(tick, 1000)`，上游再怎么高频每秒只写一次响应式状态；
       · 暂停 / 继续刷新；显示「最后更新 HH:mm:ss」；
       · 陈旧数据（`stale`）整行转灰；质量非 Good 的行左侧带 `--warn` 竖条；
       · 列表分页，条数只有 UiPager 一个口径；
-      · 空态给下一步动作（EmptyState）；
+      · 空态给下一步动作（EmptyState 一句话说明 + 动作按钮）；
+      · 数值只来自 `GET /api/stream`（SSE）与 `GET /api/points`，
+        **绝不预填随机历史 / 随机曲线**：无流数据时曲线为平线、数值为 `——`；
       · sparkline 为纯内联 SVG，未引入图表库；无 emoji。
   -->
-  <PageHeader
-    crumb="运行监控 / 实时监控"
-    title="实时监控"
-    desc="实时数值按 1s 节流渲染；质量码与采集耗时逐点可见。超过 1s 未更新的行整行转灰，质量异常行左侧带竖条。"
-  >
-    <template #actions>
-      <span
-        class="wc-tag"
-        :class="IS_REAL ? 'wc-tag--ok' : 'wc-tag--info'"
-        :title="IS_REAL ? '已接入网关真实接口：GET /api/stream（SSE 实时遥测）' : '当前为内嵌演示数据源，未接入真实后端'"
-      >
-        {{ IS_REAL ? '实时数据' : '演示数据' }}
-      </span>
-      <button type="button" class="wc-btn" @click="handleManualRefresh">立即刷新</button>
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
     <!-- 顶部状态条：暂停 / 最后更新 / 连接态 -->
     <div class="wc-card">
@@ -53,7 +39,8 @@
           </div>
 
           <div class="mn-bar__live">
-            <button type="button" class="wc-btn" :class="{ 'wc-btn--primary': paused }" @click="togglePause">
+            <button type="button" class="wc-btn" data-testid="monitor-refresh" @click="handleManualRefresh">立即刷新</button>
+            <button type="button" class="wc-btn" :class="{ 'wc-btn--primary': paused }" data-testid="monitor-pause" @click="togglePause">
               {{ paused ? '继续刷新' : '暂停刷新' }}
             </button>
             <span class="wc-conn" :class="paused ? 'wc-conn--degraded' : `wc-conn--${session.state.connection}`">
@@ -62,25 +49,19 @@
             </span>
             <span class="mn-bar__ts">
               最后更新 <span class="wc-mono" data-test="last-update">{{ lastTickText }}</span>
-              <span class="mn-bar__tick">· 已刷新 {{ tickCount }} 次 · 节流 1000 ms</span>
             </span>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- KPI 卡片行：数值来自 1s 节流快照 -->
+    <!-- KPI 卡片行：数值来自 1s 节流快照（= SSE 实际到达的点位；后端未提供的指标显示 —） -->
     <div class="wc-grid wc-grid--4">
       <StatCard label="本周期采样" :value="formatInt(live.sampledPoints)" unit="点" sub="合并刷新" />
-      <StatCard label="数据质量" :value="live.goodPct.toFixed(1)" unit="% 良好" :delta="0.4" tone="ok" />
-      <StatCard
-        label="最慢驱动"
-        :value="String(live.slowestMs)"
-        unit="ms"
-        :sub="live.slowestDevice"
-        :tone="live.slowestMs > 100 ? 'warn' : 'default'"
-      />
-      <StatCard label="离线队列" :value="(live.queueDepth / 1000).toFixed(1)" unit="k 条" :delta="-320" sub="补发中" />
+      <StatCard label="数据质量" :value="live.goodPct.toFixed(1)" unit="% 良好" tone="ok" />
+      <!-- SSE 帧不含「最慢驱动耗时 / 离线队列深度」→ 显示 —，不把「未知」伪装成 0 -->
+      <StatCard label="最慢驱动" value="—" sub="后端未提供" />
+      <StatCard label="离线队列" value="—" sub="后端未提供" />
     </div>
 
     <!-- 实时点位值 -->
@@ -96,7 +77,7 @@
       <EmptyState
         v-if="filteredPoints.length === 0"
         title="没有符合条件的点位"
-        desc="可能是筛选条件过窄（当前筛选：设备 / 质量 / 仅显示异常）。你可以清空筛选查看全部，或前往点位与映射新增点位。"
+        desc="放宽设备 / 质量筛选，或前往点位与映射新增点位。"
       >
         <template #actions>
           <button type="button" class="wc-btn" @click="resetFilters">清空筛选</button>
@@ -214,20 +195,25 @@
           >
             <g v-for="(bar, i) in qualityBars" :key="bar.key">
               <rect
-                :x="8 + i * 22"
-                :y="52 - bar.height"
-                :width="16"
+                :x="barSlot * i + BAR_GAP / 2"
+                :y="BAR_BASE_Y - bar.height"
+                :width="barW"
                 :height="bar.height"
                 :style="{ fill: bar.color }"
                 rx="1.5"
               />
-              <text class="mn-bars__label" :x="16 + i * 22" :y="58" text-anchor="middle">
-                {{ bar.key }}
+              <text
+                class="mn-bars__label"
+                :x="barSlot * i + barSlot / 2"
+                :y="58"
+                text-anchor="middle"
+              >
+                {{ qualityLabelOf(bar.key) }}
               </text>
               <text
                 class="mn-bars__value"
-                :x="16 + i * 22"
-                :y="48 - bar.height"
+                :x="barSlot * i + barSlot / 2"
+                :y="BAR_BASE_Y - BAR_VALUE_LIFT - bar.height"
                 text-anchor="middle"
                 font-weight="600"
               >
@@ -235,24 +221,9 @@
               </text>
             </g>
           </svg>
-          <p class="wc-note">
-            <span class="wc-note__icon">ⓘ</span>
-            <span>
-              统一质量码由各驱动状态映射而来（OPC UA StatusCode / Modbus 异常码 / 超时）。
-              <b>「模拟」是独立取值</b>，不与「良好」混同；前端不自造质量枚举。
-            </span>
-          </p>
         </div>
       </section>
     </div>
-
-    <p class="wc-note">
-      <span class="wc-note__icon">ⓘ</span>
-      <span>
-        数值每 <b>1000 ms</b> 合并刷新一次（节流），即使上游以 100 ms 推送也不会增加渲染频率。
-        可用「暂停刷新」冻结数值以便读数；恢复后立即追上最新一拍。
-      </span>
-    </p>
   </div>
 </template>
 
@@ -260,19 +231,19 @@
 /**
  * @file MonitorPage.vue
  * @module web-console/pages/MonitorPage
- * @description 实时监控页。1s 节流 + mock 推流 / real 模式消费 `/api/stream` SSE + sparkline 波动可视化。
+ * @description 实时监控页。1s 节流 + 消费 `/api/stream` SSE + sparkline 波动可视化。
  *
  * ── 节流契约（本页最关键的硬约束）────────────────────────────────────────────
- * `setInterval(tick, 1000)` 就是节流点：上游推送频率无关紧要（real 模式下 SSE 帧
+ * `setInterval(tick, 1000)` 就是节流点：上游推送频率无关紧要（SSE 帧
  * 只落 `pointSnapshots` 缓存、不触发渲染），`live` 快照与 `series` 历史每秒
  * **至多**被写一次，Vue 因此每秒至多重渲染一次。
  * 「暂停」只清除定时器，不改变任何已渲染数据（冻结语义）。
+ * 数据全部来自真实接口（`/api/stream` SSE + `/api/points`），无任何演示数据。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   EmptyState,
-  PageHeader,
   StatCard,
   StatusTag,
   UiPager,
@@ -283,7 +254,6 @@ import {
   type TableColumn,
 } from '@ui-kit';
 import {
-  API_MODE,
   dataVersion,
   repo,
   type DeviceRecord,
@@ -293,9 +263,6 @@ import { pointSnapshots, snapshotKey, streamStatus, wireQualityToDataQuality, ty
 import { session } from '../store/session';
 
 const router = useRouter();
-
-/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
-const IS_REAL = API_MODE === 'real';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -312,17 +279,37 @@ const HISTORY_LEN = 20;
 const QUALITY_ORDER: readonly PointRecord['quality'][] = ['Good', 'Uncertain', 'Bad', 'Timeout', 'CalcFailed'];
 
 /**
- * 质量码 → 柱状图颜色（全部取自 ui-kit token / global.css 桥接变量，非自造色值）。
+ * 质量码 → 中文短名（设计系统 §「质量码对外展示一律中文」）。
+ *
+ * 仅用于图表轴标签展示；wire 枚举本身不改（数据层仍是英文 5 值枚举）。
+ */
+const QUALITY_LABEL: Readonly<Record<string, string>> = Object.freeze({
+  Good: '良好',
+  Uncertain: '不确定',
+  Bad: '坏',
+  Timeout: '超时',
+  CalcFailed: '计算失败',
+});
+
+/**
+ * 质量码 → 柱状图颜色（全部取自 ui-kit token，非自造色值）。
  *
  * SVG 表现属性不支持 `var()`，故这里只存放「变量名字符串」，由模板经
  * `:style` 下发（见 `qualityBars` 与模板 `:style="{ fill: bar.color }"`）。
+ *
+ * 暗黑模式（`root[data-theme='dark']`，底色 `--bg-card` #161a22）实测对比度：
+ *   --ok #2fbf87 → 7.28:1 / --warn #f5a524 → 8.40:1 / --danger #f9746a → 6.23:1
+ *   --unknown #7d879c → 4.75:1（≥4.5，达标）
+ * 原 `--series-alt`（global.css 单点桥接变量 #7a5af8）未在暗色块提亮，
+ * 对 --bg-card 仅 3.76:1，低于图形 4.5:1 阈值，故 CalcFailed 改用同为暗色块
+ * 提亮过的 `--info` #4c9bff（6.06:1），且与其余四类语义不冲突。
  */
 const QUALITY_COLOR: Readonly<Record<string, string>> = Object.freeze({
   Good: 'var(--ok)',
   Uncertain: 'var(--warn)',
   Bad: 'var(--danger)',
   Timeout: 'var(--unknown)',
-  CalcFailed: 'var(--series-alt)',
+  CalcFailed: 'var(--info)',
 });
 
 /** 设备连接状态列定义（分页口径：设备数固定 8 台，不设分页）。 */
@@ -346,7 +333,7 @@ const devices: DeviceRecord[] = repo.allDevices();
 /**
  * 缓存填充完成（dataVersion 自增）→ 原地刷新静态清单。
  *
- * 避免预取晚于挂载时实时表停留空态：real 模式下清单来自 `preloadRealData`
+ * 避免预取晚于挂载时实时表停留空态：清单来自 `preloadRealData`
  * 填好的 `realCache`（点位来自 `GET /api/points`、设备来自 `GET /api/devices`）；
  * dataVersion 自增即表示缓存已就绪，此处原地刷新（保持数组引用 / 响应式不变）。
  * 实时数值本身由 1s tick 从 SSE `pointSnapshots` 消费，不在此重读。
@@ -367,11 +354,11 @@ function applyInto<T>(target: T[], source: readonly T[]): void {
 /**
  * 点位运行时状态：当前值 / 上一拍差值 / 历史序列 / 耗时 / 时间戳。
  *
- * 以 `point.id` 为键；初始化时用 mock 的 `value` 作为基线，并预填一段历史，
- * 使 sparkline 首帧即有形状（避免「空白 → 突变」）。
+ * 以 `point.id` 为键；基线取后端点位快照值，`history` 恒从空开始（首帧平线），
+ * 绝不伪造曲线。后续历史只由 SSE 实际帧推进。
  *
- * real 模式追加字段：`tsRaw`（SSE 帧的纳秒字符串原文，透传展示）与
- * `qualityCode`（后端质量码整数，悬浮提示用）；mock 模式恒为空 / null。
+ * `tsRaw`（SSE 帧的纳秒字符串原文，透传展示）与
+ * `qualityCode`（后端质量码整数，悬浮提示用）。
  */
 interface PointRuntime {
   /** 当前值（不可用为 null） */
@@ -384,9 +371,9 @@ interface PointRuntime {
   latencyMs: number;
   /** 最后更新时间（毫秒时间戳） */
   tsMs: number;
-  /** 最近一次流帧的纳秒时间戳原文（real 模式；mock 恒空串） */
+  /** 最近一次流帧的纳秒时间戳原文（SSE 帧透传；无帧时为空串） */
   tsRaw: string;
-  /** 最近一次流帧的质量码整数（real 模式；mock 恒 null） */
+  /** 最近一次流帧的质量码整数（SSE 帧透传；无帧时为 null） */
   qualityCode: number | null;
 }
 
@@ -396,120 +383,38 @@ const series = reactive<Record<string, PointRuntime>>({});
 /** 质量码（可被推流改写：如 Timeout 行偶发恢复为 Uncertain）。 */
 const runtimeQuality = reactive<Record<string, PointRecord['quality']>>({});
 
-/** 按点位特征推导抖动幅度（不同量纲各有一套合理振幅）。 */
-function amplitudeOf(point: PointRecord): number {
-  if (point.value === null) {
-    return 0;
-  }
-  const unit = point.unit;
-  if (unit === '℃') {
-    return 0.8;
-  }
-  if (unit === 'MPa') {
-    return 0.06;
-  }
-  if (unit === 'V' || unit === 'A') {
-    return 0.9;
-  }
-  if (unit === 'kW') {
-    return 0.12;
-  }
-  if (unit === '%' || unit === '%RH') {
-    return 0.4;
-  }
-  if (unit === 's') {
-    return 0.06;
-  }
-  if (unit === 'kWh') {
-    return 4;
-  }
-  // 计件类（件 / 累计）近似单调，用极小幅抖动
-  return Math.max(Math.abs(point.value) * 0.0005, 0.5);
-}
-
-/** 小数位：按原 mock 值的小数位数推断，保证显示稳定不跳位。 */
-function decimalsOf(point: PointRecord): number {
-  if (point.value === null) {
-    return 2;
-  }
-  const text = String(point.value);
-  const dot = text.indexOf('.');
-  return dot < 0 ? 0 : Math.min(text.length - dot - 1, 2);
-}
-
-/** 初始化运行时状态（首帧基线）。 */
+/**
+ * 初始化运行时状态（首帧基线）。
+ *
+ * **绝不预填随机历史**：`history` 保持为空（sparkline 落平线），数值用后端快照
+ * 基线（无值即 `——`），耗时置 0，时间戳从当前时刻起算（超过 1.5s 无流帧即整行转灰）。
+ */
 function seed(): void {
   const nowMs = Date.now();
   for (const point of allPoints) {
     runtimeQuality[point.id] = point.quality;
-    const base = point.value;
-    const amp = amplitudeOf(point);
-    const history: number[] = [];
-    if (base !== null) {
-      for (let i = HISTORY_LEN - 1; i >= 0; i -= 1) {
-        const wave = Math.sin(i / 3) * amp * 0.8;
-        const noise = (Math.random() * 2 - 1) * amp * 0.6;
-        history.push(Number((base + wave + noise).toFixed(decimalsOf(point))));
-      }
-    }
     series[point.id] = {
-      value: base,
+      value: point.value,
       delta: 0,
-      history,
-      latencyMs: latencyOf(point),
-      tsMs: point.stale ? nowMs - 187_000 : nowMs,
+      history: [],
+      latencyMs: 0,
+      tsMs: nowMs,
       tsRaw: '',
       qualityCode: null,
     };
   }
 }
 
-/** 采集耗时演示值：按协议特征给出量级差异（离线设备给 0）。 */
-function latencyOf(point: PointRecord): number {
-  const device = devices.find((d) => d.id === point.deviceId);
-  if (!device) {
-    return 12;
-  }
-  if (device.status === 'offline') {
-    return 0;
-  }
-  if (device.protocol === 's7') {
-    return 42;
-  }
-  if (device.protocol === 'modbus-rtu') {
-    return 18;
-  }
-  if (device.protocol === 'opc-ua') {
-    return 26;
-  }
-  if (device.protocol === 'mc') {
-    return 22;
-  }
-  if (device.protocol === 'mqtt') {
-    return 9;
-  }
-  return 12;
-}
-
 // ---------------------------------------------------------------------------
 // 1s 节流推流
 // ---------------------------------------------------------------------------
 
-/** 相对静态快照的基准采样数（用于 KPI 抖动）。 */
-const BASE_SAMPLE = allPoints.length * 7;
-
-/** 节流后的实时快照。 */
+/** 节流后的实时快照（初值 0；首拍 tick 立即由 SSE 快照覆盖）。 */
 const live = reactive({
-  /** 本周期采样点数 */
-  sampledPoints: BASE_SAMPLE,
-  /** 最慢驱动耗时（ms） */
-  slowestMs: 42,
-  /** 最慢驱动名 */
-  slowestDevice: '1#注塑机',
-  /** 离线队列深度（条） */
-  queueDepth: 1204,
+  /** 本周期采样点数（= 已有流数据的点位数） */
+  sampledPoints: 0,
   /** 质量良好占比（%） */
-  goodPct: 96.1,
+  goodPct: 0,
 });
 
 /** 最后更新毫秒时间戳。 */
@@ -524,91 +429,23 @@ const paused = ref<boolean>(false);
 /** 定时器句柄。 */
 let timer: ReturnType<typeof setInterval> | null = null;
 
-/** 有界随机抖动。 */
-function jitter(base: number, range: number, min: number): number {
-  return Math.max(min, base + (Math.random() * 2 - 1) * range);
-}
-
 /**
- * 单个节拍的调度入口（仍由 1s 定时器驱动 —— 即「1s 节流渲染」的实现）。
+ * 单个节拍的调度入口（由 1s 定时器驱动 —— 即「1s 节流渲染」的实现）。
  *
- * · mock 模式：内嵌推流抖动（演示行为，保持原样）；
- * · real 模式：从 SSE 逐点快照表（`pointSnapshots`）读取最新值。
- *   SSE 帧的到达频率与本函数无关 —— 快照表只被写不渲染，渲染仍每秒至多一次。
+ * 从 SSE 逐点快照表（`pointSnapshots`）读取最新值：SSE 帧的到达频率与本函数
+ * 无关 —— 快照表只被写不渲染，渲染仍每秒至多一次。
  */
 function tick(): void {
-  if (IS_REAL) {
-    tickReal();
-  } else {
-    tickMock();
-  }
+  tickReal();
 }
 
 /**
- * mock 模式节拍：更新全部点位当前值与历史（内嵌演示推流，行为与原版一致）。
- */
-function tickMock(): void {
-  const nowMs = Date.now();
-
-  for (const point of allPoints) {
-    const state = series[point.id];
-    if (!state) {
-      continue;
-    }
-    const quality = runtimeQuality[point.id] ?? point.quality;
-
-    // 质量不可用（Bad / Timeout / CalcFailed）→ 无值，时间戳推进但数值保持「——」
-    if (quality === 'Bad' || quality === 'Timeout' || quality === 'CalcFailed') {
-      state.value = null;
-      state.delta = 0;
-      state.latencyMs = quality === 'Timeout' ? 120 : 0;
-      state.tsMs = nowMs;
-      continue;
-    }
-
-    const amp = amplitudeOf(point);
-    const base = point.value ?? 0;
-    const previous = state.value ?? base;
-    const next = Number(jitter(previous, amp, Number.NEGATIVE_INFINITY).toFixed(decimalsOf(point)));
-
-    state.delta = Number((next - previous).toFixed(decimalsOf(point)));
-    state.value = next;
-    state.latencyMs = Math.round(jitter(latencyOf(point), 4, 1));
-    state.tsMs = nowMs;
-    state.history.push(next);
-    if (state.history.length > HISTORY_LEN) {
-      state.history.shift();
-    }
-  }
-
-  // KPI 快照（同样每秒只写一次）
-  live.sampledPoints = Math.round(jitter(BASE_SAMPLE, 24, 1));
-  const slow = allPoints.reduce<{ name: string; ms: number }>(
-    (acc, p) => {
-      const ms = series[p.id]?.latencyMs ?? 0;
-      const dev = devices.find((d) => d.id === p.deviceId);
-      return ms > acc.ms ? { name: dev?.name ?? '—', ms } : acc;
-    },
-    { name: '—', ms: 0 },
-  );
-  live.slowestMs = slow.ms;
-  live.slowestDevice = slow.name;
-  live.queueDepth = Math.round(jitter(1204, 40, 0));
-
-  const good = allPoints.filter((p) => (runtimeQuality[p.id] ?? p.quality) === 'Good').length;
-  live.goodPct = Number(((good / Math.max(allPoints.length, 1)) * 100).toFixed(1));
-
-  lastTickMs.value = nowMs;
-  tickCount.value += 1;
-}
-
-/**
- * real 模式节拍：消费 SSE 逐点快照（key = `${device_id}/${point_id}`）。
+ * 节拍实现：消费 SSE 逐点快照（key = `${device_id}/${point_id}`）。
  *
  * · 快照存在 → 以流帧为准：值 / 质量（wire 枚举映射到前端 5 值枚举）/
  *   纳秒 ts 原文透传；历史序列仅在取到数值时推进；
- * · 快照不存在（该点尚无流数据）→ 保持基线值与 mock 配置质量，不伪造；
- * · 采集耗时 / 离线队列：后端帧不含这些指标，置 0 / '—'，不伪造。
+ * · 快照不存在（该点尚无流数据）→ 保持基线值与配置质量，不伪造；
+ * · 采集耗时 / 离线队列：后端帧不含这些指标，置 0，展示为 `—`，不伪造。
  */
 function tickReal(): void {
   const nowMs = Date.now();
@@ -648,9 +485,6 @@ function tickReal(): void {
 
   // KPI 快照（同样每秒只写一次；采样数 = 已有流数据的点位数）
   live.sampledPoints = pointSnapshots.size;
-  live.slowestMs = 0;
-  live.slowestDevice = '—';
-  live.queueDepth = 0;
   live.goodPct = Number(((good / Math.max(allPoints.length, 1)) * 100).toFixed(1));
 
   lastTickMs.value = nowMs;
@@ -706,19 +540,15 @@ const lastTickText = computed<string>(() => {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 });
 
-/** 顶栏连接态文案（real 模式直读 SSE 通道状态；mock 模式保持原会话指示）。 */
+/** 顶栏连接态文案（直读 SSE 通道状态）。 */
 const connectionLabel = computed<string>(() => {
-  if (IS_REAL) {
-    const labels: Readonly<Record<StreamStatus, string>> = Object.freeze({
-      open: '实时通道已连接（SSE）',
-      connecting: '实时通道连接中…',
-      unauthorized: '实时通道未授权',
-      idle: '实时通道未连接',
-    });
-    return labels[streamStatus.value];
-  }
-  const map: Record<string, string> = { connected: '实时通道已连接', degraded: '链路降级', disconnected: '实时通道已断开' };
-  return map[session.state.connection] ?? '未知';
+  const labels: Readonly<Record<StreamStatus, string>> = Object.freeze({
+    open: '实时通道已连接（SSE）',
+    connecting: '实时通道连接中…',
+    unauthorized: '实时通道未授权',
+    idle: '实时通道未连接',
+  });
+  return labels[streamStatus.value];
 });
 
 // ---------------------------------------------------------------------------
@@ -750,7 +580,7 @@ const qualityOptions: readonly SelectOption[] = [
   { value: 'CalcFailed', label: 'CalcFailed（计算失败）' },
 ];
 
-/** 满足筛选条件的点位（保持 mock 顺序稳定）。 */
+/** 满足筛选条件的点位（保持后端清单顺序稳定）。 */
 const filteredPoints = computed<readonly PointRecord[]>(() =>
   allPoints.filter((point) => {
     if (deviceFilter.value && point.deviceId !== deviceFilter.value) {
@@ -846,7 +676,7 @@ interface PointRow {
   readonly quality: string;
   /** 质量标签色调类 */
   readonly qualityClass: string;
-  /** 质量码悬浮提示（real 模式含后端 quality_code；mock 为空） */
+  /** 质量码悬浮提示（含后端 quality_code；无帧时为空） */
   readonly qualityTitle: string;
   /** 采集耗时展示 */
   readonly latencyMs: string;
@@ -959,13 +789,11 @@ const pagedRows = computed<readonly PointRow[]>(() => {
       classes.push('is-abnormal');
     }
 
-    // 时间戳：real 模式透传 SSE 帧的纳秒字符串原文（大数红线，绝不 parseInt）；
-    // mock 模式保持原有的秒级展示。
+    // 时间戳：透传 SSE 帧的纳秒字符串原文（大数红线，绝不 parseInt）；无帧则按陈旧度展示。
     const tsRaw = state?.tsRaw ?? '';
-    const tsText =
-      IS_REAL && tsRaw ? tsRaw : stale ? `${ageSec.toFixed(0)}s 前（陈旧）` : (tsMs / 1000).toFixed(3);
+    const tsText = tsRaw ? tsRaw : stale ? `${ageSec.toFixed(0)}s 前（陈旧）` : (tsMs / 1000).toFixed(3);
     const qualityCode = state?.qualityCode ?? null;
-    const qualityTitle = IS_REAL && qualityCode !== null ? `quality_code: ${qualityCode}` : '';
+    const qualityTitle = qualityCode !== null ? `quality_code: ${qualityCode}` : '';
 
     return {
       id: point.id,
@@ -1004,11 +832,39 @@ interface QualityBar {
   key: string;
   /** 点位数 */
   value: number;
-  /** 柱高（逻辑坐标 0–44） */
+  /** 柱高（viewBox 逻辑坐标，已夹紧在 BAR_MIN_H–BAR_MAX_H 之间） */
   height: number;
   /** 填充色 */
   color: string;
 }
+
+// ---------------------------------------------------------------------------
+// 质量码柱状图几何（viewBox 坐标系：宽 100 × 高 60，与模板 viewBox 一致）
+// ---------------------------------------------------------------------------
+
+/** viewBox 可用宽度，柱子等分于此宽度。 */
+const BAR_VIEW_W = 100;
+/** 基线 y：柱底贴 52，其下留 8 单位给轴标签。 */
+const BAR_BASE_Y = 52;
+/** 柱间空隙（viewBox 单位），等分时留出。 */
+const BAR_GAP = 4;
+/**
+ * 柱最大高度 38：基线 52 − 38 = 顶边 y=14（不越过 52）；
+ * 其上数值标签基线 = 52 − BAR_VALUE_LIFT − 38 = 8，减去实测字形上伸 ≈5.43 后
+ * bbox 顶边 = 2.57，仍在 viewBox 内——故数据变大时柱体与数值标签都不会顶出容器。
+ * （先取 41，实测标签 bbox 顶边 −0.43 被裁切，据此收紧到 38。）
+ */
+const BAR_MAX_H = 38;
+/** 柱最小高度：计数为 0 的类别也保留一段可见柱体。 */
+const BAR_MIN_H = 2;
+/** 数值标签相对柱顶的抬升量（viewBox 单位）。 */
+const BAR_VALUE_LIFT = 6;
+
+/** 单条柱占的槽位宽度（含空隙）= 可用宽 / 柱条数，条数变化时自动重算。 */
+const barSlot = computed(() => BAR_VIEW_W / Math.max(qualityBars.value.length, 1));
+
+/** 柱宽 = 槽位宽 − 空隙，由条数等分得出（模板 `:width`，不再写死）。 */
+const barW = computed(() => Math.max(1, barSlot.value - BAR_GAP));
 
 /** 质量分布柱（基于**全量**点位统计，与筛选无关）。 */
 const qualityBars = computed<readonly QualityBar[]>(() => {
@@ -1018,8 +874,17 @@ const qualityBars = computed<readonly QualityBar[]>(() => {
     color: QUALITY_COLOR[key] ?? 'var(--unknown)',
   }));
   const max = Math.max(...counts.map((c) => c.value), 1);
-  return counts.map((c) => ({ ...c, height: Math.max(2, (c.value / max) * 44) }));
+  return counts.map((c) => ({
+    ...c,
+    // 归一到 BAR_MAX_H 并双向夹紧：max=0 时取下限，数据再大也不会超过上限。
+    height: Math.min(BAR_MAX_H, Math.max(BAR_MIN_H, (c.value / max) * BAR_MAX_H)),
+  }));
 });
+
+/** 质量码 → 图表轴中文短名（未知码原样回显）。 */
+function qualityLabelOf(key: string): string {
+  return QUALITY_LABEL[key] ?? key;
+}
 
 // ---------------------------------------------------------------------------
 // 导航
@@ -1117,11 +982,11 @@ function go(name: string): void {
   display: block;
 }
 .mn-bars__label {
-  font-size: 5.4px;
+  font-size: 4.2px;
   fill: var(--text-3);
 }
 .mn-bars__value {
-  font-size: 5.6px;
+  font-size: 4.6px;
   fill: var(--text-1);
 }
 .mn-table tr.is-abnormal > td:first-child {

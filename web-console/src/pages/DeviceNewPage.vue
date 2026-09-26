@@ -10,8 +10,8 @@
       · 每一步的「下一步」按本步校验实时禁用（不是提交后才报错）；
       · 向导条只可回退到**已到达过**的步骤，未到达的锁定（跳过 = 绕过校验）；
       · 写操作受 RoleGate 控制（工程师及以上）；
-      · 连通性测试：real 模式真实调用 `POST /api/devices/test`（Modbus 全探测，
-        其余协议后端返回结构化 unsupported）；mock 模式走演示流程并明确标注；
+      · 连通性测试：真实调用 `POST /api/devices/test`（Modbus 全探测，
+        其余协议后端返回结构化 unsupported，绝不伪造成功）；
       · 提交只把配置交给 `repo.createDevice`（内存态 + 写审计），授权判定一律在网关侧。
   -->
   <PageHeader
@@ -421,9 +421,9 @@
  * · 连接参数字段随协议**整块替换**（PROTO_FIELDS），避免通用表单硬塞异构协议字段；
  * · 字段控件支持 `text / number / password / select` + `unit` 后缀 + `group` 分组标题；
  * · 向导只可回退到已到达的步骤（`maxReached`），未到达的步骤锁定 —— 跳过等于绕过校验；
- * · 连通性探测：real 模式真实调用 `POST /api/devices/test`，**只展示后端返回的结构化结果**；
- *   mock 模式走演示流程并在结果里标注「演示」，绝不伪装成真实探测结果；
- * · 提交沿用 `repo.createDevice`（mock 内存态 / real 本地覆盖层 + 审计），签名不变。
+ * · 连通性探测：真实调用 `POST /api/devices/test`，**只展示后端返回的结构化结果**，
+ *   绝不摆拍耗时、绝不伪造成功；
+ * · 提交只把配置交给 `repo.createDevice`，写失败时如实呈现原因。
  */
 import { computed, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
@@ -445,7 +445,6 @@ import {
   type ProtocolType,
   type DeviceDraft,
 } from '@/api/repo';
-import { API_MODE } from '@/api/client';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -497,7 +496,7 @@ const PROTO_META: Readonly<Record<ProtocolType, ProtoMeta>> = Object.freeze({
     use: 'SCADA / 空压机 / 数控机床',
     freq: '500 ms ~ 2 s',
     multi: false,
-    keyField: 'Endpoint URL',
+    keyField: '端点地址',
     tips: [
       '安全策略选 None 仅限内网调试，生产环境必须签名加密',
       '命名空间索引由服务端分配、重启可能变化，建议用命名空间 URI 而非索引',
@@ -543,7 +542,7 @@ const PROTO_META: Readonly<Record<ProtocolType, ProtoMeta>> = Object.freeze({
     multi: false,
     keyField: '订阅 Topic',
     tips: [
-      'Client ID 重复会互相顶掉连接，表现为反复掉线',
+      '客户端 ID 重复会互相顶掉连接，表现为反复掉线',
       '通配符 # 订阅整棵子树，流量可能远超预期',
       'QoS 2 开销大，多数工业场景 QoS 1 已足够',
     ],
@@ -630,7 +629,7 @@ const PROTO_FIELDS: Readonly<Record<ProtocolType, readonly ProtoField[]>> = Obje
     { key: 'byteOrder', label: '默认字节序', kind: 'select', group: '读取策略', opts: BYTE_ORDER_SELECT, value: BYTE_ORDER_SELECT[0] },
   ],
   'opc-ua': [
-    { key: 'endpoint', label: 'Endpoint URL', kind: 'text', required: true, group: '端点与安全', placeholder: 'opc.tcp://192.168.10.31:4840', hint: '可直接填 discovery 地址，保存时自动拉取端点列表' },
+    { key: 'endpoint', label: '端点地址', kind: 'text', required: true, group: '端点与安全', placeholder: 'opc.tcp://192.168.10.31:4840', hint: '可直接填 discovery 地址，保存时自动拉取端点列表' },
     { key: 'security', label: '安全策略', kind: 'select', group: '端点与安全', opts: ['None（不加密，仅内网调试）', 'Basic256Sha256 · Sign', 'Basic256Sha256 · Sign & Encrypt', 'Aes128Sha256RsaOaep · Sign & Encrypt'], value: 'Basic256Sha256 · Sign & Encrypt' },
     { key: 'auth', label: '认证方式', kind: 'select', group: '端点与安全', opts: ['匿名', '用户名 / 密码', 'X.509 证书'], value: '用户名 / 密码' },
     { key: 'user', label: '用户名', kind: 'text', group: '端点与安全', placeholder: 'opcua_user' },
@@ -673,7 +672,7 @@ const PROTO_FIELDS: Readonly<Record<ProtocolType, readonly ProtoField[]>> = Obje
   ],
   mqtt: [
     { key: 'broker', label: 'Broker 地址', kind: 'text', required: true, group: 'Broker 连接', placeholder: 'mqtt://10.0.0.9:1883' },
-    { key: 'clientId', label: 'Client ID', kind: 'text', required: true, group: 'Broker 连接', placeholder: 'iot-daq-src-01', hint: '同一 Broker 上不可重复，否则会互相顶掉连接' },
+    { key: 'clientId', label: '客户端 ID', kind: 'text', required: true, group: 'Broker 连接', placeholder: 'iot-daq-src-01', hint: '同一 Broker 上不可重复，否则会互相顶掉连接' },
     { key: 'auth', label: '认证方式', kind: 'select', group: 'Broker 连接', opts: ['匿名', '用户名 / 密码', 'TLS 客户端证书'], value: '用户名 / 密码' },
     { key: 'user', label: '用户名', kind: 'text', group: 'Broker 连接', placeholder: 'gw_reader' },
     { key: 'pass', label: '密码', kind: 'password', group: 'Broker 连接', placeholder: '选填' },
@@ -954,7 +953,7 @@ const stepValid = computed(() => {
 });
 
 // ---------------------------------------------------------------------------
-// ④ 连通性测试（real：POST /api/devices/test；mock：演示流程并标注）
+// ④ 连通性测试（POST /api/devices/test，只渲染后端结构化结果）
 // ---------------------------------------------------------------------------
 
 type StepState = 'idle' | 'run' | 'done' | 'fail';
@@ -1026,19 +1025,11 @@ const probeRegister = computed(() =>
   protocol.value === 'modbus-tcp' || protocol.value === 'modbus-rtu' ? '40001' : '—',
 );
 
-/** 毫秒延时。 */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
 /**
  * 跑一次连通性测试。
  *
- * · real：真实调用 `POST /api/devices/test`，**只渲染后端结构化结果**（Modbus 全探测，
- *   其余协议返回 unsupported_protocol —— 不伪造成功）；
- * · mock：按演示节奏推进四步，并在结果文案中明确标注「演示」。
+ * 真实调用 `POST /api/devices/test`，**只渲染后端结构化结果**（Modbus 全探测，
+ * 其余协议返回 unsupported_protocol —— 不伪造成功、不摆拍耗时）。
  */
 async function runTest(): Promise<void> {
   if (testRunning.value) {
@@ -1050,29 +1041,8 @@ async function runTest(): Promise<void> {
   resetTestSteps();
   const steps = testSteps.value;
 
-  if (API_MODE !== 'real') {
-    for (const step of steps) {
-      if (step.n === '4') {
-        break;
-      }
-      step.state = 'run';
-      step.time = '进行中';
-      await sleep(420);
-      step.state = 'done';
-      step.time = `${8 + Number(step.n) * 4} ms`;
-    }
-    steps[3].state = 'idle';
-    steps[3].time = '需人工核对';
-    testRunning.value = false;
-    testResult.value = {
-      ok: true,
-      text: '演示流程跑通（mock 模式未发起任何真实连接，不代表设备真的连通）。真实连通性请在 real 模式下由网关侧探测。',
-    };
-    return;
-  }
-
   try {
-    // real：统一走 repo.actions.testDevice（已封装 POST /api/devices/test，
+    // 统一走 repo.actions.testDevice（已封装 POST /api/devices/test，
     // 返回结构化 ProbeResult；后端只做 Modbus 全探测，其余协议返回 unsupported_protocol）。
     const pr = await repo.actions.testDevice({
       protocol: probeTarget.value.protocol || undefined,
@@ -1196,7 +1166,7 @@ function downloadTemplate(): void {
  *
  * @param mode `saveAndStart` = 保存并要求网关立即开始采集；`save` = 仅保存连接参数。
  */
-function submit(mode: 'save' | 'saveAndStart'): void {
+async function submit(mode: 'save' | 'saveAndStart'): Promise<void> {
   saveTouched.value = true;
   if (!nameValid.value || !protocol.value) {
     return;
@@ -1217,7 +1187,14 @@ function submit(mode: 'save' | 'saveAndStart'): void {
     retryTimes: Number((conn.retry ?? '') || 3),
     actor: session.state.displayName,
   };
-  const created = repo.createDevice(draft);
+  const result = await repo.createDevice(draft);
+  if (!result.ok || !result.data) {
+    // 写失败：如实呈现后端原因，绝不报告成功。
+    createdName.value = '';
+    createdNote.value = `设备未提交：${result.message}`;
+    return;
+  }
+  const created = result.data;
   createdName.value = created.name;
   createdNote.value =
     mode === 'saveAndStart'

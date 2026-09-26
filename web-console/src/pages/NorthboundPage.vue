@@ -5,51 +5,75 @@
   ★ 本项目最关键的规格：**编码是每路出口（forwarder）独立可选**，不是全局开关。
     每条出口各自可选 protobuf（默认）或 json，互不影响。
 
-  ★ JSON 编码大整数精度陷阱（设计硬要求，必须内联可见）：
-    JSON 的 number 是 IEEE754 double，安全整数上限 2^53−1 = 9007199254740991。
-    纳秒时间戳 / 大 uint64 计数器必须编码为**字符串**，否则静默丢精度。
-    选 JSON 时该提示必须出现（下方 jsonWarning 区块）。
+  ★ JSON 编码大整数精度陷阱（真实契约）：JSON 的 number 是 IEEE754 double，
+    安全整数上限 2^53−1。纳秒时间戳 / 大 uint64 计数器必须编码为**字符串**。
+    该说明收在「编辑出口」弹窗的折叠帮助里，不占主视图。
 
-  ★ 编码与签名解耦：两种编码语义一致、验签结果相同（提示中说明）。
+  ★ 布局（需求 9 弹窗化）：主视图只有 **列表 + 搜索框 + 按钮**；
+    「新增出口」与「编辑出口」两张表单全部收进标准弹窗（wc-modal），列表不再常驻渲染表单。
 
-  布局完全照搬原型：出口列表（分页 + 单条测试连接）→ 新增出口 + 消息示例/断网续传。
+  ★ 数据链路（无 mock，成败都不编造）：
+    · 读：`GET /api/forwarders`（失败保留 repo 数据源并展示原因）；
+    · 写：新增 `POST /api/forwarders`、编码修改 `repo.setForwarderEncoding`（PUT）、
+          删除 `DELETE /api/forwarders/:id`（后端未落地 → 原样报错，绝不假装成功）；
+    · 测试连接 `POST /api/forwarders/:id/test`（后端仅 TCP 建连探测，原样转述）。
+  ★ 大数红线：qos / topic_prefix 等一律字符串直通，绝不 parseInt。
 -->
 <template>
-  <PageHeader
-    crumb="分发 / 北向转发"
-    title="北向转发"
-    desc="每路出口独立配置编码（protobuf / json）、QoS 与转发范围；断网自动转存本地队列（queue.db），恢复后按序补发。"
-  >
-    <template #actions>
-      <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色为只读，不能新增出口">
-        <span style="display: inline-flex; gap: 8px">
-          <button type="button" class="wc-btn wc-btn--primary" @click="focusNewOutlet">新增出口</button>
-        </span>
-      </RoleGate>
-    </template>
-  </PageHeader>
-
   <div class="wc-content">
-    <!-- ══ 出口列表（分页 + 每路独立编码）══════════════════════════════════ -->
+    <!-- ══ 出口列表（分页 + 搜索 + 弹窗式增改）════════════════════════════ -->
     <section class="wc-card">
       <div class="wc-card__head">
         <h3>出口列表</h3>
         <span class="wc-card__sub">每路出口独立编码与重发策略 · 共 {{ forwarderTotal }} 条</span>
+        <div class="wc-card__ops">
+          <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色为只读，不能新增出口">
+            <button type="button" class="wc-btn wc-btn--primary" data-testid="add-outlet" @click="openCreate">
+              新增出口
+            </button>
+          </RoleGate>
+        </div>
       </div>
 
-      <!-- real 模式：出口数据源不可得时给出「原因 + 恢复路径」，不静默吞错 -->
+      <!-- 工具条：搜索框 -->
+      <div class="nb-toolbar">
+        <input
+          v-model="query"
+          class="wc-input"
+          type="search"
+          placeholder="搜索出口名称 / Broker / Topic 前缀"
+          aria-label="搜索出口"
+          data-testid="forwarder-search"
+        />
+      </div>
+
+      <!-- 真实错误：数据源不可得的原因（不静默吞错） -->
       <div v-if="forwardersNotice" class="wc-banner wc-banner--warn" data-testid="forwarders-notice">
         <span class="wc-banner__icon">!</span>
         <span>{{ forwardersNotice }}</span>
       </div>
 
+      <!-- 真实操作结果：删除出口的回执 -->
+      <div v-if="operationMessage" class="wc-banner wc-banner--warn" data-testid="operation-notice">
+        <span class="wc-banner__icon">i</span>
+        <span>{{ operationMessage }}</span>
+      </div>
+
       <EmptyState
         v-if="forwarderTotal === 0"
         title="还没有配置北向出口"
-        desc="北向出口决定采集到的数据发往哪里。至少配置一路 MQTT Broker 或 HTTP(S) 接口，数据才能上云。"
+        desc="至少配置一路 MQTT Broker 或 HTTP(S) 接口，数据才能上云。"
       >
         <template #actions>
-          <button type="button" class="wc-btn wc-btn--primary" @click="focusNewOutlet">新增出口</button>
+          <button type="button" class="wc-btn wc-btn--primary" data-testid="add-outlet-empty" @click="openCreate">
+            新增出口
+          </button>
+        </template>
+      </EmptyState>
+
+      <EmptyState v-else-if="filteredForwarders.length === 0" title="没有匹配的出口" desc="换个关键词试试。">
+        <template #actions>
+          <button type="button" class="wc-btn" data-testid="clear-search" @click="query = ''">清除搜索</button>
         </template>
       </EmptyState>
 
@@ -58,175 +82,78 @@
           <template #cell-name="{ row }">
             <div class="nb-outlet">
               <span class="nb-outlet__name">{{ row.name }}</span>
-              <span v-if="!row.enabled" class="wc-tag wc-tag--unknown">停用</span>
             </div>
           </template>
           <template #cell-brokerUrl="{ row }">
             <span class="wc-mono">{{ row.brokerUrl }}</span>
           </template>
           <template #cell-encoding="{ row }">
-            <!-- 每路出口独立编码：直接在下拉里切换，互不影响 -->
-            <select
-              class="nb-enc-select"
-              :value="row.encoding"
-              :disabled="!canEdit"
-              :data-testid="`enc-select-${row.id}`"
-              :aria-label="`${row.name} 的编码`"
-              @change="onEncodingChange(row, $event)"
-            >
-              <option value="protobuf">protobuf</option>
-              <option value="json">json</option>
-            </select>
+            <span class="wc-tag" :class="row.encoding === 'json' ? 'wc-tag--info' : 'wc-tag--ok'">
+              {{ row.encoding }}
+            </span>
           </template>
-          <template #cell-qos="{ row }">
-            <span class="wc-mono">{{ row.qos }}</span>
+          <template #cell-qosText="{ row }">
+            <span class="wc-mono">{{ row.qosText }}</span>
           </template>
-          <template #cell-status="{ row }">
-            <StatusTag :status="row.status" />
-          </template>
-          <template #cell-covered="{ row }">
-            <span class="wc-mono">{{ countText(row.coveredDevices) }} / {{ countText(row.recommendedDeviceLimit) }}</span>
-          </template>
-          <template #cell-lastConsistencyCheckAt="{ row }">
-            <span class="wc-mono">{{ row.lastConsistencyCheckAt }}</span>
+          <template #cell-topicTemplate="{ row }">
+            <span class="wc-mono">{{ row.topicTemplate }}</span>
           </template>
           <template #actions="{ row }">
             <button
               type="button"
               class="wc-btn wc-btn--sm"
               :data-testid="`edit-btn-${row.id}`"
-              @click="selectRow(row)"
+              @click="openEdit(row)"
             >
               编辑
             </button>
             <button
               type="button"
-              class="wc-btn wc-btn--sm"
-              :data-testid="`test-btn-${row.id}`"
-              @click="testConnection(row)"
+              class="wc-btn wc-btn--sm wc-btn--danger"
+              :disabled="!canEdit"
+              :data-testid="`delete-btn-${row.id}`"
+              @click="askDelete(row)"
             >
-              测试连接
+              删除
             </button>
           </template>
         </UiTable>
 
         <UiPager
           :page="forwarderPage"
-          :total="forwarderTotal"
+          :total="filteredForwarders.length"
           :page-size="FORWARDER_PAGE_SIZE"
           @update:page="onForwarderPage"
         />
-
-        <p v-if="testResult" class="wc-hint" data-testid="test-result" style="margin: 10px 12px">
-          {{ testResult }}
-        </p>
       </template>
     </section>
+  </div>
 
-    <!-- 单条出口编辑（含编码单选 + 一致性自检）—— 选中列表某行后展开 -->
-    <section v-if="selected" class="wc-card">
-      <div class="wc-card__head">
-        <h3>出口 1 · {{ selected.name }}</h3>
-        <span class="wc-card__sub">
-          <StatusTag :status="selected.status" />
-          <span style="margin-left: 8px">{{ selected.connectedForText }}</span>
-        </span>
-      </div>
-      <div class="wc-card__body">
-        <dl class="wc-kv">
-          <dt>Broker</dt>
-          <dd class="wc-mono">{{ selected.brokerUrl }}</dd>
-          <dt>传输安全</dt>
-          <dd>{{ selected.transportSecurity }}</dd>
-          <dt>客户端 ID</dt>
-          <dd class="wc-mono">{{ selected.clientId }}</dd>
-          <dt>Topic 模板</dt>
-          <dd class="wc-mono">{{ selected.topicTemplate }}</dd>
-        </dl>
-
-        <!-- ── 数据编码（每路独立单选）────────────────────────────────── -->
-        <div class="nb-section">
-          <p class="nb-section__title">数据编码（本出口独立选择）</p>
-          <UiRadio v-model="selectedEncoding" :options="encodingOptions" :disabled="!canEdit" />
-
-          <!-- ★ JSON 精度与性能提示：选 JSON 时必须出现 -->
-          <div v-if="selectedEncoding === 'json'" class="wc-banner wc-banner--warn nb-json-warn" data-testid="json-warning">
-            <span class="wc-banner__icon">!</span>
-            <span>
-              该出口使用 JSON 编码：超出 2<sup>53</sup>−1（9007199254740991）的整数将编码为字符串
-              （纳秒时间戳、大 uint64 计数器）。JSON 的 number 是 IEEE754 double，直接编码会<b>静默丢精度</b>。
-              体积约为 protobuf 的 1.5–3×，推荐设备上限
-              {{ countText(selected.recommendedDeviceLimit) }} 台（当前 {{ countText(selected.coveredDevices) }} 台）。
-              <br />
-              编码与签名解耦：protobuf / json 两种编码语义一致、验签结果相同。
-            </span>
-          </div>
-          <div v-else class="wc-hint" data-testid="proto-hint">
-            protobuf（默认）：体积小、性能高，二进制编码；与 json 编码语义一致、验签结果相同。推荐设备上限
-            {{ countText(selected.recommendedDeviceLimit) }} 台（当前 {{ countText(selected.coveredDevices) }} 台）。
-          </div>
-        </div>
-
-        <!-- ── 编码一致性自检（task 62 的跨端哈希口径一致性可见化）────────── -->
-        <div class="nb-section">
-          <p class="nb-section__title">编码一致性自检</p>
-          <div class="nb-consistency">
-            <button
-              type="button"
-              class="wc-btn"
-              data-testid="consistency-btn"
-              @click="runConsistencyCheck"
-            >
-              运行一致性自检
-            </button>
-            <span class="wc-note">
-              上次通过 {{ selected.lastConsistencyCheckAt }}（两路编码验签结果一致）
-            </span>
-          </div>
-          <p v-if="consistencyResult" class="wc-hint" data-testid="consistency-result">
-            {{ consistencyResult }}
-          </p>
-        </div>
-
-        <!-- ── 测试发布 ─────────────────────────────────────────────── -->
-        <div class="nb-section">
-          <p class="nb-section__title">测试发布</p>
-          <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center">
-            <button
-              type="button"
-              class="wc-btn wc-btn--primary"
-              :disabled="!canEdit"
-              data-testid="save-encoding"
-              @click="saveEncoding"
-            >
-              保存本出口编码
-            </button>
-            <button type="button" class="wc-btn" data-testid="test-publish" @click="testPublish">
-              测试发布
-            </button>
-          </div>
-          <pre v-if="publishSample" class="nb-sample" data-testid="publish-sample">{{ publishSample }}</pre>
-        </div>
-      </div>
-    </section>
-
-    <!-- ══ 新增出口 + 消息示例 / 断网续传（2:1 栅格，照搬原型）══════════════ -->
-    <div class="wc-grid wc-grid--2-1">
-      <section class="wc-card">
-        <div class="wc-card__head">
-          <h3>新增出口</h3>
+  <!-- ══ 新增出口弹窗（原常驻表单整体收进此处）══════════════════════════ -->
+  <Teleport to="body">
+    <div v-show="createOpen" class="wc-modal__mask" data-testid="create-outlet-modal" @click.self="closeCreate">
+      <div
+        class="wc-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="新增出口"
+        tabindex="-1"
+        @keydown.esc="closeCreate"
+      >
+        <div class="wc-modal__head">
+          <h3 class="wc-modal__title">新增出口</h3>
           <span class="wc-card__sub">支持 MQTT Broker 与 HTTP(S) 接口；转发范围支持全部设备或指定设备</span>
         </div>
-        <div class="wc-card__body">
+        <div class="wc-modal__body">
           <UiRadio v-model="outletType" :options="outletTypeOptions" :disabled="!canEdit" />
 
-          <!-- ── MQTT Broker 分支（原型 outletTypeBody :1319-1325）── -->
+          <!-- ── MQTT Broker 分支 ── -->
           <div v-if="outletType === 'mqtt'" class="nb-form-grid">
             <UiField label="出口名称" required>
-              <UiInput v-model="outletForm.name" placeholder="如：客户 EMQX（生产）" :disabled="!canEdit" />
+              <UiInput v-model="outletForm.name" placeholder="如：客户 EMQX（生产）" :disabled="!canEdit" data-testid="outlet-name" />
             </UiField>
             <UiField label="Broker 地址" required hint="mqtt://host:1883 / mqtts://host:8883">
-              <UiInput v-model="outletForm.brokerUrl" placeholder="mqtt://10.0.0.5:1883" :disabled="!canEdit" />
+              <UiInput v-model="outletForm.brokerUrl" placeholder="mqtt://10.0.0.5:1883" :disabled="!canEdit" data-testid="outlet-broker" />
             </UiField>
             <UiField label="客户端 ID">
               <UiInput v-model="outletForm.clientId" placeholder="iotdaq-line1-01" :disabled="!canEdit" />
@@ -256,7 +183,7 @@
               </div>
             </UiField>
             <UiField label="数据编码" required hint="每路出口独立可选；默认 protobuf">
-              <UiSelect v-model="outletForm.encoding" :options="encodingSelectOptions" :disabled="!canEdit" />
+              <UiSelect v-model="outletForm.encoding" :options="encodingSelectOptions" :disabled="!canEdit" data-testid="outlet-encoding" />
             </UiField>
             <UiField label="QoS" required hint="0 至多一次 / 1 至少一次 / 2 恰好一次（默认 1）">
               <UiSelect v-model="outletForm.qos" :options="qosOptions" :disabled="!canEdit" />
@@ -266,13 +193,13 @@
             </UiField>
           </div>
 
-          <!-- ── HTTP(S) 接口分支（原型 outletTypeBody :1327-1334）── -->
+          <!-- ── HTTP(S) 接口分支 ── -->
           <div v-else class="nb-form-grid">
             <UiField label="出口名称" required>
-              <UiInput v-model="outletForm.name" placeholder="如：客户 HTTP 接口" :disabled="!canEdit" />
+              <UiInput v-model="outletForm.name" placeholder="如：客户 HTTP 接口" :disabled="!canEdit" data-testid="outlet-name" />
             </UiField>
             <UiField label="接口地址（URL）" required hint="支持 http / https；https 强制校验服务端证书">
-              <UiInput v-model="outletForm.brokerUrl" placeholder="https://client.example.com/api/ingest" :disabled="!canEdit" />
+              <UiInput v-model="outletForm.brokerUrl" placeholder="https://client.example.com/api/ingest" :disabled="!canEdit" data-testid="outlet-broker" />
             </UiField>
             <UiField label="请求方法">
               <UiSelect v-model="outletForm.httpMethod" :options="httpMethodOptions" :disabled="!canEdit" />
@@ -304,13 +231,9 @@
                 {{ dev.name }}
               </button>
             </div>
-            <p class="wc-note">
-              <span class="wc-note__icon">i</span>
-              <span>点击设备名切换勾选；未勾选任何设备时该出口不会转发任何数据。</span>
-            </p>
           </div>
 
-          <!-- 新增出口选 JSON 时同样给出精度提示（MQTT 分支；原型 outletTypeHint :1339） -->
+          <!-- 新增出口选 JSON 时给出精度提示（MQTT 分支） -->
           <div
             v-if="outletType === 'mqtt' && outletForm.encoding === 'json'"
             class="wc-banner wc-banner--warn"
@@ -319,7 +242,7 @@
             <span>JSON 编码：纳秒时间戳 / 大 uint64 计数器将编码为字符串，避免超出 2<sup>53</sup>−1 静默丢精度。</span>
           </div>
 
-          <!-- HTTP 出口固定 JSON 编码（原型 outletTypeHint :1338） -->
+          <!-- HTTP 出口固定 JSON 编码 -->
           <div v-if="outletType === 'http'" class="wc-banner wc-banner--warn" data-testid="new-http-hint">
             <span class="wc-banner__icon">!</span>
             <span>
@@ -329,101 +252,157 @@
             </span>
           </div>
 
-          <div style="display: flex; gap: 8px">
+          <!-- 真实错误 / 校验失败原因（唯一允许留在弹窗里的提示） -->
+          <p v-if="outletMessage" class="wc-modal__error" role="alert" data-testid="outlet-message">
+            {{ outletMessage }}
+          </p>
+        </div>
+        <div class="wc-modal__foot">
+          <button type="button" class="wc-btn" data-testid="outlet-cancel" @click="closeCreate">取消</button>
+          <button type="button" class="wc-btn" :disabled="!canEdit" @click="testOutletForm">测试连接</button>
+          <button
+            type="button"
+            class="wc-btn wc-btn--primary"
+            :disabled="!canEdit"
+            data-testid="save-outlet"
+            @click="saveOutlet"
+          >
+            保存出口
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- ══ 编辑出口弹窗（原选中行展开区收进此处；含折叠帮助）═════════════ -->
+  <Teleport to="body">
+    <div v-show="editOpen" class="wc-modal__mask" data-testid="outlet-modal" @click.self="closeEdit">
+      <div
+        class="wc-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="编辑出口"
+        tabindex="-1"
+        @keydown.esc="closeEdit"
+      >
+        <div class="wc-modal__head">
+          <h3 class="wc-modal__title">编辑出口 · {{ selected?.name }}</h3>
+        </div>
+        <div class="wc-modal__body" v-if="selected">
+          <dl class="wc-kv">
+            <dt>Broker</dt>
+            <dd class="wc-mono">{{ selected.brokerUrl }}</dd>
+            <dt>传输安全</dt>
+            <dd>{{ selected.transportSecurity }}</dd>
+            <dt>Topic 模板</dt>
+            <dd class="wc-mono">{{ selected.topicTemplate }}</dd>
+          </dl>
+
+          <!-- ── 数据编码（每路独立单选）────────────────────────────────── -->
+          <div class="nb-section">
+            <p class="nb-section__title">数据编码（本出口独立选择）</p>
+            <UiRadio v-model="selectedEncoding" :options="encodingOptions" :disabled="!canEdit" />
+
+            <!-- ★ JSON 精度提示：选 JSON 时出现 -->
+            <div v-if="selectedEncoding === 'json'" class="wc-banner wc-banner--warn nb-json-warn" data-testid="json-warning">
+              <span class="wc-banner__icon">!</span>
+              <span>
+                该出口使用 JSON 编码：超出 2<sup>53</sup>−1（9007199254740991）的整数将编码为字符串
+                （纳秒时间戳、大 uint64 计数器），直接编码会<b>静默丢精度</b>。
+                编码与签名解耦：protobuf / json 语义一致、验签结果相同。
+              </span>
+            </div>
+          </div>
+
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center">
             <button
               type="button"
               class="wc-btn wc-btn--primary"
               :disabled="!canEdit"
-              data-testid="save-outlet"
-              @click="saveOutlet"
+              data-testid="save-encoding"
+              @click="saveEncoding"
             >
-              保存出口
+              保存本出口编码
             </button>
-            <button type="button" class="wc-btn" :disabled="!canEdit" @click="testOutletForm">测试连接</button>
+            <button type="button" class="wc-btn" data-testid="test-connection" @click="testConnection(selected)">
+              测试连接
+            </button>
           </div>
-          <p v-if="outletMessage" class="wc-hint" data-testid="outlet-message">{{ outletMessage }}</p>
-        </div>
-      </section>
 
-      <div style="display: flex; flex-direction: column; gap: 16px">
-        <section class="wc-card">
-          <div class="wc-card__head">
-            <h3>消息示例</h3>
-            <span class="wc-card__sub">自定义参数随北向报文一起发送 · JSON 编码示意</span>
-          </div>
-          <div class="wc-card__body">
+          <!-- 真实错误 / 操作回执（唯一允许留在弹窗里的提示） -->
+          <p v-if="editMessage" class="wc-modal__error" role="alert" data-testid="edit-message">{{ editMessage }}</p>
+          <p v-if="testResult" class="wc-modal__result" data-testid="test-result">{{ testResult }}</p>
+
+          <!-- 折叠帮助：消息示例 + 断网续传（主视图不出现） -->
+          <details class="nb-help">
+            <summary>消息示例与断网续传说明</summary>
             <pre class="nb-sample">{{ messageSample }}</pre>
-            <p class="wc-note">
-              <span class="wc-note__icon">i</span>
-              <span>
-                大整数（纳秒时间戳 / uint64 计数器）在 JSON 编码下<b>必须为字符串</b>（安全整数上限 2<sup>53</sup>−1）；
-                quality 使用中文质量码；MQTT 出口的 protobuf / json 每路独立可选。
-              </span>
-            </p>
-          </div>
-        </section>
-
-        <section class="wc-card">
-          <div class="wc-card__head">
-            <h3>断网续传</h3>
-          </div>
-          <div class="wc-card__body">
             <dl class="wc-kv">
               <dt>本地队列</dt>
               <dd class="wc-mono">queue.db（独立库）</dd>
-              <dt>当前深度</dt>
-              <dd class="wc-mono">{{ queueDepthText }}</dd>
               <dt>容量上限</dt>
               <dd class="wc-mono">10 GB / 7 天（环形覆盖）</dd>
               <dt>补发策略</dt>
               <dd class="wc-mono">按序 + 幂等去重</dd>
-              <dt>B 档回执</dt>
-              <dd class="wc-mono">区间序号 + 条数 + 摘要哈希</dd>
             </dl>
-            <div>
-              <div class="nb-prog-head">
-                <span class="wc-card__sub">补发进度</span>
-                <span class="wc-mono">{{ backlogProgress }}%</span>
-              </div>
-              <div class="wc-bar">
-                <div class="wc-bar__fill" :style="{ width: `${backlogProgress}%` }" />
-              </div>
-            </div>
-          </div>
-        </section>
+          </details>
+        </div>
+        <div class="wc-modal__foot">
+          <button type="button" class="wc-btn" data-testid="outlet-edit-cancel" @click="closeEdit">取消</button>
+        </div>
       </div>
     </div>
-  </div>
+  </Teleport>
+
+  <!-- ══ 删除出口：危险操作二次确认（影响 + 原因 + 对象全名二次校验）═══ -->
+  <DangerConfirmModal
+    :open="deleteOpen"
+    :title="`删除出口 ${deleteTarget?.name ?? ''}`"
+    :impacts="DELETE_IMPACTS"
+    :facts="deleteFacts"
+    :reasons="DELETE_REASONS"
+    :min-note-length="10"
+    :confirm-value="deleteTarget?.name ?? ''"
+    confirm-mode="full"
+    confirm-label="出口名二次确认（输入出口名称）"
+    confirm-placeholder="输入待删除的出口名称"
+    confirm-text="删除出口"
+    @close="deleteOpen = false"
+    @submit="onDeleteSubmit"
+  />
 </template>
 
 <script setup lang="ts">
 /**
  * @file NorthboundPage.vue
  * @module web-console/pages/NorthboundPage
- * @description 北向转发页（出口列表分页 + 每路出口独立编码 + JSON 精度提示 + 一致性自检）。
+ * @description 北向转发页（出口列表 + 搜索 + 弹窗式新增/编辑 + 危险删除确认）。
+ *
+ * 契约边界（诚实表示未知，绝不伪造）：
+ * · 读 `GET /api/forwarders`；写 `POST /api/forwarders` / `repo.setForwarderEncoding`(PUT) /
+ *   `DELETE /api/forwarders/:id`；探测 `POST /api/forwarders/:id/test`（仅 TCP 建连）。
+ * · 后端不上报连接态 / 覆盖设备数 / 编码自检时间 → 相应列不渲染，不冒充已知值。
+ * · 一致性自检 / 测试发布无后端端点 → 不提供（避免本地伪造「自检通过」）。
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import {
-  PageHeader,
   UiTable,
   UiPager,
   UiInput,
   UiSelect,
   UiRadio,
-  StatusTag,
   EmptyState,
   RoleGate,
   UiField,
+  DangerConfirmModal,
   type TableColumn,
   type SelectOption,
   type RadioOption,
+  type DangerFact,
 } from '@ui-kit';
-import { API_MODE, repo, DEFAULT_ACTOR, type Encoding, type ForwarderRecord } from '@/api/repo';
+import { repo, dataVersion, DEFAULT_ACTOR, type Encoding, type ForwarderRecord } from '@/api/repo';
 import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
-
-/** 是否接入真实后端（`VITE_API_MODE=real`）；mock 模式行为保持与原版一致。 */
-const IS_REAL = API_MODE === 'real';
 
 /** 每页条数（出口列表）。 */
 const FORWARDER_PAGE_SIZE = 5;
@@ -433,7 +412,7 @@ const FORWARDER_PAGE_SIZE = 5;
 // ---------------------------------------------------------------------------
 
 /**
- * 出口行视图：`/api/forwarders`（真实）与 mock 仓库（演示）共用同一行形状。
+ * 出口行视图：`/api/forwarders`（唯一真实来源）。
  *
  * 与 `ForwarderRecord` 的差异（**诚实表示未知**，不用 0 / false 冒充已知值）：
  *  · `status` 放宽为 string —— 后端 `/api/forwarders` 不上报连接态，空串渲染为「—」；
@@ -458,7 +437,7 @@ function kindOfUrl(url: string): 'mqtt' | 'http' {
   return /^https?:\/\//i.test(url.trim()) ? 'http' : 'mqtt';
 }
 
-/** mock 仓库出口 → 行视图（QoS 文本按出口类别给出）。 */
+/** 后端出口记录 → 行视图（QoS 文本按出口类别给出）。 */
 function toOutletRow(f: ForwarderRecord): OutletRow {
   const kind = kindOfUrl(f.brokerUrl);
   return {
@@ -519,23 +498,22 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/** 小值计数渲染：null（后端未上报）渲染为「—」，避免用 0 冒充已知值。 */
-function countText(value: number | null): string {
-  return value === null ? '—' : String(value);
-}
-
 /** 当前角色是否可编辑（RoleGate 仅控制可见性，非授权判定）。 */
 const canEdit = computed<boolean>(() => session.state.role === 'admin' || session.state.role === 'engineer');
 
-// ---------- 出口列表 ----------
+// ---------- 出口列表 + 搜索 ----------
 const allForwarders = ref<OutletRow[]>(repo.allForwarders().map(toOutletRow));
+const query = ref('');
+const forwarderPage = ref(1);
 
 /**
- * 出口数据源不可得的原因（real 模式专用）。
- *
+ * 出口数据源不可得的原因。
  * 不静默吞错：`GET /api/forwarders` 失败时保留现有数据源，并把原因展示出来。
  */
 const forwardersNotice = ref('');
+
+/** 删除出口等操作的真实回执（成功 / 失败都如实展示）。 */
+const operationMessage = ref('');
 
 /** 出口数据源失败的「原因 + 恢复路径」文案。 */
 function forwarderFailureText(cause: unknown, subject: string): string {
@@ -554,14 +532,10 @@ function forwarderFailureText(cause: unknown, subject: string): string {
 }
 
 /**
- * real 模式：出口清单直接取 `GET /api/forwarders`（`id` = 出口名）。
- *
+ * 出口清单取 `GET /api/forwarders`（`id` = 出口名）。
  * 失败时**不静默吞错**：保留 repo 数据源并展示原因，页面不崩、不伪造出口。
  */
 async function loadForwarders(): Promise<void> {
-  if (!IS_REAL) {
-    return;
-  }
   try {
     const raw = await apiRequest<unknown[]>('/api/forwarders');
     if (!Array.isArray(raw)) {
@@ -571,9 +545,7 @@ async function loadForwarders(): Promise<void> {
     allForwarders.value = raw.map((row, i) => mapForwarderRow(asRecord(row), i));
     forwardersNotice.value = '';
     if (selected.value) {
-      selected.value = allForwarders.value.find((f) => f.id === selected.value?.id) ?? allForwarders.value[0] ?? null;
-    } else {
-      selected.value = allForwarders.value[0] ?? null;
+      selected.value = allForwarders.value.find((f) => f.id === selected.value?.id) ?? null;
     }
   } catch (cause) {
     allForwarders.value = repo.allForwarders().map(toOutletRow);
@@ -588,12 +560,30 @@ onMounted(() => {
 /** 出口总数（条数只有分页条一个口径）。 */
 const forwarderTotal = computed<number>(() => allForwarders.value.length);
 
-const forwarderPage = ref(1);
+/** 按关键词过滤（名称 / Broker / Topic 前缀 / 编码）。 */
+const filteredForwarders = computed<OutletRow[]>(() => {
+  const kw = query.value.trim().toLowerCase();
+  if (!kw) {
+    return allForwarders.value;
+  }
+  return allForwarders.value.filter(
+    (r) =>
+      r.name.toLowerCase().includes(kw) ||
+      r.brokerUrl.toLowerCase().includes(kw) ||
+      r.topicTemplate.toLowerCase().includes(kw) ||
+      r.encoding.includes(kw),
+  );
+});
 
 /** 当前页出口。 */
 const pagedForwarders = computed<OutletRow[]>(() => {
   const start = (forwarderPage.value - 1) * FORWARDER_PAGE_SIZE;
-  return allForwarders.value.slice(start, start + FORWARDER_PAGE_SIZE);
+  return filteredForwarders.value.slice(start, start + FORWARDER_PAGE_SIZE);
+});
+
+/** 搜索变化时回到第 1 页。 */
+watch(query, () => {
+  forwarderPage.value = 1;
 });
 
 /** 出口列表列定义。 */
@@ -602,9 +592,7 @@ const forwarderColumns: readonly TableColumn[] = [
   { key: 'brokerUrl', label: 'Broker', mono: true },
   { key: 'encoding', label: '编码' },
   { key: 'qosText', label: 'QoS', mono: true },
-  { key: 'status', label: '状态' },
-  { key: 'covered', label: '覆盖 / 上限' },
-  { key: 'lastConsistencyCheckAt', label: '编码自检' },
+  { key: 'topicTemplate', label: 'Topic 前缀', mono: true },
 ];
 
 /** 换页。 */
@@ -612,25 +600,18 @@ function onForwarderPage(next: number): void {
   forwarderPage.value = next;
 }
 
-/** 当前选中的出口（编辑区展示）。 */
-const selected = ref<OutletRow | null>(allForwarders.value[0] ?? null);
+/** 当前编辑的出口（编辑弹窗数据源）。 */
+const selected = ref<OutletRow | null>(null);
 
-/** 编辑区编码草稿（与列表行解耦，保存后才写回）。 */
-const selectedEncoding = ref<Encoding>(selected.value?.encoding ?? 'protobuf');
-
-/** 选中出口变化时同步编码草稿。 */
-watch(selected, (next) => {
-  selectedEncoding.value = next?.encoding ?? 'protobuf';
-  consistencyResult.value = '';
-  publishSample.value = '';
-});
+/** 编辑弹窗编码草稿（与列表行解耦，保存后才写回）。 */
+const selectedEncoding = ref<Encoding>('protobuf');
 
 /** 编码单选选项。 */
 const encodingOptions: readonly RadioOption[] = [
   { value: 'protobuf', label: 'protobuf（默认）', desc: '体积小、性能高；二进制编码，与 json 语义一致。' },
   {
     value: 'json',
-    label: 'json（第三方兼容）',
+    label: 'JSON（第三方兼容）',
     desc: '超出 2^53−1 的整数编为字符串；体积约 protobuf 的 1.5–3×，性能下降。',
   },
 ];
@@ -638,63 +619,61 @@ const encodingOptions: readonly RadioOption[] = [
 /** 下拉选项（新增出口表单用）。 */
 const encodingSelectOptions: readonly SelectOption[] = [
   { value: 'protobuf', label: 'protobuf（默认）' },
-  { value: 'json', label: 'json（第三方兼容）' },
+  { value: 'json', label: 'JSON（第三方兼容）' },
 ];
 
-// ---------- 逐条切换编码 ----------
-/**
- * 列表内直接切换某路出口的编码（**只改该行**，其余出口不受影响）。
- */
-function onEncodingChange(row: OutletRow, event: Event): void {
-  if (!canEdit.value) {
+// ---------------------------------------------------------------------------
+// 编辑出口（弹窗）
+// ---------------------------------------------------------------------------
+const editOpen = ref(false);
+const editMessage = ref('');
+
+/** 打开编辑弹窗（预填当前行）。 */
+function openEdit(row: OutletRow): void {
+  selected.value = allForwarders.value.find((f) => f.id === row.id) ?? null;
+  if (!selected.value) {
     return;
   }
-  const next = (event.target as HTMLSelectElement).value as Encoding;
-  const ok = repo.setForwarderEncoding({ id: row.id, encoding: next, actor: DEFAULT_ACTOR });
-  if (ok) {
-    // 重新拉取，保证列表与真相一致（real 模式下改编码走本地覆盖层，后端无写接口）
-    allForwarders.value = repo.allForwarders().map(toOutletRow);
-    if (selected.value?.id === row.id) {
-      selected.value = allForwarders.value.find((f) => f.id === row.id) ?? null;
-    }
-  }
+  selectedEncoding.value = selected.value.encoding;
+  editMessage.value = '';
+  testResult.value = '';
+  editOpen.value = true;
 }
 
-/** 保存编辑区所选编码到当前出口。 */
-function saveEncoding(): void {
+/** 关闭编辑弹窗。 */
+function closeEdit(): void {
+  editOpen.value = false;
+  editMessage.value = '';
+  testResult.value = '';
+}
+
+/** 保存编辑弹窗所选编码到当前出口（真实 PUT；后端未落地时原样报错）。 */
+async function saveEncoding(): Promise<void> {
   if (!canEdit.value || !selected.value) {
     return;
   }
   const id = selected.value.id;
-  const ok = repo.setForwarderEncoding({ id, encoding: selectedEncoding.value, actor: DEFAULT_ACTOR });
-  if (ok) {
-    allForwarders.value = repo.allForwarders().map(toOutletRow);
+  const result = await repo.setForwarderEncoding({ id, encoding: selectedEncoding.value, actor: DEFAULT_ACTOR });
+  if (result.ok) {
+    editMessage.value = result.message;
+    await loadForwarders();
     selected.value = allForwarders.value.find((f) => f.id === id) ?? null;
+  } else {
+    editMessage.value = `出口「${id}」编码未变更：${result.message}`;
   }
 }
 
-// ---------- 测试连接 ----------
-/** 单条出口测试结果提示。 */
+// ---------- 测试连接（编辑弹窗内） ----------
+/** 测试连接结果（真实探测回执，原样展示）。 */
 const testResult = ref('');
 
-/** 选中某行进入编辑区。 */
-function selectRow(row: OutletRow): void {
-  selected.value = allForwarders.value.find((f) => f.id === row.id) ?? null;
-}
-
 /**
- * 测试某条出口连接。
+ * 测试某条出口连接：`POST /api/forwarders/{id}/test`。
  *
- * real：`POST /api/forwarders/{id}/test` —— 后端仅做 **TCP 建连**探测
- * （响应含 `probe:"tcp_connect"`；`mqtts://` 不做 TLS 握手 / MQTT CONNACK），
- * 未知出口 404；结果原样展示，不把「TCP 通」说成「MQTT 可用」。
- * mock：保持原演示行为。
+ * 后端仅做 **TCP 建连**探测（`mqtts://` 不做 TLS 握手 / MQTT CONNACK），未知出口 404；
+ * 结果原样展示，不把「TCP 通」说成「MQTT 可用」。
  */
 async function testConnection(row: OutletRow): Promise<void> {
-  if (!IS_REAL) {
-    testResult.value = `${row.name}：连接${row.status === 'connected' ? '正常' : '异常'}，编码 ${row.encoding}。`;
-    return;
-  }
   testResult.value = `正在探测「${row.name}」…`;
   try {
     const raw = await apiRequest<Record<string, unknown>>(
@@ -721,32 +700,11 @@ async function testConnection(row: OutletRow): Promise<void> {
   }
 }
 
-// ---------- 一致性自检 / 测试发布 ----------
-const consistencyResult = ref('');
-const publishSample = ref('');
+// ---------------------------------------------------------------------------
+// 新增出口（弹窗）
+// ---------------------------------------------------------------------------
+const createOpen = ref(false);
 
-/** 运行编码一致性自检（两种编码验签结果一致）。 */
-function runConsistencyCheck(): void {
-  consistencyResult.value = `一致性自检通过：protobuf 与 json 两种编码对同一批数据的摘要哈希一致，验签结果相同（${nowText()}）。`;
-}
-
-/** 测试发布一条样例消息。 */
-function testPublish(): void {
-  const enc = selected.value?.encoding ?? 'protobuf';
-  const tsNs = '1758608530123456789';
-  if (enc === 'json') {
-    publishSample.value =
-      `Content-Type: application/json\n` +
-      `{"ts":"2026-09-23T12:31:40.123+08:00","ts_ns":"${tsNs}","device_mid":"dev-001",` +
-      `"device_name":"1#注塑机","point":"T_Barrel1","value":214.6,"unit":"℃","quality":"良好"}`;
-  } else {
-    publishSample.value =
-      `Content-Type: application/x-protobuf\n` +
-      `[二进制 payload，字段与 JSON 语义一致；ts_ns 以 fixed64 传输，无精度损失]`;
-  }
-}
-
-// ---------- 新增出口表单 ----------
 /** 出口类型。 */
 const outletType = ref<'mqtt' | 'http'>('mqtt');
 
@@ -765,20 +723,20 @@ const scopeOptions: readonly RadioOption[] = [
   { value: 'devices', label: '指定设备', desc: '仅转发所选设备的点位；未勾选时不转发任何数据。' },
 ];
 
-/** QoS 选项（原型 :1323）。 */
+/** QoS 选项。 */
 const qosOptions: readonly SelectOption[] = [
   { value: '0', label: '0（至多一次）' },
   { value: '1', label: '1（至少一次）' },
   { value: '2', label: '2（恰好一次）' },
 ];
 
-/** HTTP 请求方法选项（原型 :1330）。 */
+/** HTTP 请求方法选项。 */
 const httpMethodOptions: readonly SelectOption[] = [
   { value: 'POST', label: 'POST' },
   { value: 'PUT', label: 'PUT' },
 ];
 
-/** HTTP 批量大小选项（原型 :1333）。 */
+/** HTTP 批量大小选项。 */
 const batchSizeOptions: readonly SelectOption[] = [
   { value: '1 条 / 请求', label: '1 条 / 请求' },
   { value: '50 条 / 请求', label: '50 条 / 请求' },
@@ -796,15 +754,15 @@ const outletForm = reactive({
   topicTemplate: 'factory/line1/${device}/${point}',
   encoding: 'protobuf' as Encoding,
   deviceIds: [] as string[],
-  /** QoS（MQTT 分支；原型 :1323） */
+  /** QoS（MQTT 分支） */
   qos: '1',
-  /** 请求方法（HTTP 分支；原型 :1330） */
+  /** 请求方法（HTTP 分支） */
   httpMethod: 'POST',
-  /** 认证 Header（HTTP 分支；原型 :1331） */
+  /** 认证 Header（HTTP 分支） */
   authHeader: '',
-  /** 超时 / 重试（HTTP 分支；原型 :1332） */
+  /** 超时 / 重试（HTTP 分支） */
   timeoutRetry: '5 s · 3 次',
-  /** 批量大小（HTTP 分支；原型 :1333） */
+  /** 批量大小（HTTP 分支） */
   batchSize: '100 条 / 请求',
 });
 
@@ -818,8 +776,11 @@ const mqttPassword = ref('');
 /** 口令显隐切换（默认隐藏，掩码态）。 */
 const showMqttPassword = ref(false);
 
-/** 设备 chips（来自 mock 仓库）。 */
-const deviceChips = repo.allDevices().map((d) => ({ id: d.id, name: d.name }));
+/** 设备 chips（来自 `repo.allDevices()` 真实设备清单；随 `dataVersion` 刷新，不在挂载时定格）。 */
+const deviceChips = computed(() => {
+  void dataVersion; // 真实数据刷新后重新取设备清单，避免页挂载那一刻定格成旧值。
+  return repo.allDevices().map((d) => ({ id: d.id, name: d.name }));
+});
 
 /** 勾选 / 取消设备。 */
 function toggleDevice(id: string): void {
@@ -831,10 +792,39 @@ function toggleDevice(id: string): void {
   }
 }
 
-/** 新增出口结果提示。 */
+/** 新增出口结果提示（真实错误 / 回执，留在弹窗内）。 */
 const outletMessage = ref('');
 
-/** 出口登记写失败的「原因 + 恢复路径」（后端 `POST /api/forwarders` 恒 501）。 */
+/** 打开新增出口弹窗（空表单）。 */
+function openCreate(): void {
+  outletType.value = 'mqtt';
+  outletScope.value = 'all';
+  outletForm.name = '';
+  outletForm.brokerUrl = '';
+  outletForm.clientId = '';
+  outletForm.username = '';
+  outletForm.topicTemplate = 'factory/line1/${device}/${point}';
+  outletForm.encoding = 'protobuf';
+  outletForm.deviceIds = [];
+  outletForm.qos = '1';
+  outletForm.httpMethod = 'POST';
+  outletForm.authHeader = '';
+  outletForm.timeoutRetry = '5 s · 3 次';
+  outletForm.batchSize = '100 条 / 请求';
+  mqttPassword.value = '';
+  showMqttPassword.value = false;
+  outletMessage.value = '';
+  createOpen.value = true;
+}
+
+/** 关闭新增弹窗并清空草稿（含敏感口令）。 */
+function closeCreate(): void {
+  createOpen.value = false;
+  mqttPassword.value = '';
+  outletMessage.value = '';
+}
+
+/** 出口登记写失败的「原因 + 恢复路径」。 */
 function outletWriteFailureText(cause: unknown): string {
   const status = cause instanceof ApiError ? cause.status : 0;
   if (status === 501) {
@@ -851,11 +841,8 @@ function outletWriteFailureText(cause: unknown): string {
 }
 
 /**
- * 保存新出口。
- *
- * mock：保持原演示行为（仅校验 + 提示）；
- * real：`POST /api/forwarders` —— 后端当前返回 501，页面**原样呈现原因与恢复路径**，
- * 绝不把 501 吞成「已保存」。
+ * 保存新出口：`POST /api/forwarders`。
+ * 后端当前返回 501 时页面**原样呈现原因与恢复路径**，绝不把 501 吞成「已保存」。
  */
 async function saveOutlet(): Promise<void> {
   if (!outletForm.name.trim() || !outletForm.brokerUrl.trim()) {
@@ -863,10 +850,6 @@ async function saveOutlet(): Promise<void> {
     return;
   }
   const scopeText = outletScope.value === 'all' ? '全部设备' : `指定 ${outletForm.deviceIds.length} 台设备`;
-  if (!IS_REAL) {
-    outletMessage.value = `出口「${outletForm.name}」已保存：编码 ${outletForm.encoding}，范围 ${scopeText}。`;
-    return;
-  }
   const payload =
     outletType.value === 'mqtt'
       ? {
@@ -893,6 +876,7 @@ async function saveOutlet(): Promise<void> {
   try {
     await apiRequest<unknown>('/api/forwarders', { method: 'POST', body: JSON.stringify(payload) });
     outletMessage.value = `出口「${outletForm.name}」已登记：范围 ${scopeText}。`;
+    await loadForwarders();
   } catch (cause) {
     outletMessage.value = outletWriteFailureText(cause);
   }
@@ -901,7 +885,7 @@ async function saveOutlet(): Promise<void> {
 /**
  * 测试新增出口表单的连通性。
  *
- * real：后端只支持对**已登记**出口（`id` = 出口名）做探测，未保存的出口无从探测 ——
+ * 后端只支持对**已登记**出口（`id` = 出口名）做探测，未保存的出口无从探测 ——
  * 如实说明限制与替代路径，不伪造「可达 38 ms」这类演示数值。
  */
 function testOutletForm(): void {
@@ -909,21 +893,70 @@ function testOutletForm(): void {
     outletMessage.value = '请先填写 Broker / 接口地址再测试。';
     return;
   }
-  if (IS_REAL) {
-    outletMessage.value =
-      '未保存的出口无法探测：后端仅支持对已登记出口做 TCP 建连探测（POST /api/forwarders/{id}/test，' +
-      'id = 出口名）。替代路径：先在网关配置文件的 [[outlets]] 段登记该出口，再回到出口列表点「测试连接」。';
+  outletMessage.value =
+    '未保存的出口无法探测：后端仅支持对已登记出口做 TCP 建连探测（POST /api/forwarders/{id}/test，' +
+    'id = 出口名）。替代路径：先登记该出口，再在列表「编辑」弹窗里点「测试连接」。';
+}
+
+// ---------------------------------------------------------------------------
+// 删除出口（危险操作二次确认）
+// ---------------------------------------------------------------------------
+const deleteOpen = ref(false);
+const deleteTarget = ref<OutletRow | null>(null);
+
+/** 删除影响清单。 */
+const DELETE_IMPACTS: readonly string[] = [
+  '该出口将从网关配置移除，指向它的数据不再转发。',
+  '正在排队等待补发给该出口的数据将不再投递。',
+  '请确认没有其它规则 / 流程依赖该出口名称。',
+];
+
+/** 删除对象摘要。 */
+const deleteFacts = computed<readonly DangerFact[]>(() => [
+  { label: '出口名称', value: deleteTarget.value?.name ?? '—' },
+  { label: '地址', value: deleteTarget.value?.brokerUrl ?? '—' },
+]);
+
+/** 删除原因枚举（必选）。 */
+const DELETE_REASONS: readonly string[] = ['出口停用下线', '地址配置错误', '迁移到新出口', '调试清理'];
+
+/** 打开删除确认。 */
+function askDelete(row: OutletRow): void {
+  if (!canEdit.value) {
     return;
   }
-  outletMessage.value = `测试连接：${outletForm.brokerUrl} 可达，握手耗时 38 ms，编码 ${outletForm.encoding}。`;
+  deleteTarget.value = row;
+  operationMessage.value = '';
+  deleteOpen.value = true;
 }
 
-/** 聚焦「新增出口」（页头按钮）。 */
-function focusNewOutlet(): void {
-  outletMessage.value = '请在下方的「新增出口」表单中填写出口信息。';
+/** 删除提交：`DELETE /api/forwarders/:id`（后端未落地 → 原样报错，绝不假装已删除）。 */
+async function onDeleteSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): Promise<void> {
+  const row = deleteTarget.value;
+  deleteOpen.value = false;
+  if (!row) {
+    return;
+  }
+  try {
+    await apiRequest<unknown>(`/api/forwarders/${encodeURIComponent(row.id)}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ reason: payload.reason, note: payload.note, confirm: row.name }),
+    });
+    operationMessage.value = `出口「${row.name}」已删除。`;
+    if (editOpen.value) {
+      closeEdit();
+    }
+    await loadForwarders();
+  } catch (cause) {
+    const status = cause instanceof ApiError ? cause.status : 0;
+    operationMessage.value =
+      status === 404 || status === 405
+        ? `出口「${row.name}」未删除：后端未提供出口删除接口（HTTP ${status}）。恢复路径：暂请在网关配置文件的 [[outlets]] 段调整出口后热重载。`
+        : `出口「${row.name}」未删除：${forwarderFailureText(cause, 'DELETE /api/forwarders/:id')}`;
+  }
 }
 
-// ---------- 静态示例 & 派生 ----------
+// ---------- 折叠帮助（编辑弹窗内） ----------
 /** 消息示例（JSON 编码，大整数为字符串）。 */
 const messageSample = `{
   "ts": "2026-09-23T12:31:40.123+08:00",
@@ -935,22 +968,19 @@ const messageSample = `{
   "data": { "name": "料筒温度1", "value": 214.6, "unit": "℃", "quality": "良好" },
   "data_raw": { "T_Barrel1": 214.6, "P_Inj": 86.12 }
 }`;
-
-/** 队列深度文案。 */
-const queueDepthText = '1,204 条';
-
-/** 补发进度（%）。 */
-const backlogProgress = 82;
-
-/** 当前时间短文本。 */
-function nowText(): string {
-  const d = new Date();
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
 </script>
 
 <style scoped>
+.nb-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 16px 0;
+}
+.nb-toolbar .wc-input {
+  flex: 1 1 auto;
+  max-width: 360px;
+}
 .nb-outlet {
   display: flex;
   align-items: center;
@@ -959,21 +989,11 @@ function nowText(): string {
 .nb-outlet__name {
   font-weight: 500;
 }
-.nb-enc-select {
-  font-family: inherit;
-  font-size: var(--fs-table);
-  min-height: 28px;
-  padding: 2px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: #fff;
-  color: var(--text-1);
-  cursor: pointer;
+.wc-card > .wc-banner {
+  margin: 12px 16px 0;
 }
-.nb-enc-select:disabled {
-  background: var(--divider);
-  color: var(--text-3);
-  cursor: not-allowed;
+.wc-card > .wc-banner:last-child {
+  margin-bottom: 12px;
 }
 .nb-section {
   display: flex;
@@ -991,12 +1011,6 @@ function nowText(): string {
 }
 .nb-json-warn sup {
   font-size: 10px;
-}
-.nb-consistency {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
 }
 .nb-sample {
   margin: 0;
@@ -1076,13 +1090,87 @@ function nowText(): string {
   opacity: 0.5;
   cursor: not-allowed;
 }
-.nb-prog-head {
+/* 折叠帮助（编辑弹窗内，主视图不出现） */
+.nb-help {
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
   display: flex;
-  justify-content: space-between;
-  margin-bottom: 6px;
+  flex-direction: column;
+  gap: 10px;
 }
-.wc-banner__icon {
-  flex: 0 0 auto;
-  font-weight: 700;
+.nb-help summary {
+  cursor: pointer;
+  font-size: var(--fs-table);
+  color: var(--text-2);
+  user-select: none;
+}
+/* ── 弹窗（与 AccountsPage 同一模式；随组件作用域，不改全局样式）──── */
+.wc-modal__mask {
+  position: fixed;
+  inset: 0;
+  background: #1d212973;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  padding: 24px;
+}
+.wc-modal {
+  background: #fff;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  width: 720px;
+  max-width: 100%;
+  max-height: 88vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  outline: none;
+}
+.wc-modal__head {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--divider);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wc-modal__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+.wc-modal__body {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.wc-modal__error {
+  margin: 0;
+  font-size: var(--fs-table);
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  line-height: 1.6;
+}
+.wc-modal__result {
+  margin: 0;
+  font-size: var(--fs-table);
+  color: var(--text-1);
+  background: var(--bg-app);
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  line-height: 1.6;
+}
+.wc-modal__foot {
+  padding: 14px 20px;
+  border-top: 1px solid var(--divider);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 </style>

@@ -31,7 +31,7 @@
  * 从缓存读取 —— 上游推送频率与渲染频率解耦（设计系统 §4.2 硬约束）。
  */
 import { reactive } from 'vue';
-import { API_MODE, getStoredToken, handleUnauthorized } from './client';
+import { getStoredToken, handleUnauthorized } from './client';
 
 /** SSE 帧内单点形状（与后端 `LivePoint` 字段名一一对应，蛇形命名直通）。 */
 export interface TelemetryPointFrame {
@@ -67,7 +67,7 @@ export interface TelemetryFrame {
 
 /** SSE 通道状态。 */
 export type StreamStatus =
-  /** 未启动（mock 模式 / 未登录 / 已关闭） */
+  /** 未启动（未登录 / 已关闭） */
   | 'idle'
   /** 连接中（首次连接或断线自动重连） */
   | 'connecting'
@@ -123,7 +123,7 @@ export function snapshotKey(deviceId: string, pointId: string): string {
   return `${deviceId}/${pointId}`;
 }
 
-/** 前端质量枚举（与 mock-data 的 `DataQuality` 同形；此处独立声明避免反向依赖页面层）。 */
+/** 前端质量枚举（与 `model.ts` 的 `DataQuality` 同形；此处独立声明避免反向依赖页面层）。 */
 export type StreamDataQuality = 'Good' | 'Uncertain' | 'Bad' | 'CalcFailed' | 'Timeout';
 
 /**
@@ -160,14 +160,11 @@ let es: EventSource | null = null;
 let probeInFlight = false;
 
 /**
- * 建立 SSE 连接（real 模式 + 已持有 token 时生效；幂等，重复调用直接返回）。
+ * 建立 SSE 连接（已持有 token 时生效；幂等，重复调用直接返回）。
  *
- * mock 模式完全不建连（与 repo 的 mock 语义一致：零网络请求）。
+ * 未登录时不建连（保持 idle，登录成功后由生命周期 watch 再触发）。
  */
 export function connectStream(): void {
-  if (API_MODE !== 'real') {
-    return;
-  }
   if (es) {
     return; // 幂等：已在连接 / 重连中
   }

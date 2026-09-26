@@ -17,13 +17,13 @@
  * 二者不同步即产生第二套分组事实源，改动时务必同步两边。
  */
 import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-router';
-import { API_MODE, getStoredToken } from './api/client';
+import { getStoredToken } from './api/client';
 
 /** 路由表（懒加载各页面组件）。 */
 const routes: readonly RouteRecordRaw[] = [
   { path: '/', redirect: '/overview' },
 
-  // ---------- 登录（仅 real 模式可达；mock 模式守卫不拦，手动访问也会被弹回总览） ----------
+  // ---------- 登录（未登录时守卫会把所有页面导到这里） ----------
   {
     path: '/login',
     name: 'login',
@@ -153,16 +153,12 @@ export const router = createRouter({
 });
 
 /**
- * 全局守卫（仅 real 模式启用登录拦截；mock 模式保持原型「免登录」行为）。
+ * 全局守卫（登录拦截）。
  *
- * · real 且无 token：访问任何页面 → `/login`（携带 redirect 便于登录后回跳）；
- * · real 且已有 token：访问 `/login` → 直接回总览；
- * · mock：一律放行。
+ * · 无 token：访问任何页面 → `/login`（携带 redirect 便于登录后回跳）；
+ * · 已有 token：访问 `/login` → 直接回总览。
  */
 router.beforeEach((to) => {
-  if (API_MODE !== 'real') {
-    return true;
-  }
   const authed = Boolean(getStoredToken());
   if (!authed && to.name !== 'login') {
     return { name: 'login', query: { redirect: to.fullPath } };
