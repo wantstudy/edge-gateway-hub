@@ -79,8 +79,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRef, FromRequestParts, Path as AxumPath, Query, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, put};
@@ -580,7 +580,102 @@ pub fn router(state: MgmtState) -> Router {
         .merge(ops)
         .route("/", get(serve_root))
         .route("/assets/*path", get(serve_asset))
+        // CORS 必须是最外层 layer：预检 OPTIONS 需在鉴权/业务之前短路，否则不带
+        // Authorization 的预检会被 `ops_guard` / `AuthedRole` 401 拦掉（见 [`cors`]）。
+        // 该 layer 覆盖全部 /api/* 与 `/`、`/assets/*` 路由，且不改动静态托管语义。
+        .layer(from_fn(cors))
         .with_state(state)
+}
+
+// ---- CORS（跨域支持，手写零依赖） ----
+
+/// CORS 白名单判定：仅放行「Tauri 桌面打包页」与「本机开发/直连」两类 Origin。
+///
+/// ## 根因
+/// Tauri 桌面打包版前端页面的 origin 是 `http://tauri.localhost`（WebView2 自定义
+/// 协议宿主），而管理面 API 在 `http://127.0.0.1:8080`。前端已改为请求**绝对地址**
+/// （`web-console/src/api/client.ts` 的 `API_BASE` / `apiUrl()`），因此浏览器 /
+/// WebView2 会对跨源请求做 CORS 检查。daemon 此前不返回任何 CORS 头时，打包版
+/// 所有 `fetch` 都会被浏览器拦截（预检直接失败）——桌面端等于不可用。
+///
+/// ## 判定规则（白名单 + 精确/前缀匹配，**绝不 `*`**）
+/// - 精确匹配：`http://tauri.localhost`、`https://tauri.localhost`（打包页两种协议），
+///   以及缺省端口的裸 `http://localhost` / `http://127.0.0.1`；
+/// - 前缀匹配（端口任意，故只判 host）：`http://localhost:<port>`、`http://127.0.0.1:<port>`。
+///   ⚠️ 前缀以 `:` 结尾，确保 `http://localhost.evil.com` 之类不被误放行
+///   （host 之后必须紧跟 `:`，`.` 开头的伪域名一律不匹配）；
+/// - 其余 Origin（任何外部域名 / `null` / https 的 localhost）一律拒绝：不加任何
+///   CORS 头，浏览器按同源策略自然拦截；**不改变业务响应体与状态码**（CORS 失败
+///   不转化为业务错误）。
+fn cors_origin_allowed(origin: &str) -> bool {
+    matches!(
+        origin,
+        "http://tauri.localhost"
+            | "https://tauri.localhost"
+            | "http://localhost"
+            | "http://127.0.0.1"
+    ) || origin.starts_with("http://localhost:")
+        || origin.starts_with("http://127.0.0.1:")
+}
+
+/// 命中白名单后向响应追加 CORS 头（`preflight` 为 true 时补齐预检四件套）。
+fn apply_cors_headers(resp: &mut Response, origin: &str, preflight: bool) {
+    // Origin 已在白名单内，HeaderValue 解析失败理论不可达；仍不 unwrap（红线）。
+    let Ok(value) = HeaderValue::from_str(origin) else {
+        return;
+    };
+    let headers = resp.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    // 响应随 Origin 变化 → 标记 Vary，防中间代理缓存把 A 源的响应喂给 B 源。
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if preflight {
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Authorization, Content-Type"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("600"),
+        );
+    }
+}
+
+/// CORS 中间件（经 [`router`] 以 `Router::layer` 挂为**最外层**）。
+///
+/// ## 关键：OPTIONS 预检必须在鉴权之前短路
+/// 预检请求按规范**不带** `Authorization` 头。若把它下沉到 `rbac::AuthedRole` /
+/// `ops_guard`，会被判 401 → 浏览器预检失败 → 真实请求从不发出。故本中间件对
+/// OPTIONS 一律直接返回 204、**不调用 `next`**（即不进入路由/鉴权/业务链）；
+/// 仅当 Origin 命中白名单时才附上 CORS 头。
+///
+/// ## 非预检请求
+/// 放行到业务链，命中白名单时**仅追加** CORS 头，不改动业务状态码 / 响应体
+///（CORS 失败不影响业务语义）；未命中的 Origin 不加任何 CORS 头，业务照常执行。
+async fn cors(req: Request, next: Next) -> Response {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let allowed = origin.as_deref().filter(|o| cors_origin_allowed(o));
+
+    if req.method() == Method::OPTIONS {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        if let Some(origin) = allowed {
+            apply_cors_headers(&mut resp, origin, true);
+        }
+        return resp;
+    }
+
+    let mut resp = next.run(req).await;
+    if let Some(origin) = allowed {
+        apply_cors_headers(&mut resp, origin, false);
+    }
+    resp
 }
 
 /// `/api/ops/*` 守卫中间件（task 57 全量接线）：
@@ -2209,5 +2304,155 @@ frequency_ms = 500
         assert!(safe_rel_path("/etc/passwd").is_none(), "absolute rejected");
         #[cfg(windows)]
         assert!(safe_rel_path("C:/boot").is_none(), "drive prefix rejected");
+    }
+
+    // ---- CORS（跨域支持） ----
+
+    /// 手写带自定义 `Origin` 头的 HTTP 请求（CORS 测试用；白名单判定在服务端）。
+    ///
+    /// 另附带预检常见的 `Access-Control-Request-*` 头，贴近浏览器真实预检报文；
+    /// 读至 EOF（Connection: close），3s 超时防挂死。
+    async fn http_req_origin(
+        port: u16,
+        method: &str,
+        path: &str,
+        origin: Option<&str>,
+    ) -> (u16, String, String) {
+        let origin_headers = origin
+            .map(|o| {
+                format!(
+                    "Origin: {o}\r\nAccess-Control-Request-Method: POST\r\n\
+                     Access-Control-Request-Headers: authorization,content-type\r\n"
+                )
+            })
+            .unwrap_or_default();
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            let mut stream = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{origin_headers}Connection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.expect("write");
+            stream.flush().await.expect("flush");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read");
+            parse_response(&String::from_utf8(buf).expect("utf8"))
+        })
+        .await
+        .expect("http_req_origin timed out")
+    }
+
+    /// CORS 白名单判定：Tauri 打包页 + 本机 http（端口任意）放行；外部域名 /
+    /// `localhost.evil.com` 之类前缀欺骗 / `null` / https 本机一律拒绝。
+    #[test]
+    fn cors_origin_whitelist_rules() {
+        for ok in [
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://localhost:5275",
+            "http://127.0.0.1:5275",
+            "http://localhost",
+            "http://127.0.0.1",
+        ] {
+            assert!(cors_origin_allowed(ok), "{ok} must be allowed");
+        }
+        for bad in [
+            "https://evil.example",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://tauri.localhost.evil.com",
+            "https://localhost:5275",
+            "null",
+        ] {
+            assert!(!cors_origin_allowed(bad), "{bad} must be rejected");
+        }
+    }
+
+    /// CORS 实测：预检 OPTIONS 命中白名单 → 204 + 预检四件套 + Vary。
+    ///
+    /// 打的是 `/api/ops/restart`（被 [`ops_guard`] 保护的写路由）：若 CORS 未在
+    /// 鉴权之前短路，不带 Authorization 的预检会被 401 拦掉 → 本断言即失败。
+    #[tokio::test]
+    async fn cors_preflight_short_circuits_before_auth() {
+        let port = spawn_server(test_state()).await;
+        let (status, head, _) = http_req_origin(
+            port,
+            "OPTIONS",
+            "/api/ops/restart",
+            Some("http://tauri.localhost"),
+        )
+        .await;
+        let head = head.to_ascii_lowercase();
+        assert_eq!(status, 204, "preflight must be 204, got head: {head}");
+        assert!(
+            head.contains("access-control-allow-origin: http://tauri.localhost"),
+            "must reflect the Origin: {head}"
+        );
+        assert!(
+            head.contains("access-control-allow-methods: get, post, put, patch, delete, options"),
+            "methods header missing: {head}"
+        );
+        assert!(
+            head.contains("access-control-allow-headers: authorization, content-type"),
+            "headers header missing: {head}"
+        );
+        assert!(
+            head.contains("access-control-max-age: 600"),
+            "max-age header missing: {head}"
+        );
+        assert!(head.contains("vary: origin"), "must Vary: Origin: {head}");
+    }
+
+    /// CORS 实测：非预检请求命中白名单 → 业务照常 200，且带反射 Origin + Vary
+    /// （不改业务响应体，`/api/overview` 无需鉴权，语义与无 Origin 时一致）。
+    #[tokio::test]
+    async fn cors_simple_request_reflects_allowed_origin() {
+        let port = spawn_server(test_state()).await;
+        let (status, head, body) =
+            http_req_origin(port, "GET", "/api/overview", Some("http://localhost:5275")).await;
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(status, 200);
+        assert!(
+            lower.contains("access-control-allow-origin: http://localhost:5275"),
+            "must reflect the Origin: {head}"
+        );
+        assert!(lower.contains("vary: origin"), "must Vary: Origin: {head}");
+        // 业务响应体不受 CORS 影响。
+        let value: Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(value["name"], "gw-test");
+    }
+
+    /// CORS 实测：非白名单 Origin → 业务正常 200，但**不加任何 CORS 头**。
+    #[tokio::test]
+    async fn cors_denied_origin_adds_no_headers() {
+        let port = spawn_server(test_state()).await;
+        let (status, head, _) =
+            http_req_origin(port, "GET", "/api/overview", Some("https://evil.example")).await;
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(status, 200, "business response unchanged: {lower}");
+        assert!(
+            !lower.contains("access-control-allow-origin"),
+            "denied origin must not receive ACAO: {head}"
+        );
+    }
+
+    /// CORS 实测：前缀欺骗 Origin（`tauri.localhost.evil.com`）预检 → 204 但无 ACAO。
+    #[tokio::test]
+    async fn cors_preflight_prefix_spoof_gets_no_acao() {
+        let port = spawn_server(test_state()).await;
+        let (status, head, _) = http_req_origin(
+            port,
+            "OPTIONS",
+            "/api/ops/restart",
+            Some("http://tauri.localhost.evil.com"),
+        )
+        .await;
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(status, 204);
+        assert!(
+            !lower.contains("access-control-allow-origin"),
+            "spoofed origin must not receive ACAO: {head}"
+        );
     }
 }
