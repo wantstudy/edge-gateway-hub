@@ -138,6 +138,8 @@ pub enum OpsAction {
     BackupPolicyWrite,
     /// 自启注册写（`PUT /api/service/autostart`；HKCU Run 键增删）。
     AutostartWrite,
+    /// 执行更新（`POST /api/updates/apply`；危险操作，能力未接线 → 诚实降级同样入环）。
+    UpdateApply,
 }
 
 impl OpsAction {
@@ -178,6 +180,7 @@ impl OpsAction {
             OpsAction::LicenseActivate => "license_activate",
             OpsAction::BackupPolicyWrite => "backup_policy_write",
             OpsAction::AutostartWrite => "autostart_write",
+            OpsAction::UpdateApply => "update_apply",
         }
     }
 }
@@ -1234,6 +1237,7 @@ frequency_ms = 100
         assert_eq!(OpsAction::CollectorsPause.as_str(), "collectors_pause");
         assert_eq!(OpsAction::CollectorsResume.as_str(), "collectors_resume");
         assert_eq!(OpsAction::LogsRead.as_str(), "logs_read");
+        assert_eq!(OpsAction::UpdateApply.as_str(), "update_apply");
     }
 
     /// QA: 默认 authorizer 全拒（fail-closed），allow 版本全放行。

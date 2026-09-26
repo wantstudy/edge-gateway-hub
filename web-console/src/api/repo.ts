@@ -1187,7 +1187,9 @@ export interface OpsApi {
   /** 新建采集器（`POST /api/ops/collectors`；后端 body 契约 `{actor, action:"pause"|"resume"}`，
    *  方法名沿用历史符号，语义实为「暂停 / 恢复采集器组」）。 */
   createCollector(input: { actor: string; action: 'pause' | 'resume' }): Promise<{ ok: boolean; message: string }>;
-  /** 拉取运行日志（`GET /api/ops/logs`，结果并入审计清单）。 */
+  /** 拉取运行日志（`GET /api/ops/logs`，结果并入审计清单）。
+   *  后端 `actor` 为**必填审计字段**（谁拉取了日志），此处统一取 `DEFAULT_ACTOR`
+   *  并与账号类方法同口径（`input.actor ?? DEFAULT_ACTOR`）。 */
   logs(): Promise<AuditEntry[]>;
   /** 健康检查（`GET /api/health`）。 */
   health(): Promise<{ ok: boolean; message: string }>;
@@ -1324,7 +1326,11 @@ function buildOps(): OpsApi {
 
     async logs(): Promise<AuditEntry[]> {
       try {
-        const raw = await apiRequest<unknown[]>('/api/ops/logs');
+        // 后端 `/api/ops/logs` 的 `actor` 为必填审计字段（缺失 → 400），
+        // 用 `DEFAULT_ACTOR` 与账号类写方法保持同一口径。
+        const raw = await apiRequest<unknown[]>(
+          `/api/ops/logs?actor=${encodeURIComponent(DEFAULT_ACTOR)}`,
+        );
         const entries = (Array.isArray(raw) ? raw : []).map((row, i) => mapEventAudit(asRecord(row), i));
         realCache.events = [...entries, ...realCache.events];
         return entries;

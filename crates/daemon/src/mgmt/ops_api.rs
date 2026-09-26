@@ -37,7 +37,9 @@ use serde_json::{json, Value};
 use tokio::time::MissedTickBehavior;
 
 use super::rbac::{AuthedRole, Permission};
-use super::remote_ops::{OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED};
+use super::remote_ops::{
+    OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED, OUTCOME_NOT_IMPLEMENTED,
+};
 use super::writeapi::{audit, validation_error, write_guard, OUTCOME_FAILED};
 use super::MgmtState;
 
@@ -136,32 +138,44 @@ pub async fn updates_check(State(state): State<MgmtState>, authed: AuthedRole) -
 /// - 失败：缺字段 / 非字符串 / 空白 / 未知字段 → **400**；未带 token → 401；
 ///   权限不足 → 403。
 ///
-/// ## 审计挂接说明
-/// 本端点暂未接入 `remote_ops` 审计环：需要 `OpsAction` 新增独立动作字面量
-/// （`update_apply`），该枚举位于本文件域之外的 `remote_ops.rs`；待执行能力真正接线
-/// 时一并补齐（**不**复用其它动作字面量，避免污染审计语义）。当前所有失败 / 降级
-/// 路径均返回结构化原因，不产生伪造的成功痕迹。
+/// ## 审计
+/// 本端点已接入 `remote_ops` 审计环，动作字面量 = `update_apply`（**独立**动作，
+/// 不复用其它字面量）：鉴权被拒 → `denied`；body 校验失败 → `bad_request`；
+/// 三要素齐全但执行能力未接线（诚实降级 200）→ `not_implemented`（请求已放行）。
+/// 审计经 `writeapi::audit` 同步落持久安全审计；持久写失败仅记 warn，**不**改变
+/// 业务响应（响应语义只由上方 wire 契约决定，不产生伪造的成功痕迹）。
 pub async fn updates_apply(
     State(state): State<MgmtState>,
     authed: AuthedRole,
     body: Bytes,
 ) -> Response {
     const REQUIRED: &[&str] = &["reason", "note", "confirm"];
+    let actor = authed.claims.sub.clone();
     if let Err(rejection) = authed.ensure(Permission::OpsCollectors) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::UpdateApply,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
         return rejection.into_response();
     }
     let req: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if value.is_object() => value,
-        _ => return updates_apply_bad_request("body must be a JSON object"),
+        _ => return updates_apply_bad_request(&state, &actor, "body must be a JSON object"),
     };
     let Some(obj) = req.as_object() else {
-        return updates_apply_bad_request("body must be a JSON object");
+        return updates_apply_bad_request(&state, &actor, "body must be a JSON object");
     };
     for key in obj.keys() {
         if !REQUIRED.contains(&key.as_str()) {
-            return updates_apply_bad_request(&format!(
-                "unknown field {key:?}; allowed fields: reason | note | confirm"
-            ));
+            return updates_apply_bad_request(
+                &state,
+                &actor,
+                &format!("unknown field {key:?}; allowed fields: reason | note | confirm"),
+            );
         }
     }
     // 四要素：reason / note / confirm 三个独立字段，trim 后均非空。
@@ -169,20 +183,28 @@ pub async fn updates_apply(
         match obj.get(*field).and_then(Value::as_str).map(str::trim) {
             Some(value) if !value.is_empty() => {}
             Some(_) => {
-                return updates_apply_bad_request(&format!(
-                    "field {field:?} must not be blank (dangerous-op contract: `reason`, \
-                     `note` and `confirm` are three independent non-empty fields)"
-                ));
+                return updates_apply_bad_request(
+                    &state,
+                    &actor,
+                    &format!(
+                        "field {field:?} must not be blank (dangerous-op contract: `reason`, \
+                         `note` and `confirm` are three independent non-empty fields)"
+                    ),
+                );
             }
             None => {
-                return updates_apply_bad_request(&format!(
-                    "missing required field {field:?} (dangerous-op contract: body must carry \
-                     independent `reason`, `note` and `confirm`)"
-                ));
+                return updates_apply_bad_request(
+                    &state,
+                    &actor,
+                    &format!(
+                        "missing required field {field:?} (dangerous-op contract: body must carry \
+                         independent `reason`, `note` and `confirm`)"
+                    ),
+                );
             }
         }
     }
-    // 执行能力未接线：诚实返回 supported:false + 面向用户原因，绝不伪造成功。
+    // 组装诚实降级响应（执行能力未接线）。
     let current = env!("CARGO_PKG_VERSION");
     let configured = update_source_url(&state);
     let (source, reason) = match &configured {
@@ -192,6 +214,19 @@ pub async fn updates_apply(
             UPDATE_NO_SOURCE_REASON.to_string(),
         ),
     };
+    // 能力未接线：入审计（not_implemented，请求已放行但未执行任何更新），
+    // 再诚实返回 supported:false + 面向用户原因，绝不伪造成功。
+    audit(
+        &state,
+        &actor,
+        OpsAction::UpdateApply,
+        true,
+        OUTCOME_NOT_IMPLEMENTED,
+        &format!(
+            "update apply requested but capability not wired (source: {source}); \
+             no update downloaded or applied"
+        ),
+    );
     Json(json!({
         "supported": false,
         "accepted": false,
@@ -205,8 +240,17 @@ pub async fn updates_apply(
     .into_response()
 }
 
-/// 更新执行请求校验失败 → 400（结构化错误；不进入执行路径）。
-fn updates_apply_bad_request(detail: &str) -> Response {
+/// 更新执行请求校验失败：入审计（bad_request，含被拒）后返回 400（结构化错误；
+/// 不进入执行路径）。审计失败仅告警，不改变该 400 响应。
+fn updates_apply_bad_request(state: &MgmtState, actor: &str, detail: &str) -> Response {
+    audit(
+        state,
+        actor,
+        OpsAction::UpdateApply,
+        false,
+        OUTCOME_BAD_REQUEST,
+        detail,
+    );
     (
         StatusCode::BAD_REQUEST,
         Json(json!({ "error": "validation_failed", "message": detail })),
