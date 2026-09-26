@@ -66,6 +66,17 @@ log()  { printf '[build-offline][info] %s\n' "$*"; }
 warn() { printf '[build-offline][警告] %s\n' "$*" >&2; }
 die()  { printf '[build-offline][致命] %s\n' "$*" >&2; exit 1; }
 
+# -----------------------------------------------------------------------------
+# web-console 交付物守卫（fail-closed）—— 接入点见 check-web-console-dist.sh 文件头。
+#   在参数解析 / 任何实质工作之前先守一道：交付物若仍是占位页，本脚本立即非零退出，
+#   绝不把假前端打进镜像再导出成离线包。守卫脚本非零退出即视为本脚本失败（set -e）。
+# -----------------------------------------------------------------------------
+WEB_CONSOLE_GUARD="${SCRIPT_DIR}/check-web-console-dist.sh"
+if [[ ! -f "${WEB_CONSOLE_GUARD}" ]]; then
+    die "缺少 web-console 守卫脚本：${WEB_CONSOLE_GUARD}"
+fi
+bash "${WEB_CONSOLE_GUARD}"
+
 usage() {
     cat <<EOF
 用法：${SCRIPT_NAME} [选项]
