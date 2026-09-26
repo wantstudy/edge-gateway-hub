@@ -282,7 +282,8 @@ frequency_ms = 100
         let now = now_unix_secs();
         let claims = Claims {
             sub: "ops-admin".to_string(),
-            role,
+            role: role.as_str().to_string(),
+            perms: None,
             exp: now + 600,
             iat: now,
             nbf: None,

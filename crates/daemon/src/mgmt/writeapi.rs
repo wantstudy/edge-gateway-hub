@@ -189,28 +189,56 @@ fn validate_protocol(protocol: &str) -> Result<(), Response> {
     }
 }
 
-/// 地址合法性：modbus / s7 / mc 走统一解析器（复用 driver，只调用不修改）；
-/// 其余协议仅非空校验（诚实限制）。
+/// `point_id` 合法性：modbus / s7 / mc 走统一解析器（寄存器号）；其余协议仅非空。
+/// 错误字段固定 `point_id`（前端据此高亮）。
 #[allow(clippy::result_large_err)]
-fn validate_address(protocol: &str, address: &str) -> Result<(), Response> {
-    if address.trim().is_empty() {
+fn validate_point_id(protocol: &str, point_id: &str) -> Result<(), Response> {
+    let trimmed = point_id.trim();
+    if trimmed.is_empty() {
         return Err(validation_error(
-            "address",
-            "address must not be empty",
-            "non-empty endpoint or point address",
+            "point_id",
+            "point_id must not be empty",
+            "non-empty point identifier (register number for modbus/s7/mc, e.g. 40001)",
         ));
     }
     if PARSER_PROTOCOLS.contains(&protocol) {
-        if let Err(err) = PointAddressParser::parse(address) {
+        if let Err(err) = PointAddressParser::parse(trimmed) {
             return Err(validation_error(
-                "address",
+                "point_id",
                 &err.to_string(),
                 &format!(
-                    "{protocol} address syntax accepted by driver::PointAddressParser \
+                    "{protocol} point_id is a register address accepted by driver::PointAddressParser \
                      (e.g. modbus \"40001\", s7 \"DB1.DBX0.0\", mc \"D100\")"
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// 设备接入端点合法性：非空；且不得是寄存器号（防把寄存器误填进端点列）。
+/// 端点形态本身（host:port / 串口 / URL）延迟到 `poll` 时解析，这里只做诚实的前置拦截。
+/// 错误字段固定 `endpoint`。
+#[allow(clippy::result_large_err)]
+fn validate_endpoint(protocol: &str, endpoint: &str) -> Result<(), Response> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err(validation_error(
+            "endpoint",
+            "endpoint must not be empty",
+            "non-empty device access endpoint (host:port, e.g. 127.0.0.1:502)",
+        ));
+    }
+    // 防把寄存器号当端点：端点不应能被 PointAddressParser 解析成寄存器。
+    if PARSER_PROTOCOLS.contains(&protocol) && PointAddressParser::parse(trimmed).is_ok() {
+        return Err(validation_error(
+            "endpoint",
+            &format!(
+                "endpoint {trimmed:?} looks like a register address (e.g. 40001); in V1 the device \
+                 access endpoint goes in `endpoint` (host:port) and the register goes in `point_id`"
+            ),
+            "device access endpoint (host:port) for `endpoint`; register number for `point_id`",
+        ));
     }
     Ok(())
 }
@@ -261,22 +289,35 @@ struct DeviceCreateBody {
     name: Option<String>,
     #[serde(default)]
     protocol: Option<String>,
+    /// 设备级接入端点（可选；点位行未覆盖时采用本值）。让端点有唯一归属。
+    #[serde(default)]
+    endpoint: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    /// 所属分组（缺省 / 空 = 默认分组；非空须指向已声明分组）。
+    #[serde(default)]
+    group_id: Option<String>,
 }
 
 /// `PUT /api/devices/:id` 请求体（全部可选；只更新出现的字段）。
+///
+/// `group_id`：漏传 = 不变；传空串 = 回落默认分组；传非空 = 迁移到该分组。
 #[derive(Debug, Default, Deserialize)]
 struct DeviceUpdateBody {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     protocol: Option<String>,
+    /// 设备级接入端点（可选；点位行未覆盖时采用本值）。
+    #[serde(default)]
+    endpoint: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    #[serde(default)]
+    group_id: Option<String>,
 }
 
-/// `POST /api/points` 请求体。
+/// `POST /api/points` 请求体（含需求 2 的点位元数据与需求 6 的推送开关）。
 #[derive(Debug, Default, Deserialize)]
 struct PointCreateBody {
     #[serde(default)]
@@ -285,22 +326,154 @@ struct PointCreateBody {
     point_id: String,
     #[serde(default)]
     protocol: String,
+    /// 设备接入端点（host:port / 串口 / URL）。V1 正例字段为 `endpoint`；`address`
+    /// 保留为 `endpoint` 的别名（缺省回退）。二者皆空 → 校验 400。
     #[serde(default)]
     address: String,
+    /// 设备接入端点（V1 正例；与 `address` 同义，优先采用）。host:port / 串口 / URL。
+    #[serde(default)]
+    endpoint: Option<String>,
     #[serde(default)]
     frequency_ms: Option<Value>,
+    /// 推送开关（键名 `push_enabled`，别名 `push`；缺省 true）。
+    #[serde(default, alias = "push")]
+    push_enabled: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    data_type: Option<String>,
+    #[serde(default)]
+    byte_order: Option<String>,
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    deadband: Option<Value>,
+    #[serde(default)]
+    target_key: Option<String>,
+    #[serde(default)]
+    point_type: Option<String>,
+    #[serde(default)]
+    formula: Option<String>,
 }
 
-/// `PUT /api/points/:device_id/:point_id` 请求体（身份字段取自路径，body 只更新
-/// 协议 / 地址 / 频率；不支持移动点位归属）。
+/// `PUT /api/points/:device_id/:point_id` 请求体（身份字段取自路径，body 更新
+/// 协议 / 地址 / 频率 / 元数据 / 推送开关；不支持移动点位归属）。
+///
+/// 文本字段：漏传 = 不变；传空串 = 清空为 `None`。
 #[derive(Debug, Default, Deserialize)]
 struct PointUpdateBody {
     #[serde(default)]
     protocol: Option<String>,
+    /// 设备接入端点（V1 正例；与 `address` 同义，优先采用）。`None` = 不变。
+    #[serde(default)]
+    endpoint: Option<String>,
+    /// 设备接入端点（legacy 别名；`endpoint` 优先，`endpoint` 缺省时回退到此）。
     #[serde(default)]
     address: Option<String>,
     #[serde(default)]
     frequency_ms: Option<Value>,
+    #[serde(default, alias = "push")]
+    push_enabled: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    data_type: Option<String>,
+    #[serde(default)]
+    byte_order: Option<String>,
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    deadband: Option<Value>,
+    #[serde(default)]
+    target_key: Option<String>,
+    #[serde(default)]
+    point_type: Option<String>,
+    #[serde(default)]
+    formula: Option<String>,
+}
+
+/// 点位元数据（请求体解析 / 校验后的规整值）。
+#[derive(Debug, Clone)]
+struct PointMetaInput {
+    push_enabled: bool,
+    name: Option<String>,
+    data_type: Option<String>,
+    byte_order: Option<String>,
+    unit: Option<String>,
+    deadband: Option<f64>,
+    target_key: Option<String>,
+    point_type: String,
+    formula: Option<String>,
+}
+
+impl Default for PointMetaInput {
+    fn default() -> Self {
+        Self {
+            push_enabled: true,
+            name: None,
+            data_type: None,
+            byte_order: None,
+            unit: None,
+            deadband: None,
+            target_key: None,
+            point_type: "physical".to_string(),
+            formula: None,
+        }
+    }
+}
+
+/// `deadband` 解析：接受 JSON number 或数字字符串；须**有限且 ≥ 0**。
+/// `None`（未声明）= 不过滤。
+#[allow(clippy::result_large_err)]
+fn parse_deadband(raw: Option<&Value>) -> Result<Option<f64>, Response> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    // 显式空串 = 清空（不过滤）；其余须为有限非负数。
+    if let Value::String(s) = raw {
+        if s.trim().is_empty() {
+            return Ok(None);
+        }
+    }
+    let value = match raw {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    let Some(v) = value else {
+        return Err(validation_error(
+            "deadband",
+            &format!("not a number: {raw}"),
+            "non-negative finite number (engineering units); number or string",
+        ));
+    };
+    if !v.is_finite() || v < 0.0 {
+        return Err(validation_error(
+            "deadband",
+            &format!("invalid deadband {v}"),
+            "non-negative finite number (engineering units)",
+        ));
+    }
+    Ok(Some(v))
+}
+
+/// `point_type` 校验（取值域 `physical` | `derived`；空 / 未声明 = physical）。
+#[allow(clippy::result_large_err)]
+fn validate_point_type(raw: Option<&str>) -> Result<String, Response> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok("physical".to_string()),
+        Some(t) => {
+            if crate::config::POINT_TYPES.contains(&t) {
+                Ok(t.to_string())
+            } else {
+                Err(validation_error(
+                    "point_type",
+                    &format!("unknown point type {t:?}"),
+                    &crate::config::POINT_TYPES.join(" | "),
+                ))
+            }
+        }
+    }
 }
 
 // ---- 配置辅助 ----
@@ -331,20 +504,66 @@ fn trimmed_or_none(raw: &Option<String>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// 构造点位行（调用方须先完成协议 / 地址 / 频率校验）。
+/// 构造点位行（调用方须先完成协议 / 端点 / 频率 / 元数据校验）。
+///
+/// `endpoint` 为设备接入端点事实源（落到 [`PointConfig::address`]）；
+/// `point_endpoint` 为点位级覆盖（仅当请求显式携带 `endpoint` 时 `Some`，落到
+/// [`PointConfig::endpoint`]）。
 fn make_point_row(
     device_id: &str,
     point_id: &str,
     protocol: &str,
-    address: &str,
+    endpoint: &str,
+    point_endpoint: Option<&str>,
     frequency_ms: u64,
+    meta: &PointMetaInput,
 ) -> PointConfig {
     PointConfig {
         device_id: device_id.to_string(),
         point_id: point_id.to_string(),
         protocol: protocol.to_string(),
-        address: address.to_string(),
+        address: endpoint.to_string(),
+        endpoint: point_endpoint.map(|s| s.to_string()),
         frequency_ms,
+        push_enabled: meta.push_enabled,
+        name: meta.name.clone(),
+        data_type: meta.data_type.clone(),
+        byte_order: meta.byte_order.clone(),
+        unit: meta.unit.clone(),
+        deadband: meta.deadband,
+        target_key: meta.target_key.clone(),
+        point_type: meta.point_type.clone(),
+        formula: meta.formula.clone(),
+        // 模拟字段由点位模拟写端点（be-sim）负责；本接口按缺省建行。
+        sim_enabled: false,
+        sim_mode: None,
+        sim_min: None,
+        sim_max: None,
+        sim_dec: None,
+        sim_period_ms: None,
+    }
+}
+
+/// 校验 `group_id` 归属：空 / 未声明 = `None`（默认分组）；非空须指向已声明分组。
+#[allow(clippy::result_large_err)]
+fn validate_group_id(
+    config: &crate::config::GatewayConfig,
+    raw: Option<&str>,
+) -> Result<Option<String>, Response> {
+    let Some(group) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if group == crate::config::DEFAULT_GROUP_ID {
+        return Ok(None); // 显式指向默认分组 ⇔ 无分组。
+    }
+    if config.device_groups.iter().any(|g| g.id == group) {
+        Ok(Some(group.to_string()))
+    } else {
+        Err(validation_error(
+            "group_id",
+            &format!("unknown group {group:?}"),
+            "an existing group id, empty string, or the reserved \"default\"",
+        ))
     }
 }
 
@@ -504,6 +723,21 @@ pub async fn device_create(
 
     let _guard = write_guard();
     let mut config = (*state.config()).clone();
+    // 分组归属校验（先于唯一性等业务分支）。
+    let group_id = match validate_group_id(&config, req.group_id.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => {
+            audit(
+                &state,
+                &actor,
+                OpsAction::DeviceCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &format!("invalid group_id {:?}", req.group_id),
+            );
+            return resp;
+        }
+    };
     if device_exists(&config, &id) {
         audit(
             &state,
@@ -525,6 +759,8 @@ pub async fn device_create(
         name: Some(name),
         enabled: req.enabled.unwrap_or(true),
         protocol: Some(protocol.clone()),
+        group_id,
+        endpoint: trimmed_or_none(&req.endpoint),
     });
     persist(
         &state,
@@ -573,7 +809,7 @@ pub async fn device_update(
             return validation_error(
                 "body",
                 &format!("malformed JSON: {err}"),
-                "object {name?, protocol?, enabled?}",
+                "object {name?, protocol?, endpoint?, enabled?}",
             );
         }
     };
@@ -604,6 +840,24 @@ pub async fn device_update(
             return resp;
         }
     }
+    // 分组归属：漏传 = 不变；传值（含空串）即覆盖（空 / "default" = 回落默认分组）。
+    let group_update = match req.group_id.as_deref() {
+        None => None,
+        Some(raw) => match validate_group_id(&config, Some(raw)) {
+            Ok(v) => Some(v),
+            Err(resp) => {
+                audit(
+                    &state,
+                    &actor,
+                    OpsAction::DeviceUpdate,
+                    true,
+                    OUTCOME_BAD_REQUEST,
+                    &format!("invalid group_id {:?}", req.group_id),
+                );
+                return resp;
+            }
+        },
+    };
     // upsert 登记行。
     match config.devices.iter_mut().find(|d| d.device_id == device_id) {
         Some(entry) => {
@@ -616,6 +870,12 @@ pub async fn device_update(
             if let Some(protocol) = trimmed_or_none(&req.protocol) {
                 entry.protocol = Some(protocol);
             }
+            if let Some(group) = group_update {
+                entry.group_id = group;
+            }
+            if req.endpoint.is_some() {
+                entry.endpoint = trimmed_or_none(&req.endpoint);
+            }
         }
         None => {
             config.devices.push(DeviceConfig {
@@ -623,6 +883,8 @@ pub async fn device_update(
                 name: trimmed_or_none(&req.name),
                 enabled: req.enabled.unwrap_or(true),
                 protocol: trimmed_or_none(&req.protocol),
+                group_id: group_update.flatten(),
+                endpoint: trimmed_or_none(&req.endpoint),
             });
         }
     }
@@ -754,7 +1016,7 @@ pub async fn point_create(
             return validation_error(
                 "body",
                 &format!("malformed JSON: {err}"),
-                "object {device_id, point_id, protocol, address, frequency_ms?}",
+                "object {device_id, point_id, protocol, endpoint?, address?, frequency_ms?}",
             );
         }
     };
@@ -790,6 +1052,16 @@ pub async fn point_create(
             "non-empty unique point identifier within the device",
         );
     }
+    // 端点解析：`endpoint` 优先，回退 legacy `address` 别名；皆空 = 缺省空串
+    // （交由 validate_endpoint 判 400）。
+    let endpoint_explicit = trimmed_or_none(&req.endpoint);
+    let endpoint_effective = endpoint_explicit
+        .clone()
+        .or_else(|| {
+            let t = req.address.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        })
+        .unwrap_or_default();
     let _guard = write_guard();
     let mut config = (*state.config()).clone();
     if !device_exists(&config, &device_id) {
@@ -814,14 +1086,25 @@ pub async fn point_create(
         );
         return resp;
     }
-    if let Err(resp) = validate_address(&req.protocol, &req.address) {
+    if let Err(resp) = validate_point_id(&req.protocol, &point_id) {
         audit(
             &state,
             &actor,
             OpsAction::PointCreate,
             true,
             OUTCOME_BAD_REQUEST,
-            &format!("invalid address {:?}", req.address),
+            &format!("invalid point_id {point_id:?}"),
+        );
+        return resp;
+    }
+    if let Err(resp) = validate_endpoint(&req.protocol, &endpoint_effective) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::PointCreate,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("invalid endpoint {:?}", endpoint_effective),
         );
         return resp;
     }
@@ -835,6 +1118,35 @@ pub async fn point_create(
                 true,
                 OUTCOME_BAD_REQUEST,
                 "invalid frequency_ms",
+            );
+            return resp;
+        }
+    };
+    // 元数据校验（结构化错误；先于唯一性检查等业务分支，fail-closed）。
+    let point_type = match validate_point_type(req.point_type.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => {
+            audit(
+                &state,
+                &actor,
+                OpsAction::PointCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                "invalid point_type",
+            );
+            return resp;
+        }
+    };
+    let deadband = match parse_deadband(req.deadband.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => {
+            audit(
+                &state,
+                &actor,
+                OpsAction::PointCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                "invalid deadband",
             );
             return resp;
         }
@@ -854,12 +1166,25 @@ pub async fn point_create(
             "unique point id within the device",
         );
     }
+    let meta = PointMetaInput {
+        push_enabled: req.push_enabled.unwrap_or(true),
+        name: trimmed_or_none(&req.name),
+        data_type: trimmed_or_none(&req.data_type),
+        byte_order: trimmed_or_none(&req.byte_order),
+        unit: trimmed_or_none(&req.unit),
+        deadband,
+        target_key: trimmed_or_none(&req.target_key),
+        point_type,
+        formula: trimmed_or_none(&req.formula),
+    };
     config.points.push(make_point_row(
         &device_id,
         &point_id,
         &req.protocol,
-        req.address.trim(),
+        &endpoint_effective,
+        endpoint_explicit.as_deref(),
         frequency_ms,
+        &meta,
     ));
     persist(
         &state,
@@ -867,8 +1192,9 @@ pub async fn point_create(
         &actor,
         OpsAction::PointCreate,
         &format!(
-            "create point {device_id:?}/{point_id:?} (protocol={}, address={:?}, frequency_ms={frequency_ms})",
-            req.protocol, req.address
+            "create point {device_id:?}/{point_id:?} (protocol={}, endpoint={:?}, frequency_ms={frequency_ms}, \
+             push_enabled={}, point_type={})",
+            req.protocol, endpoint_effective, meta.push_enabled, meta.point_type
         ),
         &device_id,
         Some(&point_id),
@@ -909,7 +1235,7 @@ pub async fn point_update(
             return validation_error(
                 "body",
                 &format!("malformed JSON: {err}"),
-                "object {protocol?, address?, frequency_ms?}",
+                "object {protocol?, endpoint?, address?, frequency_ms?}",
             );
         }
     };
@@ -946,15 +1272,19 @@ pub async fn point_update(
         );
         return resp;
     }
-    let address = trimmed_or_none(&req.address).unwrap_or(cur_address);
-    if let Err(resp) = validate_address(&protocol, &address) {
+    let endpoint_explicit = trimmed_or_none(&req.endpoint);
+    let new_address = endpoint_explicit
+        .clone()
+        .or_else(|| trimmed_or_none(&req.address))
+        .unwrap_or_else(|| cur_address.clone());
+    if let Err(resp) = validate_endpoint(&protocol, &new_address) {
         audit(
             &state,
             &actor,
             OpsAction::PointUpdate,
             true,
             OUTCOME_BAD_REQUEST,
-            &format!("invalid address {address:?}"),
+            &format!("invalid endpoint {new_address:?}"),
         );
         return resp;
     }
@@ -972,17 +1302,89 @@ pub async fn point_update(
             return resp;
         }
     };
+    // 元数据校验（结构化错误；先于任何变更，fail-closed）。
+    // `point_type` 漏传 = 不变；显式空串 = 复位 `physical`。
+    let point_type_update = match req.point_type.as_deref() {
+        None => None,
+        Some(raw) => match validate_point_type(Some(raw)) {
+            Ok(v) => Some(v),
+            Err(resp) => {
+                audit(
+                    &state,
+                    &actor,
+                    OpsAction::PointUpdate,
+                    true,
+                    OUTCOME_BAD_REQUEST,
+                    "invalid point_type",
+                );
+                return resp;
+            }
+        },
+    };
+    // `deadband` 漏传 = 不变；显式空串 = 清空；其余须为有限非负数。
+    let deadband_update = match req.deadband.as_ref() {
+        None => None,
+        Some(raw) => match parse_deadband(Some(raw)) {
+            Ok(v) => Some(v),
+            Err(resp) => {
+                audit(
+                    &state,
+                    &actor,
+                    OpsAction::PointUpdate,
+                    true,
+                    OUTCOME_BAD_REQUEST,
+                    "invalid deadband",
+                );
+                return resp;
+            }
+        },
+    };
+
     let row = &mut config.points[idx];
     row.protocol = protocol.clone();
-    row.address = address.clone();
+    row.address = new_address.clone();
+    // 仅当请求显式携带 `endpoint` 时才改写点位级覆盖（含显式清空为 None）。
+    if req.endpoint.is_some() {
+        row.endpoint = endpoint_explicit;
+    }
     row.frequency_ms = frequency_ms;
+    if let Some(push) = req.push_enabled {
+        row.push_enabled = push;
+    }
+    if let Some(point_type) = point_type_update {
+        row.point_type = point_type;
+    }
+    if let Some(deadband) = deadband_update {
+        row.deadband = deadband;
+    }
+    // 文本字段：漏传 = 不变，传值（含空串）即覆盖，空串 = 清空为 None。
+    if req.name.is_some() {
+        row.name = trimmed_or_none(&req.name);
+    }
+    if req.data_type.is_some() {
+        row.data_type = trimmed_or_none(&req.data_type);
+    }
+    if req.byte_order.is_some() {
+        row.byte_order = trimmed_or_none(&req.byte_order);
+    }
+    if req.unit.is_some() {
+        row.unit = trimmed_or_none(&req.unit);
+    }
+    if req.target_key.is_some() {
+        row.target_key = trimmed_or_none(&req.target_key);
+    }
+    if req.formula.is_some() {
+        row.formula = trimmed_or_none(&req.formula);
+    }
+    let push_enabled = row.push_enabled;
     persist(
         &state,
         config,
         &actor,
         OpsAction::PointUpdate,
         &format!(
-            "update point {device_id:?}/{point_id:?} (protocol={protocol}, address={address:?}, frequency_ms={frequency_ms})"
+            "update point {device_id:?}/{point_id:?} (protocol={protocol}, endpoint={new_address:?}, \
+             frequency_ms={frequency_ms}, push_enabled={push_enabled})"
         ),
         &device_id,
         Some(&point_id),
@@ -1093,7 +1495,8 @@ frequency_ms = 100
         let now = now_unix_secs();
         let claims = Claims {
             sub: "ops-admin".to_string(),
-            role,
+            role: role.as_str().to_string(),
+            perms: None,
             exp: now + 600,
             iat: now,
             nbf: None,
@@ -1396,6 +1799,9 @@ frequency_ms = 100
 
     /// QA Happy: 点位新增落盘往返（frequency_ms 字符串形态）+ 重复 400；
     /// GET /api/points 立即可见。
+    ///
+    /// 新点位契约（#37）：`point_id` = 南向寄存器地址（PointAddressParser 可解析），
+    /// `endpoint` 为端点正例字段，`address` 是它的别名。
     #[tokio::test]
     async fn point_create_roundtrip_and_duplicate_is_400() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1406,30 +1812,33 @@ frequency_ms = 100
         let (status, _, body) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_press","protocol":"modbus-tcp","address":"40010","frequency_ms":"250"}"#,
+            r#"{"device_id":"dev-01","point_id":"40001","protocol":"modbus-tcp","endpoint":"127.0.0.1:502","frequency_ms":"250"}"#,
             &token,
         )
         .await;
         assert_eq!(status, 200, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(value["point_id"], "p_press");
+        assert_eq!(value["point_id"], "40001");
         assert_eq!(value["device_id"], "dev-01");
         assert!(value["config_version"].is_string(), "大数红线: {value}");
+        // 注：accepted() 响应体只含 accepted/device_id/point_id/config_version；
+        // address / endpoint 语义在下方落盘断言覆盖。
 
         let config = load_config(&path);
         let row = config
             .points
             .iter()
-            .find(|p| p.point_id == "p_press")
+            .find(|p| p.point_id == "40001")
             .expect("point row persisted");
-        assert_eq!(row.address, "40010");
+        assert_eq!(row.address, "127.0.0.1:502");
+        assert_eq!(row.endpoint.as_deref(), Some("127.0.0.1:502"));
         assert_eq!(row.frequency_ms, 250);
 
         // 重复 (device, point) → 400。
         let (status, _, body) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_press","protocol":"modbus-tcp","address":"40011"}"#,
+            r#"{"device_id":"dev-01","point_id":"40001","protocol":"modbus-tcp","endpoint":"127.0.0.1:503"}"#,
             &token,
         )
         .await;
@@ -1446,6 +1855,9 @@ frequency_ms = 100
 
     /// QA Error: 非法地址 400（modbus / s7 走 PointAddressParser 校验——
     /// 复用 driver 解析器，只调用不修改）；合法 s7 地址通过。
+    ///
+    /// 新契约（#37）：`point_id` 本身就是南向地址，非法地址在 `point_id` 字段报错；
+    /// 端点走 `endpoint` 正例字段（`validate_endpoint` 拒绝寄存器地址形态）。
     #[tokio::test]
     async fn point_address_validation_rejects_invalid() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1453,18 +1865,18 @@ frequency_ms = 100
         let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        // modbus 非法地址。
+        // modbus 非法地址（point_id = 南向地址，非解析即 400）。
         let (status, _, body) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_bad","protocol":"modbus-tcp","address":"INVALID"}"#,
+            r#"{"device_id":"dev-01","point_id":"INVALID","protocol":"modbus-tcp","endpoint":"192.168.1.10:502"}"#,
             &token,
         )
         .await;
         assert_eq!(status, 400, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["error"], "validation_failed");
-        assert_eq!(value["field"], "address");
+        assert_eq!(value["field"], "point_id");
         assert!(
             value["reason"]
                 .as_str()
@@ -1477,7 +1889,7 @@ frequency_ms = 100
         let (status, _, body) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_bad","protocol":"s7","address":"DB1.DBX0.9"}"#,
+            r#"{"device_id":"dev-01","point_id":"DB1.DBX0.9","protocol":"s7","endpoint":"192.168.1.10:102"}"#,
             &token,
         )
         .await;
@@ -1487,7 +1899,7 @@ frequency_ms = 100
         let (status, _, body) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_s7","protocol":"s7","address":"DB2.DBW20"}"#,
+            r#"{"device_id":"dev-01","point_id":"DB2.DBW20","protocol":"s7","endpoint":"192.168.1.10:102"}"#,
             &token,
         )
         .await;
@@ -1495,13 +1907,13 @@ frequency_ms = 100
         assert!(load_config(&path)
             .points
             .iter()
-            .any(|p| p.point_id == "p_s7" && p.protocol == "s7"));
+            .any(|p| p.point_id == "DB2.DBW20" && p.protocol == "s7"));
 
-        // 空地址 400。
+        // 空地址（trim 后空 point_id）400。
         let (status, _, _) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_bad","protocol":"modbus-tcp","address":"  "}"#,
+            r#"{"device_id":"dev-01","point_id":"  ","protocol":"modbus-tcp","endpoint":"192.168.1.10:502"}"#,
             &token,
         )
         .await;
@@ -1509,7 +1921,8 @@ frequency_ms = 100
     }
 
     /// QA: frequency_ms 校验——低于下限 400（计划指标 ≥100ms）、非数字 400、
-    /// 缺省 1000ms、数字形态可用。
+    /// 缺省 1000ms、数字形态可用。point_id / endpoint 用合法值，确保校验链
+    /// 走到 frequency_ms 分支。
     #[tokio::test]
     async fn point_frequency_validation() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1521,7 +1934,7 @@ frequency_ms = 100
         let (status, _, body) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_fast","protocol":"modbus-tcp","address":"40001","frequency_ms":50}"#,
+            r#"{"device_id":"dev-01","point_id":"40001","protocol":"modbus-tcp","endpoint":"192.168.1.10:502","frequency_ms":50}"#,
             &token,
         )
         .await;
@@ -1534,7 +1947,7 @@ frequency_ms = 100
         let (status, _, _) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_fast","protocol":"modbus-tcp","address":"40001","frequency_ms":"abc"}"#,
+            r#"{"device_id":"dev-01","point_id":"40001","protocol":"modbus-tcp","endpoint":"192.168.1.10:502","frequency_ms":"abc"}"#,
             &token,
         )
         .await;
@@ -1544,7 +1957,7 @@ frequency_ms = 100
         let (status, _, _) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-01","point_id":"p_dflt","protocol":"modbus-tcp","address":"40002"}"#,
+            r#"{"device_id":"dev-01","point_id":"40002","protocol":"modbus-tcp","endpoint":"192.168.1.10:502"}"#,
             &token,
         )
         .await;
@@ -1553,7 +1966,7 @@ frequency_ms = 100
             load_config(&path)
                 .points
                 .iter()
-                .find(|p| p.point_id == "p_dflt")
+                .find(|p| p.point_id == "40002")
                 .expect("row")
                 .frequency_ms,
             1000
@@ -1568,11 +1981,12 @@ frequency_ms = 100
         let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        // 修改地址 + 频率（数字形态）。
+        // 修改端点 + 频率（数字形态）；新契约 `endpoint` 为正例字段，`address`
+        // 是别名（落盘 row.address = 有效端点）。
         let (status, _, body) = http_put_bearer(
             port,
             "/api/points/dev-01/p_temp",
-            r#"{"address":"40001","frequency_ms":500}"#,
+            r#"{"endpoint":"192.168.1.10:502","frequency_ms":500}"#,
             &token,
         )
         .await;
@@ -1582,14 +1996,14 @@ frequency_ms = 100
             .into_iter()
             .find(|p| p.point_id == "p_temp")
             .expect("row");
-        assert_eq!(row.address, "40001");
+        assert_eq!(row.address, "192.168.1.10:502");
         assert_eq!(row.frequency_ms, 500);
 
         // 未知点位 → 404。
         let (status, _, _) = http_put_bearer(
             port,
             "/api/points/dev-01/nope",
-            r#"{"address":"40002"}"#,
+            r#"{"endpoint":"192.168.1.10:502"}"#,
             &token,
         )
         .await;
@@ -1599,7 +2013,7 @@ frequency_ms = 100
         let (status, _, _) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"nope","point_id":"p1","protocol":"mc","address":"D100"}"#,
+            r#"{"device_id":"nope","point_id":"D100","protocol":"mc","endpoint":"192.168.1.10:502"}"#,
             &token,
         )
         .await;
@@ -1789,14 +2203,14 @@ frequency_ms = 100
         )
         .await;
         assert_eq!(status, 200);
-        let (status, _, _) = http_post_bearer(
+        let (status, _, body) = http_post_bearer(
             port,
             "/api/points",
-            r#"{"device_id":"dev-02","point_id":"p1","protocol":"modbus-tcp","address":"40001"}"#,
+            r#"{"device_id":"dev-02","point_id":"40001","protocol":"modbus-tcp","endpoint":"192.168.1.20:502"}"#,
             &token,
         )
         .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 200, "{body}");
 
         let (status, _, body) = http_get(port, "/api/status").await;
         assert_eq!(status, 200);

@@ -9,19 +9,22 @@
 //! - `POST /api/forwarders`               出口登记（`device.write`）——**诚实 501**（写能力未落地）；
 //! - `POST /api/forwarders/:id/test`      出口 TCP 可达性探测（`device.view`）；
 //! - `GET  /api/rules`                    转发规则（读，开放）——**诚实空态**（无规则引擎数据源）；
-//! - `GET  /api/alerts`                   告警（读，开放）——**诚实空态**（无告警引擎数据源）；
-//! - `PUT  /api/alerts/rules`             告警规则写（`device.write`）——**诚实 501**；
+//! - `GET  /api/alerts`                   告警记录（`device.view`）——数据源 = `alarm::AlarmStore`；
+//! - `GET  /api/alerts/rules`、`PUT /api/alerts/rules`、
+//!   `PUT/DELETE /api/alerts/rules/:id`（`device.write`）——见 `mgmt/alerts_api`。
 //! - `GET  /api/license/status`           授权状态快照（读，开放；来自 `LicenseRuntime` watch）。
 //!
 //! ## CSV 契约（硬契约：校验错误必须「行号 + 原因 + 允许值」；导出即可当导入模板）
-//! - 列：`device_id,point_id,protocol,address,frequency_ms`（= `config.rs PointConfig`）；
+//! - 列：`device_id,point_id,protocol,endpoint,frequency_ms,push`（= `config.rs PointConfig`
+//!   的可导入子集；`endpoint` = 设备接入端点 host:port，`push` = 北向推送开关，
+//!   接受 `1/0` 或 `true/false`，缺省 = 推送）；
 //! - **行号** = 文件内 1 基物理行号（表头 = 第 1 行）；
 //! - 校验失败**整批拒绝**（fail-closed，零落盘），400 返回
 //!   `{error: "validation_failed", errors: [{line, reason, allowed}, ...]}`；
 //! - 支持最简 RFC4180：逗号分隔、双引号包裹、`""` 转义（手写解析，**零新依赖**）；
-//! - modbus 地址接受两种形态（与 southbound 运行期语义一致）：寄存器号
-//!   （`40001`，过 `PointAddressParser`）或端点式（`host:port`，southbound
-//!   `address` 列的实际语义）——导出再导入因此总是可往返；
+//! - 语义（与运行期 / API 一致）：`point_id` = 南向寄存器号（`40001` 过
+//!   `PointAddressParser`）；`endpoint` = 设备接入端点（`host:port`）。导出再导入
+//!   总是可往返；
 //! - XLSX 明确**不支持**（记录为后续缺口，非 CSV 一律按解析失败报 400）。
 //!
 //! ## 复用与红线
@@ -54,8 +57,9 @@ use crate::config::GatewayConfig;
 use crate::driver::modbus::{ModbusConfig, ModbusDriver, ModbusFraming};
 use crate::driver::{Driver, PointAddressParser, ReadPoint};
 
-/// CSV 模板表头（导出即模板；导入第 1 行必须含全部列名）。
-const POINTS_CSV_HEADER: &str = "device_id,point_id,protocol,address,frequency_ms";
+/// CSV 模板表头（导出即模板；导入第 1 行必须含除 `push` 外的全部列名——`push`
+/// 为可选列，缺省 = 推送，兼容旧模板）。
+const POINTS_CSV_HEADER: &str = "device_id,point_id,protocol,endpoint,frequency_ms,push";
 /// 点表导入单批行数上限（防御性上限，防超大请求打爆内存）。
 const MAX_IMPORT_ROWS: usize = 10_000;
 /// 设备 / 出口探测缺省超时（毫秒）。
@@ -146,20 +150,10 @@ fn split_broker_url(url: &str) -> Option<(String, Option<u16>)> {
     Some((host_port.to_string(), None))
 }
 
-/// 主机名形态判定（防把 `DB1.DBX0.0` 之类的点位地址误判为端点）：
-/// 至少含一个 `.`、或为 `localhost`、或为方括号包裹的 IPv6。
-fn looks_like_host(host: &str) -> bool {
-    !host.is_empty()
-        && (host.contains('.') || host.eq_ignore_ascii_case("localhost") || host.starts_with('['))
-}
-
-/// 判定 `host[:port]` 是否为合法端点形态（供 modbus 端点式地址校验）。
-fn is_endpoint_shape(raw: &str) -> bool {
-    match split_broker_url(&format!("tcp://{raw}")) {
-        Some((host, _port)) => looks_like_host(&host),
-        None => false,
-    }
-}
+// 注（dead_code 清理，C-3）：原 `looks_like_host` / `is_endpoint_shape` 已删除。
+// 它们是「modbus 端点式地址校验」的早期草稿，全仓无调用者；端点形态校验现由
+// `mgmt::writeapi` 的端点归一化路径承担（新契约 `endpoint` 正例字段）。若后续
+// 端点校验需要 host 形态判定，从 writeapi 的实现取用，勿在此重造。
 
 // ===========================================================================
 // CSV（手写零依赖解析 / 生成）
@@ -251,20 +245,34 @@ struct ImportRow {
     device_id: String,
     point_id: String,
     protocol: String,
-    address: String,
+    /// 设备接入端点（host:port）；落盘时映射到 `PointConfig.address`（端点事实源）。
+    endpoint: String,
     frequency_ms: u64,
+    /// 北向推送开关（`push` 列；空 / 缺列 = true）。
+    push_enabled: bool,
 }
 
-/// modbus 地址的双重语义校验：寄存器号（`40001`，过 `PointAddressParser`）
-/// 或端点式（`host:port`，southbound `address` 列的实际语义）。
-/// 其余解析器协议（s7 / mc）仅接受解析器形态；非解析器协议仅非空校验。
-/// 返回 `Err((reason, allowed))` 供行级错误报告。
-fn check_address(protocol: &str, address: &str) -> Result<(), (String, String)> {
-    let trimmed = address.trim();
+/// 解析 `push` 列布尔值：接受 `1/0` 或 `true/false`（大小写不敏感）；
+/// 空串 = 缺省推送（true）。`Err(reason)` 供行级「原因 + 允许值」错误报告。
+fn parse_push_cell(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(true),
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        other => Err(format!(
+            "push {other:?} is not a boolean (accepted: 1/0, true/false, empty = push)"
+        )),
+    }
+}
+
+/// `point_id` 双重语义校验：modbus / s7 / mc 走 `PointAddressParser`（寄存器号）；
+/// 其余协议仅非空校验。返回 `Err((reason, allowed))` 供行级错误报告。
+fn check_point_id(protocol: &str, point_id: &str) -> Result<(), (String, String)> {
+    let trimmed = point_id.trim();
     if trimmed.is_empty() {
         return Err((
-            "address must not be empty".to_string(),
-            "non-empty endpoint (host:port) or point address".to_string(),
+            "point_id must not be empty".to_string(),
+            "non-empty point identifier (register number for modbus/s7/mc, e.g. 40001)".to_string(),
         ));
     }
     if !writeapi::PROTOCOLS.contains(&protocol) {
@@ -275,25 +283,46 @@ fn check_address(protocol: &str, address: &str) -> Result<(), (String, String)> 
         ));
     }
     let parser_protocols = ["modbus-tcp", "modbus-rtu", "s7", "mc"];
-    if !parser_protocols.contains(&protocol) {
-        return Ok(()); // opcua / http / mqtt：endpoint / URL 语义，仅非空校验。
+    if parser_protocols.contains(&protocol) && PointAddressParser::parse(trimmed).is_err() {
+        return Err((
+            format!(
+                "invalid point_id {trimmed:?}: not a register address accepted by driver::PointAddressParser"
+            ),
+            format!(
+                "{protocol} point_id: register number (e.g. modbus \"40001\", s7 \"DB1.DBX0.0\", mc \"D100\")"
+            ),
+        ));
     }
-    if PointAddressParser::parse(trimmed).is_ok() {
-        return Ok(());
+    Ok(())
+}
+
+/// 设备接入端点校验：非空；且不得是寄存器号（防把寄存器误填进端点列）。
+/// 端点形态（host:port / 串口 / URL）延迟到 `poll` 时解析。返回 `Err((reason, allowed))`。
+fn check_endpoint(protocol: &str, endpoint: &str) -> Result<(), (String, String)> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err((
+            "endpoint must not be empty".to_string(),
+            "non-empty device access endpoint (host:port, e.g. 127.0.0.1:502)".to_string(),
+        ));
     }
-    // modbus 允许端点式地址（host:port / host，端口可缺省 = 502）。
-    if (protocol == "modbus-tcp" || protocol == "modbus-rtu") && is_endpoint_shape(trimmed) {
-        return Ok(());
+    if !writeapi::PROTOCOLS.contains(&protocol) {
+        return Err((
+            format!("unknown protocol {protocol:?}"),
+            writeapi::PROTOCOLS.join(" | "),
+        ));
     }
-    Err((
-        format!(
-            "invalid point address {trimmed:?}: not a register number (e.g. 40001) nor a host:port endpoint"
-        ),
-        format!(
-            "{protocol} address: register number accepted by driver::PointAddressParser \
-             (e.g. modbus \"40001\", s7 \"DB1.DBX0.0\", mc \"D100\") or host:port endpoint for modbus"
-        ),
-    ))
+    let parser_protocols = ["modbus-tcp", "modbus-rtu", "s7", "mc"];
+    if parser_protocols.contains(&protocol) && PointAddressParser::parse(trimmed).is_ok() {
+        return Err((
+            format!(
+                "endpoint {trimmed:?} looks like a register address (e.g. 40001); put the register in `point_id` and the device access endpoint (host:port) in `endpoint`"
+            ),
+            "device access endpoint (host:port) for `endpoint`; register number for `point_id`"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// 导入请求（CSV 文本 + 缺省设备 + 覆盖开关）。
@@ -463,8 +492,10 @@ pub async fn points_export(
                 csv_field(&point.device_id),
                 csv_field(&point.point_id),
                 csv_field(&point.protocol),
-                csv_field(&point.address),
+                csv_field(point.endpoint.as_deref().unwrap_or(&point.address)),
                 csv_field(&point.frequency_ms.to_string()),
+                // 推送开关：1 = 推送，0 = 不推送（导入接受 1/0 或 true/false）。
+                if point.push_enabled { "1" } else { "0" }.to_string(),
             ]
             .join(","),
         );
@@ -551,8 +582,11 @@ pub async fn points_import(
             device_id: row.device_id.clone(),
             point_id: row.point_id.clone(),
             protocol: row.protocol.clone(),
-            address: row.address.clone(),
+            address: row.endpoint.clone(),
             frequency_ms: row.frequency_ms,
+            push_enabled: row.push_enabled,
+            // CSV 未承载元数据列：按 serde 缺省（physical / 无元数据）。
+            ..crate::config::PointConfig::default()
         });
     }
     let affected: Vec<String> = rows
@@ -624,11 +658,12 @@ fn validate_import(request: &ImportRequest, config: &GatewayConfig) -> Vec<Impor
             std::collections::HashMap::new()
         }
     };
+    // 必需列（`push` 为可选列，缺省 = 推送，兼容旧模板）。
     for column in [
         "device_id",
         "point_id",
         "protocol",
-        "address",
+        "endpoint",
         "frequency_ms",
     ] {
         if !header_map.contains_key(column) {
@@ -747,15 +782,20 @@ fn validate_import(request: &ImportRequest, config: &GatewayConfig) -> Vec<Impor
             ));
             continue;
         }
-        let Some(address) = get_col(&fields, "address") else {
+        let Some(endpoint) = get_col(&fields, "endpoint") else {
             errors.push(ImportError::new(
                 line_no,
-                "address is empty",
-                "non-empty endpoint (host:port) or point address",
+                "endpoint is empty",
+                "non-empty device access endpoint (host:port, e.g. 127.0.0.1:502)",
             ));
             continue;
         };
-        if let Err((reason, allowed)) = check_address(&protocol, &address) {
+        // `point_id` 必须先于端点校验（寄存器号语义）；任一不通过即行错误。
+        if let Err((reason, allowed)) = check_point_id(&protocol, &point_id) {
+            errors.push(ImportError::new(line_no, reason, allowed));
+            continue;
+        }
+        if let Err((reason, allowed)) = check_endpoint(&protocol, &endpoint) {
             errors.push(ImportError::new(line_no, reason, allowed));
             continue;
         }
@@ -794,6 +834,19 @@ fn validate_import(request: &ImportRequest, config: &GatewayConfig) -> Vec<Impor
                 }
             },
         };
+        // push 列（可选）：空 / 缺列 = 推送；非法值 → 行级错误。
+        let push_raw = header_map
+            .get("push")
+            .and_then(|idx| fields.get(*idx))
+            .map_or("", String::as_str);
+        if let Err(reason) = parse_push_cell(push_raw) {
+            errors.push(ImportError::new(
+                line_no,
+                reason,
+                "1 | 0 | true | false (empty = push)",
+            ));
+            continue;
+        }
         let key = (device_id.clone(), point_id.clone());
         if !seen.insert(key.clone()) {
             errors.push(ImportError::new(
@@ -854,12 +907,12 @@ fn revalidate_rows(request: &ImportRequest, config: &GatewayConfig) -> Vec<Impor
         };
         let point_id = get_col(&fields, "point_id");
         let protocol = get_col(&fields, "protocol");
-        let address = get_col(&fields, "address");
+        let endpoint = get_col(&fields, "endpoint");
         let freq_raw = get_col(&fields, "frequency_ms");
         // 设备存在性 / 合法性由 validate_import 保证；此处只做防御性兜底。
         let known = config.devices.iter().any(|d| d.device_id == device_id)
             || config.points.iter().any(|p| p.device_id == device_id);
-        if !known || point_id.is_empty() || protocol.is_empty() || address.is_empty() {
+        if !known || point_id.is_empty() || protocol.is_empty() || endpoint.is_empty() {
             continue;
         }
         let frequency_ms = if freq_raw.is_empty() {
@@ -867,12 +920,15 @@ fn revalidate_rows(request: &ImportRequest, config: &GatewayConfig) -> Vec<Impor
         } else {
             freq_raw.parse().unwrap_or(writeapi::DEFAULT_FREQUENCY_MS)
         };
+        // push 合法性由 validate_import 保证；此处兜底（非法 → 视为推送）。
+        let push_enabled = parse_push_cell(&get_col(&fields, "push")).unwrap_or(true);
         rows.push(ImportRow {
             device_id,
             point_id,
             protocol,
-            address,
+            endpoint,
             frequency_ms,
+            push_enabled,
         });
     }
     rows
@@ -1564,34 +1620,6 @@ pub async fn rules_list() -> Response {
     .into_response()
 }
 
-/// `GET /api/alerts` → 告警（诚实空态：告警引擎未落地）。
-pub async fn alerts_list() -> Response {
-    Json(json!({
-        "items": [],
-        "total": "0",
-        "source": "unsupported",
-        "reason": "告警引擎未落地（设备离线 / 北向中断等告警事件域尚未建模）；返回诚实空态，不伪造告警",
-    }))
-    .into_response()
-}
-
-/// `PUT /api/alerts/rules` → 告警规则写（诚实 501：鉴权就绪，能力未落地）。
-pub async fn alerts_rules_put(
-    State(state): State<MgmtState>,
-    authed: AuthedRole,
-    body: Bytes,
-) -> Response {
-    not_implemented_write(
-        &state,
-        authed,
-        body.as_ref(),
-        OpsAction::AlarmRulesWrite,
-        "alarm rule configuration has no backing engine yet",
-        "告警引擎未落地，无规则可写；鉴权与审计管线已就绪",
-    )
-    .await
-}
-
 /// 诚实 501 通用路径：鉴权（`device.write`，仅 system）→ 审计（not_implemented）
 /// → 501 结构化响应（对齐 remote_ops::collectors 的「管线先于能力」模式）。
 async fn not_implemented_write(
@@ -1653,20 +1681,15 @@ async fn not_implemented_write(
 // 授权状态
 // ===========================================================================
 
-/// `GET /api/license/status` → 授权状态快照（读，开放；来自 `LicenseRuntime` watch）。
-///
-/// 大数红线：`valid_until` / `remaining_secs` / `remaining_days` 一律字符串。
-/// `lease.raw`（签名租约原文）**绝不回显**。runtime 未装配时诚实返回
-/// `unlicensed`（fail-closed 展示语义）。
-pub async fn license_status(State(state): State<MgmtState>) -> Response {
+/// `GET /api/license/status` 的响应体构造（激活端点成功分支复用同一形状）。
+fn license_status_body(state: &MgmtState) -> Value {
     let Some(runtime) = state.daemon().license_runtime() else {
-        return Json(json!({
+        return json!({
             "status": "unlicensed",
             "tier": "",
             "north_forward_allowed": false,
-            "note": "license runtime not assembled (fail-closed view)",
-        }))
-        .into_response();
+            "note": "网关授权模块未就绪，当前按未授权（fail-closed）呈现",
+        });
     };
     let now = crate::mgmt::auth_jwt::now_unix_secs();
     let north_allowed = runtime.north_forward_allowed();
@@ -1701,7 +1724,209 @@ pub async fn license_status(State(state): State<MgmtState>) -> Response {
         }),
     };
     body["north_forward_allowed"] = json!(north_allowed);
-    Json(body).into_response()
+    body
+}
+
+/// `GET /api/license/status` → 授权状态快照（读，开放；来自 `LicenseRuntime` watch）。
+///
+/// 大数红线：`valid_until` / `remaining_secs` / `remaining_days` 一律字符串。
+/// `lease.raw`（签名租约原文）**绝不回显**。runtime 未装配时诚实返回
+/// `unlicensed`（fail-closed 展示语义）。
+pub async fn license_status(State(state): State<MgmtState>) -> Response {
+    Json(license_status_body(&state)).into_response()
+}
+
+/// `POST /api/license/activate` → 激活码激活（`device.write`，仅 system；B-1）。
+///
+/// Body：`{"code": string, "reason": string}`（`code` = 激活码原文；`reason`
+/// 进审计 detail，缺省记 `"<unspecified>"`）。
+///
+/// **验证零新造**：复用 [`crate::auth::client::LicensingClient::activate`] 的
+/// 全链路（请求签名 / 云端验码 / TOFU 响应验签 / 机器码绑定，fail-closed）；
+/// 成功后经 [`crate::license::LicenseRuntime::apply_activation_success`] 把租约
+/// 推进运行态（与后台激活循环成功分支同构），再回同形状授权快照。
+///
+/// 失败结构化映射（按 [`DaemonError`] 变体，**不做 msg.contains**）：
+/// - `ConfigError` → 400 `config_error`（激活码为空 / 锚点集缺失等本地配置问题）；
+/// - `AuthError` → 422 `activation_rejected`（云端拒绝：无效码 / 过期 / 他机绑定等，
+///   服务端拒绝原因为粗粒度变体，不猜测细分原因）；
+/// - `SecurityError` → 422 `security_verification_failed`（响应验签 / nonce 复核失败）；
+/// - `NetworkError` → 502 `network_error`（云端不可达，可重试）；
+/// - 其余 → 500 `internal`。
+///
+/// 边界（诚实声明）：`activation_code` 在 config 序列化层被脱敏（skip_serializing，
+/// 既有红线），本次激活**不持久化激活码原文**——进程重启后需经
+/// `IOTDAQ_ACTIVATION_CODE` 环境变量或再次调用本端点恢复激活态。
+pub async fn license_activate(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    // 激活改变整机授权态（含北向转发解锁），与配置写同档高危 → 仅 system。
+    if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
+        writeapi::audit(
+            &state,
+            &authed.claims.sub,
+            OpsAction::LicenseActivate,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let actor = authed.claims.sub.clone();
+    let req: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return audit_activate_bad_request(&state, &actor, "malformed json body", || {
+                writeapi::validation_error("body", "malformed json body", "object {code, reason}")
+            });
+        }
+    };
+    let code = req
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let reason = req
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("<unspecified>");
+    if code.is_empty() {
+        return audit_activate_bad_request(&state, &actor, "activation code is empty", || {
+            writeapi::validation_error(
+                "code",
+                "activation code must not be empty",
+                "activation code text issued by the license backend",
+            )
+        });
+    }
+    let Some(runtime) = state.daemon().license_runtime() else {
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::LicenseActivate,
+            true,
+            writeapi::OUTCOME_FAILED,
+            "license runtime not assembled; activate refused",
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "license_runtime_unavailable",
+                "message": "网关授权模块未装配（runtime 未就绪），无法激活",
+            })),
+        )
+            .into_response();
+    };
+
+    let client = runtime.config().client.clone();
+    let detail = format!("license activate attempt (reason: {reason})");
+    match client.activate(code).await {
+        Ok(LicenseState::Licensed { lease }) => {
+            runtime.apply_activation_success(lease);
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::LicenseActivate,
+                true,
+                OUTCOME_ACCEPTED,
+                &format!("{detail}: licensed"),
+            );
+            Json(json!({ "ok": true, "status": license_status_body(&state) })).into_response()
+        }
+        Ok(other) => {
+            // 云端受理但未发放租约（非 Licensed 终态）：如实回传当前状态，不假成功。
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::LicenseActivate,
+                true,
+                writeapi::OUTCOME_FAILED,
+                &format!("{detail}: server returned non-licensed state"),
+            );
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "activation_rejected",
+                    "message": "云端未发放有效租约（激活码无效 / 过期 / 绑定他机等）",
+                    "state": other.name(),
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::LicenseActivate,
+                true,
+                writeapi::OUTCOME_FAILED,
+                &format!("{detail}: {err}"),
+            );
+            activate_error_response(err)
+        }
+    }
+}
+
+/// 激活请求校验失败：入审计（bad_request）后返回 400。
+fn audit_activate_bad_request(
+    state: &MgmtState,
+    actor: &str,
+    detail: &str,
+    build: impl FnOnce() -> Response,
+) -> Response {
+    writeapi::audit(
+        state,
+        actor,
+        OpsAction::LicenseActivate,
+        true,
+        OUTCOME_BAD_REQUEST,
+        detail,
+    );
+    build()
+}
+
+/// [`DaemonError`] → 激活端点结构化响应（按变体映射，禁 msg.contains）。
+fn activate_error_response(err: crate::error::DaemonError) -> Response {
+    use crate::error::DaemonError;
+    match &err {
+        DaemonError::ConfigError(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "config_error",
+                "message": err.to_string(),
+            })),
+        )
+            .into_response(),
+        DaemonError::AuthError(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "activation_rejected",
+                "message": err.to_string(),
+            })),
+        )
+            .into_response(),
+        DaemonError::SecurityError(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "security_verification_failed",
+                "message": err.to_string(),
+            })),
+        )
+            .into_response(),
+        DaemonError::NetworkError(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "network_error",
+                "message": err.to_string(),
+            })),
+        )
+            .into_response(),
+        _ => writeapi::internal(&format!("license activate failed: {err}")),
+    }
 }
 
 // ===========================================================================
@@ -1711,175 +1936,14 @@ pub async fn license_status(State(state): State<MgmtState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::DaemonShared;
-    use crate::config::ConfigShared;
-    use crate::mgmt::auth_jwt::{now_unix_secs, sign, Claims};
     use crate::mgmt::rbac::Role;
     use crate::mgmt::remote_ops::runtime_for;
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    use crate::mgmt::test_support::{
+        http_get, http_request, load_config, make_state, post_csv, post_json, put_json,
+        spawn_server, token_for,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    /// 测试种子配置：登记空设备 + 点位设备（端点式地址，southbound 同语义）+ 1 出口。
-    fn seed_toml(broker_port: u16) -> String {
-        format!(
-            r#"
-[gateway]
-gateway_id = "gw-test"
-
-[[outlets]]
-name = "north-1"
-broker = "mqtt://127.0.0.1:{broker_port}"
-topic_prefix = "telemetry"
-qos = 1
-encoding = "json"
-
-[[devices]]
-device_id = "dev-empty"
-name = "空设备"
-protocol = "opcua"
-
-[[points]]
-device_id = "dev-01"
-point_id = "40001"
-protocol = "modbus-tcp"
-address = "192.168.1.10:502"
-frequency_ms = 100
-
-[[points]]
-device_id = "dev-01"
-point_id = "40003"
-protocol = "modbus-tcp"
-address = "192.168.1.10:502"
-frequency_ms = 500
-"#
-        )
-    }
-
-    /// 构造绑定临时配置文件 + 全新 ops runtime 的 MgmtState（独立实例，防并行污染）。
-    fn make_state(dir: &tempfile::TempDir, broker_port: u16) -> (MgmtState, PathBuf) {
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, seed_toml(broker_port)).expect("seed config");
-        let config = Arc::new(GatewayConfig::load(&path).expect("load"));
-        let daemon = DaemonShared::new();
-        daemon.set_config(Arc::new(ConfigShared::new((*config).clone())));
-        let state = MgmtState::new(daemon, config).with_config_path(&path);
-        remote_ops::install(&state, Arc::new(remote_ops::DenyAllOpsAuthorizer));
-        (state, path)
-    }
-
-    /// 以 state 的实际签名密钥签发测试 token（对齐 writeapi 测试装配口径）。
-    fn token_for(state: &MgmtState, role: Role) -> String {
-        let now = now_unix_secs();
-        let claims = Claims {
-            sub: "ops-admin".to_string(),
-            role,
-            exp: now + 600,
-            iat: now,
-            nbf: None,
-            jti: "test-jti-pages".to_string(),
-        };
-        sign(&claims, state.auth().key()).expect("sign test token")
-    }
-
-    /// 在 127.0.0.1 随机端口启动 axum 服务（本机回环）。
-    async fn spawn_server(state: MgmtState) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(async move {
-            axum::serve(listener, crate::mgmt::router(state))
-                .await
-                .expect("serve error");
-        });
-        port
-    }
-
-    /// 解析原始 HTTP 响应 → (状态码, 头部文本, body)。
-    fn parse_response(raw: &str) -> (u16, String, String) {
-        let (head, body) = raw
-            .split_once("\r\n\r\n")
-            .expect("response must contain header/body separator");
-        let status_line = head.lines().next().expect("status line");
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .expect("status code");
-        (status, head.to_string(), body.to_string())
-    }
-
-    /// 手写 HTTP 请求（10s 超时——探测类端点含真实网络 IO，预算放宽）。
-    async fn http_request(
-        port: u16,
-        method: &str,
-        path: &str,
-        body: Option<&str>,
-        token: Option<&str>,
-        content_type: &str,
-    ) -> (u16, String, String) {
-        tokio::time::timeout(Duration::from_secs(10), async move {
-            let mut stream = TcpStream::connect(("127.0.0.1", port))
-                .await
-                .expect("connect");
-            let body = body.unwrap_or("");
-            let auth = token
-                .map(|t| format!("Authorization: Bearer {t}\r\n"))
-                .unwrap_or_default();
-            let request = if method == "GET" {
-                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n")
-            } else {
-                format!(
-                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-            };
-            stream.write_all(request.as_bytes()).await.expect("write");
-            stream.flush().await.expect("flush");
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.expect("read");
-            parse_response(&String::from_utf8(buf).expect("utf8"))
-        })
-        .await
-        .expect("http_request timed out")
-    }
-
-    async fn http_get(port: u16, path: &str) -> (u16, String, String) {
-        http_request(port, "GET", path, None, None, "text/plain").await
-    }
-
-    async fn post_json(port: u16, path: &str, body: &str, token: &str) -> (u16, String, String) {
-        http_request(
-            port,
-            "POST",
-            path,
-            Some(body),
-            Some(token),
-            "application/json",
-        )
-        .await
-    }
-
-    async fn post_csv(port: u16, path: &str, body: &str, token: &str) -> (u16, String, String) {
-        http_request(port, "POST", path, Some(body), Some(token), "text/csv").await
-    }
-
-    async fn put_json(port: u16, path: &str, body: &str, token: &str) -> (u16, String, String) {
-        http_request(
-            port,
-            "PUT",
-            path,
-            Some(body),
-            Some(token),
-            "application/json",
-        )
-        .await
-    }
-
-    /// 从落盘文件重读配置（往返断言用）。
-    fn load_config(path: &std::path::Path) -> GatewayConfig {
-        GatewayConfig::load(path).expect("reload saved config")
-    }
+    use tokio::net::TcpListener;
 
     /// 最小 Modbus TCP 应答器：收 FC03 读请求 → 回 1 个寄存器（值 0x0102）。
     async fn spawn_modbus_stub() -> u16 {
@@ -1921,9 +1985,9 @@ frequency_ms = 500
         let mut lines = body.lines();
         assert_eq!(lines.next().expect("header"), POINTS_CSV_HEADER);
         let row1 = lines.next().expect("row 1");
-        assert_eq!(row1, "dev-01,40001,modbus-tcp,192.168.1.10:502,100");
+        assert_eq!(row1, "dev-01,40001,modbus-tcp,192.168.1.10:502,100,1");
         let row2 = lines.next().expect("row 2");
-        assert_eq!(row2, "dev-01,40003,modbus-tcp,192.168.1.10:502,500");
+        assert_eq!(row2, "dev-01,40003,modbus-tcp,192.168.1.10:502,500,1");
 
         // device_id 过滤。
         let (status, _, body) = http_get(port, "/api/points/export?device_id=dev-01").await;
@@ -1982,6 +2046,85 @@ frequency_ms = 500
         assert_eq!(points.len(), 2, "{body}");
     }
 
+    /// 需求 5：`push` 列导入——`1/0` 与 `true/false` 均接受（大小写不敏感），
+    /// 空值缺省推送；导出回显为 `1/0`（导出即可当导入模板）。
+    #[tokio::test]
+    async fn import_push_column_accepts_bool_forms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, path) = make_state(&dir, 1);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let csv = concat!(
+            "device_id,point_id,protocol,endpoint,frequency_ms,push\n",
+            "dev-empty,40010,modbus-tcp,192.168.1.10:502,200,1\n",
+            "dev-empty,40011,modbus-tcp,192.168.1.10:502,200,0\n",
+            "dev-empty,40012,modbus-tcp,192.168.1.10:502,200,TRUE\n",
+            "dev-empty,40013,modbus-tcp,192.168.1.10:502,200,false\n",
+            "dev-empty,40014,modbus-tcp,192.168.1.10:502,200,\n",
+        );
+        let (status, _, body) = post_csv(port, "/api/points/import", csv, &token).await;
+        assert_eq!(status, 200, "{body}");
+
+        let config = load_config(&path);
+        let by_id = |pid: &str| {
+            config
+                .points
+                .iter()
+                .find(|p| p.device_id == "dev-empty" && p.point_id == pid)
+                .unwrap_or_else(|| panic!("point {pid} persisted"))
+                .push_enabled
+        };
+        assert!(by_id("40010"), "push=1 → enabled");
+        assert!(!by_id("40011"), "push=0 → disabled");
+        assert!(by_id("40012"), "push=TRUE → enabled (case-insensitive)");
+        assert!(!by_id("40013"), "push=false → disabled");
+        assert!(by_id("40014"), "push empty → default enabled");
+
+        // 导出回显 1/0（导出即可当导入模板）。
+        let (_, _, exported) = http_get(port, "/api/points/export?device_id=dev-empty").await;
+        assert!(
+            exported.contains("dev-empty,40011,modbus-tcp,192.168.1.10:502,200,0"),
+            "disabled point exported as 0: {exported}"
+        );
+        assert!(
+            exported.contains("dev-empty,40010,modbus-tcp,192.168.1.10:502,200,1"),
+            "enabled point exported as 1: {exported}"
+        );
+    }
+
+    /// 需求 5 错误路径：非法 `push` 值 → 「行号 + 原因 + 允许值」，整批拒绝零落盘。
+    #[tokio::test]
+    async fn import_push_column_invalid_value_is_row_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir, 1);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state).await;
+
+        let csv = concat!(
+            "device_id,point_id,protocol,endpoint,frequency_ms,push\n",
+            "dev-empty,40015,modbus-tcp,192.168.1.10:502,200,1\n",
+            "dev-empty,40016,modbus-tcp,192.168.1.10:502,200,maybe\n",
+        );
+        let (status, _, body) = post_csv(port, "/api/points/import", csv, &token).await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "validation_failed");
+        let errors = value["errors"].as_array().expect("errors array");
+        let line3 = errors
+            .iter()
+            .find(|e| e["line"] == "3")
+            .expect("line 3 error");
+        assert!(
+            line3["reason"].as_str().expect("reason").contains("maybe"),
+            "{line3}"
+        );
+        assert!(
+            line3["allowed"].as_str().expect("allowed").contains("true"),
+            "{line3}"
+        );
+    }
+
     /// QA 红线: 坏行必须「行号 + 原因 + 允许值」——未知协议（行 3）、
     /// 频率越下限（行 4）、重复点位（行 5）逐条入 errors；**整批拒绝零落盘**。
     #[tokio::test]
@@ -1992,11 +2135,11 @@ frequency_ms = 500
         let port = spawn_server(state.clone()).await;
 
         let csv = concat!(
-            "device_id,point_id,protocol,address,frequency_ms\n",
-            "dev-empty,p_ok,modbus-tcp,40005,200\n",
-            "dev-empty,p_bad,magic-bus,40005,200\n",
-            "dev-empty,p_fast,modbus-tcp,40006,10\n",
-            "dev-01,40001,modbus-tcp,40007,200\n",
+            "device_id,point_id,protocol,endpoint,frequency_ms\n",
+            "dev-empty,40005,modbus-tcp,192.168.1.10:502,200\n",
+            "dev-empty,40008,magic-bus,192.168.1.10:502,200\n",
+            "dev-empty,40006,modbus-tcp,192.168.1.10:502,10\n",
+            "dev-01,40001,modbus-tcp,192.168.1.10:502,200\n",
         );
         let (status, _, body) = post_csv(port, "/api/points/import", csv, &token).await;
         assert_eq!(status, 400, "{body}");
@@ -2086,7 +2229,7 @@ frequency_ms = 500
 
         let json_body = serde_json::json!({
             "device_id": "dev-empty",
-            "csv": "device_id,point_id,protocol,address,frequency_ms\n,pt-json,modbus-tcp,40009,\n"
+            "csv": "device_id,point_id,protocol,endpoint,frequency_ms\n,40009,modbus-tcp,192.168.1.10:502,\n"
         })
         .to_string();
         let (status, _, body) = post_json(port, "/api/points/import", &json_body, &token).await;
@@ -2096,10 +2239,11 @@ frequency_ms = 500
         let row = load_config(&path)
             .points
             .into_iter()
-            .find(|p| p.point_id == "pt-json")
+            .find(|p| p.point_id == "40009")
             .expect("row persisted");
         assert_eq!(row.frequency_ms, 1_000, "empty frequency_ms → default");
-        assert_eq!(row.address, "40009");
+        // address 为 endpoint 的别名：落盘值 = 有效端点。
+        assert_eq!(row.address, "192.168.1.10:502");
     }
 
     /// QA: replace=true 覆盖导入——先删目标设备既有点位（replaced 计数），再写入；
@@ -2112,8 +2256,8 @@ frequency_ms = 500
         let port = spawn_server(state.clone()).await;
 
         let csv = concat!(
-            "device_id,point_id,protocol,address,frequency_ms\n",
-            "dev-01,new-point,modbus-tcp,40010,250\n",
+            "device_id,point_id,protocol,endpoint,frequency_ms\n",
+            "dev-01,40010,modbus-tcp,192.168.1.10:502,250\n",
         );
         let (status, _, body) = post_csv(
             port,
@@ -2134,7 +2278,7 @@ frequency_ms = 500
             .filter(|p| p.device_id == "dev-01")
             .collect();
         assert_eq!(dev01.len(), 1);
-        assert_eq!(dev01[0].point_id, "new-point");
+        assert_eq!(dev01[0].point_id, "40010");
         assert_eq!(dev01[0].frequency_ms, 250);
 
         // replace=true 缺设备 → 400。
@@ -2540,27 +2684,47 @@ frequency_ms = 500
         let system = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        // GET /api/rules：items 空 + source=unsupported。
-        let (status, _, body) = http_get(port, "/api/rules").await;
-        assert_eq!(status, 200);
+        // GET /api/rules：转发规则已由 mgmt/rules_api 落地为真实端点（不再是无数据源的
+        // 占位）。读接口要求 device.view → 无 token 401；system token 200，
+        // items 为真实空数组（source 由占位的 "unsupported" 改为 "ok"）。
+        let (status, _, _) = http_get(port, "/api/rules").await;
+        assert_eq!(status, 401);
+        let (status, _, body) =
+            http_request(port, "GET", "/api/rules", None, Some(&system), "text/plain").await;
+        assert_eq!(status, 200, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["items"].as_array().expect("items").len(), 0);
-        assert_eq!(value["source"], "unsupported");
+        assert_eq!(value["source"], "ok");
 
-        // GET /api/alerts：同上。
-        let (status, _, body) = http_get(port, "/api/alerts").await;
-        assert_eq!(status, 200);
+        // GET /api/alerts：告警引擎已接生产，数据源真实——读接口要求 device.view。
+        // 无 token → 401；system → 200 + `source: "ok"`，items 为**真实空数组**
+        // （一次告警都没触发过就是空的，绝不伪造条目、也不谎称 unsupported）。
+        let (status, _, _) = http_get(port, "/api/alerts").await;
+        assert_eq!(status, 401);
+        let (status, _, body) = http_request(
+            port,
+            "GET",
+            "/api/alerts",
+            None,
+            Some(&system),
+            "text/plain",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(value["source"], "unsupported");
+        assert_eq!(value["items"].as_array().expect("items").len(), 0);
+        assert_eq!(value["source"], "ok");
 
-        // PUT /api/alerts/rules：system → 501（鉴权通过、能力未落地）。
+        // PUT /api/alerts/rules：整体保存端点已落地（`rules: []` = 清空全部规则，
+        // 是合法语义，不再返回 501）。
         let (status, _, body) =
             put_json(port, "/api/alerts/rules", r#"{"rules":[]}"#, &system).await;
-        assert_eq!(status, 501, "{body}");
+        assert_eq!(status, 200, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(value["error"], "not_implemented");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["replaced"], 0);
 
-        // PUT /api/alerts/rules：ops → 403。
+        // PUT /api/alerts/rules：ops 无 device.write → 403。
         let ops = token_for(&state, Role::Ops);
         let (status, _, _) = put_json(port, "/api/alerts/rules", r#"{"rules":[]}"#, &ops).await;
         assert_eq!(status, 403);
@@ -2585,5 +2749,84 @@ frequency_ms = 500
         )
         .await;
         assert_eq!(status, 200, "{body}");
+    }
+
+    // ---- B-1：POST /api/license/activate ----
+
+    /// QA（B-1）: 鉴权与校验路径——无 token → 401；空激活码 → 400 结构化；
+    /// 非法 body → 400；runtime 未装配 → 503 license_runtime_unavailable。
+    /// （云端正例需真实 licensing-server：见真机验收，本单测覆盖全部本地分支。）
+    #[tokio::test]
+    async fn license_activate_local_branches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir, 15020);
+        let system = token_for(&state, Role::System);
+        let ops = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        // 无 token → 401（身份未建立，不区分权限细节）。
+        let (status, _, body) = http_request(
+            port,
+            "POST",
+            "/api/license/activate",
+            Some(r#"{"code":"X","reason":"trial"}"#),
+            None,
+            "application/json",
+        )
+        .await;
+        assert_eq!(status, 401, "{body}");
+
+        // ops 无 device.write → 403 + 审计。
+        let (status, _, body) = http_request(
+            port,
+            "POST",
+            "/api/license/activate",
+            Some(r#"{"code":"SOME-CODE","reason":"trial"}"#),
+            Some(&ops),
+            "application/json",
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+
+        // 空激活码 → 400 validation_failed。
+        let (status, _, body) = http_request(
+            port,
+            "POST",
+            "/api/license/activate",
+            Some(r#"{"code":"   ","reason":"trial"}"#),
+            Some(&system),
+            "application/json",
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "validation_failed");
+        assert_eq!(value["field"], "code");
+
+        // 非法 body → 400。
+        let (status, _, body) = http_request(
+            port,
+            "POST",
+            "/api/license/activate",
+            Some("not-json{{{"),
+            Some(&system),
+            "application/json",
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+
+        // runtime 未装配 → 503 license_runtime_unavailable（诚实失败，不假成功）。
+        let (status, _, body) = http_request(
+            port,
+            "POST",
+            "/api/license/activate",
+            Some(r#"{"code":"SOME-CODE","reason":"trial"}"#),
+            Some(&system),
+            "application/json",
+        )
+        .await;
+        assert_eq!(status, 503, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "license_runtime_unavailable");
     }
 }

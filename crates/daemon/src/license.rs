@@ -332,6 +332,20 @@ impl LicenseRuntime {
         self.aux_lock().initialized
     }
 
+    /// 管理面激活端点（`POST /api/license/activate`）专用：把一次**已验签成功**
+    /// 的激活结果直接推进运行态。与 [`Self::maybe_activate`] 成功分支完全同构：
+    /// 置在线时刻 → 跃迁 `Licensed` → 续期试用标记并落盘（强制，不节流）。
+    ///
+    /// 调用方（mgmt 层）须先经 [`crate::auth::client::LicensingClient::activate`]
+    /// 完成 TOFU 验签，拿到 `Licensed` 租约后才能调用本方法——本方法只做状态推进，
+    /// 不做任何验证（验证责任在调用方，不造第二套）。
+    pub fn apply_activation_success(&self, lease: crate::auth::client::LeaseToken) {
+        let now = (self.cfg.now_ms)();
+        self.set_last_online(now);
+        self.transition(LicenseState::Licensed { lease });
+        self.renew_marker_from_disk(now, 0);
+    }
+
     // ---- 步进 / 循环 ----
 
     /// 一次纯步进：启动阶段（试点 / 激活）+ 心跳到期判定 + 宽限倒计时 +
@@ -938,6 +952,7 @@ mod tests {
                 protocol: protocol.to_string(),
                 address: format!("192.168.1.{i}:502"),
                 frequency_ms,
+                ..Default::default()
             })
             .collect();
         GatewayConfig {
@@ -946,6 +961,7 @@ mod tests {
             points,
             devices: Vec::new(),
             mgmt_auth: None,
+            ..Default::default()
         }
     }
 
@@ -997,6 +1013,7 @@ mod tests {
             protocol: "s7".to_string(),
             address: "10.0.0.1:102".to_string(),
             frequency_ms: 100,
+            ..Default::default()
         });
         let problems = free_quota_problems(&config);
         assert_eq!(

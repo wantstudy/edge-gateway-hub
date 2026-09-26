@@ -58,11 +58,14 @@ use crate::dataplane::{LiveTelemetry, NorthDataPlane};
 use crate::error::DaemonResult;
 use crate::hardening::RestrictedMode;
 use crate::license::{LicenseRuntime, LicenseRuntimeConfig, LICENSE_RECOVERY_HINT};
+use crate::mgmt::health::DeviceHealthRegistry;
 use crate::north::runtime::{NorthForwardGate, NorthRuntime, NorthRuntimeConfig};
 use crate::offline_queue::{OfflineQueue, QueueConfig, SystemClock, QUEUE_DB_FILE_NAME};
 use crate::ota::OtaBootDecision;
 use crate::pipeline::RawSample;
-use crate::scheduler::{GroupConfig, GroupScheduler, PollHandler, RunningScheduler};
+use crate::scheduler::{
+    groups_changed, GroupConfig, GroupScheduler, PollHandler, RunningScheduler,
+};
 
 // ---- 默认常量 ----
 
@@ -142,6 +145,24 @@ struct DaemonSharedInner {
     audit: RwLock<Option<Arc<crate::audit::AuditLogger>>>,
     /// 实时遥测广播（task 52）：解码后逐点遥测扇出给管理面 `/api/stream` 订阅者。
     live_tx: broadcast::Sender<LiveTelemetry>,
+    /// 设备真实运行健康度注册表（需求 1）：由数据面采集路径逐拍写入
+    ///（成功 / 失败），管理面 `/api/devices`、`/api/overview` 据此读三态状态。
+    health: Arc<DeviceHealthRegistry>,
+    /// 告警记录仓库（BE-ALARM）：数据面告警引擎逐拍写入真实记录，管理面
+    /// `GET /api/alerts` 据此回显。**进程内 historian**——重启即清空（如实标注，
+    /// 不假装持久化）。
+    alarms: Arc<crate::alarm::AlarmStore>,
+    /// 运行中的采集调度器（`None` = 未启动 / 无设备组 / 已停机）。
+    ///
+    /// 挂在此处（而非 `run` 的局部变量）的原因：配置热重载任务需要就地
+    /// [`RunningScheduler::rebuild`]——API 新建 / 删除设备后必须重起对应组的轮询
+    /// 任务，否则新点位永远不采集、被删组留着僵尸轮询。
+    scheduler: RwLock<Option<RunningScheduler>>,
+    /// **类型擦除**的轮询动作（启动装配时从上层的 poll handler 接线而来）。
+    ///
+    /// 与 `scheduler` 同挂共享态的原因：启动时配置里没有设备 ⇒ 调度器未启动，而
+    /// 用户随后经 API 建出第一个设备时，热重载任务得能用手头这份 handler 补启动。
+    poll_handler: RwLock<Option<Arc<dyn PollHandler>>>,
 }
 
 /// daemon 全局共享状态：生命周期 / 心跳 / 配置快照（task 51）。
@@ -173,6 +194,10 @@ impl DaemonShared {
                 license_assembly_error: RwLock::new(None),
                 audit: RwLock::new(None),
                 live_tx,
+                health: Arc::new(DeviceHealthRegistry::new()),
+                alarms: crate::alarm::AlarmStore::shared(),
+                scheduler: RwLock::new(None),
+                poll_handler: RwLock::new(None),
             }),
         }
     }
@@ -240,6 +265,66 @@ impl DaemonShared {
     /// 当前配置版本号（每次成功热重载 +1）。
     pub fn config_version(&self) -> u64 {
         self.config_shared().version()
+    }
+
+    /// 挂载运行中的采集调度器（启动装配完成时由 `run` 调用）。
+    pub fn set_scheduler(&self, scheduler: RunningScheduler) {
+        let mut guard = self
+            .inner
+            .scheduler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(scheduler);
+    }
+
+    /// 取调度器写锁**就地重建**采集组（配置热重载用）。
+    ///
+    /// 拿到的守卫内是 `None` 表示当前没有可调度的组（未启动 / 无设备 / 已停机），
+    /// 调用方直接跳过。临界区只做「比对组差异 → [`RunningScheduler::rebuild`]」，
+    /// 不跨 `await`，避免重建过程中配置又被改写。
+    pub fn scheduler_mut(&self) -> std::sync::RwLockWriteGuard<'_, Option<RunningScheduler>> {
+        self.inner
+            .scheduler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 调度器**只读**守卫（观测用：overview 的样本速率统计读各组累计计数；
+    /// C-4）。守卫内是 `None` = 未启动 / 无设备 / 已停机。读锁临界区，
+    /// 与重建写锁互斥；调用方不得跨 `await` 持有。
+    pub fn scheduler(&self) -> std::sync::RwLockReadGuard<'_, Option<RunningScheduler>> {
+        self.inner
+            .scheduler
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 挂载类型擦除的轮询动作（热重载时用于「首次出现设备组」补启动调度器）。
+    pub fn set_poll_handler(&self, handler: Arc<dyn PollHandler>) {
+        let mut guard = self
+            .inner
+            .poll_handler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(handler);
+    }
+
+    /// 类型擦除的轮询动作（`None` = 未接线采集驱动）。
+    pub fn poll_handler(&self) -> Option<Arc<dyn PollHandler>> {
+        self.inner
+            .poll_handler
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 取走并清空运行中的采集调度器（停机用：取走后无人能再重建或轮询）。
+    pub fn take_scheduler(&self) -> Option<RunningScheduler> {
+        self.inner
+            .scheduler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// 广播一次配置重载事件（mgmt SSE 消费；`send_replace` 保证最新版本号落存储）。
@@ -376,6 +461,22 @@ impl DaemonShared {
     /// 取得实时遥测广播发送端克隆（数据面注入点用；[`NorthDataPlane::new`] 注入）。
     pub fn live_sender(&self) -> broadcast::Sender<LiveTelemetry> {
         self.inner.live_tx.clone()
+    }
+
+    /// 设备真实运行健康度注册表（需求 1；采集路径写入、管理面读）。
+    ///
+    /// 句柄在 `DaemonShared` 构造时即创建（永久有效，非 `Option`）：数据面桥接
+    ///（[`NorthDataPlane`]）持同一 `Arc` 逐拍写入，管理面 `/api/devices`
+    /// 与 `/api/overview` 据此判定三态——**不伪造**。
+    pub fn health_registry(&self) -> Arc<DeviceHealthRegistry> {
+        Arc::clone(&self.inner.health)
+    }
+
+    /// 告警记录仓库句柄（数据面写入 / 管理面 `GET /api/alerts` 读取，同一份）。
+    ///
+    /// 与 [`Self::health_registry`] 同口径：构造期即创建，非 `Option`。
+    pub fn alarms_store(&self) -> Arc<crate::alarm::AlarmStore> {
+        Arc::clone(&self.inner.alarms)
     }
 }
 
@@ -761,17 +862,19 @@ impl BootstrapBuilder {
             Arc::new(NorthDataPlane::new(
                 inner,
                 &config_shared.snapshot(),
+                config_shared.clone(),
                 shared.live_sender(),
+                shared.health_registry(),
+                shared.alarms_store(),
             ))
         });
         let running_scheduler = match &data_plane {
             Some(plane) if !groups.is_empty() => {
-                match GroupScheduler::new(
-                    DynPollHandler {
-                        inner: Arc::clone(plane) as Arc<dyn PollHandler>,
-                    },
-                    groups,
-                ) {
+                let handler = Arc::clone(plane) as Arc<dyn PollHandler>;
+                // 类型擦除的 handler 留在共享态：配置首个设备组出现时（启动时无设备）
+                // 热重载任务拿它补启动调度器，不必重启进程。
+                shared.set_poll_handler(handler.clone());
+                match GroupScheduler::new(DynPollHandler { inner: handler }, groups) {
                     Ok(scheduler) => {
                         let running = scheduler.start();
                         info!(
@@ -796,6 +899,10 @@ impl BootstrapBuilder {
                 None
             }
         };
+        // 挂到共享态供热重载任务重建组（API 增删设备 / 点位后必须生效）。
+        if let Some(running) = running_scheduler {
+            shared.set_scheduler(running);
+        }
 
         // ④ 北向启动（task 19 + task 54 的**最后一跳**）：把 `MqttClient` +
         //    `NorthOutlet` 真正接到运行期，替换原先的 no-op 占位。
@@ -900,7 +1007,7 @@ impl BootstrapBuilder {
         }
 
         // ⑦ 优雅停机（顺序固定，宽限期兜底）。
-        graceful_shutdown(&shared, &self, running_scheduler).await;
+        graceful_shutdown(&shared, &self).await;
 
         // ⑧ 清理后台任务与热重载线程。
         watchdog_task.abort();
@@ -1276,14 +1383,10 @@ impl NorthForwardGate for AssemblyFailedGate {
 ///
 /// 超时即中止：`timeout` 丢弃 steps future，`RunningScheduler` 的 `Drop`
 /// 会幂等 abort 全部组任务；state 保持在 `Stopping` 并打 `shutdown_timed_out` 标志。
-async fn graceful_shutdown(
-    shared: &DaemonShared,
-    builder: &BootstrapBuilder,
-    scheduler: Option<RunningScheduler>,
-) {
+async fn graceful_shutdown(shared: &DaemonShared, builder: &BootstrapBuilder) {
     shared.set_state(LifecycleState::Stopping);
     info!("bootstrap: graceful shutdown started");
-    let steps = shutdown_sequence(shared, builder, scheduler);
+    let steps = shutdown_sequence(shared, builder);
     match tokio::time::timeout(builder.shutdown_grace, steps).await {
         Ok(()) => {
             shared.set_state(LifecycleState::Stopped);
@@ -1302,13 +1405,10 @@ async fn graceful_shutdown(
 /// 停机三步骤：调度器 → 离线队列 flush → 北向停止。
 ///
 /// 每步之间 `yield_now`：给 watch 订阅方（mgmt SSE / 测试断言）一个确定的观察点。
-async fn shutdown_sequence(
-    shared: &DaemonShared,
-    builder: &BootstrapBuilder,
-    scheduler: Option<RunningScheduler>,
-) {
-    // ① 调度器停：中止并等待全部组任务退出。
-    if let Some(scheduler) = scheduler {
+async fn shutdown_sequence(shared: &DaemonShared, builder: &BootstrapBuilder) {
+    // ① 调度器停：先**取走**句柄（停止期间热重载再触发也是空操作），再中止并等待
+    //    全部组任务退出。
+    if let Some(scheduler) = shared.take_scheduler() {
         scheduler.shutdown().await;
     }
     info!("bootstrap: shutdown step 1/3 scheduler stopped");
@@ -1415,13 +1515,98 @@ fn utc_now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// 配置重载转发任务：轮询 `ConfigShared` 版本号，变化时刷新共享态并广播事件。
+/// 按新的组集合把共享态里的采集调度器对齐（`ConfigShared` 快照已刷新的前提下）。
+///
+/// 三种落点，按优先级：
+/// 1. **组集合为空**（最后一个设备 / 点位被删）→ 把调度器取下来停掉，不留僵尸轮询；
+/// 2. **已有运行中调度器** → 就地 [`RunningScheduler::rebuild`]（保留同名组统计，
+///    被删组 abort、新组起、失败则旧调度器照跑）；
+/// 3. **还没有调度器但配置首次出现设备组** → 用共享态里的类型擦除 handler **补启动**
+///    （启动时配置无设备是常态，不该逼用户重启进程才有采集）。
+async fn resync_scheduler(
+    shared: &DaemonShared,
+    version: u64,
+    groups: &[GroupConfig],
+    config: &GatewayConfig,
+) {
+    // 采集动作侧的设备计划表先换：南向按 device_id 派活，计划表里没有新设备时
+    // 每一拍都会 `unknown device group`。与调度器侧的顺序不能颠倒。
+    if let Some(handler) = shared.poll_handler() {
+        handler.refresh_devices(config).await;
+    }
+
+    if groups.is_empty() {
+        match shared.take_scheduler() {
+            Some(scheduler) => {
+                scheduler.shutdown().await;
+                info!(
+                    version,
+                    "bootstrap: scheduler stopped; no device group left in config"
+                );
+            }
+            None => warn!(
+                version,
+                "bootstrap: config has no device group; collection untouched"
+            ),
+        }
+        return;
+    }
+
+    if let Some(scheduler) = shared.scheduler_mut().as_mut() {
+        match scheduler.rebuild(groups.to_vec()) {
+            Ok(()) => info!(
+                version,
+                groups = ?scheduler.group_names(),
+                "bootstrap: scheduler groups rebuilt after config reload"
+            ),
+            // 重建失败 = 保留旧调度器继续跑（错误隔离，绝不半重建）。
+            Err(err) => error!(
+                version, error = %err,
+                "bootstrap: [ERROR] scheduler rebuild failed; old groups kept running"
+            ),
+        }
+        return;
+    }
+
+    // 补启动：仅当采集驱动已接线（否则什么也采不到，只能记录）。
+    match shared.poll_handler() {
+        Some(handler) => match GroupScheduler::new(
+            DynPollHandler {
+                inner: Arc::clone(&handler),
+            },
+            groups.to_vec(),
+        ) {
+            Ok(scheduler) => {
+                let running = scheduler.start();
+                let names = running.group_names().to_vec();
+                shared.set_scheduler(running);
+                info!(version, groups = ?names, "bootstrap: scheduler started on demand");
+            }
+            Err(err) => error!(
+                version, error = %err,
+                "bootstrap: [ERROR] scheduler build failed on demand; collection untouched"
+            ),
+        },
+        None => warn!(
+            version,
+            "bootstrap: no poll handler wired; new device groups will not be collected"
+        ),
+    }
+}
+
+/// 配置重载转发任务：轮询 `ConfigShared` 版本号，变化时刷新共享态、广播事件，
+/// 并按**组差异**就地重建采集调度器。
+///
+/// 只改 `ConfigShared` 快照是不够的：调度器句柄原本只在 `run` 的局部变量里，
+/// 热重载后 API 新建的设备 / 点位永远不会被轮询（UI 上 `polls` 恒 0、状态恒 offline）。
+/// 这里在刷新共享态后比一次组身份（组名 + 点位 + 周期），有差异才 rebuild。
 async fn forward_config_reload(
     shared: DaemonShared,
     config_shared: Arc<ConfigShared>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut last_version = config_shared.version();
+    let mut last_groups: Vec<GroupConfig> = build_groups(&config_shared.snapshot());
     let mut ticker = tokio::time::interval(RELOAD_POLL_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -1439,6 +1624,17 @@ async fn forward_config_reload(
                 version,
                 "bootstrap: config reload propagated to DaemonShared"
             );
+
+            // 采集组重建：按组身份比对，等价则不动既有任务（无谓的 abort/重启
+            // 会造成采集空档）；被删组由 `rebuild` 内的 abort 就地掐掉，不留僵尸轮询。
+            let groups = build_groups(&config_shared.snapshot());
+            if groups_changed(&last_groups, &groups) {
+                // 基线无条件推进到新组集合：旧基线不再代表运行中的调度器，留旧值会让
+                // 每次重载都无谓重试一遍。
+                let next_groups = groups.clone();
+                resync_scheduler(&shared, version, &groups, &config_shared.snapshot()).await;
+                last_groups = next_groups;
+            }
         }
     }
 }
@@ -1844,6 +2040,69 @@ frequency_ms = 3000
         assert_eq!(names, vec!["dev-b", "dev-a"], "first-seen order");
         assert_eq!(groups[0].interval, Duration::from_millis(2000));
         assert_eq!(groups[0].point_ids, vec!["b1".to_string()], "deduped");
+    }
+
+    /// QA 热重载：组身份差决定是否 rebuild——删设备必须触发，改无关字段必须**不**触发。
+    ///
+    /// 「有差异才 rebuild」是热重载不抖动的关键：无谓的 abort / 重启会让采集出现空档，
+    /// 也会让 UI 的成功率曲线抖一下。
+    #[test]
+    fn group_diff_drives_rebuild_only_on_real_group_changes() {
+        let toml = r#"
+[[points]]
+device_id = "dev-a"
+point_id = "a1"
+protocol = "modbus-tcp"
+address = "127.0.0.1:502"
+frequency_ms = 1000
+
+[[points]]
+device_id = "dev-b"
+point_id = "b1"
+protocol = "mc"
+address = "D100"
+frequency_ms = 2000
+"#;
+        let mut config = GatewayConfig::parse(toml).expect("parse");
+        let before = build_groups(&config);
+        assert_eq!(
+            before.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["dev-a", "dev-b"]
+        );
+
+        // 无关字段改动（网关标识）：组身份完全不变 → 不该 rebuild。
+        let mut untouched = config.clone();
+        untouched.gateway.gateway_id = "gw-another".to_string();
+        assert!(
+            !groups_changed(&before, &build_groups(&untouched)),
+            "non-group config change must not restart polling tasks"
+        );
+
+        // 删掉一个设备 → 少一组 → 必须 rebuild（否则僵尸轮询该组）。
+        config.points.retain(|p| p.device_id != "dev-b");
+        let after = build_groups(&config);
+        assert_eq!(
+            after.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["dev-a"]
+        );
+        assert!(groups_changed(&before, &after), "deleted device → rebuild");
+
+        // 同设备的点位被删 → 该组点位变化 → 必须 rebuild。
+        let mut shrink = config.clone();
+        shrink.points.retain(|p| p.point_id != "a1");
+        assert!(
+            groups_changed(&after, &build_groups(&shrink)),
+            "deleted point → rebuild"
+        );
+
+        // 全部点位被删 → 组集合为空 → 也必须 rebuild（停机，不留僵尸轮询）。
+        let mut empty = config.clone();
+        empty.points.clear();
+        assert!(build_groups(&empty).is_empty());
+        assert!(
+            groups_changed(&after, &build_groups(&empty)),
+            "no group → rebuild"
+        );
     }
 
     // ---- 集成波次接线：完整性自检（task 50） ----

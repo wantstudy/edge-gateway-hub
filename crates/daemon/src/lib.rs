@@ -16,6 +16,7 @@
 //! 规划模块（后续任务逐步填充）：
 //! - `north`    北向 MQTT 转发（Wave 3 task 19+）
 
+pub mod alarm;
 pub mod audit;
 pub mod auth;
 pub mod backpressure;

@@ -613,8 +613,17 @@ async fn main() -> ExitCode {
     };
     eprintln!("[iot-daq-daemon] 管理面已监听 http://{}", args.bind_addr);
     tokio::spawn(async move {
+        // 周期备份循环（B-2；`[settings.backup_policy].interval_min == 0` 时空转）。
+        // 30s tick 读热快照：PUT 备份策略后下一拍按新间隔生效。测试服务不挂本循环。
+        daemon::mgmt::ops_api::spawn_periodic_backup(&mgmt_state);
         // 运行期 serve 异常只记录不主动杀 daemon：北向采集不受管理面单点影响。
-        if let Err(e) = axum::serve(listener, daemon::mgmt::router(mgmt_state)).await {
+        // ⚠️ 必须挂 ConnectInfo：`/api/auth/bootstrap` 用它在**任何业务分支之前**
+        //    判定来源是否为回环（`is_local_peer`）。旧写法 `axum::serve(.., router)`
+        //    拿不到 ConnectInfo → `None` → 恒 403 → 首次初始化入口等于不存在。
+        //    本行是 task 27 的上线前提，请勿回退。
+        let svc = daemon::mgmt::router(mgmt_state)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        if let Err(e) = axum::serve(listener, svc).await {
             eprintln!("[iot-daq-daemon] 管理面 serve 异常退出: {e}");
         }
     });

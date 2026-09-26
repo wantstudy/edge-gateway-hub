@@ -39,6 +39,7 @@ use tokio::time::{interval_at, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::backpressure::AcquisitionGovernor;
+use crate::config::GatewayConfig;
 use crate::error::{DaemonError, DaemonResult};
 use crate::pipeline::RawSample;
 
@@ -146,6 +147,19 @@ pub trait PollHandler: Send + Sync {
     /// 返回 `Err` 时调度器记录错误统计并继续下一拍，**不会**终止该组调度
     /// （错误 = 整组无样本；个别点位解码失败由实现方跳过并告警，不整体失败）。
     async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>>;
+
+    /// 配置热重载：让本 handler 重新推导它的**设备 / 点位计划表**（默认 no-op）。
+    ///
+    /// 绝大多数实现是无状态采集动作，默认实现为空即可。持有「设备计划表」这类
+    /// 派生状态的实现（如 [`crate::southbound::DevicePollHandler`]）**必须重写**，
+    /// 否则重载后会出现半新半旧：调度器侧已经起了新组，采集动作侧仍按旧设备表
+    /// 派活，新组的每一拍都报 `unknown device group`，新点位永远采不到数。
+    ///
+    /// 实现契约（调用方依赖这些性质做错误隔离，不要破坏）：
+    /// - **只改内存计划表**，绝不中止调用方（调度器）的任务与连接；
+    /// - 已删除设备的残留连接必须摘掉（不留僵尸南向连接）；
+    /// - 同名设备的既有连接要保留（避免热重载时重建连接造成采集断流）。
+    async fn refresh_devices(&self, _config: &GatewayConfig) {}
 }
 
 // ---- 运行时统计 ----
@@ -320,9 +334,12 @@ impl<H: PollHandler> GroupScheduler<H> {
 /// 执行一轮轮询（含可选超时）+ 统计落账 + 错误隔离。
 ///
 /// 手动路径（[`GroupScheduler::poll_group`] / [`GroupScheduler::poll_all`]）与后台任务
-/// （[`GroupScheduler::spawn_group`]）共用此函数，保证两条路径行为与统计口径一致。
-async fn execute_poll<H: PollHandler>(
-    handler: &H,
+/// （[`spawn_group`]）共用此函数，保证两条路径行为与统计口径一致。
+///
+/// 参数取 `&dyn PollHandler`（而非泛型 `&H`）：启动后的 [`RunningScheduler`] 只持有
+/// 类型擦除的 handler，重建组时才能复用同一份轮询动作重起任务。
+async fn execute_poll(
+    handler: &dyn PollHandler,
     config: &GroupConfig,
     stats: &GroupStats,
 ) -> DaemonResult<usize> {
@@ -369,10 +386,13 @@ impl<H: PollHandler + 'static> GroupScheduler<H> {
                     .get(&config.name)
                     .cloned()
                     .unwrap_or_else(|| Arc::new(GroupStats::default()));
-                Self::spawn_group(handler.clone(), config, group_stats, None, None)
+                spawn_group(handler.clone(), config, group_stats, None, None, false)
             })
             .collect();
         RunningScheduler {
+            handler,
+            governor: None,
+            rows_provider: None,
             names,
             handles,
             stats,
@@ -405,68 +425,95 @@ impl<H: PollHandler + 'static> GroupScheduler<H> {
                     .get(&config.name)
                     .cloned()
                     .unwrap_or_else(|| Arc::new(GroupStats::default()));
-                Self::spawn_group(
+                spawn_group(
                     handler.clone(),
                     config,
                     group_stats,
                     Some(governor.clone()),
                     Some(rows_provider.clone()),
+                    false,
                 )
             })
             .collect();
         RunningScheduler {
+            handler,
+            governor: Some(governor),
+            rows_provider: Some(rows_provider),
             names,
             handles,
             stats,
         }
     }
+}
 
-    /// 单组任务主循环：等拍 → 轮询 → 记账 → （可选）观测水位节流 → 继续（失败不退出）。
-    fn spawn_group(
-        handler: Arc<H>,
-        config: GroupConfig,
-        stats: Arc<GroupStats>,
-        governor: Option<Arc<Mutex<AcquisitionGovernor>>>,
-        rows_provider: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            // 首拍推迟一个周期（设计决策 2）+ 阻塞后不补采（设计决策 3）。
-            let mut ticker = interval_at(Instant::now() + config.interval, config.interval);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            let mut current_interval = config.interval;
-            info!(
-                "scheduler: group {} started with interval {}ms, {} point(s)",
-                config.name,
-                config.interval.as_millis(),
-                config.point_ids.len()
-            );
-            loop {
-                // 等拍 → 轮询（返回值仅用于日志路径；失败已在 `execute_poll` 内记账）。
-                ticker.tick().await;
-                let _ = execute_poll(handler.as_ref(), &config, &stats).await;
+/// 单组任务主循环：等拍 → 轮询 → 记账 → （可选）观测水位节流 → 继续（失败不退出）。
+///
+/// 参数取 `Arc<dyn PollHandler>`（而非泛型 `Arc<H>`）：启动后的 [`RunningScheduler`]
+/// 只持有类型擦除的 handler，[`RunningScheduler::rebuild`] 才能复用同一份轮询动作
+/// 重起任务，无需先把整座调度器拆了重建。
+///
+/// `resume`: 首拍是否**立刻**触发（[`RunningScheduler::rebuild`] 用）。冷启动必须
+/// 按设计决策 2 推迟一个周期（避免瞬时爆发 + 便于 QA 精确断言）；但重建是「续跑」
+/// ——旧任务刚被 abort，若同样推迟一个周期，被保留的设备就要空转一整个周期才恢复，
+/// 南向连接虽在，数据仍会出现一段空档。故重建路径首拍立即采集。
+fn spawn_group(
+    handler: Arc<dyn PollHandler>,
+    config: GroupConfig,
+    stats: Arc<GroupStats>,
+    governor: Option<Arc<Mutex<AcquisitionGovernor>>>,
+    rows_provider: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    resume: bool,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // 首拍推迟一个周期（设计决策 2；`resume` 时立即）+ 阻塞后不补采（决策 3）。
+        let first_tick_at = if resume {
+            Instant::now()
+        } else {
+            Instant::now() + config.interval
+        };
+        let mut ticker = interval_at(first_tick_at, config.interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut current_interval = config.interval;
+        info!(
+            "scheduler: group {} started with interval {}ms, {} point(s)",
+            config.name,
+            config.interval.as_millis(),
+            config.point_ids.len()
+        );
+        loop {
+            // 等拍 → 轮询（返回值仅用于日志路径；失败已在 `execute_poll` 内记账）。
+            ticker.tick().await;
+            let _ = execute_poll(handler.as_ref(), &config, &stats).await;
 
-                // 自适应节流（仅启用调控器时生效）：观测内存队列水位，持续高位则
-                // 放大轮询周期（降采样），低位则恢复；迟滞防抖。
-                if let (Some(gov), Some(provider)) = (&governor, &rows_provider) {
-                    if let Ok(mut guard) = gov.lock() {
-                        let decision = guard.observe(provider());
-                        let next = Duration::from_millis(decision.poll_interval_ms);
-                        if next != current_interval {
-                            current_interval = next;
-                            // 重建 interval（首拍同样推迟一个周期，避免瞬间爆发）。
-                            ticker = interval_at(Instant::now() + next, next);
-                            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                        }
+            // 自适应节流（仅启用调控器时生效）：观测内存队列水位，持续高位则
+            // 放大轮询周期（降采样），低位则恢复；迟滞防抖。
+            if let (Some(gov), Some(provider)) = (&governor, &rows_provider) {
+                if let Ok(mut guard) = gov.lock() {
+                    let decision = guard.observe(provider());
+                    let next = Duration::from_millis(decision.poll_interval_ms);
+                    if next != current_interval {
+                        current_interval = next;
+                        // 重建 interval（首拍同样推迟一个周期，避免瞬间爆发）。
+                        ticker = interval_at(Instant::now() + next, next);
+                        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
                     }
                 }
             }
-        })
-    }
+        }
+    })
 }
 
-/// 已启动的调度器句柄：持有各组任务句柄与共享统计表。
-#[derive(Debug)]
+/// 已启动的调度器句柄：持有各组任务句柄、共享统计表与重建所需的类型擦除上下文。
+///
+/// 不实现 `Debug`：`handler` 是 `dyn` 特质对象，无法派生；调试信息请用
+/// [`Self::group_names`] 与 [`Self::polls`]。
 pub struct RunningScheduler {
+    /// 轮询动作（类型擦除，重建时复用）。
+    handler: Arc<dyn PollHandler>,
+    /// 自适应节流调控器（未启用时为 `None`）。
+    governor: Option<Arc<Mutex<AcquisitionGovernor>>>,
+    /// 内存队列水位观测器（未启用时为 `None`）。
+    rows_provider: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     names: Vec<String>,
     handles: Vec<JoinHandle<()>>,
     stats: StatsMap,
@@ -488,6 +535,68 @@ impl RunningScheduler {
         self.stats(name).map_or(0, |s| s.polls())
     }
 
+    /// 用新的组集合**就地重建**运行的任务（配置热重载用）。
+    ///
+    /// 语义与约束：
+    /// 1. **先校验后动手**：组集合非法（空 / 组名重复 / 组内点位非法）直接返回
+    ///    `Err`，`self` 保持原样——旧调度器继续跑（错误隔离，绝不半重建）。
+    /// 2. **保留同名组的统计**：`polls` / `samples` / `errors` 沿用旧的
+    ///    [`Arc<GroupStats>`]，UI 的采集次数与成功率不会归零闪烁。
+    /// 3. **先 abort 旧 handle，再换上新的**：旧任务在 abort 后不再轮询，
+    ///    被删组的僵尸采集被就地掐掉；新句柄在成功 spawn 后才写入字段。
+    /// 4. **被删组的统计条目一并摘掉**：`stats()` / `polls()` 对已删组返回 `None`，
+    ///    与「该组不再运行」保持一致，避免 UI 读到永不前进的僵尸计数。
+    /// 5. **续跑语义**：重建时各任务首拍**立即**采集（[`Self::spawn_group`] 的
+    ///    `resume`），不等满新周期——被保留的设备否则要空转一个周期才恢复，数据断档。
+    /// 6. 失败时（只可能是第 1 步的校验）旧 `names` / `handles` / `stats` 全部保留。
+    ///
+    /// # Errors
+    /// - 组集合为空 / 组名重复 / 任一 [`GroupConfig`] 非法 → `ConfigError`（2000）。
+    pub fn rebuild(&mut self, groups: Vec<GroupConfig>) -> DaemonResult<()> {
+        validate_groups(&groups)?;
+
+        // 新统计表：同名组沿用旧计数（Arc 共享），新组从零开始。
+        let mut rebuilt: HashMap<String, Arc<GroupStats>> = HashMap::with_capacity(groups.len());
+        for group in &groups {
+            let retained = self
+                .stats
+                .get(&group.name)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(GroupStats::default()));
+            rebuilt.insert(group.name.clone(), retained);
+        }
+
+        let names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(groups.len());
+        for config in groups {
+            let group_stats = rebuilt
+                .get(&config.name)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(GroupStats::default()));
+            handles.push(spawn_group(
+                self.handler.clone(),
+                config,
+                group_stats,
+                self.governor.clone(),
+                self.rows_provider.clone(),
+                true,
+            ));
+        }
+
+        // 走到这里才动旧状态：旧 handle 先 abort（被删组立即停止采集），再整体替换；
+        // 统计表换成新的一份（同名沿用、新组从零、已删组摘除）。
+        self.abort();
+        self.names = names;
+        self.handles = handles;
+        self.stats = Arc::new(rebuilt);
+        info!(
+            "scheduler: rebuilt {} group task(s): {:?}",
+            self.handles.len(),
+            self.names
+        );
+        Ok(())
+    }
+
     /// 中止全部组任务（同步，不等待）。
     pub fn abort(&self) {
         for handle in &self.handles {
@@ -504,6 +613,49 @@ impl RunningScheduler {
             let _ = handle.await;
         }
     }
+}
+
+/// 校验组集合：非空、组名互不重复、每组配置自检通过（与 [`GroupScheduler::new`] 同一套规则）。
+///
+/// # Errors
+/// - 组集合为空 / 组名重复 / 任一 [`GroupConfig`] 非法 → `ConfigError`（2000）。
+pub fn validate_groups(groups: &[GroupConfig]) -> DaemonResult<()> {
+    if groups.is_empty() {
+        return Err(DaemonError::ConfigError(
+            "scheduler: at least one group is required".to_string(),
+        ));
+    }
+    let mut names: HashSet<&str> = HashSet::with_capacity(groups.len());
+    for group in groups {
+        group.validate()?;
+        if !names.insert(group.name.as_str()) {
+            return Err(DaemonError::ConfigError(format!(
+                "scheduler: duplicated group name {:?}",
+                group.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 判断两组集合是否等价（**组身份** = 组名 + 组内点位 + 轮询周期 + 单次轮询超时）。
+///
+/// 配置热重载据此决定要不要 [`RunningScheduler::rebuild`]：等价就让既有任务继续跑，
+/// 避免无谓的 abort / 重启造成采集空档（被删组仍会被差异检测捕获并 abort）。
+pub fn groups_changed(a: &[GroupConfig], b: &[GroupConfig]) -> bool {
+    if a.len() != b.len() {
+        return true;
+    }
+    let mut left = a.to_vec();
+    let mut right = b.to_vec();
+    left.sort_by(|x, y| x.name.cmp(&y.name));
+    right.sort_by(|x, y| x.name.cmp(&y.name));
+    left.iter().zip(right.iter()).any(|(x, y)| {
+        x.name != y.name
+            || x.interval != y.interval
+            || x.poll_timeout != y.poll_timeout
+            || x.point_ids != y.point_ids
+    })
 }
 
 impl Drop for RunningScheduler {
@@ -621,6 +773,16 @@ mod tests {
             points.iter().map(|p| (*p).to_string()).collect(),
         )
         .expect("valid group config")
+    }
+
+    /// 一个**校验不过**的组配置：点位列表为空（`group()` 辅助函数会直接 panic，故单列）。
+    fn empty_points() -> GroupConfig {
+        GroupConfig {
+            name: "A".to_string(),
+            interval: Duration::from_millis(100),
+            point_ids: Vec::new(),
+            poll_timeout: None,
+        }
     }
 
     /// 让刚 spawn 的组任务在 t=0 完成初始化（登记首个周期起点），避免首拍漂移。
@@ -1056,5 +1218,194 @@ mod tests {
             "factor stays at 1000 permille"
         );
         running.shutdown().await;
+    }
+
+    // ---- 热重载：就地重建采集组 ----
+
+    /// 重建：新增组被拉起、被删组的任务被 abort、同名组的统计**不归零**。
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_adds_removes_groups_and_retains_stats() {
+        let handler = FakeHandler::new(&[("keep", &["k1"]), ("add", &["n1"])]);
+        let probe = handler.clone();
+        let scheduler = GroupScheduler::new(
+            handler,
+            vec![group("keep", 100, &["k1"]), group("drop", 100, &["d1"])],
+        )
+        .expect("valid scheduler");
+        let mut running = scheduler.start();
+        settle().await;
+
+        advance_steps(Duration::from_millis(100), 3).await;
+        let before_keep = running.polls("keep");
+        assert!(before_keep > 0, "old group polled before rebuild");
+        let kept_stats = running.stats("keep").expect("stats keep");
+
+        // 「drop」消失、「keep」保留点位、「add」新建。
+        running
+            .rebuild(vec![
+                group("keep", 100, &["k1"]),
+                group("add", 100, &["n1"]),
+            ])
+            .expect("rebuild ok");
+        settle().await;
+
+        assert_eq!(
+            running.group_names(),
+            &["keep".to_string(), "add".to_string()],
+            "removed group must not linger in the running set"
+        );
+        assert!(
+            running.stats("drop").is_none(),
+            "dropped group has no live task (no zombie polling)"
+        );
+        // 同名组沿用旧统计句柄（Arc 同一份 → 计数不归零）。
+        assert!(
+            Arc::ptr_eq(&kept_stats, &running.stats("keep").expect("stats keep")),
+            "same-named group must retain the very same stats handle"
+        );
+        // 计数不归零（重建沿用同名组的统计句柄）：可能因「续跑首拍」多记 1 次。
+        assert!(
+            running.polls("keep") >= before_keep,
+            "counters must not reset on rebuild"
+        );
+        // 重建走「续跑」语义：新组首拍立即采集，不必等满一个周期。
+        assert!(
+            running.polls("add") >= 1,
+            "rebuilt group must poll immediately, got {}",
+            running.polls("add")
+        );
+
+        // 被删组不再被轮询：推进时间后 handler 侧该组计数不前进。
+        let before_drop_polls = probe.polls("drop");
+        advance_steps(Duration::from_millis(100), 3).await;
+        assert_eq!(
+            probe.polls("drop"),
+            before_drop_polls,
+            "aborted group must stop polling (no zombie)"
+        );
+        // 新组与保留组都在跑。
+        assert!(probe.polls("add") > 0, "new group is being polled");
+        assert!(
+            probe.polls("keep") > before_keep,
+            "kept group keeps polling"
+        );
+
+        running.shutdown().await;
+    }
+
+    /// 重建不掐断保留组的采集：改周期（必触发 rebuild）后，保留组必须**立刻**再采，
+    /// 而不是空转一整个周期——否则 `last_sample_at` 会断档（热重载抖动项）。
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_resumes_kept_group_without_waiting_a_full_interval() {
+        let handler = FakeHandler::new(&[("keep", &["k1"])]);
+        let probe = handler.clone();
+        let scheduler = GroupScheduler::new(handler, vec![group("keep", 100, &["k1"])])
+            .expect("valid scheduler");
+        let mut running = scheduler.start();
+        settle().await;
+        advance_steps(Duration::from_millis(100), 2).await;
+
+        // 周期从 100ms 改成 60s：组身份变了 → 必须 rebuild；但采集不能停摆。
+        let before = probe.polls("keep");
+        assert!(before > 0, "group polled before rebuild");
+        running
+            .rebuild(vec![group("keep", 60_000, &["k1"])])
+            .expect("rebuild ok");
+        // 只推进 10ms（远小于 60s 新周期）：首拍若不「续跑立即」就不会有这次采集。
+        advance(Duration::from_millis(10)).await;
+
+        assert_eq!(
+            probe.polls("keep"),
+            before + 1,
+            "kept group must poll once right after rebuild, not after a full interval"
+        );
+        assert_eq!(running.polls("keep"), before + 1, "stats keep counting up");
+
+        running.shutdown().await;
+    }
+
+    /// 重建失败（空 / 组名重复 / 点位非法）保留旧调度器继续跑，绝不半重建。
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_rejects_invalid_groups_and_keeps_old_scheduler_running() {
+        let handler = FakeHandler::new(&[("A", &["a1"])]);
+        let probe = handler.clone();
+        let scheduler =
+            GroupScheduler::new(handler, vec![group("A", 100, &["a1"])]).expect("valid scheduler");
+        let mut running = scheduler.start();
+        settle().await;
+        advance_steps(Duration::from_millis(100), 2).await;
+        let before = running.polls("A");
+
+        let cases: Vec<(&str, Vec<GroupConfig>)> = vec![
+            ("empty", vec![]),
+            (
+                "duplicated name",
+                vec![group("A", 100, &["a1"]), group("A", 200, &["a2"])],
+            ),
+            ("empty point set", vec![empty_points()]),
+        ];
+        for (label, groups) in cases {
+            let err = running.rebuild(groups).expect_err(label);
+            assert_eq!(err.error_code(), ERR_CONFIG, "{label}: config error code");
+            assert_eq!(
+                running.group_names(),
+                &["A".to_string()],
+                "{label}: old groups untouched"
+            );
+            assert!(running.stats("A").is_some(), "{label}: old stats untouched");
+        }
+
+        // 旧任务仍在轮询：推进时间后计数继续前进（不是被悄悄停掉）。
+        advance_steps(Duration::from_millis(100), 2).await;
+        assert!(
+            probe.polls("A") > 0,
+            "old scheduler must keep running after failed rebuild"
+        );
+        assert!(running.polls("A") >= before);
+
+        running.shutdown().await;
+    }
+
+    /// 组身份比对：等价集合不触发重建，任何一维度变化都要触发。
+    #[test]
+    fn groups_changed_detects_group_identity_differences() {
+        let base = vec![group("A", 100, &["a1", "a2"]), group("B", 1000, &["b1"])];
+
+        assert!(
+            !groups_changed(&base, &base.clone()),
+            "same list is a no-op"
+        );
+        // 顺序不同但内容一致 → 等价（比对前按组名排序）。
+        let shuffled = vec![group("B", 1000, &["b1"]), group("A", 100, &["a1", "a2"])];
+        assert!(!groups_changed(&base, &shuffled), "order must not matter");
+
+        // 组名 / 点位 / 周期 / 超时 任一变化 → 有差异。
+        assert!(groups_changed(
+            &base,
+            &[group("C", 100, &["a1", "a2"]), group("B", 1000, &["b1"])]
+        ));
+        assert!(groups_changed(
+            &base,
+            &[group("A", 100, &["a1"]), group("B", 1000, &["b1"])]
+        ));
+        assert!(groups_changed(
+            &base,
+            &[group("A", 250, &["a1", "a2"]), group("B", 1000, &["b1"])]
+        ));
+        assert!(groups_changed(
+            &base,
+            &[
+                group("A", 100, &["a1", "a2"])
+                    .with_timeout(Duration::from_millis(50))
+                    .expect("valid timeout"),
+                group("B", 1000, &["b1"])
+            ]
+        ));
+        // 数量变化（加组 / 减组）→ 有差异。
+        assert!(groups_changed(&base, &[group("A", 100, &["a1", "a2"])]));
+        assert!(groups_changed(
+            &base,
+            &[group("A", 100, &["a1", "a2"]), group("C", 100, &["c1"])]
+        ));
     }
 }

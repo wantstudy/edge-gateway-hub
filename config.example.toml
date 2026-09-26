@@ -70,9 +70,9 @@ gateway_id = "gw-local-dev"
 # ── 采集点位（本地页面测试可不配）──
 # [[points]]
 # device_id = "plc-01"
-# point_id = "temp_01"
+# point_id = "40001"                     # 点位标识 = 南向寄存器号（modbus 4xxxx / s7 DB.. / mc D..）
 # protocol = "modbus-tcp"               # modbus-tcp | modbus-rtu | s7 ...
-# address = "40001"
+# address = "192.168.1.10:502"           # 设备接入端点（host:port）；同义字段 endpoint 亦可
 # frequency_ms = 1000
 # push_enabled = true                    # 北向推送开关（别名 push）；false = 只采集/进实时流，不转发
 # ── 点位元数据（全部可选；缺省 = 未声明）──
@@ -88,9 +88,9 @@ gateway_id = "gw-local-dev"
 # ── 点位模拟（可选；缺省关闭，走真实南向读）──
 # [[points]]
 # device_id = "plc-01"
-# point_id = "temp_sim"
+# point_id = "40001"                     # 点位标识 = 南向寄存器号
 # protocol = "modbus-tcp"
-# address = "40001"
+# address = "192.168.1.10:502"           # 设备接入端点（host:port）
 # frequency_ms = 1000
 # sim_enabled = true                     # 开启该点位模拟（不发起真实南向读）
 # sim_mode = "random"                    # 模拟模式（可选；建议 random | fixed，引擎定义取值域）

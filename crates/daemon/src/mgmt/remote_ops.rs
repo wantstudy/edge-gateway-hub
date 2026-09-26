@@ -99,12 +99,45 @@ pub enum OpsAction {
     ForwarderCreate,
     /// 北向出口连通性探测（`POST /api/forwarders/{id}/test`）。
     ForwarderTest,
-    /// 告警规则写（`PUT /api/alerts/rules`；诚实 501 占位动作）。
+    /// 告警规则整体保存（`PUT /api/alerts/rules`；`rules` 即全量）。
     AlarmRulesWrite,
+    /// 告警规则修改 / 启停（`PUT /api/alerts/rules/:id`；部分更新语义）。
+    AlarmRuleUpdate,
+    /// 告警规则删除（`DELETE /api/alerts/rules/:id`）。
+    AlarmRuleDelete,
+    /// 告警处置（ `POST /api/alerts/:id/ack`；改内存态记录，不落配置）。
+    AlarmAck,
+    /// 转发规则新增（`POST /api/rules`）。
+    RuleCreate,
+    /// 转发规则修改 / 启停（`PUT /api/rules/:id`；部分更新语义）。
+    RuleUpdate,
+    /// 转发规则删除（`DELETE /api/rules/:id`）。
+    RuleDelete,
     /// 设置持久化写（`PUT /api/settings`；mgmt settings 页面真实落盘）。
     SettingsWrite,
     /// 远程停机（`POST /api/ops/stop`；优雅停机，不承诺拉起——比 restart 更保守）。
     Stop,
+    /// 首次安装初始化（`POST /api/auth/bootstrap`；仅无账号 + 本地请求时放行）。
+    AuthBootstrap,
+    // —— 账号与角色管理（mgmt accounts_api；D 项收口）——
+    /// 账号新增（`POST /api/accounts`）。
+    AccountCreate,
+    /// 账号修改（改角色 / 停启用 / 重置口令；`PUT /api/accounts/:account`）。
+    AccountUpdate,
+    /// 账号删除（`DELETE /api/accounts/:account`）。
+    AccountDelete,
+    /// 自定义角色新增（`POST /api/roles`）。
+    RoleCreate,
+    /// 自定义角色修改（`PUT /api/roles/:id`）。
+    RoleUpdate,
+    /// 自定义角色删除（`DELETE /api/roles/:id`）。
+    RoleDelete,
+    /// 授权激活（`POST /api/license/activate`；B-1 收口）。
+    LicenseActivate,
+    /// 备份策略写（`PUT /api/settings/backup-policy`；B-2 收口）。
+    BackupPolicyWrite,
+    /// 自启注册写（`PUT /api/service/autostart`；HKCU Run 键增删）。
+    AutostartWrite,
 }
 
 impl OpsAction {
@@ -127,8 +160,24 @@ impl OpsAction {
             OpsAction::ForwarderCreate => "forwarder_create",
             OpsAction::ForwarderTest => "forwarder_test",
             OpsAction::AlarmRulesWrite => "alarm_rules_write",
+            OpsAction::AlarmRuleUpdate => "alarm_rule_update",
+            OpsAction::AlarmRuleDelete => "alarm_rule_delete",
+            OpsAction::AlarmAck => "alarm_ack",
+            OpsAction::RuleCreate => "rule_create",
+            OpsAction::RuleUpdate => "rule_update",
+            OpsAction::RuleDelete => "rule_delete",
             OpsAction::SettingsWrite => "settings_write",
             OpsAction::Stop => "stop",
+            OpsAction::AuthBootstrap => "auth.bootstrap",
+            OpsAction::AccountCreate => "account_create",
+            OpsAction::AccountUpdate => "account_update",
+            OpsAction::AccountDelete => "account_delete",
+            OpsAction::RoleCreate => "role_create",
+            OpsAction::RoleUpdate => "role_update",
+            OpsAction::RoleDelete => "role_delete",
+            OpsAction::LicenseActivate => "license_activate",
+            OpsAction::BackupPolicyWrite => "backup_policy_write",
+            OpsAction::AutostartWrite => "autostart_write",
         }
     }
 }
@@ -523,6 +572,10 @@ struct RestartBody {
     confirm: String,
     #[serde(default)]
     reason: String,
+    /// 补充说明：与 `reason`（枚举原文）**独立**的自由文本字段，禁止由调用方拼接进
+    /// `reason`。二者一并落审计，便于对 `reason` 做枚举级统计。
+    #[serde(default)]
+    note: String,
 }
 
 /// POST /api/ops/collectors 请求体。
@@ -561,7 +614,7 @@ pub async fn restart(State(state): State<MgmtState>, authed: AuthedRole, body: B
             );
             return bad_request(
                 "bad_request",
-                "body must be a JSON object {actor, confirm, reason}",
+                "body must be a JSON object {actor, confirm, reason, note}",
             );
         }
     };
@@ -603,7 +656,8 @@ pub async fn restart(State(state): State<MgmtState>, authed: AuthedRole, body: B
             &format!("confirm must echo the gateway id {gateway_id:?}"),
         );
     }
-    if req.confirm != gateway_id {
+    // 大数 / 大小写口径：`trim()` + 大小写不敏感精确匹配（confirm 须回显 gateway_id）。
+    if !req.confirm.trim().eq_ignore_ascii_case(&gateway_id) {
         runtime.record_audit(
             &req.actor,
             OpsAction::Restart,
@@ -624,7 +678,10 @@ pub async fn restart(State(state): State<MgmtState>, authed: AuthedRole, body: B
         OpsAction::Restart,
         true,
         OUTCOME_ACCEPTED,
-        &format!("graceful shutdown requested; reason={:?}", req.reason),
+        &format!(
+            "graceful shutdown requested; reason={:?} note={:?}",
+            req.reason, req.note
+        ),
     );
     tracing::info!(
         actor = %req.actor,
@@ -667,7 +724,7 @@ pub async fn stop(State(state): State<MgmtState>, authed: AuthedRole, body: Byte
             );
             return bad_request(
                 "bad_request",
-                "body must be a JSON object {actor, confirm, reason}",
+                "body must be a JSON object {actor, confirm, reason, note}",
             );
         }
     };
@@ -709,7 +766,8 @@ pub async fn stop(State(state): State<MgmtState>, authed: AuthedRole, body: Byte
             &format!("confirm must echo the gateway id {gateway_id:?}"),
         );
     }
-    if req.confirm != gateway_id {
+    // 大数 / 大小写口径：`trim()` + 大小写不敏感精确匹配（confirm 须回显 gateway_id）。
+    if !req.confirm.trim().eq_ignore_ascii_case(&gateway_id) {
         runtime.record_audit(
             &req.actor,
             OpsAction::Stop,
@@ -729,7 +787,10 @@ pub async fn stop(State(state): State<MgmtState>, authed: AuthedRole, body: Byte
         OpsAction::Stop,
         true,
         OUTCOME_ACCEPTED,
-        &format!("graceful stop requested; reason={:?}", req.reason),
+        &format!(
+            "graceful stop requested; reason={:?} note={:?}",
+            req.reason, req.note
+        ),
     );
     tracing::info!(
         actor = %req.actor,
@@ -1058,7 +1119,8 @@ frequency_ms = 100
         let now = now_unix_secs();
         let claims = Claims {
             sub: "ops-admin".to_string(),
-            role,
+            role: role.as_str().to_string(),
+            perms: None,
             exp: now + 600,
             iat: now,
             nbf: None,

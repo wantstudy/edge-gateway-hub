@@ -166,6 +166,7 @@ mod tests {
                 protocol: "modbus-tcp".to_string(),
                 address: format!("192.168.1.{i}:502"),
                 frequency_ms,
+                ..Default::default()
             })
             .collect();
         GatewayConfig {
@@ -176,6 +177,7 @@ mod tests {
             devices: Vec::new(),
             // task 57：可选 mgmt_auth 段缺省 None（测试配置不含登录凭证）。
             mgmt_auth: None,
+            ..Default::default()
         }
     }
 
@@ -272,6 +274,7 @@ mod tests {
             protocol: "modbus-tcp".to_string(),
             address: "192.168.1.0:502".to_string(),
             frequency_ms: 500,
+            ..Default::default()
         });
         assert_eq!(
             validate(&config, false),
@@ -307,6 +310,7 @@ mod tests {
             protocol: "opcua".to_string(),
             address: "opc.tcp://10.0.0.1:4840".to_string(),
             frequency_ms: 100,
+            ..Default::default()
         });
         let config = config_with_outlet(config);
 

@@ -43,7 +43,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
 use super::auth_jwt::{now_unix_secs, sign, Claims, IssuerKey, JwtError};
-use super::rbac::{AuthedRole, RbacAuth, Role};
+use super::rbac::{permissions_of, AuthedRole, Permission, RbacAuth, Role};
 use crate::config::GatewayConfig;
 
 /// JWT 签名密钥环境变量（64 个 hex 字符 = 32 字节）。
@@ -106,8 +106,11 @@ impl PasswordRef {
 pub struct LoginUser {
     /// 用户名（精确匹配）。
     pub name: String,
-    /// 已解析的规范角色。
-    pub role: Role,
+    /// 角色 id 字面量（内置四角色之一，或自定义角色 id；进 JWT `role` claim）。
+    pub role_id: String,
+    /// 解析后的权限集（B-3：登录签发时随 token 携带，签名防篡改；
+    /// 内置角色 = 现有矩阵映射零变化，自定义角色 = permissions 并集）。
+    pub perms: Vec<Permission>,
     /// 口令摘要的存储形态（[`PasswordRef`]；模块私有，外部只经 [`MgmtAuth`] 判定）。
     password: PasswordRef,
 }
@@ -144,11 +147,17 @@ impl MgmtAuth {
 
     /// 追加一个账号（`stored` 为口令摘要的**存储串**：Argon2id 的 PHC 串，或历史
     /// 遗留的 `SHA-256(password)` hex；两者皆非法 / 空用户名 → warn 跳过该账号，
-    /// 绝不放入弱凭证）。
+    /// 绝不放入弱凭证）。`role_id` = 角色 id 字面量；`perms` = 解析后的权限集。
     ///
     /// 返回是否真的装入（调用方据此统计「可用账号数」）。
-    pub fn with_user(mut self, name: &str, role: Role, stored: &str) -> Self {
-        self.add_user(name, role, stored);
+    pub fn with_user(
+        mut self,
+        name: &str,
+        role_id: &str,
+        perms: Vec<Permission>,
+        stored: &str,
+    ) -> Self {
+        self.add_user(name, role_id, perms, stored);
         self
     }
 
@@ -160,7 +169,8 @@ impl MgmtAuth {
         self.dev_pass = Some(password.to_string());
         self.users.push(LoginUser {
             name: DEV_ADMIN_USER.to_string(),
-            role: Role::System,
+            role_id: Role::System.as_str().to_string(),
+            perms: permissions_of(Role::System).to_vec(),
             password: phc_or_legacy(password),
         });
         self
@@ -169,23 +179,34 @@ impl MgmtAuth {
     /// 按配置快照重建账号表（**只换 `users`，绝不动签名密钥**）。
     ///
     /// 用途：bootstrap 落盘 / `config.toml` 热重载之后，让登录判定跟随最新配置。
-    /// 规则与启动时 [`build`] 完全一致：未知角色 / 非法摘要的账号跳过；生产路
-    /// 零可用账号且已启用 dev 管理员时补回 dev 账号。返回可用账号数。
+    /// 规则与启动时 [`build`] 完全一致：停用 / 角色解析失败 / 非法摘要的账号跳过
+    /// （fail-closed）；生产路零可用账号且已启用 dev 管理员时补回 dev 账号。
+    /// 返回可用账号数。
     pub fn sync_users(&mut self, config: &GatewayConfig) -> usize {
         self.users.clear();
         let mut loaded = 0usize;
         if let Some(section) = &config.mgmt_auth {
             for user in &section.users {
-                match Role::from_str(&user.role) {
-                    Some(role) => {
-                        if self.add_user(&user.name, role, &user.password_hash) {
+                // 停用账号 fail-closed：不进登录判定表（与「角色解析失败跳过」同口径）。
+                if user.status.as_deref() == Some("disabled") {
+                    tracing::warn!(
+                        user = %user.name,
+                        "mgmt auth: account disabled; user skipped (fail-closed)"
+                    );
+                    continue;
+                }
+                match resolve_user_role(section, &user.role) {
+                    Some((role_id, perms)) => {
+                        if self.add_user(&user.name, &role_id, perms, &user.password_hash) {
                             loaded += 1;
                         }
                     }
                     None => tracing::warn!(
                         user = %user.name,
                         role = %user.role,
-                        "mgmt auth: unknown role in config; user skipped (fail-closed)"
+                        "mgmt auth: role not resolvable (unknown builtin literal, undefined \
+                         custom role, or custom role with unknown permission id); \
+                         user skipped (fail-closed)"
                     ),
                 }
             }
@@ -194,7 +215,8 @@ impl MgmtAuth {
             if let Some(pass) = self.dev_pass.as_deref() {
                 self.users.push(LoginUser {
                     name: DEV_ADMIN_USER.to_string(),
-                    role: Role::System,
+                    role_id: Role::System.as_str().to_string(),
+                    perms: permissions_of(Role::System).to_vec(),
                     password: phc_or_legacy(pass),
                 });
             }
@@ -206,13 +228,20 @@ impl MgmtAuth {
     ///
     /// 接受两种存储串（[`PasswordRef`]）：Argon2id 的 PHC 串，或遗留的
     /// `SHA-256(password)` hex；两者都不是 → 视为弱凭证，跳过。
-    fn add_user(&mut self, name: &str, role: Role, stored: &str) -> bool {
+    fn add_user(
+        &mut self,
+        name: &str,
+        role_id: &str,
+        perms: Vec<Permission>,
+        stored: &str,
+    ) -> bool {
         let password = parse_password_ref(stored);
         match password {
             Some(password) if !name.trim().is_empty() => {
                 self.users.push(LoginUser {
                     name: name.trim().to_string(),
-                    role,
+                    role_id: role_id.to_string(),
+                    perms,
                     password,
                 });
                 true
@@ -254,8 +283,8 @@ impl MgmtAuth {
 
     /// 登录判定：口令校验（Argon2id → 遗留 SHA-256 回退）→ 签发 JWT。
     ///
-    /// 成功返回 `(token, role)`；用户不存在 / 密码错 / 签发失败一律 `None`
-    /// （调用方统一转 401，不区分原因）。
+    /// 成功返回 `(token, role_id)`（role_id = 角色 id 字面量，内置或自定义）；
+    /// 用户不存在 / 密码错 / 签发失败一律 `None`（调用方统一转 401，不区分原因）。
     ///
     /// ## 遗留格式升级（就地、幂等）
     /// 若命中账号存的还是无盐 `SHA-256(password)`，且口令校验通过，则**立即**以
@@ -264,7 +293,7 @@ impl MgmtAuth {
     /// - 记入 [`Self::pending_migration`]，由调用方回写配置（见
     ///   [`persist_password_migration`]）——这一步失败只告警，账号照旧可登录，
     ///   下次登录会再试一次。
-    pub fn login(&mut self, username: &str, password: &str) -> Option<(String, Role)> {
+    pub fn login(&mut self, username: &str, password: &str) -> Option<(String, String)> {
         let matched = self.users.iter().position(|u| u.name == username);
         let verified = match matched {
             Some(index) => verify_password(&self.users[index], password),
@@ -293,19 +322,28 @@ impl MgmtAuth {
             }
         }
         let user = &self.users[index];
-        let (token, _) = self.issue_token(&user.name, user.role).ok()?;
-        Some((token, user.role))
+        let (token, _) = self
+            .issue_token(&user.name, &user.role_id, user.perms.clone())
+            .ok()?;
+        Some((token, user.role_id.clone()))
     }
 
-    /// 以给定主体 / 角色签发 JWT（`exp = now + TOKEN_TTL_SECS`，`jti` = uuid v4）。
+    /// 以给定主体 / 角色 id / 权限集签发 JWT（`exp = now + TOKEN_TTL_SECS`，
+    /// `jti` = uuid v4）。`perms` 随 token 签名携带（B-3 防篡改授权源）。
     ///
     /// 返回 `(token, exp)`；`exp` 供测试断言与日志取用。
-    pub fn issue_token(&self, sub: &str, role: Role) -> Result<(String, i64), JwtError> {
+    pub fn issue_token(
+        &self,
+        sub: &str,
+        role_id: &str,
+        perms: Vec<Permission>,
+    ) -> Result<(String, i64), JwtError> {
         let now = now_unix_secs();
         let exp = now.saturating_add(TOKEN_TTL_SECS);
         let claims = Claims {
             sub: sub.to_string(),
-            role,
+            role: role_id.to_string(),
+            perms: Some(perms),
             exp,
             iat: now,
             nbf: None,
@@ -348,14 +386,15 @@ pub fn build(config: &GatewayConfig, env: &dyn Fn(&str) -> Option<String>) -> (R
     let (key, dev_key) = resolve_issuer_key(env);
     let mut login = MgmtAuth::new(key);
 
-    // 生产路：config `[mgmt_auth]` 账号表（未知角色 / 非法哈希的账号跳过，fail-closed）。
+    // 生产路：config `[mgmt_auth]` 账号表（停用 / 角色解析失败 / 非法哈希的
+    // 账号跳过，fail-closed）。
     let mut loaded = 0usize;
     if let Some(section) = &config.mgmt_auth {
         for user in &section.users {
-            match Role::from_str(&user.role) {
-                Some(role) => {
+            match resolve_user_role(section, &user.role) {
+                Some((role_id, perms)) => {
                     let before = login.user_count();
-                    login = login.with_user(&user.name, role, &user.password_hash);
+                    login = login.with_user(&user.name, &role_id, perms, &user.password_hash);
                     if login.user_count() > before {
                         loaded += 1;
                     }
@@ -363,7 +402,8 @@ pub fn build(config: &GatewayConfig, env: &dyn Fn(&str) -> Option<String>) -> (R
                 None => tracing::warn!(
                     user = %user.name,
                     role = %user.role,
-                    "mgmt auth: unknown role in config; user skipped (fail-closed)"
+                    "mgmt auth: role not resolvable (unknown builtin literal, undefined custom \
+                     role, or custom role with unknown permission id); user skipped (fail-closed)"
                 ),
             }
         }
@@ -404,6 +444,34 @@ pub fn build(config: &GatewayConfig, env: &dyn Fn(&str) -> Option<String>) -> (R
     (RbacAuth::new(key), login)
 }
 
+// ---- B-3：角色 → 权限集解析（登录装配唯一入口） ----
+
+/// 把配置账号的 `role` 字段解析为 `(role_id, 权限集)`（B-3 单一解析入口；
+/// `sync_users` / `build` 共用）。
+///
+/// - **内置角色字面量** → 现有矩阵映射（`permissions_of`）——回归零变化；
+/// - **自定义角色 id** → 在 `[mgmt_auth.roles]` 中定位，permissions 逐项经
+///   `Permission::from_id` 解析成并集（`accounts_api` 建角色时已校验合法 id，
+///   手改配置出现未知 id → 整个账号解析失败——fail-closed，绝不「半解析」放行）；
+/// - 其余（未知字面量 / 未定义的自定义角色 id）→ `None`，调用方跳过该账号。
+pub(crate) fn resolve_user_role(
+    section: &crate::config::MgmtAuthSection,
+    role_raw: &str,
+) -> Option<(String, Vec<Permission>)> {
+    if let Some(role) = Role::from_str(role_raw) {
+        return Some((role.as_str().to_string(), permissions_of(role).to_vec()));
+    }
+    let custom = section.roles.iter().find(|r| r.id == role_raw)?;
+    let mut perms: Vec<Permission> = Vec::with_capacity(custom.permissions.len());
+    for id in &custom.permissions {
+        let permission = Permission::from_id(id)?;
+        if !perms.contains(&permission) {
+            perms.push(permission);
+        }
+    }
+    Some((custom.id.clone(), perms))
+}
+
 // ---- 摘要、校验与恒时比较 ----
 
 /// 口令校验结果（三态：新格式通过 / 遗留格式通过 / 不通过）。
@@ -432,7 +500,8 @@ fn argon2() -> Argon2<'static> {
 /// 口令 → Argon2id PHC 串（每次调用生成**新的 16 字节随机盐**，故同口令两次哈希必异）。
 ///
 /// 失败（理论上不可达）返回 `None`，调用方自行降级——生产代码里不放 `unwrap`。
-fn hash_phc(password: &str) -> Option<String> {
+/// `pub(crate)`：账号管理写端点（`accounts_api`）建号 / 重置口令共用同一哈希参数。
+pub(crate) fn hash_phc(password: &str) -> Option<String> {
     let salt = SaltString::generate(OsRng);
     argon2()
         .hash_password(password.as_bytes(), &salt)
@@ -583,6 +652,35 @@ fn persist_password_migration(state: &super::MgmtState, user: &str, phc: &str) {
     );
 }
 
+/// 登录成功 → 回写 `last_login_at_ms`（Unix 毫秒；账号清单端点读它展示）。
+///
+/// 与 [`persist_password_migration`] 同范式（写锁 → 快照改 → save → replace），
+/// 差异：目标字段缺失（老配置 / 用户不存在）静默返回——登录通道绝不能因为
+/// 元数据回写失败而受影响（fail-safe，只 warn）。
+fn persist_last_login(state: &super::MgmtState, user: &str) {
+    let _guard = super::writeapi::write_guard();
+    let Some(path) = state.config_path() else {
+        return; // dev 账号等不落 config 的登录：无回写目标，静默
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut next = (*state.config()).clone();
+    let Some(section) = next.mgmt_auth.as_mut() else {
+        return;
+    };
+    let Some(target) = section.users.iter_mut().find(|u| u.name == user) else {
+        return; // dev 管理员等内存账号：无 config 行，静默
+    };
+    target.last_login_at_ms = Some(now_ms);
+    if let Err(err) = next.save(&path) {
+        tracing::warn!(user = %user, error = %err, "auth: last_login_at persist failed");
+        return;
+    }
+    state.daemon().config_shared().replace(next);
+}
+
 /// 账号体系是否已初始化：系统里只要存在**任何一个可用账号**（含 dev 管理员，
 /// 它来自环境变量、不落 config）即视为已初始化 ⇒ bootstrap 必须恒 409
 /// （否则回环访问者可在「配了 dev pass 但无 `[[mgmt_auth.users]]`」的实例上
@@ -626,6 +724,9 @@ pub async fn login(State(state): State<super::MgmtState>, body: Bytes) -> Respon
         if let Some((user, phc)) = live.take_pending_migration() {
             persist_password_migration(&state, &user, &phc);
         }
+        // 登录成功回写 last_login_at（元数据落盘；与迁移回写同范式，不做备份——
+        // 非配置语义变更，且登录频率下 IO 可忽略）。
+        persist_last_login(&state, &username);
     }
     if let Some(logger) = state.daemon().audit_logger() {
         let (event, outcome_literal) = if outcome.is_some() {
@@ -649,9 +750,9 @@ pub async fn login(State(state): State<super::MgmtState>, body: Bytes) -> Respon
         }
     }
     match outcome {
-        Some((token, role)) => Json(serde_json::json!({
+        Some((token, role_id)) => Json(serde_json::json!({
             "token": token,
-            "role": role.as_str(),
+            "role": role_id,
         }))
         .into_response(),
         None => (
@@ -670,7 +771,7 @@ pub async fn login(State(state): State<super::MgmtState>, body: Bytes) -> Respon
 pub async fn whoami(authed: AuthedRole) -> Response {
     Json(serde_json::json!({
         "sub": authed.claims.sub,
-        "role": authed.role.as_str(),
+        "role": authed.claims.role,
         "exp": authed.claims.exp.to_string(),
     }))
     .into_response()
@@ -711,7 +812,11 @@ pub struct BootstrapBody {
 
 /// 非本地来源 / 拿不到对端地址 → 403。bootstrap 是全系统唯一的匿名写通道，
 /// 任何拿不到本地对端信息的情况一律 fail-closed（不猜、不超时放行）。
-const NOT_LOCAL_MESSAGE: &str = "bootstrap requires a loopback connection";
+///
+/// 文案为**中文**：该 `message` 会被控制台登录页原样透出（`LoginPage.vue` 的
+/// `describeBootstrapFailure` 优先展示后端 `message`），英文会直接变成界面上的
+/// 英文提示。
+const NOT_LOCAL_MESSAGE: &str = "该操作仅允许从本机回环地址调用（127.0.0.1 / ::1）";
 
 /// `GET /api/auth/state` → 账号体系初始化状态（**免认证**，无副作用，不写审计）。
 ///
@@ -748,10 +853,9 @@ pub async fn auth_state(State(state): State<super::MgmtState>) -> Response {
             });
         }
         Some(_) => {
-            note =
-                Some("not in trial state (licensed / grace / degraded / unlicensed)".to_string());
+            note = Some("当前非试用状态（已授权 / 宽限期 / 降级 / 未授权）".to_string());
         }
-        None => note = Some("license runtime not assembled; trial state unknown".to_string()),
+        None => note = Some("网关授权模块未就绪，试用状态暂不可判定".to_string()),
     }
 
     let mut body = serde_json::json!({
@@ -803,17 +907,13 @@ pub async fn bootstrap(
     let username = parsed.username.trim();
     let password = parsed.password.as_str();
     if username.is_empty() {
-        return super::writeapi::validation_error(
-            "username",
-            "username must not be empty",
-            "non-empty username",
-        );
+        return super::writeapi::validation_error("username", "账号不能为空", "非空账号");
     }
     if password.chars().count() < MIN_PASSWORD_LEN {
         return super::writeapi::validation_error(
             "password",
-            &format!("password must be at least {MIN_PASSWORD_LEN} characters"),
-            "non-empty username & password with length >= 8",
+            &format!("口令至少需要 {MIN_PASSWORD_LEN} 个字符"),
+            "非空账号，且口令长度 ≥ 8",
         );
     }
 
@@ -838,7 +938,7 @@ pub async fn bootstrap(
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "already_initialized",
-                "message": "account system already initialized; bootstrap is closed",
+                "message": "账号体系已初始化，创建首个管理员的入口已永久关闭",
             })),
         )
             .into_response();
@@ -860,6 +960,14 @@ pub async fn bootstrap(
         role: BOOTSTRAP_ROLE_LITERAL.to_string(),
         password_hash: digest,
         display_name: (!display_name.is_empty()).then(|| display_name.to_string()),
+        status: Some("active".to_string()),
+        created_at_ms: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        ),
+        last_login_at_ms: None,
     });
     new_config.mgmt_auth = Some(section);
     let detail = bootstrap_audit_detail(username, peer, &parsed);
@@ -878,7 +986,10 @@ pub async fn bootstrap(
     let role = crate::mgmt::rbac::Role::from_str(BOOTSTRAP_ROLE_LITERAL)
         .unwrap_or(crate::mgmt::rbac::Role::System);
     let role_literal = role.as_str().to_string();
-    match state.login_auth().issue_token(username, role) {
+    match state
+        .login_auth()
+        .issue_token(username, &role_literal, permissions_of(role).to_vec())
+    {
         Ok((token, _exp)) => Json(serde_json::json!({
             "token": token,
             "role": role_literal,
@@ -1196,7 +1307,7 @@ frequency_ms = 100
         let claims = verify(token, state.login_auth().key(), now_unix_secs(), 60)
             .expect("token must verify with configured key");
         assert_eq!(claims.sub, "alice");
-        assert_eq!(claims.role, Role::System);
+        assert_eq!(claims.role, "system");
     }
 
     /// QA 安全: 错误密码 → 401；未知用户 → 401；且两者响应体**完全一致**
@@ -1363,7 +1474,8 @@ frequency_ms = 100
     fn legacy_storage_verifies_then_stays_legacy() {
         let user = LoginUser {
             name: "legacy".to_string(),
-            role: Role::Ops,
+            role_id: Role::Ops.as_str().to_string(),
+            perms: Vec::new(),
             password: PasswordRef::LegacyHex(SHA256_ABC_HEX.to_string()),
         };
         assert_eq!(verify_password(&user, "abc"), Verify::AcceptedLegacy);
@@ -1405,12 +1517,14 @@ frequency_ms = 100
 
         let lhs = LoginUser {
             name: "a".to_string(),
-            role: Role::System,
+            role_id: Role::System.as_str().to_string(),
+            perms: Vec::new(),
             password: PasswordRef::Phc(first),
         };
         let rhs = LoginUser {
             name: "b".to_string(),
-            role: Role::System,
+            role_id: Role::System.as_str().to_string(),
+            perms: Vec::new(),
             password: PasswordRef::Phc(second),
         };
         assert_eq!(verify_password(&lhs, "same-password"), Verify::Accepted);
@@ -2200,5 +2314,121 @@ password_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         }
         // 哈希链完好（登录事件正确入链）。
         assert!(logger.verify_chain().expect("verify").ok);
+    }
+
+    // ---- B-3：自定义角色运行时授权融合 ----
+
+    /// 已知向量：SHA-256("s3cret-pass")（自定义角色账号测试用口令摘要）。
+    fn sha256_hex(input: &str) -> String {
+        use sha2::Digest as _;
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// 带自定义角色的配置：`role-custom` 授予 `account.view` + `receipt.view`，
+    /// 账号 carol 绑定该自定义角色；bob 绑定**未定义**的 ghost 角色。
+    fn config_with_custom_role() -> GatewayConfig {
+        let hash = sha256_hex("s3cret-pass");
+        GatewayConfig::parse(&format!(
+            r#"
+[gateway]
+gateway_id = "gw-custom-role"
+
+[[mgmt_auth.users]]
+name = "carol"
+role = "role-custom"
+password_hash = "{hash}"
+
+[[mgmt_auth.users]]
+name = "bob"
+role = "role-ghost"
+password_hash = "{hash}"
+
+[[mgmt_auth.roles]]
+id = "role-custom"
+name = "车间操作员"
+permissions = ["account.view", "receipt.view"]
+
+[[mgmt_auth.roles]]
+id = "role-bad-perm"
+name = "坏权限角色"
+permissions = ["account.view", "nuke.all"]
+
+[[mgmt_auth.users]]
+name = "dave"
+role = "role-bad-perm"
+password_hash = "{hash}"
+"#
+        ))
+        .expect("parse custom-role config")
+    }
+
+    /// QA（B-3 核心）: 自定义角色账号登录成功，token `role` = 自定义 id、
+    /// `perms` = 角色 permissions 并集（签名 claim，防篡改）；内置角色账号
+    /// 权限集仍等于既有矩阵（回归零变化）。
+    #[test]
+    fn custom_role_account_resolves_perms_into_token() {
+        let config = config_with_custom_role();
+        let key = IssuerKey([0x77u8; 32]);
+        let mut login = MgmtAuth::new(key);
+        // 仅 carol 可用（dave 绑定含未知权限 id 的角色、bob 绑定未定义角色 → 跳过）。
+        let loaded = login.sync_users(&config);
+        assert_eq!(
+            loaded, 1,
+            "only carol resolves; dave/bob skipped (fail-closed)"
+        );
+
+        let (token, role_id) = login
+            .login("carol", "s3cret-pass")
+            .expect("custom-role login must succeed");
+        assert_eq!(role_id, "role-custom", "role id literal returned as-is");
+
+        let claims = verify(&token, key, now_unix_secs(), 60).expect("token verifies");
+        assert_eq!(claims.role, "role-custom");
+        let perms = claims.perms.as_ref().expect("perms claim present");
+        assert_eq!(perms.len(), 2, "union of the custom role permissions");
+        assert!(perms.contains(&Permission::AccountView));
+        assert!(perms.contains(&Permission::ReceiptView));
+        assert!(
+            !perms.contains(&Permission::DeviceWrite),
+            "custom role must not inherit builtin matrix"
+        );
+
+        // 内置角色回归：权限集 = permissions_of(System) 逐项相等（零变化）。
+        let builtin = config_with_users();
+        let mut login2 = MgmtAuth::new(key);
+        assert_eq!(login2.sync_users(&builtin), 2);
+        let (token2, role2) = login2.login("alice", "abc").expect("builtin login");
+        assert_eq!(role2, "system");
+        let claims2 = verify(&token2, key, now_unix_secs(), 60).expect("verify");
+        assert_eq!(
+            claims2.perms.as_deref(),
+            Some(permissions_of(Role::System)),
+            "builtin role perms = existing matrix (regression zero-change)"
+        );
+    }
+
+    /// QA（B-3 fail-closed）: 自定义角色 permissions 含未知权限 id → 账号整体
+    /// 跳过（绝不「半解析」后放行剩余权限）；绑定未定义自定义角色 id 的账号
+    /// 同样跳过（历史语义）。
+    #[test]
+    fn custom_role_fail_closed_on_unknown_perm_or_undefined_role() {
+        let config = config_with_custom_role();
+        let key = IssuerKey([0x78u8; 32]);
+        let mut login = MgmtAuth::new(key);
+        let loaded = login.sync_users(&config);
+        assert_eq!(
+            loaded, 1,
+            "dave (unknown perm id) and bob (undefined role) skipped; only carol loaded"
+        );
+        assert!(
+            login.login("dave", "s3cret-pass").is_none(),
+            "unknown perm id in custom role → account not loaded (fail-closed)"
+        );
+        assert!(
+            login.login("bob", "s3cret-pass").is_none(),
+            "undefined custom role id → account not loaded (fail-closed)"
+        );
     }
 }

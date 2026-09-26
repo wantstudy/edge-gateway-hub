@@ -131,6 +131,42 @@ pub enum Permission {
 }
 
 impl Permission {
+    /// 全部权限的闭集（[`Self::from_id`] 的解析域；新增权限必须登记于此，
+    /// `from_id_roundtrip_covers_catalog` 测试守护闭环）。
+    pub const ALL: &[Permission] = &[
+        Permission::CodeView,
+        Permission::CodeIssue,
+        Permission::CodeRevoke,
+        Permission::CodeReissue,
+        Permission::CodeReveal,
+        Permission::DeviceView,
+        Permission::DeviceMarkAnomaly,
+        Permission::TenantView,
+        Permission::TenantPolicyUpdate,
+        Permission::ReceiptView,
+        Permission::ReceiptMark,
+        Permission::TransferView,
+        Permission::TransferProcess,
+        Permission::KeyView,
+        Permission::KeyRotate,
+        Permission::AuditView,
+        Permission::AuditExport,
+        Permission::AccountView,
+        Permission::AccountUpdate,
+        Permission::OpsRestart,
+        Permission::OpsCollectors,
+        Permission::OpsLogsRead,
+        Permission::DeviceWrite,
+        Permission::PointWrite,
+    ];
+
+    /// 权限 id 字面量 → 枚举（`/api/permissions` 目录与自定义角色配置段的
+    /// 解析入口；未知 id → `None`，调用方 fail-closed）。
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_id(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.as_str() == raw)
+    }
+
     /// 权限字面量（点分小写；与 rbac.ts `Action` 字符串完全一致）。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -292,23 +328,30 @@ impl RbacAuth {
 
 /// 已通过 JWT 鉴权的请求身份（extractor 产物；handler 内用 [`AuthedRole::ensure`]
 /// 做权限判定，401/403 自动区分）。
+///
+/// ## B-3 权限集判定
+/// `role` 为内置四角色时填充（展示 / 日志友好）；自定义角色 id → `None`。
+/// **授权判定唯一依据是 `perms`**（登录装配时解析、随 token 签名防篡改）：
+/// 内置角色 = 现有矩阵映射（零变化）；自定义角色 = 其 permissions 并集。
 #[derive(Debug, Clone)]
 pub struct AuthedRole {
     /// 已校验的 claims（`sub` / `jti` / `exp` 可供审计取用）。
     pub claims: Claims,
-    /// 解析后的规范角色。
-    pub role: Role,
+    /// 解析后的内置角色（自定义角色 id → `None`；仅展示用途）。
+    pub role: Option<Role>,
+    /// 权限集（授权判定唯一依据；`claims.perms` 缺省时按内置角色映射派生）。
+    pub perms: Vec<Permission>,
 }
 
 impl AuthedRole {
-    /// 权限判定（403 路径）：角色不持该权限时返回 [`AuthRejection::Forbidden`]。
+    /// 权限判定（403 路径）：权限集不含该权限时返回 [`AuthRejection::Forbidden`]。
     pub fn ensure(&self, permission: Permission) -> Result<(), AuthRejection> {
-        if authorize(self.role, permission) {
+        if self.perms.contains(&permission) {
             Ok(())
         } else {
             Err(AuthRejection::Forbidden(format!(
                 "role {:?} is not granted {:?}",
-                self.role.as_str(),
+                self.claims.role,
                 permission.as_str()
             )))
         }
@@ -359,6 +402,11 @@ impl From<JwtError> for AuthRejection {
             JwtError::UnknownRole(role) => {
                 AuthRejection::Forbidden(format!("unknown role {role:?} in token"))
             }
+            // perms claim 内未知权限 id：签名已验真（服务端签发域），
+            // 属授权数据无效 → 403（与 UnknownRole 同分型）。
+            JwtError::UnknownPermission(id) => {
+                AuthRejection::Forbidden(format!("unknown permission id {id:?} in token"))
+            }
             other => AuthRejection::Unauthorized(other.to_string()),
         }
     }
@@ -405,8 +453,19 @@ where
         // 签名 / 时间窗 / 角色解析全部在 Rust 侧完成（红线）；未知角色由
         // `From<JwtError>` 转 403，其余转 401。
         let claims = verify(&token, auth.key, now_unix_secs(), auth.leeway_secs)?;
-        let role = claims.role;
-        Ok(AuthedRole { claims, role })
+        // B-3：授权判定从「角色字面量」升级为「权限集成员判定」。内置角色
+        // 经 `Role::from_str` 填充展示字段；`claims.perms` 已在 verify 阶段
+        // 解析为枚举（未知 id 拒绝），此处仅缺省派生兜底（老 token 路径）。
+        let role = Role::from_str(&claims.role);
+        let perms = match &claims.perms {
+            Some(perms) => perms.clone(),
+            None => role.map_or_else(Vec::new, |r| permissions_of(r).to_vec()),
+        };
+        Ok(AuthedRole {
+            claims,
+            role,
+            perms,
+        })
     }
 }
 
@@ -423,12 +482,14 @@ mod tests {
     /// 测试基准时刻（任意固定秒级 Unix 时间）。
     const NOW: i64 = 1_700_000_000;
 
-    /// 构造一组有效 claims（exp/iat 相对真实墙钟，extractor 测试直接可用）。
+    /// 构造一组有效 claims（exp/iat 相对真实墙钟，extractor 测试直接可用；
+    /// `perms: None` = 按内置角色映射派生——与老 token 兼容路径同形）。
     fn claims_for(role: Role) -> Claims {
         let now = now_unix_secs();
         Claims {
             sub: "user-1".to_string(),
-            role,
+            role: role.as_str().to_string(),
+            perms: None,
             exp: now + 600,
             iat: now,
             nbf: None,
@@ -699,7 +760,7 @@ mod tests {
         let authed = AuthedRole::from_request_parts(&mut parts_with(Some(&token)), &state)
             .await
             .expect("valid token must pass");
-        assert_eq!(authed.role, Role::Ops);
+        assert_eq!(authed.role, Some(Role::Ops));
         assert_eq!(authed.claims.sub, "user-1");
         authed.ensure(Permission::CodeIssue).expect("ops may issue");
         let rejection = authed
@@ -739,6 +800,87 @@ mod tests {
             rejection.status(),
             StatusCode::FORBIDDEN,
             "unknown role = authenticated but no valid authority: {rejection}"
+        );
+    }
+
+    // ---- B-3：自定义角色权限集判定 ----
+
+    /// QA: `Permission::from_id` 与 `as_str` 逐项互逆（目录解析闭环；新增权限
+    /// 忘登记 `ALL` 会被此测试拦截）。
+    #[test]
+    fn from_id_roundtrip_covers_catalog() {
+        for permission in Permission::ALL {
+            assert_eq!(Permission::from_id(permission.as_str()), Some(*permission));
+        }
+        // 大小写敏感 + 未知 id 拒绝（fail-closed）。
+        assert_eq!(Permission::from_id("Code.View"), None);
+        assert_eq!(Permission::from_id("code.view "), None);
+        assert_eq!(Permission::from_id("nuke.everything"), None);
+        assert_eq!(Permission::from_id(""), None);
+    }
+
+    /// QA（B-3 核心）: 自定义角色 token（`role` = 自定义 id + 显式 `perms`）
+    /// 按**权限集成员**判定——授予的权限过、未授予的 403；内置角色映射
+    /// 不参与（防「自定义角色 id 落回内置矩阵」的越权路径）。
+    #[tokio::test]
+    async fn custom_role_token_authorized_by_perms_claim() {
+        let state = test_state();
+        let now = now_unix_secs();
+        let claims = Claims {
+            sub: "operator-01".to_string(),
+            role: "role-custom-1".to_string(),
+            perms: Some(vec![Permission::AccountView, Permission::ReceiptView]),
+            exp: now + 600,
+            iat: now,
+            nbf: None,
+            jti: "jti-custom".to_string(),
+        };
+        let token = sign(&claims, TEST_KEY).expect("sign");
+        let authed = AuthedRole::from_request_parts(&mut parts_with(Some(&token)), &state)
+            .await
+            .expect("valid custom-role token must pass");
+        // 自定义角色：role 字段为 None（无内置语义），判定走 perms。
+        assert_eq!(authed.role, None);
+        assert_eq!(authed.claims.role, "role-custom-1");
+        authed
+            .ensure(Permission::AccountView)
+            .expect("granted perm must pass");
+        authed
+            .ensure(Permission::ReceiptView)
+            .expect("granted perm must pass");
+        // 未授予 → 403（即使该权限属于某个内置角色的矩阵——判定与内置矩阵脱钩）。
+        let rejection = authed
+            .ensure(Permission::DeviceWrite)
+            .expect_err("custom role must not inherit builtin matrix");
+        assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
+        let rejection = authed
+            .ensure(Permission::KeyRotate)
+            .expect_err("granted-perms-only token must not rotate keys");
+        assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// QA 安全（B-3 fail-closed）: perms claim 内未知权限 id → 403 独立拒绝
+    /// （服务端签发域理论不可达；出现即拒，绝不「半解析」静默放行）。
+    #[tokio::test]
+    async fn unknown_perm_id_in_token_is_rejected_403() {
+        let state = test_state();
+        let now = now_unix_secs();
+        let payload = format!(
+            r#"{{"sub":"user-1","role":"ops","perms":["code.view","nuke.all"],"exp":{},"iat":{},"jti":"jti-1"}}"#,
+            now + 600,
+            now
+        );
+        let token = craft_token(
+            &serde_json::json!({"alg": "HS256", "typ": "JWT"}),
+            &serde_json::from_str::<serde_json::Value>(&payload).expect("payload json"),
+        );
+        let rejection = AuthedRole::from_request_parts(&mut parts_with(Some(&token)), &state)
+            .await
+            .expect_err("unknown perm id must be rejected");
+        assert_eq!(
+            rejection.status(),
+            StatusCode::FORBIDDEN,
+            "unknown perm id = authenticated but invalid authority data: {rejection}"
         );
     }
 }

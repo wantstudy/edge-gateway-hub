@@ -474,6 +474,7 @@ fn config_with_devices(device_count: usize, protocol: &str, frequency_ms: u64) -
             protocol: protocol.to_string(),
             address: format!("192.168.1.{i}:502"),
             frequency_ms,
+            ..Default::default()
         })
         .collect();
     GatewayConfig {
@@ -482,6 +483,7 @@ fn config_with_devices(device_count: usize, protocol: &str, frequency_ms: u64) -
         points,
         devices: Vec::new(),
         mgmt_auth: None,
+        ..Default::default()
     }
 }
 

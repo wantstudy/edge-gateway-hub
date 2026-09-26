@@ -732,6 +732,98 @@ pub fn backup_before_rewrite(path: &Path) -> DaemonResult<PathBuf> {
     Ok(backup)
 }
 
+/// 备份保留策略清理：只删**本服务自产的** `{file_name}.bak-*`（与
+/// [`backup_before_rewrite`] 同一命名模式；`.tmp-` 半成品一并纳入清理范围——
+/// 同前缀，同样只可能是本服务产物）。按名字内嵌的**数字时刻**升序保留最新
+/// `retention` 份，超出部分从最旧开始删除。
+///
+/// - 排序键 = `.bak-` 后前导数字段（`bak-<unix秒>` / `bak-manual-<ms>` /
+///   `bak-periodic-<ms>` / `bak-<秒>-<序号>` 全部命中；同一前缀下秒/毫秒
+///   长度混排时字典序 ≠ 时间序，故必须按数值比较）；
+/// - 数字段不可解析的名字排序键取 `u64::MAX`（视为最新，保留——fail-safe）；
+/// - `retention == 0` → 不清理（调用方语义：0 = 保留无限份）；
+/// - 单个文件删除失败 → 记 warn 并跳过该文件继续（绝不因清理失败阻断写路径）；
+/// - **绝不匹配其它命名模式**：用户自建备份（如 `config.toml.mybak`）不受影响。
+///
+/// 返回实际删除的文件数。
+/// 备份扫描目录解析：相对裸文件名（如 `config.toml`）的 `parent()` 是空串，
+/// `read_dir("")` 会失败 → 清理/计数双双静默 no-op（真机缺陷实证）。此处统一
+/// 把空 parent 回退为 `"."`（进程 cwd），与「相对路径相对 cwd 解析」语义一致。
+fn backup_search_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn enforce_backup_retention(config_path: &Path, retention: u32) -> usize {
+    if retention == 0 {
+        return 0;
+    }
+    let dir = backup_search_dir(config_path);
+    let file_name = config_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let prefix = format!("{file_name}.bak-");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut backups: Vec<(u64, String)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
+        .filter(|name| name.starts_with(&prefix))
+        .map(|name| {
+            let digits: String = name[prefix.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            let ts = digits.parse::<u64>().unwrap_or(u64::MAX);
+            (ts, name)
+        })
+        .collect();
+    backups.sort();
+    let excess = backups.len().saturating_sub(retention as usize);
+    let mut removed = 0usize;
+    for (_, name) in backups.into_iter().take(excess) {
+        match std::fs::remove_file(dir.join(&name)) {
+            Ok(()) => removed += 1,
+            Err(err) => tracing::warn!(
+                file = %name,
+                error = %err,
+                "backup retention: failed to remove oldest backup; skipped"
+            ),
+        }
+    }
+    removed
+}
+
+/// 统计 `{file_name}.bak-*` 备份文件数（与 [`enforce_backup_retention`] 同一
+/// 匹配口径；目录不可读 → 0）。
+pub fn count_backup_files(config_path: &Path) -> usize {
+    let dir = backup_search_dir(config_path);
+    let file_name = config_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let prefix = format!("{file_name}.bak-");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // 错误工具（与 telemetry_store.rs 同风格）
 // ---------------------------------------------------------------------------
@@ -1126,6 +1218,36 @@ mod tests {
             .filter_map(|e| e.ok())
             .collect();
         assert!(entries.is_empty(), "失败路径不得创建任何文件");
+    }
+
+    /// QA 回归（真机缺陷实证）：相对裸文件名（`config.toml`）的 `parent()` 是
+    /// 空串，`read_dir("")` 失败导致 retention/计数双双静默 no-op——目录解析
+    /// 必须回退 `"."`（cwd），否则真机清理永远不生效而单测（绝对路径）全绿。
+    #[test]
+    fn backup_search_dir_falls_back_to_cwd_for_bare_relative_path() {
+        // 裸文件名 → 空目录分量 → 回退 "."。
+        let dir = backup_search_dir(Path::new("config.toml"));
+        assert_eq!(
+            dir,
+            PathBuf::from("."),
+            "bare relative name must resolve to cwd"
+        );
+        // 带目录分量的相对路径 → parent 原样保留。
+        assert_eq!(
+            backup_search_dir(Path::new("conf/config.toml")),
+            PathBuf::from("conf")
+        );
+        // 绝对路径 → parent 原样保留（单测既有路径）。
+        let absolute = std::env::temp_dir().join("some-config.toml");
+        assert_eq!(
+            backup_search_dir(&absolute),
+            absolute.parent().expect("parent")
+        );
+        // 显式 `./config.toml` → "."（本就可用，不受修复影响）。
+        assert_eq!(
+            backup_search_dir(Path::new("./config.toml")),
+            PathBuf::from(".")
+        );
     }
 
     /// 配置升级链：v1→v2→v3 顺序执行；未知起点版本报错（不走改动）。

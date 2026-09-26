@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use thiserror::Error;
 
-use super::rbac::Role;
+use super::rbac::{permissions_of, Permission, Role};
 
 /// HS256 HMAC 实例别名。
 type HmacSha256 = Hmac<Sha256>;
@@ -76,13 +76,22 @@ impl IssuerKey {
 
 // ---- Claims ----
 
-/// 管理面 JWT claims（sub / role / exp / iat / nbf / jti）。
+/// 管理面 JWT claims（sub / role / perms / exp / iat / nbf / jti）。
+///
+/// ## B-3 自定义角色运行时融合
+/// `role` 为**角色 id 字面量**（内置四角色之一，或自定义角色 id）——授权判定
+/// 不再依赖内置角色枚举，而是依赖 `perms`（服务端在登录装配时解析出的权限集，
+/// 随 token 签名**防篡改**）。`perms = None`（老 token / 测试构造）时按内置
+/// 角色映射派生（[`Role::from_str`] 解析失败仍拒——历史语义零变化）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claims {
     /// 主体（账号 / 会话标识）。
     pub sub: String,
-    /// 规范角色（[`Role::as_str`]；四 id 之一）。
-    pub role: Role,
+    /// 角色 id 字面量（内置四角色之一，或自定义角色 id；仅展示 / 审计用途，
+    /// **授权判定以 `perms` 为准**）。
+    pub role: String,
+    /// 解析后的权限集（服务端签发，签名防篡改；`None` = 按内置角色映射派生）。
+    pub perms: Option<Vec<Permission>>,
     /// 过期时刻（秒级 Unix；`now > exp + leeway` 即拒）。
     pub exp: i64,
     /// 签发时刻（秒级 Unix；`now < iat - leeway` 即拒，防未来签发）。
@@ -94,16 +103,24 @@ pub struct Claims {
 }
 
 impl Claims {
-    /// 序列化为 JSON Value（role 用规范字面量；exp/iat/nbf 按标准 NumericDate 编码）。
+    /// 序列化为 JSON Value（role 用角色 id；perms 逐项转点分小写 id；exp/iat/nbf
+    /// 按标准 NumericDate 编码）。
     fn to_json(&self) -> Value {
-        json!({
+        let mut body = json!({
             "sub": self.sub,
-            "role": self.role.as_str(),
+            "role": self.role,
             "exp": self.exp,
             "iat": self.iat,
             "nbf": self.nbf,
             "jti": self.jti,
-        })
+        });
+        if let Some(perms) = &self.perms {
+            body["perms"] = json!(perms
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<&'static str>>());
+        }
+        body
     }
 }
 
@@ -114,6 +131,9 @@ struct ClaimsRaw {
     sub: String,
     #[serde(default)]
     role: String,
+    /// 权限集（可选；缺省 = 按内置角色映射派生——老 token 兼容路径）。
+    #[serde(default)]
+    perms: Option<Vec<String>>,
     exp: Option<i64>,
     iat: Option<i64>,
     #[serde(default)]
@@ -132,16 +152,36 @@ impl TryFrom<ClaimsRaw> for Claims {
         if raw.role.is_empty() {
             return Err(JwtError::MissingClaim("role"));
         }
-        let role =
-            Role::from_str(&raw.role).ok_or_else(|| JwtError::UnknownRole(raw.role.clone()))?;
         let exp = raw.exp.ok_or(JwtError::MissingClaim("exp"))?;
         let iat = raw.iat.ok_or(JwtError::MissingClaim("iat"))?;
         if raw.jti.is_empty() {
             return Err(JwtError::MissingClaim("jti"));
         }
+        // 权限集：显式 perms claim → 逐项解析（未知权限 id fail-closed 拒绝，
+        // 防止「半解析」静默放行）；缺省 → 按内置角色映射派生（角色未知仍拒，
+        // 保持 UnknownRole 历史语义与 403 分型不变）。
+        let perms = match raw.perms {
+            Some(ids) => {
+                let mut perms = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let permission = Permission::from_id(&id)
+                        .ok_or_else(|| JwtError::UnknownPermission(id.clone()))?;
+                    if !perms.contains(&permission) {
+                        perms.push(permission);
+                    }
+                }
+                Some(perms)
+            }
+            None => Role::from_str(&raw.role).map(|role| permissions_of(role).to_vec()),
+        };
+        // perms 缺省且角色未知 → 历史语义：UnknownRole（403 分型）。
+        if perms.is_none() {
+            return Err(JwtError::UnknownRole(raw.role));
+        }
         Ok(Claims {
             sub: raw.sub,
-            role,
+            role: raw.role,
+            perms,
             exp,
             iat,
             nbf: raw.nbf,
@@ -191,6 +231,10 @@ pub enum JwtError {
     /// 角色字面量不是四个规范 id（历史别名 admin/viewer 等）。
     #[error("JwtUnknownRole: role {0:?} is not one of ops|lic_ops|risk|system")]
     UnknownRole(String),
+    /// perms claim 内出现未知权限 id（token 由服务端签发，理论不可达——
+    /// 出现即拒绝：fail-closed，绝不「半解析」静默放行）。
+    #[error("JwtUnknownPermission: perm id {0:?} is not in the permission catalog")]
+    UnknownPermission(String),
     /// 必需 claim 缺失或为空。
     #[error("JwtMissingClaim: required claim {0:?} missing or empty")]
     MissingClaim(&'static str),
@@ -320,7 +364,8 @@ mod tests {
     fn claims() -> Claims {
         Claims {
             sub: "ops-user".to_string(),
-            role: Role::LicOps,
+            role: Role::LicOps.as_str().to_string(),
+            perms: None,
             exp: NOW + 600,
             iat: NOW,
             nbf: None,
@@ -354,11 +399,14 @@ mod tests {
     }
 
     /// QA Happy: 签发 → 校验往返，claims 无损（含可选 nbf 缺省）。
+    /// `perms: None` 构造的 claims 经校验派生为内置角色标准权限集（B-3 兼容路径）。
     #[test]
     fn sign_verify_roundtrip_preserves_claims() {
         let token = sign(&claims(), KEY).expect("sign");
         let verified = verify(&token, KEY, NOW, DEFAULT_LEEWAY_SECS).expect("verify");
-        assert_eq!(verified, claims());
+        let mut expected = claims();
+        expected.perms = Some(permissions_of(Role::LicOps).to_vec());
+        assert_eq!(verified, expected);
         // 结构检查：三段、header 定值、无填充。
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);

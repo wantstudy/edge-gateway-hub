@@ -65,6 +65,32 @@ fn default_frequency_ms() -> u64 {
     1000
 }
 
+/// 点位推送开关缺省值（缺省**推送**，向后兼容老配置：无 `push` 键 = true）。
+///
+/// 语义（需求 6）：`push_enabled = false` 的点位**照常采集、照常进实时流
+/// （`/api/stream`）**，但不进北向转发批次。过滤点在真实投递路径
+/// [`crate::dataplane::NorthDataPlane`]（见该模块 `forward`）。
+fn default_push_enabled() -> bool {
+    true
+}
+
+/// 点位类型缺省值（`physical`；`derived` = 公式派生点）。
+fn default_point_type() -> String {
+    "physical".to_string()
+}
+
+/// 点位类型取值域（`PointConfig::point_type`）。
+pub const POINT_TYPES: &[&str] = &["physical", "derived"];
+
+/// 默认设备分组 id：**永远存在**且不可删除 / 不可改名（需求 4）。
+///
+/// 配置里没有 `[[device_groups]]` 段时，接口层仍必须体现本分组（无需强制写盘）；
+/// `DeviceConfig::group_id` 为 `None` 即归属本分组。
+pub const DEFAULT_GROUP_ID: &str = "default";
+
+/// 默认设备分组显示名。
+pub const DEFAULT_GROUP_NAME: &str = "默认分组";
+
 fn default_heartbeat_secs() -> u64 {
     86_400
 }
@@ -185,6 +211,49 @@ impl Default for SecuritySection {
     }
 }
 
+/// 备份策略默认保留份数（`[settings.backup_policy].retention_count`）。
+fn default_backup_retention() -> u32 {
+    20
+}
+
+/// `[settings]` 管理面设置段（**可选**；缺省 = 全部按默认策略，旧配置兼容）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct SettingsSection {
+    /// 写前备份策略。
+    #[serde(default)]
+    pub backup_policy: BackupPolicy,
+}
+
+/// 备份策略（`[settings.backup_policy]`；把既有「写前自动备份」行为显式化）。
+///
+/// - `auto_before_write`：`GatewayConfig::save` 落盘前是否自动备份（默认 `true`
+///   = 既有行为显式化；显式关掉后写路径**不再**生成 `.bak-*`，恢复只能靠手动备份）。
+/// - `retention_count`：`{config}.bak-*` 备份最大保留份数，超出删最旧
+///   （**只清本服务自产的该前缀文件**，绝不碰用户其他文件）；`0` = 不清理。
+/// - `interval_min`：周期备份间隔（分钟；`0` = 关闭，默认）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BackupPolicy {
+    /// 写路径前自动备份开关（默认 `true`）。
+    #[serde(default = "default_true")]
+    pub auto_before_write: bool,
+    /// `.bak-*` 备份最大保留份数（超出删最旧；`0` = 不清理；默认 20）。
+    #[serde(default = "default_backup_retention")]
+    pub retention_count: u32,
+    /// 周期备份间隔（分钟；`0` = 关闭；默认 0）。
+    #[serde(default)]
+    pub interval_min: u32,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            auto_before_write: true,
+            retention_count: default_backup_retention(),
+            interval_min: 0,
+        }
+    }
+}
+
 /// 管理面登录账号（task 57 全量接线：生产路凭证来源）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MgmtAuthUser {
@@ -196,6 +265,38 @@ pub struct MgmtAuthUser {
     /// `SHA-256(password)` 的 hex 编码（服务端只存哈希，比对走恒时比较；
     /// 明文密码永不写入配置文件）。
     pub password_hash: String,
+    /// 显示名（`None` = 展示层回退 `name`；首次安装 bootstrap 可带）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// 账号状态（`"active"` / `"disabled"`；`None` = 按 active 处理——老配置兼容）。
+    /// disabled 账号在登录装配时被跳过（fail-closed，见 `auth_login::sync_users`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// 建号时刻（Unix 毫秒；账号管理端点写入。`None` = 老配置未记录）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<u64>,
+    /// 最近一次登录成功时刻（Unix 毫秒；登录成功回写。`None` = 尚无记录）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_login_at_ms: Option<u64>,
+}
+
+/// 管理面自定义角色（`[[mgmt_auth.roles]]`；账号与角色页）。
+///
+/// **内置角色**（rbac 的四角色）不写入本段——本段只承载用户自建角色；
+/// `permissions` 为权限 id 字符串列表（如 `device.write` / `point.write`）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MgmtAuthRole {
+    /// 角色标识（唯一键）。
+    pub id: String,
+    /// 角色显示名。
+    pub name: String,
+    /// 权限 id 列表（`rbac::Permission::as_str` 的取值域；空 = 无权限）。
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// 是否内置角色（**只读标记**；内置角色不入配置段，本段恒 `false`——
+    /// 与前端 `RoleRecord.builtin` 对齐；老配置缺省 `false`）。
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 /// 管理面登录凭证段（**可选**；缺省时生产路无凭证，登录仅开发路可用，
@@ -205,6 +306,163 @@ pub struct MgmtAuthSection {
     /// 登录账号列表（空列表 = 无任何登录凭证 → 登录端点全拒）。
     #[serde(default)]
     pub users: Vec<MgmtAuthUser>,
+    /// 自定义角色列表（**可选**；缺省空 = 只有内置角色）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<MgmtAuthRole>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `[[rules]]` 转发规则（声明式存储行；引擎语义由 [`crate::rules`] 承载）。
+///
+/// 结构：**UI 字段**（`id` / `name` / `forwarder_id` / `priority` / `enabled`，
+/// 供列表页展示与排序）+ **引擎字段**（`when` 条件树 / `actions` 动作列表，
+/// 类型直接复用 [`crate::rules::Condition`] / [`crate::rules::Action`]——经
+/// [`Self::to_rule`] 可零拷贝语义转成引擎规则）。
+/// **禁用 `#[serde(flatten)]`**：`rules::Rule` 有 `deny_unknown_fields`，与
+/// flatten 不兼容；本结构是独立的存储 schema，不直接反序列化成 `Rule`。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RuleConfig {
+    /// 规则主键（唯一）。
+    pub id: String,
+    /// 规则名称。
+    pub name: String,
+    /// 生效出口 id（`[[outlets]].name`；`None` = 未绑定；UI 字段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarder_id: Option<String>,
+    /// WHERE 条件树（**引擎字段**；`None` = 恒真 → 通配规则）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<crate::rules::Condition>,
+    /// DO 动作列表（**引擎字段**；按数组顺序执行；缺省空列表 = 无动作）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<crate::rules::Action>,
+    /// SELECT 字段白名单（**引擎字段**；空 = 输出全部字段；UI 字段）。
+    ///
+    /// 由转发规则页「字段白名单（select，逗号分隔）」编辑（web-console
+    /// `RulesPage.vue`）；`to_rule()` 逐字透传给 [`crate::rules::Rule::select`]。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub select: Vec<String>,
+    /// 依赖的规则 id 列表（**引擎字段**；DAG 由 [`crate::rules::RuleEngine`]
+    /// 构造期校验——环 / 自依赖 / 未知 id 一律拒绝；UI 字段）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// 优先级（数字越小越先匹配；缺省 0；UI 字段）。
+    #[serde(default)]
+    pub priority: i64,
+    /// 是否启用（缺省 true）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for RuleConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            forwarder_id: None,
+            when: None,
+            actions: Vec::new(),
+            select: Vec::new(),
+            depends_on: Vec::new(),
+            priority: 0,
+            enabled: true,
+        }
+    }
+}
+
+impl RuleConfig {
+    /// 转换为引擎规则 [`crate::rules::Rule`]（`version` / `select` / `transform` /
+    /// `depends_on` 取引擎缺省；`id` / `when` / `actions` 逐字透传）。
+    ///
+    /// 引擎侧构造期校验（字段白名单 / JSONPath / DAG 等）仍由
+    /// [`crate::rules::RuleSet`] 在装载时执行——本方法不做语义校验。
+    #[must_use]
+    pub fn to_rule(&self) -> crate::rules::Rule {
+        crate::rules::Rule {
+            id: self.id.clone(),
+            version: None,
+            when: self.when.clone(),
+            actions: self.actions.clone(),
+            select: self.select.clone(),
+            transform: None,
+            depends_on: self.depends_on.clone(),
+        }
+    }
+}
+
+/// 单条告警规则（`[[alarms.rules]]`）。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AlarmRuleConfig {
+    /// 规则主键（唯一）。
+    pub id: String,
+    /// 规则名称（`None` = 展示层回退 `id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 告警级别（`critical` / `major` / `minor` / `warning`；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// 来源类型（`device` / `forwarder` / `license` / `system`；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    /// 触发条件描述（如 `status == offline`；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// 数值阈值（`None` = 非阈值型规则）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+    /// 绑定设备 id（**引擎消费**；`None` = 任意设备）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// 绑定点位 id（**引擎消费**；`None` = 设备级聚合）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_id: Option<String>,
+    /// 比较运算符（**引擎消费**；取值域见 [`ALARM_RULE_OPS`]；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// 持续满足时长（毫秒；`None` = 立即触发）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// 抑制窗口（毫秒；`None` = 不抑制）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppress_ms: Option<u64>,
+    /// 是否启用（缺省 true）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AlarmRuleConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: None,
+            level: None,
+            source_type: None,
+            condition: None,
+            threshold: None,
+            device_id: None,
+            point_id: None,
+            op: None,
+            duration_ms: None,
+            suppress_ms: None,
+            enabled: true,
+        }
+    }
+}
+
+/// 告警规则比较运算符取值域（[`AlarmRuleConfig::op`]；`gt`>、`ge`>=、`lt`<、
+/// `le`<=、`eq`==、`ne`!=）。仅声明 schema 值域，供告警引擎（BE-ALARM）校验。
+pub const ALARM_RULE_OPS: &[&str] = &["gt", "ge", "lt", "le", "eq", "ne"];
+
+/// `[alarms]` 告警配置段（**可选**；缺省 `None` = 未配置告警）。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct AlarmsSection {
+    /// 告警总开关（缺省 false——未显式启用不产生告警）。
+    pub enabled: bool,
+    /// 告警规则列表（`[[alarms.rules]]`）。
+    pub rules: Vec<AlarmRuleConfig>,
 }
 
 /// `[gateway]` 命名空间。
@@ -319,6 +577,9 @@ impl std::fmt::Debug for OutletConfig {
 }
 
 /// `[[points]]` 点位平铺行（设备级字段随行冗余，便于批量导入导出）。
+///
+/// 全部新字段（`push_enabled` 及元数据）均 `serde(default)`，老配置文件
+/// （只含 `device_id/point_id/protocol/address/frequency_ms`）可无缝加载。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PointConfig {
     /// 南向设备标识。
@@ -329,9 +590,96 @@ pub struct PointConfig {
     pub protocol: String,
     /// 设备接入地址（如 `192.168.1.10:502` 或串口号）。
     pub address: String,
+    /// 点位级端点覆盖（可选；缺省 = 本点位 `address` 或所属设备
+    /// `DeviceConfig.endpoint`）。
+    ///
+    /// V1 同批次引入，让端点有唯一归属：点位行 `address` 仍是端点事实源，
+    /// 本字段仅作点位级覆盖冗余（例如同一设备下个别点位走不同网关出口）。
+    /// `None` = 不覆盖，回退设备级端点 / `address`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// 采集频率（毫秒；计划指标 ≥100ms）。
     #[serde(default = "default_frequency_ms")]
     pub frequency_ms: u64,
+    /// 北向推送开关（缺省 **true** = 推送）。`false` = 照常采集、照常进实时流，
+    /// 但不进北向转发批次（需求 6）。TOML / JSON 键名 `push_enabled`，同时接受
+    /// 别名 `push`（CSV 列名与前端习惯）。
+    #[serde(default = "default_push_enabled", alias = "push")]
+    pub push_enabled: bool,
+    /// 点位显示名（`None` = 展示层回退 `point_id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 数据类型（如 `float32` / `int16` / `bool`；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    /// 字节序（如 `ABCD` / `BADC` / `CDAB`；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_order: Option<String>,
+    /// 工程单位（如 `degC` / `kPa`；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// 死区阈值（工程单位；JSON 层为 number，**非**大整数——未声明 = `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadband: Option<f64>,
+    /// 北向目标键名（`None` = 回退 `point_id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_key: Option<String>,
+    /// 点位类型：`physical`（默认）| `derived`（公式派生）。
+    #[serde(default = "default_point_type")]
+    pub point_type: String,
+    /// 公式表达式（`point_type = derived` 时使用；`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
+    /// 点位模拟开关（缺省 false = 不模拟，走真实南向读）。
+    #[serde(default)]
+    pub sim_enabled: bool,
+    /// 模拟模式（**可选**；`None` / 缺省 = 由模拟引擎取缺省波形）。取值域由
+    /// 模拟引擎（BE-SIM）定义：建议 `random`（min~max 随机）| `fixed`（恒定
+    /// `sim_min`）；未知值在引擎装载期拒绝，schema 层不校验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_mode: Option<String>,
+    /// 模拟值下限（`None` = 未声明，由模拟器取缺省）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_min: Option<f64>,
+    /// 模拟值上限（`None` = 未声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_max: Option<f64>,
+    /// 模拟值小数位数（`None` = 未声明；`u32` 计数按 JSON number 语义安全）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_dec: Option<u32>,
+    /// 模拟刷新周期（毫秒；`None` = 未声明，回退点位 `frequency_ms`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_period_ms: Option<u64>,
+}
+
+/// 手写 [`Default`]：`push_enabled = true`、`point_type = "physical"`，
+/// 其余元数据为 `None`（与 serde 缺省语义一致；供测试字面量 `..Default::default()`）。
+impl Default for PointConfig {
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            point_id: String::new(),
+            protocol: String::new(),
+            address: String::new(),
+            endpoint: None,
+            frequency_ms: default_frequency_ms(),
+            push_enabled: default_push_enabled(),
+            name: None,
+            data_type: None,
+            byte_order: None,
+            unit: None,
+            deadband: None,
+            target_key: None,
+            point_type: default_point_type(),
+            formula: None,
+            sim_enabled: false,
+            sim_mode: None,
+            sim_min: None,
+            sim_max: None,
+            sim_dec: None,
+            sim_period_ms: None,
+        }
+    }
 }
 
 /// 设备登记行（可选 `[[devices]]` 段；管理面写接口的设备事实源）。
@@ -353,10 +701,31 @@ pub struct DeviceConfig {
     /// 设备默认协议（可选；仅当该设备无点位行时在设备摘要中展示）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
+    /// 所属设备分组 id（可选；缺省 / 空 = 归属 [`DEFAULT_GROUP_ID`] 默认分组）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// 设备级接入端点（可选；缺省 = 点位行的端点）。
+    ///
+    /// V1 同批次引入，让端点有唯一归属：设备登记段可在此声明端点，点位行
+    /// `address` / `endpoint` 未覆盖时采用本值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 fn default_device_enabled() -> bool {
     true
+}
+
+/// `[[device_groups]]` 设备分组（需求 4）。
+///
+/// 默认分组（[`DEFAULT_GROUP_ID`] / [`DEFAULT_GROUP_NAME`]）**不写入本段也永远存在**；
+/// 本段只承载用户自建分组。`id` 唯一，`name` 为显示名。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DeviceGroupConfig {
+    /// 分组标识（唯一键；不得等于 [`DEFAULT_GROUP_ID`]）。
+    pub id: String,
+    /// 分组显示名。
+    pub name: String,
 }
 
 /// 网关强类型配置根。
@@ -374,10 +743,23 @@ pub struct GatewayConfig {
     /// 拒读新字段）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<DeviceConfig>,
+    /// `[[device_groups]]` 设备分组段（**可选**；缺省空列表 = 只有默认分组，
+    /// 接口层永远合成出默认分组，见 [`DEFAULT_GROUP_ID`]）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_groups: Vec<DeviceGroupConfig>,
+    /// `[[rules]]` 转发规则段（**可选**；缺省空列表 = 无规则）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleConfig>,
+    /// `[alarms]` 告警配置段（**可选**；缺省 `None` = 未配置告警）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alarms: Option<AlarmsSection>,
     /// `[mgmt_auth]` 管理面登录凭证段（**可选**；缺省 = 生产路未配置凭证，
     /// 登录走 `mgmt::auth_login` 的开发路 / fail-closed 逻辑，既有字段语义不变）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mgmt_auth: Option<MgmtAuthSection>,
+    /// `[settings]` 管理面设置段（**可选**；缺省 = 备份策略全默认，旧配置兼容）。
+    #[serde(default)]
+    pub settings: SettingsSection,
 }
 
 impl GatewayConfig {
@@ -391,6 +773,7 @@ impl GatewayConfig {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| DaemonError::StorageError(format!("read {}: {e}", path.display())))?;
         let config: GatewayConfig = toml::from_str(&raw)?;
+        warn_inverted_points(&config);
         Ok(config)
     }
 
@@ -403,9 +786,12 @@ impl GatewayConfig {
     }
 
     /// 保存配置到 TOML 文件（管理面写路径）：
-    /// toml 序列化 → `backup_before_rewrite` 写前原子备份 → 临时文件 + fsync +
-    /// 同目录 rename 原子落盘。任一步失败即中止，原文件保持写前状态（或可从
-    /// `.bak-<unix秒>` 备份恢复）。
+    /// toml 序列化 → （按 `[settings.backup_policy]`）`backup_before_rewrite`
+    /// 写前原子备份 + retention 清理 → 临时文件 + fsync + 同目录 rename 原子落盘。
+    /// 任一步失败即中止，原文件保持写前状态（或可从 `.bak-<unix秒>` 备份恢复）。
+    ///
+    /// `auto_before_write = false` 时跳过写前备份（恢复只能靠手动备份端点）；
+    /// retention 清理只删本服务自产的 `{file_name}.bak-*`，失败仅告警不阻断写路径。
     ///
     /// # Errors
     /// - 序列化失败 → [`DaemonError::ConfigError`]；
@@ -414,15 +800,78 @@ impl GatewayConfig {
         let path = path.as_ref();
         let raw = toml::to_string_pretty(self)
             .map_err(|e| DaemonError::ConfigError(format!("serialize config: {e}")))?;
-        let backup = crate::migrations::backup_before_rewrite(path)?;
-        tracing::info!(
-            target: "daemon::config",
-            path = %path.display(),
-            backup = %backup.display(),
-            "config: backup created before rewrite"
-        );
+        if self.settings.backup_policy.auto_before_write {
+            let backup = crate::migrations::backup_before_rewrite(path)?;
+            tracing::info!(
+                target: "daemon::config",
+                path = %path.display(),
+                backup = %backup.display(),
+                "config: backup created before rewrite"
+            );
+            // retention 清理（auto 备份与手动备份共用同一策略；0 = 不清理）。
+            let removed = crate::migrations::enforce_backup_retention(
+                path,
+                self.settings.backup_policy.retention_count,
+            );
+            if removed > 0 {
+                tracing::info!(
+                    target: "daemon::config",
+                    removed,
+                    retention = self.settings.backup_policy.retention_count,
+                    "config: backup retention pruned oldest .bak files"
+                );
+            }
+        }
         atomic_write(path, raw.as_bytes())?;
         Ok(())
+    }
+}
+
+/// 启发式判定 `raw` 是否「长得像寄存器号」（而非设备端点 host:port / 串口 / URL）。
+///
+/// 仅接受纯 ASCII 数字（最多一个 `.` 表示位号，如 `40001.1`）；`192.168.1.10:502` /
+/// `COM1` / `opc.tcp://...` 等含字母或冒号的合法端点一律返回 `false`，避免误报。
+/// 不依赖 driver 解析器（保持 config 模块零 driver 依赖）；语义误判只影响告警、
+/// 不影响任何功能（端点解析延迟到 `poll` 时显式报错）。
+fn looks_like_register(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut seen_dot = false;
+    for ch in trimmed.chars() {
+        if ch == '.' {
+            if seen_dot {
+                return false; // 多个点号 → 是 IP / URL，不是寄存器。
+            }
+            seen_dot = true;
+        } else if !ch.is_ascii_digit() {
+            return false; // 含任何非数字非单点 → 不是寄存器。
+        }
+    }
+    true
+}
+
+/// 启动期存量检测：对 `address` 长得像寄存器号、且未显式声明 `endpoint` 的点位行
+/// 打 `warn!` 并给出可操作文案。**绝不改写配置**——`persist_config` 会在热重载 / 持久化
+/// 时把内存纠正值写回 `config.toml`，静默改用户资产；故此处只告警、不动数据。
+fn warn_inverted_points(config: &GatewayConfig) {
+    for point in &config.points {
+        if looks_like_register(&point.address) && point.endpoint.is_none() {
+            tracing::warn!(
+                target: "daemon::config",
+                device_id = %point.device_id,
+                point_id = %point.point_id,
+                address = %point.address,
+                "point row `address`={:?} looks like a register number (e.g. 40001); in V1 the \
+                 `address`/endpoint field is the DEVICE ACCESS ENDPOINT (host:port), while \
+                 `point_id` holds the register. This row will fail to resolve at poll time. \
+                 Fix manually: set `address`/`endpoint` to the device endpoint (e.g. \
+                 192.168.1.10:502) and `point_id` to the register (e.g. 40001). Config is NOT \
+                 auto-migrated.",
+                point.address
+            );
+        }
     }
 }
 
@@ -681,6 +1130,7 @@ fn reload_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::{Action, CmpOp, Condition, ConditionValue};
 
     const EXAMPLE_TOML: &str = r#"
 [gateway]
@@ -1095,6 +1545,8 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             name: Some("二号设备".to_string()),
             enabled: false,
             protocol: Some("s7".to_string()),
+            group_id: None,
+            endpoint: None,
         });
         config.save(&path).expect("save");
 
@@ -1131,6 +1583,102 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "no tmp leftovers: {leftovers:?}");
+    }
+
+    // ---- B-2：备份策略 ----
+
+    /// QA（B-2）: `[settings.backup_policy]` 向后兼容——旧配置（无 settings 段）
+    /// 解析为默认策略（auto=true / retention=20 / interval=0）；显式段可覆盖；
+    /// retention=0 语义合法（不清理）。
+    #[test]
+    fn backup_policy_defaults_and_override() {
+        // 旧配置无 [settings] 段 → serde default。
+        let config = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy");
+        let policy = &config.settings.backup_policy;
+        assert!(
+            policy.auto_before_write,
+            "auto backup defaults on (现状显式化)"
+        );
+        assert_eq!(policy.retention_count, 20, "retention defaults to 20");
+        assert_eq!(policy.interval_min, 0, "periodic backup defaults off");
+
+        // 显式段覆盖。
+        let config = GatewayConfig::parse(
+            "[settings.backup_policy]\nauto_before_write = false\nretention_count = 3\ninterval_min = 15\n",
+        )
+        .expect("parse explicit policy");
+        let policy = &config.settings.backup_policy;
+        assert!(!policy.auto_before_write);
+        assert_eq!(policy.retention_count, 3);
+        assert_eq!(policy.interval_min, 15);
+    }
+
+    /// QA（B-2）: `auto_before_write = false` → save() 不再生成写前备份；
+    /// `retention_count` 超限的旧 `.bak-*` 被清理（只清本服务自产前缀文件，
+    /// 用户自建文件不动）。
+    #[test]
+    fn save_honors_backup_policy_and_retention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXAMPLE_TOML).expect("seed");
+
+        // 造 3 个假旧备份（自产前缀）+ 1 个用户自建文件（不同前缀）。
+        for name in [
+            "config.toml.bak-1000",
+            "config.toml.bak-2000",
+            "config.toml.bak-3000",
+            "config.toml.mybak-keepme",
+        ] {
+            std::fs::write(dir.path().join(name), b"old").expect("seed backup");
+        }
+
+        let mut config = GatewayConfig::load(&path).expect("load");
+        config.settings.backup_policy.auto_before_write = true;
+        config.settings.backup_policy.retention_count = 2; // 3 旧 + 1 新 → 保留最新 2
+        config.gateway.gateway_id = "gw-policy-test".to_string();
+        config.save(&path).expect("save");
+
+        let mut bak: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
+            .filter(|n| n.starts_with("config.toml.bak-"))
+            .collect();
+        bak.sort();
+        assert_eq!(
+            bak.len(),
+            2,
+            "retention keeps newest 2 (incl. fresh): {bak:?}"
+        );
+        // 保留的是「最新两份」（写前快照 + bak-3000），最旧的 1000/2000 已删。
+        assert!(
+            !bak.contains(&"config.toml.bak-1000".to_string())
+                && !bak.contains(&"config.toml.bak-2000".to_string()),
+            "oldest backups pruned: {bak:?}"
+        );
+        // 用户自建文件绝不被清理。
+        assert!(
+            dir.path().join("config.toml.mybak-keepme").exists(),
+            "user files must never be touched"
+        );
+
+        // auto_before_write = false → 下一次 save 不再新增备份。
+        config.settings.backup_policy.auto_before_write = false;
+        config.settings.backup_policy.retention_count = 0; // 0 = 不清理
+        config.gateway.gateway_id = "gw-policy-test-2".to_string();
+        let count_before = bak.len();
+        config.save(&path).expect("save again");
+        let bak_after: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
+            .filter(|n| n.starts_with("config.toml.bak-"))
+            .collect();
+        assert_eq!(
+            bak_after.len(),
+            count_before,
+            "auto_before_write=false must skip write-before-backup"
+        );
     }
 
     /// QA: `[[devices]]` 可选段向后兼容——旧配置（无 devices 段）解析为空列表；
@@ -1262,5 +1810,393 @@ password = "s3cr3t-password"
             !raw.contains("password"),
             "unset `password` must be omitted when serializing: {raw}"
         );
+    }
+
+    // ---- 需求 1/2/4/6：点位推送开关 / 点位元数据 / 设备分组（向后兼容） ----
+
+    /// 老配置（无新字段）可加载；`push_enabled` 缺省 true、`point_type` 缺省
+    /// physical、元数据为 None、`device_groups` 为空 —— 逐条断言向后兼容。
+    #[test]
+    fn new_point_and_group_fields_are_backward_compatible() {
+        let config = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy config");
+        let point = &config.points[0];
+        assert!(
+            point.push_enabled,
+            "legacy point without `push` must default to push-enabled (true)"
+        );
+        assert_eq!(point.point_type, "physical", "default point type");
+        assert!(point.name.is_none());
+        assert!(point.data_type.is_none());
+        assert!(point.byte_order.is_none());
+        assert!(point.unit.is_none());
+        assert!(point.deadband.is_none());
+        assert!(point.target_key.is_none());
+        assert!(point.formula.is_none());
+        assert!(
+            config.device_groups.is_empty(),
+            "legacy config without [[device_groups]] must default to empty"
+        );
+        // 空字段序列化时省略（旧 daemon 仍可读新写出的文件）。
+        // 注：`push_enabled` / `point_type` 为带缺省的非 Option 字段，恒序列化
+        //（值即缺省值，旧 daemon 忽略未知键，向后兼容）。
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        for absent in [
+            "data_type",
+            "byte_order",
+            "target_key",
+            "formula",
+            "device_groups",
+        ] {
+            assert!(
+                !raw.contains(absent),
+                "unset `{absent}` must be omitted when serializing: {raw}"
+            );
+        }
+    }
+
+    /// 点位元数据 + 推送开关全字段解析；`deadband` 为 number（非大整数）。
+    #[test]
+    fn point_metadata_and_push_flag_parse() {
+        let raw = r#"
+[[points]]
+device_id = "dev-01"
+point_id = "p_temp"
+protocol = "modbus-tcp"
+address = "192.168.1.10:502"
+frequency_ms = 1000
+push = false
+name = "炉温"
+data_type = "float32"
+byte_order = "ABCD"
+unit = "degC"
+deadband = 0.5
+target_key = "temperature"
+point_type = "derived"
+formula = "p_a + p_b"
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse point metadata");
+        let point = &config.points[0];
+        assert!(!point.push_enabled, "push=false honored");
+        assert_eq!(point.name.as_deref(), Some("炉温"));
+        assert_eq!(point.data_type.as_deref(), Some("float32"));
+        assert_eq!(point.byte_order.as_deref(), Some("ABCD"));
+        assert_eq!(point.unit.as_deref(), Some("degC"));
+        assert_eq!(point.deadband, Some(0.5));
+        assert_eq!(point.target_key.as_deref(), Some("temperature"));
+        assert_eq!(point.point_type, "derived");
+        assert_eq!(point.formula.as_deref(), Some("p_a + p_b"));
+        // `push` 为 serde 别名（字段名 push_enabled 的对外/Toml 名）。
+        let json = serde_json::to_value(point).expect("serialize point");
+        assert_eq!(json["push_enabled"], serde_json::json!(false));
+    }
+
+    /// `[[device_groups]]` 段解析 + `DeviceConfig::group_id` 归属解析。
+    #[test]
+    fn device_groups_section_parses() {
+        let raw = r#"
+[[device_groups]]
+id = "line-a"
+name = "A 线"
+
+[[device_groups]]
+id = "line-b"
+name = "B 线"
+
+[[devices]]
+device_id = "dev-01"
+protocol = "modbus-tcp"
+group_id = "line-a"
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse device groups");
+        assert_eq!(config.device_groups.len(), 2);
+        assert_eq!(config.device_groups[0].id, "line-a");
+        assert_eq!(config.device_groups[0].name, "A 线");
+        assert_eq!(config.device_groups[1].id, "line-b");
+        assert_eq!(config.devices[0].group_id.as_deref(), Some("line-a"));
+        // 缺省 group_id = None（归属默认分组）。
+        let bare = GatewayConfig::parse("[[devices]]\ndevice_id = \"dev-02\"\n")
+            .expect("parse bare device");
+        assert!(bare.devices[0].group_id.is_none());
+    }
+
+    /// `PointConfig::default()` 与 serde 缺省语义一致（push 默认开、类型 physical）。
+    #[test]
+    fn point_config_default_matches_serde_defaults() {
+        let defaulted = PointConfig::default();
+        assert!(defaulted.push_enabled);
+        assert_eq!(defaulted.point_type, "physical");
+        assert_eq!(defaulted.frequency_ms, default_frequency_ms());
+        assert!(!defaulted.sim_enabled, "simulation is off by default");
+    }
+
+    // ---- 扩展 schema：点位模拟字段 / [[rules]] / [alarms] / [[mgmt_auth.roles]] ----
+
+    /// 点位模拟字段全字段解析 + 老配置缺省（向后兼容）。
+    #[test]
+    fn point_simulation_fields_parse_and_default_off() {
+        let raw = r#"
+[[points]]
+device_id = "dev-01"
+point_id = "p_sim"
+protocol = "modbus-tcp"
+address = "192.168.1.10:502"
+frequency_ms = 1000
+sim_enabled = true
+sim_min = 0.0
+sim_max = 100.5
+sim_dec = 2
+sim_period_ms = 500
+sim_mode = "random"
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse sim point");
+        let point = &config.points[0];
+        assert!(point.sim_enabled);
+        assert_eq!(point.sim_min, Some(0.0));
+        assert_eq!(point.sim_max, Some(100.5));
+        assert_eq!(point.sim_dec, Some(2));
+        assert_eq!(point.sim_period_ms, Some(500));
+        assert_eq!(point.sim_mode.as_deref(), Some("random"));
+
+        // 老点位（无 sim 键）→ 模拟关闭、各字段 None。
+        let legacy = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy");
+        let legacy_point = &legacy.points[0];
+        assert!(
+            !legacy_point.sim_enabled,
+            "legacy point keeps simulation off"
+        );
+        assert!(legacy_point.sim_min.is_none());
+        assert!(legacy_point.sim_max.is_none());
+        assert!(legacy_point.sim_dec.is_none());
+        assert!(legacy_point.sim_period_ms.is_none());
+        assert!(legacy_point.sim_mode.is_none(), "sim_mode defaults to None");
+    }
+
+    /// `[[rules]]` 转发规则 schema 解析 + 缺省（priority=0 / enabled=true）+
+    /// [`RuleConfig::to_rule`] 引擎转换 + 落盘往返。
+    ///
+    /// 引擎字段 `when` / `actions` 直接复用 `crate::rules` 的
+    /// [`Condition`] / [`Action`] 类型（结构化，**非**字符串描述）。
+    #[test]
+    fn rules_section_parses_with_defaults() {
+        let raw = r#"
+[[rules]]
+id = "r1"
+name = "只转好值"
+forwarder_id = "north-1"
+priority = 10
+enabled = false
+
+[rules.when]
+kind = "cmp"
+field = "value"
+op = "gt"
+value = 30
+
+[[rules.actions]]
+kind = "publish"
+topic = "alarms"
+
+[[rules.actions]]
+kind = "remap"
+
+[rules.actions.fields]
+t = "$.value"
+
+[[rules]]
+id = "r2"
+name = "缺省项"
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse rules");
+        assert_eq!(config.rules.len(), 2);
+        let r1 = &config.rules[0];
+        assert_eq!(r1.id, "r1");
+        assert_eq!(r1.forwarder_id.as_deref(), Some("north-1"));
+        assert_eq!(r1.priority, 10);
+        assert!(!r1.enabled);
+        // 引擎字段：cmp 条件 + publish / remap 两种动作。
+        assert_eq!(
+            r1.when,
+            Some(Condition::Cmp {
+                field: "value".to_string(),
+                op: CmpOp::Gt,
+                value: ConditionValue::Num(30.0),
+            })
+        );
+        assert_eq!(
+            r1.actions,
+            vec![
+                Action::Publish {
+                    topic: "alarms".to_string()
+                },
+                Action::Remap {
+                    fields: std::collections::BTreeMap::from([(
+                        "t".to_string(),
+                        "$.value".to_string()
+                    )]),
+                },
+            ]
+        );
+        // 缺省：priority 0 / enabled true / when None / actions 空。
+        let r2 = &config.rules[1];
+        assert_eq!(r2.priority, 0);
+        assert!(r2.enabled, "rule defaults to enabled");
+        assert!(r2.when.is_none());
+        assert!(r2.actions.is_empty(), "actions defaults to empty");
+        assert!(r2.forwarder_id.is_none());
+
+        // to_rule()：id / when / actions 逐字透传，引擎专有字段取缺省。
+        let engine_rule = r1.to_rule();
+        assert_eq!(engine_rule.id, "r1");
+        assert_eq!(engine_rule.when, r1.when);
+        assert_eq!(engine_rule.actions, r1.actions);
+        assert!(
+            engine_rule.transform.is_none(),
+            "transform defaults to None"
+        );
+        assert!(engine_rule.select.is_empty());
+        assert!(engine_rule.depends_on.is_empty());
+        let wildcard = r2.to_rule();
+        assert!(wildcard.when.is_none(), "no when = wildcard rule");
+
+        // 老配置无 rules 段 → 空列表；空列表序列化时省略。
+        let legacy = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy");
+        assert!(legacy.rules.is_empty());
+        let serialized = toml::to_string_pretty(&legacy).expect("serialize");
+        assert!(
+            !serialized.contains("rules"),
+            "empty rules must be skipped when serializing: {serialized}"
+        );
+        // 结构化字段落盘往返：序列化 → 再解析 → 逐字段等值（同形编码互逆）。
+        let roundtrip = toml::to_string_pretty(&config).expect("serialize rules config");
+        let reparsed = GatewayConfig::parse(&roundtrip).expect("re-parse own output");
+        assert_eq!(reparsed.rules, config.rules, "toml roundtrip lossless");
+        // 空引擎字段不得出现在序列化结果里（避免旧版本拒读）。
+        let r2_out = toml::to_string_pretty(r2).expect("serialize rule");
+        assert!(!r2_out.contains("when"), "None when skipped: {r2_out}");
+        assert!(
+            !r2_out.contains("actions"),
+            "empty actions skipped: {r2_out}"
+        );
+    }
+
+    /// `[alarms]` + `[[alarms.rules]]` schema 解析 + 缺省（段缺省 None）。
+    ///
+    /// 覆盖阈值型**引擎字段**（`device_id` / `point_id` / `op` / `threshold` /
+    /// `duration_ms` / `suppress_ms`，供 BE-ALARM）与展示字段（`level` /
+    /// `source_type` / `condition`）并存，且老配置完全兼容。
+    #[test]
+    fn alarms_section_parses_and_defaults_to_none() {
+        let raw = r#"
+[alarms]
+enabled = true
+
+[[alarms.rules]]
+id = "a1"
+name = "设备离线"
+level = "major"
+source_type = "device"
+condition = "status == offline"
+device_id = "dev-1"
+point_id = "p1"
+op = "gt"
+threshold = 0.5
+duration_ms = 5000
+suppress_ms = 60000
+enabled = false
+
+[[alarms.rules]]
+id = "a2"
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse alarms");
+        let alarms = config.alarms.as_ref().expect("alarms section present");
+        assert!(alarms.enabled);
+        assert_eq!(alarms.rules.len(), 2);
+        let a1 = &alarms.rules[0];
+        assert_eq!(a1.id, "a1");
+        assert_eq!(a1.level.as_deref(), Some("major"));
+        assert_eq!(a1.source_type.as_deref(), Some("device"));
+        assert_eq!(a1.device_id.as_deref(), Some("dev-1"));
+        assert_eq!(a1.point_id.as_deref(), Some("p1"));
+        assert_eq!(a1.op.as_deref(), Some("gt"));
+        assert_eq!(a1.threshold, Some(0.5));
+        assert_eq!(a1.duration_ms, Some(5000));
+        assert_eq!(a1.suppress_ms, Some(60000));
+        assert!(!a1.enabled);
+        // 缺省：enabled true、可选字段 None。
+        let a2 = &alarms.rules[1];
+        assert!(a2.enabled);
+        assert!(a2.level.is_none());
+        assert!(a2.device_id.is_none());
+        assert!(a2.op.is_none());
+        assert!(a2.duration_ms.is_none());
+        assert!(a2.suppress_ms.is_none());
+
+        // 老配置无 [alarms] → None。
+        let legacy = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy");
+        assert!(legacy.alarms.is_none(), "alarms default to None");
+
+        // 空可选引擎字段不得序列化（避免旧版本拒读）。
+        let a2_out = toml::to_string_pretty(a2).expect("serialize alarm rule");
+        for key in ["device_id", "point_id", "op", "duration_ms", "suppress_ms"] {
+            assert!(!a2_out.contains(key), "empty {key} skipped: {a2_out}");
+        }
+    }
+
+    /// 告警运算符取值域常量自身正确（`gt`/`ge`/`lt`/`le`/`eq`/`ne`，无重复）。
+    #[test]
+    fn alarm_rule_ops_domain_is_canonical() {
+        assert_eq!(ALARM_RULE_OPS, &["gt", "ge", "lt", "le", "eq", "ne"]);
+        let mut seen = ALARM_RULE_OPS.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), ALARM_RULE_OPS.len(), "ops must be unique");
+    }
+
+    /// `[[mgmt_auth.roles]]` 自定义角色 schema 解析 + 老配置兼容（缺省空列表）。
+    #[test]
+    fn mgmt_auth_custom_roles_parse_and_backward_compatible() {
+        let raw = r#"
+[[mgmt_auth.users]]
+name = "alice"
+role = "system"
+password_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+[[mgmt_auth.roles]]
+id = "viewer"
+name = "只读"
+permissions = ["device.view", "audit.view"]
+
+[[mgmt_auth.roles]]
+id = "writer"
+name = "只需写点位"
+
+[[mgmt_auth.roles]]
+id = "ops-lite"
+name = "带 builtin 标记的角色"
+permissions = ["device.view"]
+builtin = true
+"#;
+        let config = GatewayConfig::parse(raw).expect("parse mgmt_auth roles");
+        let section = config.mgmt_auth.as_ref().expect("section present");
+        assert_eq!(section.users.len(), 1);
+        assert_eq!(section.roles.len(), 3);
+        assert_eq!(section.roles[0].id, "viewer");
+        assert_eq!(section.roles[0].name, "只读");
+        assert_eq!(
+            section.roles[0].permissions,
+            vec!["device.view".to_string(), "audit.view".to_string()]
+        );
+        // 缺省 permissions 为空列表、builtin false（内置角色不入配置段）。
+        assert!(section.roles[1].permissions.is_empty());
+        assert!(!section.roles[0].builtin, "builtin defaults to false");
+        assert!(!section.roles[1].builtin);
+        // 显式 builtin = true 可解析（只读标记；由接口层保证不落自建角色）。
+        assert!(section.roles[2].builtin, "explicit builtin marker parsed");
+
+        // 老配置（只有 users、无 roles）→ roles 空列表。
+        let legacy = GatewayConfig::parse("[mgmt_auth]").expect("empty mgmt_auth");
+        let section = legacy.mgmt_auth.expect("section present");
+        assert!(section.roles.is_empty(), "legacy mgmt_auth has no roles");
+        assert!(section.users.is_empty());
     }
 }

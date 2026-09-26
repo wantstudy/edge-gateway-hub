@@ -72,8 +72,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use serde::de::{Deserializer, Error as DeError};
-use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
 use crate::error::{DaemonError, DaemonResult};
 use crate::pipeline::{DataProcessor, PointConfig, ProcessedSample, RawSample};
@@ -245,7 +245,7 @@ impl Transform {
 /// 比较运算符（JSON 名为 snake_case：`gt` / `ge` / `lt` / `le` / `eq` / `ne`）。
 ///
 /// 数值字段（[`NUMERIC_FIELDS`]）支持全部；字符串字段（[`STRING_FIELDS`]）仅 `eq` / `ne`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CmpOp {
     /// `>` 大于。
@@ -263,7 +263,7 @@ pub enum CmpOp {
 }
 
 /// 比较值：`untagged`，JSON number → [`Self::Num`]，JSON string → [`Self::Str`]。
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ConditionValue {
     /// 数值比较值（JSON number）。
@@ -360,6 +360,31 @@ impl<'de> Deserialize<'de> for Condition {
     }
 }
 
+impl Condition {
+    /// 序列化为与 [`Self::from_value`] 互逆的 kind 标签 JSON 形态
+    ///（`{"kind": ..., ...}`）。`Serialize` 走同形编码，保证
+    /// 「配置落盘 → 重新加载」的 `Condition` 往返等值（config.rs `RuleConfig.when`）。
+    fn to_json_value(&self) -> Value {
+        match self {
+            Condition::Cmp { field, op, value } => {
+                json!({"kind": "cmp", "field": field, "op": op, "value": value})
+            }
+            Condition::And(conditions) => json!({"kind": "and", "conditions": conditions}),
+            Condition::Or(conditions) => json!({"kind": "or", "conditions": conditions}),
+            Condition::Not(condition) => json!({"kind": "not", "condition": condition}),
+        }
+    }
+}
+
+impl Serialize for Condition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_json_value().serialize(serializer)
+    }
+}
+
 /// DO 动作（P0 子集：路由 + 字段重映射）。
 ///
 /// JSON 形式：
@@ -422,6 +447,25 @@ impl<'de> Deserialize<'de> for Action {
     {
         let value = Value::deserialize(deserializer)?;
         Action::from_value(&value).map_err(D::Error::custom)
+    }
+}
+
+impl Action {
+    /// 序列化为与 [`Self::from_value`] 互逆的 kind 标签 JSON 形态（同 [`Condition`]）。
+    fn to_json_value(&self) -> Value {
+        match self {
+            Action::Publish { topic } => json!({"kind": "publish", "topic": topic}),
+            Action::Remap { fields } => json!({"kind": "remap", "fields": fields}),
+        }
+    }
+}
+
+impl Serialize for Action {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_json_value().serialize(serializer)
     }
 }
 
@@ -2247,5 +2291,64 @@ mod tests {
         let out = set.evaluate(raw("s", 1.0)).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].topic, "next");
+    }
+
+    // ---- Serialize（config.rs RuleConfig 落盘同形编码；与手写 Deserialize 互逆） ----
+
+    /// QA: `Condition` 四种 kind 的 Serialize → Deserialize 往返等值；
+    /// 序列化形态必须是 `{"kind": ...}` 标签形（`cmp` 数值 + 字符串两种比较值）。
+    #[test]
+    fn condition_serialize_roundtrips_all_kinds() {
+        let cases = vec![
+            Condition::Cmp {
+                field: "value".to_string(),
+                op: CmpOp::Gt,
+                value: ConditionValue::Num(30.5),
+            },
+            Condition::Cmp {
+                field: "quality".to_string(),
+                op: CmpOp::Ne,
+                value: ConditionValue::Str("BAD".to_string()),
+            },
+            Condition::And(vec![Condition::Cmp {
+                field: "value".to_string(),
+                op: CmpOp::Le,
+                value: ConditionValue::Num(100.0),
+            }]),
+            Condition::Or(vec![]),
+            Condition::Not(Box::new(Condition::Cmp {
+                field: "unit".to_string(),
+                op: CmpOp::Eq,
+                value: ConditionValue::Str("degC".to_string()),
+            })),
+        ];
+        for condition in cases {
+            let text = serde_json::to_string(&condition).expect("serialize");
+            let parsed: Condition =
+                serde_json::from_str(&text).expect("deserialize must accept own output");
+            assert_eq!(&parsed, &condition, "roundtrip must be lossless: {text}");
+            assert!(text.contains("\"kind\""), "kind-tagged shape: {text}");
+        }
+    }
+
+    /// QA: `Action` 两种 kind（publish / remap）Serialize → Deserialize 往返等值。
+    #[test]
+    fn action_serialize_roundtrips_both_kinds() {
+        let cases = vec![
+            Action::Publish {
+                topic: "alarms".to_string(),
+            },
+            Action::Remap {
+                fields: BTreeMap::from([
+                    ("t".to_string(), "$.value".to_string()),
+                    ("dev".to_string(), "$.device_id".to_string()),
+                ]),
+            },
+        ];
+        for action in cases {
+            let text = serde_json::to_string(&action).expect("serialize");
+            let parsed: Action = serde_json::from_str(&text).expect("own output must re-parse");
+            assert_eq!(&parsed, &action, "roundtrip must be lossless: {text}");
+        }
     }
 }

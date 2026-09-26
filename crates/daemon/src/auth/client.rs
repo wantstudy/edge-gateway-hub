@@ -829,6 +829,7 @@ impl LicensingClient {
 
         let url = self.cfg.endpoint("activate");
         let resp = self.transport.post_json(&url, &body)?;
+        let resp = unwrap_api_envelope(&resp);
         let raw = resp
             .get("lease_token")
             .and_then(|v| v.as_str())
@@ -845,7 +846,7 @@ impl LicensingClient {
             .ok_or_else(|| {
                 DaemonError::AuthError("activate response is missing 'lease_id' field".to_string())
             })?;
-        let server_time = require_secs_field(&resp, "server_time", "activation")?;
+        let server_time = require_secs_field(resp, "server_time", "activation")?;
         let server_pubkey = resp
             .get("server_pubkey")
             .and_then(|v| v.as_str())
@@ -1562,6 +1563,19 @@ pub fn verify_payload_hash(
 ) -> [u8; 32] {
     let message = render_verify_signing_message(device_mid, lease_id, payload_digest, ts, nonce);
     domain_separated_digest(VERIFY_SEMANTIC_DOMAIN, message.as_bytes())
+}
+
+/// 云端响应信封解包：licensing-server 统一以 `{code:"OK", data:{...}, message}`
+/// 包裹成功负载（`http.rs ApiEnvelope::ok`）。设备端解析（激活 / 心跳）需要
+/// 的是 `data` 内的裸负载——本函数在 `code=="OK"` 且携带 `data` 对象时返回
+/// `data`，否则原样返回（兼容无信封的裸负载与测试 fake server，双形态皆收）。
+fn unwrap_api_envelope(resp: &serde_json::Value) -> &serde_json::Value {
+    match resp.get("code").and_then(|v| v.as_str()) {
+        Some("OK") if resp.get("data").is_some_and(|d| d.is_object()) => {
+            resp.get("data").unwrap_or(resp)
+        }
+        _ => resp,
+    }
 }
 
 /// 渲染 `/activation` 签名域串（**未哈希**；与服务端 `render_activation_signing_message` 逐字节一致）。

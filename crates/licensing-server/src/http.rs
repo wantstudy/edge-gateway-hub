@@ -89,7 +89,11 @@ pub fn router(service: SharedService, auth: Arc<AdminAuth>) -> Router {
     let state = AppState { service, auth };
     Router::new()
         // 设备端（设备签名体系，无管理端 JWT）。
+        // `/activate` 别名：daemon 侧 LicensingClient 激活端点拼的是
+        // `{base_url}/activate`（auth/client.rs `endpoint("activate")`），
+        // 与本服务既有 `/activation` 同一 handler——两路由并存，兼容两端契约。
         .route("/activation", post(activate))
+        .route("/activate", post(activate))
         .route("/heartbeat", post(heartbeat))
         .route("/verify", post(verify))
         .route("/audit/receipt", post(audit_receipt))

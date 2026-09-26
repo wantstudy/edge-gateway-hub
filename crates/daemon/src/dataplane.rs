@@ -38,7 +38,7 @@
 //! - **绝不 panic**：管线配置非法 → 降级为「只采不转」（error! 可观测）；锁中毒
 //!   取回内部数据；submit 拒绝 / 编码失败只计数 + warn。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock, PoisonError};
 
@@ -48,11 +48,14 @@ use protocol_proto::TelemetryBatch;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::broadcast;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
+use crate::alarm::{AlarmEngine, AlarmRecord, AlarmStore};
 use crate::backpressure::{AuditLog, PushOutcome};
 use crate::config::GatewayConfig;
+use crate::config::{ConfigShared, RuleConfig};
 use crate::error::DaemonResult;
+use crate::mgmt::health::{now_ms, DeviceHealthRegistry};
 use crate::north::encoder::{encoder_for, sample_to_data_point, BatchEncoder, JsonEncoder};
 use crate::north::runtime::NorthRuntime;
 use crate::offline_queue::{Clock, SystemClock};
@@ -60,6 +63,7 @@ use crate::pipeline::{
     AcquisitionPipeline, DataProcessor, PointConfig as PipelinePointConfig, ProcessedSample,
     RawSample,
 };
+use crate::rules::{RoutedMessage, RuleEngine};
 use crate::scheduler::PollHandler;
 
 /// 取锁并在中毒时取回内部数据（**绝不 panic**；与 `north/runtime.rs` 同口径）。
@@ -99,6 +103,14 @@ pub struct DataPlaneStats {
     pub rejected: u64,
     /// 批次编码失败次数（出口侧问题不影响其余出口）。
     pub encode_errors: u64,
+    /// 转发规则求值次数（已启用规则非空时每拍每个发射样本 +1）。
+    pub rules_evaluated: u64,
+    /// 转发规则命中的消息条数（`DO` 动作产出的 `RoutedMessage` 总数）。
+    pub rules_routed: u64,
+    /// 喂给告警引擎的样本数（已启用告警规则非空时每拍每个发射样本 +1）。
+    pub alarms_evaluated: u64,
+    /// 告警引擎产出的记录数（新触发 / 续期 / 恢复）。
+    pub alarms_fired: u64,
 }
 
 /// 数据面桥接（`PollHandler` 装饰器）：南向采集 → 管线变换 → 北向投递。
@@ -126,6 +138,69 @@ pub struct NorthDataPlane {
     ///
     /// 仅 `Err`/`None` 丢弃、不 panic（broadcast 无订阅者 / 编码异常均为正常路径）。
     live_tx: broadcast::Sender<LiveTelemetry>,
+    /// 设备真实运行健康度注册表（需求 1）：每拍成功 / 失败事实在此落账。
+    health: Arc<DeviceHealthRegistry>,
+    /// 不推送点位集合（需求 6）：`device_id -> {point_id}`，`push_enabled=false` 的
+    /// 点位**照常采集 / 进实时流**，但被排除在北向转发批次之外。
+    ///
+    /// 键用 device_id 分桶 + 内层 point_id，避免每拍为查表而拼接字符串（热路径零分配）。
+    no_push: HashMap<String, HashSet<String>>,
+    /// 配置共享句柄（**规则引擎热重建的真相源**：管理面改规则后
+    /// `ConfigShared::replace` 推新快照 + 新版本号，下一拍据此重建引擎）。
+    config: Arc<ConfigShared>,
+    /// 转发规则引擎（`[[rules]]` 已启用规则的求值器；`None` = 无启用的规则或
+    /// 规则集非法降级）。构造期即完成全部语义校验（JSONPath / topic / DAG）；
+    /// 用 `StdMutex` 而非 `OnceLock`：配置版本变化时要能**原地重建**（启停 /
+    /// 增删规则的热生效），锁中毒按既有口径取回内部数据（零 panic）。
+    rules: StdMutex<Option<RuleEngine>>,
+    /// 规则引擎当前对应的配置版本号（版本未变则复用既有引擎，热路径零重建）。
+    rule_version: AtomicU64,
+    /// 告警引擎（`[alarms]` 已启用规则；空装配 = 无告警数据源，本阶段整体跳过）。
+    ///
+    /// 与 `rules` 同构：配置版本变化即原地重建；告警记录另存 [`Self::alarms`]
+    /// 仓库，不随引擎重建丢（否则每次改规则，页面上正在看的告警就凭空消失）。
+    alarm_engine: StdMutex<AlarmEngine>,
+    /// 告警引擎当前对应的配置版本号。
+    alarm_version: AtomicU64,
+    /// 告警记录仓库（数据面写 / 管理面 `GET /api/alerts` 读；进程内 historian）。
+    alarms: Arc<AlarmStore>,
+}
+
+/// 由配置里的 `[[rules]]` 构造规则引擎：只吃 **已启用** 规则，按 `priority`
+/// 升序（数字越小越先匹配）求值。
+///
+/// 规则集语义非法（未知字段路径 / 空 publish topic / `depends_on` 成环或指向
+/// 未知 id / 重复 id）→ `warn` 后**降级为「无规则」**，绝不影响采集与北投递：
+/// 半写的规则会把全部样本转发出去，那比「没有规则」危险得多。
+fn build_rule_engine(config: &GatewayConfig) -> Option<RuleEngine> {
+    let mut enabled: Vec<&RuleConfig> = config.rules.iter().filter(|rule| rule.enabled).collect();
+    if enabled.is_empty() {
+        return None;
+    }
+    enabled.sort_by_key(|rule| rule.priority);
+    match RuleEngine::from_rules(enabled.iter().map(|rule| rule.to_rule()).collect()) {
+        Ok(engine) => Some(engine),
+        Err(err) => {
+            warn!(error = %err, "dataplane: rule engine rejected the rule set; rules disabled this process");
+            None
+        }
+    }
+}
+
+/// 由配置里的 `[alarms]` 构造告警引擎（只吃 **enabled** 规则；语义非法的规则
+/// 由引擎装配期跳过 + warn，绝不静默塞进求值路径）。
+///
+/// `[alarms]` 缺省 / `enabled = false` / 无可用规则 → 空引擎 ⇒ 数据面告警阶段
+/// 整拍跳过（热路径零开销，与无告警配置的网关行为完全一致）。
+fn build_alarm_engine(config: &GatewayConfig) -> AlarmEngine {
+    let (engine, skipped) = AlarmEngine::from_config(config);
+    if !skipped.is_empty() {
+        warn!(
+            skipped = skipped.len(),
+            "dataplane: alarm engine skipped unusable alarm rule(s); the remaining rules still evaluate"
+        );
+    }
+    engine
 }
 
 /// 原子计数器组（内部可变、快照只读）。
@@ -139,6 +214,12 @@ struct DataPlaneCounters {
     spilled: AtomicU64,
     rejected: AtomicU64,
     encode_errors: AtomicU64,
+    rules_evaluated: AtomicU64,
+    rules_routed: AtomicU64,
+    /// 本拍喂给告警引擎的样本数（无告警配置时不累加）。
+    alarms_evaluated: AtomicU64,
+    /// 本拍告警引擎产出（新触发 / 续期 / 恢复）的记录数。
+    alarms_fired: AtomicU64,
 }
 
 impl DataPlaneCounters {
@@ -165,15 +246,38 @@ impl NorthDataPlane {
     /// - 出口泳道按 `[[outlets]]` 全量构建（编码按该路 `encoding`；北向启动期
     ///   被拒绝的出口在 [`Self::attach`] 时剔除）。
     ///
-    /// `live_tx` 为管理面实时遥测广播发送端（[`DaemonShared::live_sender`] 注入）。
+    /// `live_tx` 为管理面实时遥测广播发送端（`DaemonShared::live_sender` 注入）；
+    /// `health` 为设备健康度注册表（`DaemonShared::health_registry` 注入），
+    /// 采集成功 / 失败逐拍落账（需求 1）。
     #[must_use]
     pub fn new(
         inner: Arc<dyn PollHandler>,
         config: &GatewayConfig,
+        config_shared: Arc<ConfigShared>,
         live_tx: broadcast::Sender<LiveTelemetry>,
+        health: Arc<DeviceHealthRegistry>,
+        alarms: Arc<AlarmStore>,
     ) -> Self {
         let gateway_id = config.gateway.gateway_id.clone();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        // 转发规则引擎：`[[rules]]` 在这条链路上第一次成为生产路径（此前
+        // `RuleEngine` 无任何生产调用方——配置里的规则只是死的 TOML 行）。
+        // 纪录的引擎版本号 = 当前配置版本，避免首拍无谓重建。
+        let rule_version = config_shared.version();
+        // 告警引擎：同规则引擎一处装配，版本号同样取当前配置版本（首拍不重建）。
+        let alarm_version = config_shared.version();
+
+        // 需求 6：收集 `push_enabled = false` 的点位（device_id -> {point_id}）。
+        // 空集合（全部推送）时不做任何过滤，热路径零额外开销。
+        let mut no_push: HashMap<String, HashSet<String>> = HashMap::new();
+        for point in &config.points {
+            if !point.push_enabled {
+                no_push
+                    .entry(point.device_id.clone())
+                    .or_default()
+                    .insert(point.point_id.clone());
+            }
+        }
 
         let point_cfgs: Vec<PipelinePointConfig> = config
             .points
@@ -198,14 +302,13 @@ impl NorthDataPlane {
             Err(err) => {
                 error!(
                     error = %err,
-                    "dataplane: [ERROR] point pipeline build failed; northbound forwarding \
-                     stays disabled (capture and scheduling continue; fix [[points]] to recover)"
+                    "dataplane: [ERROR] point pipeline build failed; northbound forwarding                      stays disabled (capture and scheduling continue; fix [[points]] to recover)"
                 );
                 None
             }
         };
 
-        let lanes = config
+        let lanes: Vec<OutletLane> = config
             .outlets
             .iter()
             .map(|outlet| OutletLane {
@@ -224,7 +327,124 @@ impl NorthDataPlane {
             clock,
             counters: DataPlaneCounters::default(),
             live_tx,
+            health,
+            no_push,
+            config: config_shared,
+            rules: StdMutex::new(build_rule_engine(config)),
+            rule_version: AtomicU64::new(rule_version),
+            alarm_engine: StdMutex::new(build_alarm_engine(config)),
+            alarm_version: AtomicU64::new(alarm_version),
+            alarms,
         }
+    }
+
+    /// 转发规则引擎是否已装配（存在启用的合法 `[[rules]]`）。
+    #[must_use]
+    pub fn has_rules(&self) -> bool {
+        lock_or_recover(&self.rules).is_some()
+    }
+
+    /// 告警引擎是否已装配（`[alarms]` 已启用且至少有一条可用规则）。
+    #[must_use]
+    pub fn has_alarms(&self) -> bool {
+        lock_or_recover(&self.alarm_engine).rule_count() > 0
+    }
+
+    /// 配置版本变化 → 重建规则引擎（**管理面新增 / 启停 / 删除规则的热生效点**）。
+    ///
+    /// 建造仅当版本真的变了（比较原子版本号），热路径零重建、零分配。
+    fn sync_rule_engine(&self) {
+        let version = self.config.version();
+        if version == self.rule_version.load(Ordering::Relaxed) {
+            return;
+        }
+        let rules_count = build_rule_engine(&self.config.snapshot()).map(|engine| {
+            let count = engine.rule_count();
+            *lock_or_recover(&self.rules) = Some(engine);
+            count
+        });
+        match rules_count {
+            Some(count) => info!(
+                config_version = version,
+                rules = count,
+                "dataplane: forwarding rule engine (re)built from [[rules]]"
+            ),
+            None => debug!(
+                config_version = version,
+                "dataplane: no enabled forwarding rule; rule stage is idle"
+            ),
+        }
+        self.rule_version.store(version, Ordering::Relaxed);
+    }
+
+    /// 配置版本变化 → 重建告警引擎（**管理面改告警规则的热生效点**）。
+    ///
+    /// 与 [`Self::sync_rule_engine`] 同口径：版本没变直接返回；重建后清空各轨道
+    /// 运行态（旧的「已持续时长 / 抑制窗口」对新规则没有意义）。
+    fn sync_alarm_engine(&self) {
+        let version = self.config.version();
+        if version == self.alarm_version.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut engine = lock_or_recover(&self.alarm_engine);
+        let rebuilt = build_alarm_engine(&self.config.snapshot());
+        let count = rebuilt.rule_count();
+        *engine = rebuilt;
+        engine.reset_tracks();
+        drop(engine);
+        info!(
+            config_version = version,
+            rules = count,
+            "dataplane: alarm engine (re)built from [alarms]"
+        );
+        self.alarm_version.store(version, Ordering::Relaxed);
+    }
+
+    /// 告警求值：对每个发射样本跑一遍阈值 + 去抖 + 抑制，返回本拍应当落库的
+    /// 告警记录（新触发 / 续期 / 恢复）。
+    ///
+    /// 返回值**只是记录的事实**（计数 + 日志），不投递任何东西：告警的出口是
+    /// 管理面列表，不是北向 topic。
+    fn evaluate_alarms(&self, processed: &[ProcessedSample], now_ns: i64) -> Vec<AlarmRecord> {
+        let mut engine = lock_or_recover(&self.alarm_engine);
+        let mut fired: Vec<AlarmRecord> = Vec::new();
+        for sample in processed {
+            fired.extend(engine.evaluate(sample, now_ns));
+        }
+        drop(engine);
+        DataPlaneCounters::add(&self.counters.alarms_evaluated, processed.len() as u64);
+        DataPlaneCounters::add(&self.counters.alarms_fired, fired.len() as u64);
+        fired
+    }
+
+    /// 规则求值：对每个发射样本跑一遍 WHERE + DO，返回 `DO` 产出的路由消息。
+    ///
+    /// 返回值**只做事实记账**（计数 + 日志）：北向泳道的 topic 由出口配置
+    /// `topic_prefix` 固定（`NorthRuntime::submit` 无 topic 入参），规则里的
+    /// `publish{topic}` 无法在现有北投递路径上保序投递——这里绝不假装已投递，
+    /// 也不把规则消息塞进遥测批次污染对端 schema。
+    fn evaluate_rules(&self, processed: &[ProcessedSample]) -> Vec<RoutedMessage> {
+        let rules = lock_or_recover(&self.rules);
+        let Some(engine) = rules.as_ref() else {
+            return Vec::new();
+        };
+        let mut routed: Vec<RoutedMessage> = Vec::new();
+        for sample in processed {
+            routed.extend(engine.route(sample));
+        }
+        drop(rules);
+        DataPlaneCounters::add(&self.counters.rules_evaluated, processed.len() as u64);
+        DataPlaneCounters::add(&self.counters.rules_routed, routed.len() as u64);
+        routed
+    }
+
+    /// 该点位是否被排除在北向转发批次之外（`push_enabled = false`）。
+    ///
+    /// **仅用于北向过滤**：实时遥测流不经过本判据（关推送的点位照常进实时流）。
+    fn is_push_blocked(&self, device_id: &str, point_id: &str) -> bool {
+        self.no_push
+            .get(device_id)
+            .is_some_and(|points| points.contains(point_id))
     }
 
     /// 挂载北向运行期句柄（晚绑定；幂等——重复 attach 忽略后者）。
@@ -269,6 +489,10 @@ impl NorthDataPlane {
             spilled: DataPlaneCounters::get(&c.spilled),
             rejected: DataPlaneCounters::get(&c.rejected),
             encode_errors: DataPlaneCounters::get(&c.encode_errors),
+            rules_evaluated: DataPlaneCounters::get(&c.rules_evaluated),
+            rules_routed: DataPlaneCounters::get(&c.rules_routed),
+            alarms_evaluated: DataPlaneCounters::get(&c.alarms_evaluated),
+            alarms_fired: DataPlaneCounters::get(&c.alarms_fired),
         }
     }
 
@@ -281,23 +505,32 @@ impl NorthDataPlane {
         if samples.is_empty() {
             return;
         }
+        // 转发规则引擎：配置版本变了就重建（管理面新增 / 启停 / 删除规则的
+        // 热生效点——与 `persist_config` 的 `ConfigShared::replace` 同.version())
+        // 这道闸门保证「页面改的规则下一拍就生效」，无需重启网关。
+        self.sync_rule_engine();
         let Some(pipeline) = &self.pipeline else {
             return; // 管线配置非法：只采不转（构造期已 error!，不逐拍刷屏）。
         };
-        let Some(runtime) = self.runtime.get() else {
-            DataPlaneCounters::bump(&self.counters.pre_runtime_cycles);
-            return; // 北向运行期未就绪（启动竞态窗口）：样本照常产生、本轮不投递。
-        };
-        DataPlaneCounters::bump(&self.counters.forward_cycles);
+        self.sync_alarm_engine();
+        let want_alarms = self.has_alarms();
+        let want_rules = self.has_rules();
 
         let ts = self.clock.now_ns();
         let mut points = Vec::with_capacity(samples.len());
+        // 规则 / 告警求值需要的原始处理样本（仅当确实有启用规则或告警规则时
+        // 收集，零规则零告警时零开销）。
+        let mut eval_inputs: Vec<ProcessedSample> = Vec::new();
+        let want_eval = want_rules || want_alarms;
         {
             let mut pipeline = lock_or_recover(pipeline);
             for sample in samples {
                 match pipeline.ingest_physical(sample.clone(), ts) {
                     Ok(Some(processed)) => {
                         DataPlaneCounters::bump(&self.counters.physical_emitted);
+                        if want_eval {
+                            eval_inputs.push(processed.clone());
+                        }
                         points.push(sample_to_data_point(&processed));
                     }
                     Ok(None) => {} // 死区过滤：不发射（公式输入已在 ingest 内记账）。
@@ -317,7 +550,7 @@ impl NorthDataPlane {
                     continue;
                 };
                 DataPlaneCounters::bump(&self.counters.derived_emitted);
-                points.push(sample_to_data_point(&ProcessedSample {
+                let derived_sample = ProcessedSample {
                     // 派生点无物理设备归属：以网关为 `device_id`（北向 schema 必填）。
                     device_id: self.gateway_id.clone(),
                     point_id: derived.point_id,
@@ -326,9 +559,44 @@ impl NorthDataPlane {
                     device_ts_ns: None,
                     collected_ts_ns: ts,
                     quality: derived.quality.to_wire(),
-                }));
+                };
+                if want_eval {
+                    eval_inputs.push(derived_sample.clone());
+                }
+                points.push(sample_to_data_point(&derived_sample));
             }
         }
+        // 告警求值（真实样本 → 真实告警记录）：产生的是**记录**，不是投递——
+        // 落进 `AlarmStore` 后由 `GET /api/alerts` 原样回显，与「是否有出口」无关。
+        if want_alarms && !eval_inputs.is_empty() {
+            let fired = self.evaluate_alarms(&eval_inputs, ts);
+            if !fired.is_empty() {
+                // 记录写入仓库：返回「最新在前」的快照，前端列表即此顺序。
+                self.alarms.upsert(&fired);
+            }
+        }
+        // 转发规则求值（WHERE + DO）：规则命中产出的消息只做事实记账（计数 +
+        // debug 日志），**不假装投递**——北向泳道 topic 由出口配置固定，`publish`
+        // 动作的 topic 在现有 `NorthRuntime::submit` 路径上无从投递（见
+        // `Self::evaluate_rules` 注释）。
+        if !eval_inputs.is_empty() {
+            let routed = self.evaluate_rules(&eval_inputs);
+            if !routed.is_empty() {
+                debug!(
+                    count = routed.len(),
+                    "dataplane: forwarding rules produced routed messages (counted, not                      delivered to the outlet topic by design — see evaluate_rules)"
+                );
+            }
+        }
+        // 北向运行期未就绪（启动竞态窗口）或根本没有出口：样本照常产生、告警
+        // **照常记录**（告警的出口是管理面列表，不是北向 topic），本轮只是不投递。
+        // 这行必须在告警 / 规则求值**之后**——否则「没有出口的网关」永远不产生
+        // 任何告警记录，页面上就是一直空着（本 ticket 要消掉的就是这个现象）。
+        let Some(runtime) = self.runtime.get() else {
+            DataPlaneCounters::bump(&self.counters.pre_runtime_cycles);
+            return;
+        };
+        DataPlaneCounters::bump(&self.counters.forward_cycles);
         if points.is_empty() {
             return; // 全部被死区过滤 / 求值失败：本拍无北向批次。
         }
@@ -339,17 +607,46 @@ impl NorthDataPlane {
             auth: None, // 签名块由既有北向签名链路负责，数据面不重复实现。
         };
 
-        // 实时遥测扇出（task 52）：把解码后逐点遥测广播给管理面 `/api/stream`
-        // 订阅者。复用 `JsonEncoder` 字段名、把 `value` 解码为 JSON 数值；
-        // 仅 `Err`/`None` 丢弃、不 panic（broadcast 无订阅者 / 编码异常均为正常路径，
-        // 不影响北向投递）。
+        // 实时遥测扇出（task 52）：把**全部**解码后逐点遥测广播给管理面
+        // `/api/stream` 订阅者——含「关推送」的点位（需求 6：关推送仍进实时流）。
+        // 复用 `JsonEncoder` 字段名、把 `value` 解码为 JSON 数值；仅 `Err`/`None`
+        // 丢弃、不 panic（broadcast 无订阅者 / 编码异常均为正常路径，不影响北向投递）。
         if let Some(live) = LiveTelemetry::from_batch(&batch) {
             let _ = self.live_tx.send(live);
         }
 
+        // 需求 6：北向转发批次**排除** `push_enabled = false` 的点位。
+        // 过滤在此真实投递路径（而非接口层）执行；无被排除点位时零额外开销（直接搬移）。
+        let any_blocked = batch
+            .points
+            .iter()
+            .any(|p| self.is_push_blocked(&p.device_id, &p.point_id));
+        let push_points: Vec<protocol_proto::DataPoint> = if any_blocked {
+            batch
+                .points
+                .into_iter()
+                .filter(|p| !self.is_push_blocked(&p.device_id, &p.point_id))
+                .collect()
+        } else {
+            batch.points
+        };
+        if push_points.is_empty() {
+            // 本拍点位全部关推送：照常采集、已进实时流，但本拍无北向批次。
+            debug!(
+                "dataplane: all emitted points have push disabled; no northbound batch this cycle"
+            );
+            return;
+        }
+        let push_batch = TelemetryBatch {
+            points: push_points,
+            ts,
+            gateway_id: batch.gateway_id,
+            auth: None,
+        };
+
         let lanes = lock_or_recover(&self.lanes);
         for lane in lanes.iter() {
-            let payload = match lane.encoder.encode_batch(&batch) {
+            let payload = match lane.encoder.encode_batch(&push_batch) {
                 Ok(payload) => payload,
                 Err(err) => {
                     DataPlaneCounters::bump(&self.counters.encode_errors);
@@ -518,9 +815,25 @@ impl PollHandler for NorthDataPlane {
     async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>> {
         // 先采集（南向读 + 解码），再把样本变换 / 投递，最后原样返回样本供
         // 调度器统计口径（len）使用——样本的产生不依赖北向是否就绪。
-        let samples = self.inner.poll(group, point_ids).await?;
+        //
+        // 需求 1：本拍真实结果（成功 / 失败）落健康度注册表——`group` 即 device_id
+        //（bootstrap `build_groups` 一组一设备），管理面据此计算三态。失败原因仍原样
+        // 上抛（调度器 / 看门狗负责），健康度只做事实记账、不吞错。
+        let result = self.inner.poll(group, point_ids).await;
+        let ts = now_ms();
+        match &result {
+            Ok(_) => self.health.record_success(group, ts),
+            Err(_) => self.health.record_failure(group, ts),
+        }
+        let samples = result?;
         self.forward(&samples);
         Ok(samples)
+    }
+
+    async fn refresh_devices(&self, config: &GatewayConfig) {
+        // 转发给内层真实采集动作：南向的设备计划表必须跟着热重载换，否则调度器
+        // 侧重建后新组每拍都撞 `unknown device group`。
+        self.inner.refresh_devices(config).await;
     }
 }
 
@@ -559,6 +872,11 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    /// 测试用健康度注册表（需求 1 落账点可观测）。
+    fn test_health() -> Arc<DeviceHealthRegistry> {
+        Arc::new(DeviceHealthRegistry::new())
     }
 
     /// 丢弃型审计出口（单测不关心背压审计内容）。
@@ -618,7 +936,14 @@ mod tests {
         let runtime = start_runtime(dir.path());
         let config = config_with("mqtt://127.0.0.1:1883", "protobuf");
         let (live_tx, mut live_rx) = broadcast::channel(16);
-        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config, live_tx);
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::new(ConfigShared::new(Default::default())),
+            live_tx,
+            test_health(),
+            AlarmStore::shared(),
+        );
         assert!(!plane.is_attached());
         plane.attach(Arc::clone(&runtime));
         assert!(plane.is_attached());
@@ -672,7 +997,14 @@ mod tests {
         let runtime = start_runtime(dir.path());
         let config = config_with("mqtt://127.0.0.1:1883", "protobuf");
         let (live_tx, _) = broadcast::channel(8);
-        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config, live_tx);
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::new(ConfigShared::new(Default::default())),
+            live_tx,
+            test_health(),
+            AlarmStore::shared(),
+        );
 
         let samples = plane
             .poll("dev-01", &["p1".to_string()])
@@ -699,7 +1031,14 @@ mod tests {
         .expect("parse");
         assert!(config.outlets.is_empty());
         let (live_tx, _) = broadcast::channel(8);
-        let plane = NorthDataPlane::new(Arc::new(FakeInner { n: 1 }), &config, live_tx);
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::new(ConfigShared::new(Default::default())),
+            live_tx,
+            test_health(),
+            AlarmStore::shared(),
+        );
         let samples = plane
             .poll("dev-01", &["p1".to_string()])
             .await
@@ -744,7 +1083,10 @@ mod tests {
         let plane = NorthDataPlane::new(
             Arc::new(FakeInner { n: 1 }),
             &config_with("x", "json"),
+            Arc::new(ConfigShared::new(Default::default())),
             live_tx,
+            test_health(),
+            AlarmStore::shared(),
         );
         plane.attach(Arc::clone(&runtime));
         plane
@@ -796,7 +1138,10 @@ mod tests {
         let plane = NorthDataPlane::new(
             Arc::new(FakeInner { n: 1 }),
             &config_with("mqtts://127.0.0.1:8883", "protobuf"),
+            Arc::new(ConfigShared::new(Default::default())),
             live_tx,
+            test_health(),
+            AlarmStore::shared(),
         );
         plane.attach(Arc::clone(&runtime));
         let samples = plane
@@ -847,5 +1192,558 @@ mod tests {
             "north quality contract"
         );
         assert_eq!(value["auth"], serde_json::Value::Null);
+    }
+
+    // ---- 需求 1 / 6：推送开关北向过滤 + 真实健康度落账 ----
+
+    /// 两点的配置（p1 推送、p2 `push=false`）。
+    fn config_two_points_one_disabled() -> GatewayConfig {
+        GatewayConfig::parse(
+            "[gateway]\ngateway_id = \"gw-dp\"\n\n\
+             [[outlets]]\nname = \"north-1\"\nbroker = \"mqtt://127.0.0.1:1883\"\nqos = 1\n\
+             encoding = \"protobuf\"\n\n\
+             [[points]]\ndevice_id = \"dev-01\"\npoint_id = \"p1\"\nprotocol = \"modbus-tcp\"\n\
+             address = \"127.0.0.1:502\"\nfrequency_ms = 100\n\n\
+             [[points]]\ndevice_id = \"dev-01\"\npoint_id = \"p2\"\nprotocol = \"modbus-tcp\"\n\
+             address = \"127.0.0.1:502\"\nfrequency_ms = 100\npush = false\n",
+        )
+        .expect("parse two-point config")
+    }
+
+    /// 需求 6：`push_enabled = false` 的点位**不进北向转发批次**，
+    /// 但**仍在实时流**（`/api/stream` 广播）中；同批次的推送点位照常投递。
+    #[tokio::test]
+    async fn push_disabled_point_stays_in_live_stream_but_not_northbound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = start_runtime(dir.path());
+        let config = config_two_points_one_disabled();
+        let (live_tx, mut live_rx) = broadcast::channel(16);
+        let health = test_health();
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 2 }),
+            &config,
+            Arc::new(ConfigShared::new(Default::default())),
+            live_tx,
+            Arc::clone(&health),
+            AlarmStore::shared(),
+        );
+        plane.attach(Arc::clone(&runtime));
+
+        let samples = plane
+            .poll("dev-01", &["p1".to_string(), "p2".to_string()])
+            .await
+            .expect("poll");
+        assert_eq!(samples.len(), 2, "capture unaffected by the push flag");
+
+        // 实时流：两点都在（关推送仍进实时流）。
+        let live = live_rx.try_recv().expect("live telemetry frame");
+        let ids: Vec<&str> = live.points.iter().map(|p| p.point_id.as_str()).collect();
+        assert!(
+            ids.contains(&"p1") && ids.contains(&"p2"),
+            "both points must be present in the live frame: {ids:?}"
+        );
+
+        // 北向批次：仅推送点位 p1（关推送的 p2 被排除）。
+        let outlet = runtime.outlet("north-1").expect("outlet");
+        let ready = outlet.send().take_ready(8);
+        assert_eq!(ready.len(), 1, "exactly one northbound batch");
+        let batch = decode_batch(Encoding::Protobuf, &ready[0].payload).expect("decode");
+        assert_eq!(
+            batch.points.len(),
+            1,
+            "push-disabled point must be excluded from the northbound batch"
+        );
+        assert_eq!(batch.points[0].point_id, "p1");
+
+        // 需求 1：成功轮询落健康度账。
+        let snapshot = health.snapshot("dev-01").expect("health recorded");
+        assert_eq!(snapshot.polls, 1);
+        assert_eq!(snapshot.errors, 0);
+        assert!(snapshot.last_success_ms.is_some(), "success timestamp set");
+    }
+
+    /// 需求 6 边界：全部点位关推送 → 本拍**无北向批次**（发送队列零投递），
+    /// 但实时流照常产出、采集样本数量不变。
+    #[tokio::test]
+    async fn all_points_push_disabled_produces_no_northbound_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = start_runtime(dir.path());
+        let config = GatewayConfig::parse(
+            "[gateway]\ngateway_id = \"gw-dp\"\n\n\
+             [[outlets]]\nname = \"north-1\"\nbroker = \"mqtt://127.0.0.1:1883\"\nqos = 1\n\
+             encoding = \"protobuf\"\n\n\
+             [[points]]\ndevice_id = \"dev-01\"\npoint_id = \"p1\"\nprotocol = \"modbus-tcp\"\n\
+             address = \"127.0.0.1:502\"\nfrequency_ms = 100\npush = false\n",
+        )
+        .expect("parse all-disabled config");
+        let (live_tx, mut live_rx) = broadcast::channel(16);
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::new(ConfigShared::new(Default::default())),
+            live_tx,
+            test_health(),
+            AlarmStore::shared(),
+        );
+        plane.attach(Arc::clone(&runtime));
+
+        let samples = plane
+            .poll("dev-01", &["p1".to_string()])
+            .await
+            .expect("poll");
+        assert_eq!(samples.len(), 1, "capture continues");
+
+        let live = live_rx.try_recv().expect("live telemetry frame");
+        assert_eq!(live.points.len(), 1, "live stream still carries the point");
+
+        let outlet = runtime.outlet("north-1").expect("outlet");
+        assert_eq!(
+            outlet.send().pending(),
+            0,
+            "no northbound batch when every point has push disabled"
+        );
+        assert_eq!(plane.stats().admitted, 0);
+    }
+
+    /// 需求 1：南向读失败 → 健康度记失败（连续失败 +1、无成功时刻）。
+    #[tokio::test]
+    async fn poll_failure_is_recorded_in_health_registry() {
+        struct FailingInner;
+        #[async_trait]
+        impl PollHandler for FailingInner {
+            async fn poll(
+                &self,
+                _group: &str,
+                _point_ids: &[String],
+            ) -> DaemonResult<Vec<RawSample>> {
+                Err(crate::error::DaemonError::ConfigError(
+                    "simulated southbound failure".to_string(),
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = start_runtime(dir.path());
+        let config = config_with("mqtt://127.0.0.1:1883", "protobuf");
+        let (live_tx, _) = broadcast::channel(8);
+        let health = test_health();
+        let plane = NorthDataPlane::new(
+            Arc::new(FailingInner),
+            &config,
+            Arc::new(ConfigShared::new(config.clone())),
+            live_tx,
+            Arc::clone(&health),
+            AlarmStore::shared(),
+        );
+        plane.attach(runtime);
+        let err = plane
+            .poll("dev-01", &["p1".to_string()])
+            .await
+            .expect_err("southbound failure must propagate");
+        assert!(matches!(err, crate::error::DaemonError::ConfigError(_)));
+
+        let snapshot = health.snapshot("dev-01").expect("failure recorded");
+        assert_eq!(snapshot.polls, 1);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.consecutive_failures, 1);
+        assert_eq!(
+            snapshot.last_success_ms, None,
+            "never succeeded → never-sampled"
+        );
+    }
+
+    // ---- 需求：转发规则引擎接生产（[[rules]] → 数据面求值） ----
+
+    /// 带 `[[rules]]` 的最小配置（规则体可注入）。
+    fn config_with_rule(rule_body: &str) -> GatewayConfig {
+        GatewayConfig::parse(&format!(
+            "[gateway]
+gateway_id = \"gw-dp\"
+
+             [[outlets]]
+name = \"north-1\"
+broker = \"mqtt://127.0.0.1:1883\"
+qos = 1
+             encoding = \"protobuf\"
+
+             [[points]]
+device_id = \"dev-01\"
+point_id = \"p1\"
+protocol = \"modbus-tcp\"
+             address = \"127.0.0.1:502\"
+frequency_ms = 100
+
+             [[rules]]
+{}
+",
+            rule_body
+        ))
+        .expect("parse config with rule")
+    }
+
+    /// 一条合法启用规则（`value > 10` → publish）。
+    fn enabled_rule_body(when_value: &str) -> String {
+        format!(
+            "id = \"r1\"
+name = \"高温转发\"
+enabled = true
+priority = 1
+             [rules.when]
+  kind = \"cmp\"
+  field = \"value\"
+  op = \"gt\"
+  value = {}
+             [[rules.actions]]
+kind = \"publish\"
+topic = \"telemetry/high\"
+",
+            when_value
+        )
+    }
+
+    /// QA（#17 BE-RULES）：启用的 `[[rules]]` 必须真的建出规则引擎（数据面可执行）；
+    /// 全部禁用 / 无规则 → 引擎不装配，规则阶段静默空转（不假装生效）。
+    #[test]
+    fn enabled_rules_build_the_engine_and_disabled_ones_do_not() {
+        let config = config_with_rule(&enabled_rule_body("10"));
+        let shared = Arc::new(ConfigShared::new(config.clone()));
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::clone(&shared),
+            broadcast::channel(8).0,
+            test_health(),
+            AlarmStore::shared(),
+        );
+        assert!(plane.has_rules(), "an enabled rule must build the engine");
+
+        // 只禁用 → 引擎不装配（数据面不承接规则求值）。
+        let mut disabled = config.clone();
+        for rule in &mut disabled.rules {
+            rule.enabled = false;
+        }
+        let shared = Arc::new(ConfigShared::new(disabled.clone()));
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &disabled,
+            Arc::clone(&shared),
+            broadcast::channel(8).0,
+            test_health(),
+            AlarmStore::shared(),
+        );
+        assert!(!plane.has_rules(), "no enabled rule → rule stage idle");
+    }
+
+    /// QA（#17 BE-RULES）：配置版本变化 → 规则引擎原地重建（页面改规则无需重启即生效）。
+    #[test]
+    fn rule_engine_is_rebuilt_when_the_config_version_moves() {
+        let config = config_with("mqtt://127.0.0.1:1883", "protobuf");
+        let shared = Arc::new(ConfigShared::new(config.clone()));
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::clone(&shared),
+            broadcast::channel(8).0,
+            test_health(),
+            AlarmStore::shared(),
+        );
+        assert!(!plane.has_rules(), "no rule in the initial snapshot");
+
+        let mut next = config.clone();
+        next.rules.push(crate::config::RuleConfig {
+            id: "r-live".to_string(),
+            name: "热生效规则".to_string(),
+            enabled: true,
+            ..Default::default()
+        });
+        // 管理面写路径落盘后即刻推新快照 + 新版本号。
+        let version = shared.replace(next.clone());
+        assert!(version > 1, "replace must bump the config version");
+        plane.sync_rule_engine();
+        assert!(
+            plane.has_rules(),
+            "engine must be rebuilt after the version bump"
+        );
+    }
+
+    /// QA（#17 BE-RULES）：规则集语义非法 → **降级为不跑规则**（不是跑一版半截的规则）。
+    ///
+    /// 与「拒绝落盘」是两道闸：管理面拦住落盘（400），落盘前提下（如手工改
+    /// config.toml）数据面宁可空跑也不用一个非法规则集去转发全量样本。
+    #[test]
+    fn semantically_invalid_rule_set_degrades_the_rule_stage() {
+        let rule_body = "id = \"r-bad\"
+name = \"非法字段\"
+enabled = true
+                         [rules.when]
+
+  kind = \"cmp\"
+  field = \"bogus_field\"
+  op = \"gt\"
+  value = 1
+
+                         [[rules.actions]]
+
+kind = \"publish\"
+topic = \"t/1\"
+";
+        let config = config_with_rule(rule_body);
+        assert!(
+            build_rule_engine(&config).is_none(),
+            "invalid rule set must not build"
+        );
+        let shared = Arc::new(ConfigShared::new(config.clone()));
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::clone(&shared),
+            broadcast::channel(8).0,
+            test_health(),
+            AlarmStore::shared(),
+        );
+        assert!(
+            !plane.has_rules(),
+            "degraded to idle instead of forwarding everything"
+        );
+    }
+
+    /// QA（#17 BE-RULES）：WHERE 真的拿 payload 求值——`value > 10` 命中（routed > 0），
+    /// `value > 100` 不命中（routed = 0）；两种情况下 `rules_evaluated` 都如实累加。
+    #[tokio::test]
+    async fn where_clause_is_evaluated_against_the_payload() {
+        for (when_value, want_routed) in [("10", 1), ("100", 0)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = start_runtime(dir.path());
+            let config = config_with_rule(&enabled_rule_body(when_value));
+            let shared = Arc::new(ConfigShared::new(config.clone()));
+            let (live_tx, _) = broadcast::channel(8);
+            let plane = NorthDataPlane::new(
+                Arc::new(FakeInner { n: 1 }),
+                &config,
+                Arc::clone(&shared),
+                live_tx,
+                test_health(),
+                AlarmStore::shared(),
+            );
+            plane.attach(Arc::clone(&runtime));
+
+            let samples = plane
+                .poll("dev-01", &["p1".to_string()])
+                .await
+                .expect("poll");
+            assert_eq!(samples.len(), 1, "capture unaffected by the rule stage");
+
+            let stats = plane.stats();
+            assert!(
+                stats.rules_evaluated >= 1,
+                "every emitted sample must be offered to the rule stage (when={when_value})"
+            );
+            assert_eq!(
+                stats.rules_routed, want_routed,
+                "WHERE mis-evaluation (when={when_value})"
+            );
+        }
+    }
+
+    // ---- QA（#18 BE-ALARM）：告警引擎接生产（[alarms] → 数据面求值 → 记录） ----
+
+    /// 带 `[alarms]` 的最小配置（`condition` 走前端在用的表达式写法）。
+    fn config_with_alarm(alarm_body: &str) -> GatewayConfig {
+        GatewayConfig::parse(&format!(
+            "[gateway]
+gateway_id = \"gw-dp\"
+
+             [[outlets]]
+name = \"north-1\"
+broker = \"mqtt://127.0.0.1:1883\"
+qos = 1
+             encoding = \"protobuf\"
+
+             [[points]]
+device_id = \"dev-01\"
+point_id = \"p1\"
+protocol = \"modbus-tcp\"
+             address = \"127.0.0.1:502\"
+frequency_ms = 100
+
+[alarms]
+enabled = true
+{}
+",
+            alarm_body
+        ))
+        .expect("parse config with alarms")
+    }
+
+    fn alarm_rule_body(condition: &str) -> String {
+        format!(
+            "[[alarms.rules]]
+id = \"a1\"
+name = \"超温告警\"
+enabled = true
+condition = \"{}\"
+",
+            condition
+        )
+    }
+
+    /// 启用的 `[alarms]` 必须真的建出引擎；`enabled = false` / 段缺省 → 空装配
+    /// （数据面整拍跳过告警阶段，不空跑求值）。
+    #[test]
+    fn enabled_alarms_build_the_engine_and_disabled_ones_do_not() {
+        let config = config_with_alarm(&alarm_rule_body("[p1] > 240"));
+        let shared = Arc::new(ConfigShared::new(config.clone()));
+        assert!(
+            NorthDataPlane::new(
+                Arc::new(FakeInner { n: 1 }),
+                &config,
+                Arc::clone(&shared),
+                broadcast::channel(8).0,
+                test_health(),
+                AlarmStore::shared(),
+            )
+            .has_alarms(),
+            "an enabled alarm rule must build the engine"
+        );
+
+        let mut disabled = config.clone();
+        disabled.alarms.as_mut().expect("section").enabled = false;
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &disabled,
+            Arc::new(ConfigShared::new(disabled.clone())),
+            broadcast::channel(8).0,
+            test_health(),
+            AlarmStore::shared(),
+        );
+        assert!(!plane.has_alarms(), "alarms disabled → alarm stage idle");
+    }
+
+    /// QA（#18 核心）：真实采样 → 引擎产生**真实告警记录** → `GET /api/alerts`
+    /// 读到的就是这份仓库。阈值不满足时是**空列表**，绝不凭空造一条。
+    #[tokio::test]
+    async fn real_samples_produce_real_alarm_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = start_runtime(dir.path());
+        // FakeInner 固定产出 12.5 → 阈值 `> 100` 不触发。
+        let config = config_with_alarm(&alarm_rule_body("[p1] > 100"));
+        let (live_tx, _live_rx) = broadcast::channel(8);
+        let store = AlarmStore::shared();
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::new(ConfigShared::new(config.clone())),
+            live_tx,
+            test_health(),
+            Arc::clone(&store),
+        );
+        plane.attach(Arc::clone(&runtime));
+        let samples = plane
+            .poll("dev-01", &["p1".to_string()])
+            .await
+            .expect("poll");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(store.len(), 0, "value 12.5 must not trip `> 100`");
+        assert_eq!(plane.stats().alarms_evaluated, 1);
+        assert_eq!(plane.stats().alarms_fired, 0);
+
+        // 阈值下调到 5 → 同一份样本必然触发（真实数据、真实记录）。
+        let mut next = config.clone();
+        next.alarms = Some(crate::config::AlarmsSection {
+            enabled: true,
+            rules: vec![crate::config::AlarmRuleConfig {
+                id: "a1".to_string(),
+                name: Some("超温告警".to_string()),
+                enabled: true,
+                condition: Some("[p1] > 5".to_string()),
+                ..Default::default()
+            }],
+        });
+        let shared = Arc::new(ConfigShared::new(next.clone()));
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &next,
+            Arc::clone(&shared),
+            broadcast::channel(8).0,
+            test_health(),
+            Arc::clone(&store),
+        );
+        plane.attach(Arc::clone(&runtime));
+        plane
+            .poll("dev-01", &["p1".to_string()])
+            .await
+            .expect("poll after the threshold change");
+
+        let rows = store.snapshot();
+        assert_eq!(rows.len(), 1, "one real record produced by the engine");
+        assert_eq!(rows[0].rule_id, "a1");
+        assert_eq!(rows[0].state, "open");
+        assert_eq!(rows[0].count, 1);
+        assert!(
+            rows[0].first_seen_at.len() == 13,
+            "毫秒 epoch 字符串（前端 formatEpochText 只认 10/13 位）"
+        );
+        assert_eq!(plane.stats().alarms_fired, 1);
+    }
+
+    /// QA（#18）：**北向运行期未挂载也要产出真实告警记录**——告警的出口是管理面
+    /// 列表而不是北向 topic，没有出口（或启动竞态窗口内）的网关照样要记告警。
+    #[tokio::test]
+    async fn alarm_records_are_produced_without_the_north_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 只建运行期句柄，**不** plane.attach（无出口 / 未就绪都走这条路径）。
+        let _runtime = start_runtime(dir.path());
+        let config = config_with_alarm(&alarm_rule_body("[p1] > 0"));
+        let (live_tx, _live_rx) = broadcast::channel(8);
+        let store = AlarmStore::shared();
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::new(ConfigShared::new(config.clone())),
+            live_tx,
+            test_health(),
+            Arc::clone(&store),
+        );
+        assert!(!plane.is_attached(), "north runtime is not mounted here");
+
+        let samples = plane
+            .poll("dev-01", &["p1".to_string()])
+            .await
+            .expect("poll");
+        assert_eq!(samples.len(), 1);
+
+        let rows = store.snapshot();
+        assert_eq!(
+            rows.len(),
+            1,
+            "alarm must be recorded without a north runtime"
+        );
+        assert_eq!(rows[0].state, "open");
+        assert_eq!(plane.stats().alarms_evaluated, 1);
+        assert_eq!(plane.stats().admitted, 0, "still nothing delivered north");
+    }
+
+    /// QA（#18）：配置版本变化 → 告警引擎热重建（页面改规则下一拍即生效）。
+    #[test]
+    fn alarm_engine_is_rebuilt_when_the_config_version_moves() {
+        let config = config_with_alarm(&alarm_rule_body("[p1] > 240"));
+        let shared = Arc::new(ConfigShared::new(config.clone()));
+        let plane = NorthDataPlane::new(
+            Arc::new(FakeInner { n: 1 }),
+            &config,
+            Arc::clone(&shared),
+            broadcast::channel(8).0,
+            test_health(),
+            AlarmStore::shared(),
+        );
+        assert!(plane.has_alarms());
+
+        let version = shared.replace(config_with("mqtt://127.0.0.1:1883", "protobuf"));
+        assert!(version > 1);
+        plane.sync_alarm_engine();
+        assert!(
+            !plane.has_alarms(),
+            "engine must be rebuilt after the version bump (no [alarms] in the new snapshot)"
+        );
     }
 }

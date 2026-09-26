@@ -572,8 +572,11 @@ fn host_anchor_root() -> PathBuf {
 
 /// Windows 锚点集（`PLATFORM_ANCHOR_PLANS` Windows 计划，5 锚点）：注册表 / WMI / 卷序列号。
 ///
-/// V1 限制：`wmic` 在 Win11 24H2 起缺省移除——对应锚点采集失败记 `None`，
-/// 由 quorum 与其余锚点兜底；WMI PowerShell 化留待平台差异任务。
+/// WMI 锚点采用 **wmic 优先 + PowerShell CIM 回退**：wmic 在 Win11 24H2 起缺省
+/// 移除（对应锚点整段采集失败、quorum 跌破下限、授权装配 fail-closed）。
+/// 回退命令的输出**整形为与 wmic 同形**（先输出字段名行再输出值行）——归一化
+/// 后与 wmic 时代逐字节一致，**老机器机器码 / 既有激活绑定零漂移**；wmic 仍
+/// 可用的机器走主路径，行为完全不变。参见 container-machine-binding.md §3。
 #[cfg(windows)]
 fn windows_command_anchors() -> Vec<Box<dyn AnchorProvider>> {
     vec![
@@ -587,20 +590,47 @@ fn windows_command_anchors() -> Vec<Box<dyn AnchorProvider>> {
                 "MachineGuid",
             ],
         )),
-        Box::new(CommandAnchor::new(
+        Box::new(CommandAnchor::with_fallback(
             "csproduct-uuid",
             "wmic",
             &["csproduct", "get", "UUID"],
+            (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "$u=(Get-CimInstance Win32_ComputerSystemProduct).UUID; \
+                     if($u){Write-Output 'UUID'; Write-Output $u}",
+                ],
+            ),
         )),
-        Box::new(CommandAnchor::new(
+        Box::new(CommandAnchor::with_fallback(
             "bios-serial",
             "wmic",
             &["bios", "get", "SerialNumber"],
+            (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "$s=(Get-CimInstance Win32_BIOS).SerialNumber; \
+                     if($s){Write-Output 'SerialNumber'; Write-Output $s}",
+                ],
+            ),
         )),
-        Box::new(CommandAnchor::new(
+        Box::new(CommandAnchor::with_fallback(
             "baseboard-serial",
             "wmic",
             &["baseboard", "get", "SerialNumber"],
+            (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "$s=(Get-CimInstance Win32_BaseBoard).SerialNumber; \
+                     if($s){Write-Output 'SerialNumber'; Write-Output $s}",
+                ],
+            ),
         )),
         Box::new(CommandAnchor::new(
             "volume-serial",
@@ -612,11 +642,15 @@ fn windows_command_anchors() -> Vec<Box<dyn AnchorProvider>> {
 
 /// 只读命令型锚点（Windows）：执行固定命令、归一 stdout 为锚点值；
 /// 命令失败 / 非零退出 / 空输出 → `None`（锚点不可用，不计入 quorum）。
+/// 配置 `fallback` 时：主命令不可用（程序缺失 / 失败 / 空输出）→ 执行回退
+/// 命令（如 wmic → PowerShell CIM），回退同样失败才返回 `None`。
 #[cfg(windows)]
 struct CommandAnchor {
     name: &'static str,
     program: &'static str,
     args: &'static [&'static str],
+    /// 回退命令（`None` = 无回退；见 `windows_command_anchors` 的 wmic 说明）。
+    fallback: Option<(&'static str, &'static [&'static str])>,
 }
 
 #[cfg(windows)]
@@ -626,6 +660,21 @@ impl CommandAnchor {
             name,
             program,
             args,
+            fallback: None,
+        }
+    }
+
+    fn with_fallback(
+        name: &'static str,
+        program: &'static str,
+        args: &'static [&'static str],
+        fallback: (&'static str, &'static [&'static str]),
+    ) -> Self {
+        Self {
+            name,
+            program,
+            args,
+            fallback: Some(fallback),
         }
     }
 }
@@ -637,25 +686,37 @@ impl AnchorProvider for CommandAnchor {
     }
 
     fn collect(&self) -> Option<String> {
-        let output = std::process::Command::new(self.program)
-            .args(self.args)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
+        let primary = run_anchor_command(self.program, self.args);
+        if primary.is_some() {
+            return primary;
         }
-        let text = String::from_utf8(output.stdout).ok()?;
-        // 归一（machine-fingerprint.md §2：trim / 大小写统一 / 分隔符统一）：
-        // 逐行 trim、去空行、统一小写后按行拼接——确定性且不回显到任何日志。
-        let mut lines: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        lines.sort_unstable();
-        let normalized = lines.join("\n").to_lowercase();
-        (!normalized.is_empty()).then_some(normalized)
+        let (program, args) = self.fallback?;
+        run_anchor_command(program, args)
     }
+}
+
+/// 执行单条锚点命令并归一 stdout（trim / 去空行 / 排序 / 小写——
+/// machine-fingerprint.md §2；失败 / 非零退出 / 空输出 → `None`）。
+#[cfg(windows)]
+fn run_anchor_command(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    // 归一（machine-fingerprint.md §2：trim / 大小写统一 / 分隔符统一）：
+    // 逐行 trim、去空行、统一小写后按行拼接——确定性且不回显到任何日志。
+    let mut lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.sort_unstable();
+    let normalized = lines.join("\n").to_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 // ---- 生产 HTTPS transport ----

@@ -38,15 +38,34 @@
 //   被拒动作入 ops 审计环；**读接口保持开放**（web-console 16 页契约不变）；
 // - **whoami**：`GET /api/auth/whoami` 返回 sub/role/exp（exp 字符串编码）。
 pub mod audit_api;
+// 账号与角色管理端点（GET/POST /api/roles + PUT/DELETE /api/roles/:id +
+// GET/POST /api/accounts + PUT/DELETE /api/accounts/:account + GET /api/permissions；
+// 账号与角色页契约，repo.ts 冻结形状；路由挂载由 router() 收口）。
+pub mod accounts_api;
 pub mod auth_jwt;
 pub mod auth_login;
+// 设备真实运行健康度注册表（需求 1 根因：设备状态三态由真实采集路径写入）。
+pub mod health;
+// 设备分组 / 默认分组（需求 4）。
+pub mod groups;
 // 页面级补齐（web-console real 模式页面契约：点表导入导出 / 配置回滚 /
 // 设备与出口连通性探测 / 规则告警诚实空态 / 授权状态快照）。
 pub mod pages;
+// 告警与告警规则端点（GET /api/alerts + GET/PUT /api/alerts/rules +
+// PUT/DELETE /api/alerts/rules/:id + POST /api/alerts/:id/ack；
+// web-console 告警中心页契约；路由挂载同样由 router() 收口）。
+pub mod alerts_api;
+// 转发规则 CRUD（GET/POST /api/rules + PUT/DELETE /api/rules/:id；
+// web-console 转发规则页契约；路由挂载由 router() 收口，见其注释）。
 pub mod rbac;
+pub mod rules_api;
 
 pub mod remote_ops;
+// 管理面 HTTP 测试脚手架（`#[cfg(test)]`，生产构建剔除；多个测试模块共用）。
+#[cfg(test)]
+pub mod test_support;
 // 设置页真实落盘（GET/PUT /api/settings + 备份清单；web-console 设置页联调缺口补齐）。
+pub mod ops_api;
 pub mod settings;
 pub mod writeapi;
 
@@ -64,7 +83,7 @@ use axum::http::{header, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::Router;
 use futures_core::Stream;
 use serde_json::{json, Value};
@@ -422,12 +441,24 @@ pub fn router(state: MgmtState) -> Router {
         .route("/api/devices", get(devices).post(writeapi::device_create))
         .route(
             "/api/devices/:id",
-            axum::routing::put(writeapi::device_update).delete(writeapi::device_delete),
+            get(device_detail)
+                .put(writeapi::device_update)
+                .delete(writeapi::device_delete),
         )
         .route("/api/points", get(points).post(writeapi::point_create))
         .route(
             "/api/points/:device_id/:point_id",
             axum::routing::put(writeapi::point_update).delete(writeapi::point_delete),
+        )
+        // 需求 4：设备分组（读开放；写自带 AuthedRole + ensure(DeviceWrite) + 审计，
+        // 与 writeapi 同范式）。默认分组永远存在、不可删除 / 改名。
+        .route(
+            "/api/groups",
+            get(groups::groups_list).post(groups::group_create),
+        )
+        .route(
+            "/api/groups/:id",
+            axum::routing::put(groups::group_update).delete(groups::group_delete),
         )
         .route("/api/outlets", get(outlets))
         // 页面级补齐（mgmt::pages）：点表导入导出 / 配置回滚 / 连通性探测 /
@@ -457,13 +488,71 @@ pub fn router(state: MgmtState) -> Router {
             "/api/forwarders/:id/test",
             axum::routing::post(pages::forwarder_test),
         )
-        .route("/api/rules", get(pages::rules_list))
-        .route("/api/alerts", get(pages::alerts_list))
+        // 转发规则 CRUD（#17 BE-RULES）：接管原无鉴权诚实空态的 `pages::rules_list`。
+        // 读须 `device.view`、写须 `device.write`——规则会驱动北向转发，属可
+        // 影响生产的配置，不过原来那个「谁都能读」的占位版本。
+        .route("/api/rules", get(rules_api::list).post(rules_api::create))
+        .route(
+            "/api/rules/:id",
+            axum::routing::put(rules_api::update).delete(rules_api::remove),
+        )
+        .route("/api/alerts", get(alerts_api::list))
+        // 账号与角色管理（D 项收口）：读挂 AccountView、写挂 AccountUpdate
+        // （401/403 由 rbac extractor 统一判）；账号 / 角色属敏感配置，
+        // 不开放匿名读（失败形状与 rbac 拒绝路径一致）。
+        .route(
+            "/api/roles",
+            get(accounts_api::roles_list).post(accounts_api::role_create),
+        )
+        .route(
+            "/api/roles/:id",
+            axum::routing::put(accounts_api::role_update).delete(accounts_api::role_remove),
+        )
+        .route(
+            "/api/accounts",
+            get(accounts_api::accounts_list).post(accounts_api::account_create),
+        )
+        .route(
+            "/api/accounts/:account",
+            axum::routing::put(accounts_api::account_update).delete(accounts_api::account_remove),
+        )
+        .route("/api/permissions", get(accounts_api::permissions_list))
+        // 运维端点四类（E 项收口）：诚实实现——未接升级源结构化返回原因。
+        // 自启读写在 Windows 下真实现（HKCU Run 键增删）。读挂 OpsLogsRead、
+        // 备份写挂 DeviceWrite、自启写挂 OpsCollectors（服务运行期控制）。
+        // （`GET /api/settings/backups` 在 :481 已挂，这里补 POST 手动备份动作。）
+        .route("/api/updates/check", get(ops_api::updates_check))
+        .route("/api/service/autostart", get(ops_api::service_autostart))
+        .route(
+            "/api/service/autostart",
+            put(ops_api::service_autostart_put),
+        )
+        .route(
+            "/api/settings/backups",
+            axum::routing::post(ops_api::create_backup),
+        )
+        .route("/api/diagnostics/selfcheck", get(ops_api::selfcheck))
         .route(
             "/api/alerts/rules",
-            axum::routing::put(pages::alerts_rules_put),
+            axum::routing::get(alerts_api::rules_list).put(alerts_api::rules_put),
         )
+        .route(
+            "/api/alerts/rules/:id",
+            axum::routing::put(alerts_api::rule_update).delete(alerts_api::rule_remove),
+        )
+        .route("/api/alerts/:id/ack", axum::routing::post(alerts_api::ack))
         .route("/api/license/status", get(pages::license_status))
+        // 授权激活（B-1 收口）：`device.write`（仅 system）——激活改变整机授权态
+        //（含北向转发解锁），与配置写同档高危。
+        .route(
+            "/api/license/activate",
+            axum::routing::post(pages::license_activate),
+        )
+        // 备份策略（B-2 收口）：读开放（与 /api/settings 同口径）、写 device.write。
+        .route(
+            "/api/settings/backup-policy",
+            get(ops_api::backup_policy_get).put(ops_api::backup_policy_put),
+        )
         // mock 契约「审计日志 ↔ GET /api/logs」：复用 remote_ops::logs handler
         //（handler 自带 AuthedRole + ensure(ops.logs_read) 二次校验，自守卫）。
         .route("/api/logs", get(remote_ops::logs))
@@ -472,6 +561,18 @@ pub fn router(state: MgmtState) -> Router {
         .route("/api/stream", get(stream))
         .route("/api/auth/login", axum::routing::post(auth_login::login))
         .route("/api/auth/whoami", get(auth_login::whoami))
+        // task 27：首次初始化（免认证）。`/api/auth/state` 只读、无副作用；
+        // `/api/auth/bootstrap` 仅在「一个账号都没有」时允许，已有账号恒 409
+        // fail-closed，且**必须**落审计。**本组两条一律不加 AuthedRole 守卫**——
+        // 未初始化时系统里根本没有可用账号，加门控等于让初始化入口永远不可达。
+        .route(
+            "/api/auth/state",
+            axum::routing::get(auth_login::auth_state),
+        )
+        .route(
+            "/api/auth/bootstrap",
+            axum::routing::post(auth_login::bootstrap),
+        )
         // task 26：安全审计远程拉取（只读；handler 自带 AuthedRole extractor +
         // ensure 门控——list=audit.view(risk/system)，export=audit.export(仅 system)）。
         .route("/api/audit", get(audit_api::list))
@@ -573,25 +674,40 @@ async fn status(State(state): State<MgmtState>) -> Response {
     .into_response()
 }
 
-/// GET /api/devices → 设备摘要数组（id/name/protocol/enabled/poll_interval_ms 字符串）。
+/// GET /api/devices → 设备摘要数组（含**真实**运行健康度，需求 1 根因修复）。
 ///
 /// 设备列表 = 点位平铺行去重推导（保首次出现顺序）∪ `[[devices]]` 登记段
 /// （仅无点位设备追加，保持登记顺序）；`poll_interval_ms` 取该设备最小采集
 /// 频率（与 bootstrap `build_groups` 口径一致，无点位设备为 `"0"`）；
 /// `name` / `enabled` 优先取登记段覆盖，`protocol` 优先按点位行推导。
-/// **响应形状不变**：旧配置（无登记段）输出与既有口径逐字节一致。
+///
+/// 运行健康度字段（由真实采集路径写入 [`health::DeviceHealthRegistry`]）：
+/// - `status`：`online` | `offline` | `error`（判定语义见 `health` 模块契约）；
+/// - `last_sample_at`：最近成功采集的 UTC 毫秒时间戳（**字符串**；未采过 = `""`）；
+/// - `success_rate`：成功率 **number**（0—100，1 位小数）；
+/// - `fail_streak`：连续失败次数 number；
+/// - `point_count`：点位行数（**字符串**）；
+/// - `group_id`：所属分组（缺省 = `default` 默认分组）。
+///
+/// 旧字段形状不变（新增字段为纯增量）。
 async fn devices(State(state): State<MgmtState>) -> Json<Value> {
     let config = state.config();
+    let registry = state.daemon().health_registry();
+    let now = health::now_ms();
     let mut order: Vec<String> = Vec::new();
-    let mut agg: HashMap<String, (String, u64)> = HashMap::new();
+    // device_id -> (protocol, min_freq_ms, point_count)
+    let mut agg: HashMap<String, (String, u64, u64)> = HashMap::new();
     for point in &config.points {
         match agg.get_mut(&point.device_id) {
-            Some(entry) => entry.1 = entry.1.min(point.frequency_ms.max(1)),
+            Some(entry) => {
+                entry.1 = entry.1.min(point.frequency_ms.max(1));
+                entry.2 = entry.2.saturating_add(1);
+            }
             None => {
                 order.push(point.device_id.clone());
                 agg.insert(
                     point.device_id.clone(),
-                    (point.protocol.clone(), point.frequency_ms.max(1)),
+                    (point.protocol.clone(), point.frequency_ms.max(1), 1),
                 );
             }
         }
@@ -609,19 +725,39 @@ async fn devices(State(state): State<MgmtState>) -> Json<Value> {
             // 协议：点位行推导优先，回退登记段默认协议，再回退空串。
             let protocol = agg
                 .get(device_id)
-                .map(|(p, _)| p.clone())
+                .map(|(p, _, _)| p.clone())
                 .or_else(|| entry.and_then(|d| d.protocol.clone()));
             let name = entry
                 .and_then(|d| d.name.clone())
                 .unwrap_or_else(|| device_id.clone());
             let enabled = entry.map(|d| d.enabled).unwrap_or(true);
-            let freq_ms = agg.get(device_id).map(|(_, f)| *f).unwrap_or(0);
+            let (freq_ms, point_count) = agg
+                .get(device_id)
+                .map(|(_, f, c)| (*f, *c))
+                .unwrap_or((0, 0));
+            // 真实健康度（不伪造：注册表缺失 = 从未采过 → offline）。
+            let snapshot = registry.snapshot(device_id);
+            let status = health::status_for(snapshot.as_ref(), freq_ms, now);
+            let last_sample_at = snapshot
+                .and_then(|h| h.last_success_ms)
+                .map(|ms| ms.to_string())
+                .unwrap_or_default();
+            let group_id = entry
+                .and_then(|d| d.group_id.clone())
+                .filter(|g| !g.trim().is_empty())
+                .unwrap_or_else(|| crate::config::DEFAULT_GROUP_ID.to_string());
             json!({
                 "id": device_id,
                 "name": name,
                 "protocol": protocol,
                 "enabled": enabled,
                 "poll_interval_ms": freq_ms.to_string(),
+                "status": status.as_str(),
+                "last_sample_at": last_sample_at,
+                "success_rate": health::success_rate(snapshot.as_ref()),
+                "fail_streak": snapshot.map_or(0, |h| h.consecutive_failures),
+                "point_count": point_count.to_string(),
+                "group_id": group_id,
             })
         })
         .collect();
@@ -629,27 +765,113 @@ async fn devices(State(state): State<MgmtState>) -> Json<Value> {
 }
 
 /// GET /api/points?device_id=xxx → 该设备点位列表（没有则空数组）。
+///
+/// 不带 `device_id` → **全量点位**（C-1 单一数据源收敛：与 `/api/overview` 的
+/// `pointCount` / `/api/devices` 的 `point_count` 同读 `config.points`，三个数字
+/// 天然一致；不做静默空数组兜底）。
 async fn points(
     State(state): State<MgmtState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<Value> {
-    let device_id = params.get("device_id").map(String::as_str).unwrap_or("");
+    let device_id = params.get("device_id").map(String::as_str);
     let rows: Vec<Value> = state
         .config()
         .points
         .iter()
-        .filter(|point| point.device_id == device_id)
-        .map(|point| {
-            json!({
-                "device_id": point.device_id,
-                "point_id": point.point_id,
-                "protocol": point.protocol,
-                "address": point.address,
-                "frequency_ms": point.frequency_ms.to_string(),
-            })
-        })
+        .filter(|point| device_id.is_none_or(|id| point.device_id == id))
+        .map(point_row)
         .collect();
     Json(Value::Array(rows))
+}
+
+/// 点位行 wire 映射（`GET /api/points` 与 `GET /api/devices/:id` 的 points
+/// 归属列表共用同一形状，C-1/C-2）。
+fn point_row(point: &crate::config::PointConfig) -> Value {
+    json!({
+        "device_id": point.device_id,
+        "point_id": point.point_id,
+        "protocol": point.protocol,
+        "address": point.address,
+        "endpoint": point.endpoint,
+        // 大数红线：frequency_ms 为计数，字符串编码。
+        "frequency_ms": point.frequency_ms.to_string(),
+        // 需求 6：推送开关（缺省 true）。
+        "push_enabled": point.push_enabled,
+        // 需求 2：点位元数据（蛇形字段名；未声明为 null）。
+        "name": point.name,
+        "data_type": point.data_type,
+        "byte_order": point.byte_order,
+        "unit": point.unit,
+        // deadband 为工程量阈值：JSON **number**（非大整数，不字符串化）。
+        "deadband": point.deadband,
+        "target_key": point.target_key,
+        "point_type": point.point_type,
+        "formula": point.formula,
+    })
+}
+
+/// GET /api/devices/:id → 单设备详情（C-2：行字段与 `GET /api/devices` 同一映射，
+/// 另附 `points` 归属列表——同一数据源 `config.points`）。
+///
+/// 未登记且无点位的 id → 404（诚实 404，不返回空壳对象）。
+async fn device_detail(State(state): State<MgmtState>, AxumPath(id): AxumPath<String>) -> Response {
+    let config = state.config();
+    let registry = state.daemon().health_registry();
+    let now = health::now_ms();
+    let owned_points: Vec<&crate::config::PointConfig> = config
+        .points
+        .iter()
+        .filter(|point| point.device_id == id)
+        .collect();
+    let entry = config.devices.iter().find(|d| d.device_id == id);
+    if entry.is_none() && owned_points.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("device {id:?} not found")})),
+        )
+            .into_response();
+    }
+    // 与 devices() 行构造同口径（单设备版）。
+    let protocol = owned_points
+        .first()
+        .map(|p| p.protocol.clone())
+        .or_else(|| entry.and_then(|d| d.protocol.clone()));
+    let name = entry
+        .and_then(|d| d.name.clone())
+        .unwrap_or_else(|| id.clone());
+    let enabled = entry.map(|d| d.enabled).unwrap_or(true);
+    let freq_ms = owned_points
+        .iter()
+        .map(|p| p.frequency_ms.max(1))
+        .min()
+        .unwrap_or(0);
+    let point_count = owned_points.len();
+    let snapshot = registry.snapshot(&id);
+    let status = health::status_for(snapshot.as_ref(), freq_ms, now);
+    let last_sample_at = snapshot
+        .as_ref()
+        .and_then(|h| h.last_success_ms)
+        .map(|ms| ms.to_string())
+        .unwrap_or_default();
+    let group_id = entry
+        .and_then(|d| d.group_id.clone())
+        .filter(|g| !g.trim().is_empty())
+        .unwrap_or_else(|| crate::config::DEFAULT_GROUP_ID.to_string());
+    Json(json!({
+        "id": id,
+        "name": name,
+        "protocol": protocol,
+        "enabled": enabled,
+        "poll_interval_ms": freq_ms.to_string(),
+        "status": status.as_str(),
+        "last_sample_at": last_sample_at,
+        "success_rate": health::success_rate(snapshot.as_ref()),
+        "fail_streak": snapshot.map_or(0, |h| h.consecutive_failures),
+        "point_count": point_count.to_string(),
+        "group_id": group_id,
+        "points": owned_points.iter().map(|p| point_row(p)).collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 /// GET /api/outlets → 北向出口列表（`target` 用对外标识 = broker 地址）。
@@ -685,24 +907,55 @@ async fn outlets(State(state): State<MgmtState>) -> Json<Value> {
 /// GET /api/overview → 网关信息 + 配置聚合 + 最近状态快照（对齐前端 GatewayInfo）。
 ///
 /// 字段名采用前端 `GatewayInfo` 的 camelCase 契约；大数（纳秒 / 计数 / 字节）一律
-/// 字符串编码（JSON 大数红线）。daemon 未实时聚合的字段（`onlineCount` / 速率 /
-/// 队列水位）给出「最佳估计」并标注——待后续接入真实设备在线探测 / 采样窗口后收敛。
+/// 字符串编码（JSON 大数红线）。
+///
+/// `deviceCount` / `pointCount` / `onlineCount` / `failedPointCount` 均为**真实统计**
+/// （设备数 = 配置去重设备；点位数 = 配置点位行数；在线数 / 异常点数由采集路径写入的
+/// 健康度三态判定得出，见 [`health`]）；速率 / 队列水位留待接入采样窗口后收敛。
 ///
 /// 读接口保持开放（与 `/api/status` 同口径；task 52 实时通道鉴权只在 `/api/stream`）。
 async fn overview(State(state): State<MgmtState>) -> Response {
     let daemon = state.daemon();
     let config = state.config();
     let uptime_secs = daemon.uptime_secs();
-    let device_count = config
-        .points
-        .iter()
-        .map(|p| p.device_id.as_str())
-        .collect::<HashSet<_>>()
-        .len();
+    // deviceCount = 登记设备行数（与 `GET /api/devices` 行数同源：点位聚合 ∪
+    // 登记段，team-lead 裁决对齐口径——用户抱怨「总览数字 vs 列表页行数对不上」）。
+    let device_count = {
+        let mut ids: HashSet<&str> = config.points.iter().map(|p| p.device_id.as_str()).collect();
+        for device in &config.devices {
+            ids.insert(device.device_id.as_str());
+        }
+        ids.len()
+    };
     let point_count = config.points.len();
-    let running = daemon.state() == LifecycleState::Running;
-    // 最佳估计：运行态下配置的设备视为在线；非运行态记为 0。
-    let online_count = if running { device_count } else { 0 };
+    // 真实在线设备数（需求 1）：由采集路径写入的健康度 + 三态判定得出，**不伪造**。
+    // 每设备最小采集周期（与 `/api/devices` / bootstrap 同口径；无点位 = 0）。
+    let registry = daemon.health_registry();
+    let now_ms = health::now_ms();
+    let mut min_freq: HashMap<&str, u64> = HashMap::new();
+    for point in &config.points {
+        let entry = min_freq.entry(point.device_id.as_str()).or_insert(u64::MAX);
+        *entry = (*entry).min(point.frequency_ms.max(1));
+    }
+    let mut online_count = 0u64;
+    let mut failed_point_count = 0u64;
+    for (device_id, freq) in &min_freq {
+        let snapshot = registry.snapshot(device_id);
+        match health::status_for(snapshot.as_ref(), *freq, now_ms) {
+            health::DeviceStatus::Online => online_count = online_count.saturating_add(1),
+            health::DeviceStatus::Error => {
+                // 该设备下全部点位计入「异常点位」。
+                failed_point_count = failed_point_count.saturating_add(
+                    config
+                        .points
+                        .iter()
+                        .filter(|p| p.device_id == *device_id)
+                        .count() as u64,
+                );
+            }
+            health::DeviceStatus::Offline => {}
+        }
+    }
     let total_forwarded = daemon
         .north_runtime()
         .map_or(0u64, |rt| rt.stats().admitted);
@@ -712,9 +965,50 @@ async fn overview(State(state): State<MgmtState>) -> Response {
         .unwrap_or(0);
     let started_at = now_epoch.saturating_sub(uptime_secs);
     let hostname = hostname_or_unknown();
+    // 机器码（B 项）：授权运行期装配出的机器码指纹（HMAC-SHA256，64 hex，来自
+    // `MachineIdentity::get_machine_fingerprint`，经 LicensingClient 注入共享）。
+    // 授权未配置 / 装配失败 → 确定性占位（SHA-256 派生自 gateway_id，同机恒同值），
+    // 并以 `machineCodeSource` 说明来源；**严禁回退 hostname**（hostname 仅保留在其
+    // 自身字段）。
+    let (machine_code, machine_code_source) = match daemon
+        .license_runtime()
+        .map(|rt| rt.config().client.machine_code().to_string())
+    {
+        Some(code) => (code, "license-fingerprint"),
+        None => (
+            placeholder_machine_code(&config.gateway.gateway_id),
+            "placeholder-unlicensed",
+        ),
+    };
+    // 样本速率（C-4）：调度器各组**累计成功采集样本数** ÷ 运行秒数（启动以来平均）。
+    // 无调度器 / uptime 为 0 → 诚实 "0"；来源经 `sampleRateSource` 字段说明。
+    // 读锁临界区内完成求和（不跨 await）。
+    let (total_samples, has_scheduler) = {
+        let scheduler = daemon.scheduler();
+        let total: u64 = scheduler
+            .as_ref()
+            .map(|s| {
+                s.group_names()
+                    .iter()
+                    .filter_map(|name| s.stats(name))
+                    .map(|stats| stats.samples())
+                    .sum()
+            })
+            .unwrap_or(0);
+        (total, scheduler.is_some())
+    };
+    // 启动以来平均速率，保留 1 位小数（整数除法会把 <1 样本/秒 的低频采集截成
+    // "0"，失去诚实性；此处是统计展示量，非大数红线范畴）。uptime == 0（进程刚起）
+    // → 诚实 "0.0"。
+    let sample_rate = if uptime_secs > 0 {
+        format!("{:.1}", total_samples as f64 / uptime_secs as f64)
+    } else {
+        "0.0".to_string()
+    };
     Json(json!({
         "name": config.gateway.gateway_id,
-        "machineCode": hostname,
+        "machineCode": machine_code,
+        "machineCodeSource": machine_code_source,
         "deployMode": "edge",
         "version": env!("CARGO_PKG_VERSION"),
         "hostname": hostname,
@@ -725,8 +1019,13 @@ async fn overview(State(state): State<MgmtState>) -> Response {
         "deviceCount": device_count.to_string(),
         "onlineCount": online_count.to_string(),
         "pointCount": point_count.to_string(),
-        "failedPointCount": "0",
-        "sampleRatePerSec": "0",
+        "failedPointCount": failed_point_count.to_string(),
+        "sampleRatePerSec": sample_rate,
+        "sampleRateSource": if has_scheduler {
+            "scheduler-samples-avg-since-start"
+        } else {
+            "unavailable-no-scheduler"
+        },
         "forwardRatePerSec": "0",
         "queueUsedGb": "0",
         "queueCapacityGb": "0",
@@ -734,6 +1033,16 @@ async fn overview(State(state): State<MgmtState>) -> Response {
         "totalForwardedRecords": total_forwarded.to_string(),
     }))
     .into_response()
+}
+
+/// 机器码确定性占位（B 项；授权未配置 / 装配失败时使用）：
+/// `SHA-256("iotdaq.machine-code.placeholder:" ++ gateway_id)` hex。
+/// 同 gateway 恒同值（确定性），且与真实指纹（HMAC 域）形状一致但语义可辨
+/// ——前端凭 `machineCodeSource != "license-fingerprint"` 判定「非真实机器码」。
+fn placeholder_machine_code(gateway_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("iotdaq.machine-code.placeholder:{gateway_id}").as_bytes());
+    hex::encode(digest)
 }
 
 /// 把秒数格式化为人类可读 uptime 文本（`Xd Yh Zm` / `Xh Ym Zs` / …）。
@@ -1231,7 +1540,8 @@ frequency_ms = 500
         let now = crate::mgmt::auth_jwt::now_unix_secs();
         let claims = crate::mgmt::auth_jwt::Claims {
             sub: "ops-admin".to_string(),
-            role: crate::mgmt::rbac::Role::System,
+            role: crate::mgmt::rbac::Role::System.as_str().to_string(),
+            perms: None,
             exp: now + 600,
             iat: now,
             nbf: None,
@@ -1665,6 +1975,226 @@ frequency_ms = 500
             },
             "oldest evicted first"
         );
+    }
+
+    // ---- 需求 1 / 4：设备真实状态 + 分组端点 ----
+
+    /// 手写 HTTP 写请求（JSON body + Bearer；5s 超时防挂死）。
+    async fn http_write_json(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: &Value,
+        token: &str,
+    ) -> (u16, String, String) {
+        let payload = body.to_string();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            stream.write_all(request.as_bytes()).await.expect("write");
+            stream.flush().await.expect("flush");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read");
+            parse_response(&String::from_utf8(buf).expect("utf8"))
+        })
+        .await
+        .expect("http write timed out")
+    }
+
+    /// QA（需求 1）：`/api/devices` 行携带**真实**健康度字段——从未采过 = offline、
+    /// 空 `last_sample_at`、success_rate 0（number）、fail_streak 0、point_count 字符串；
+    /// 注入一次成功轮询后转 online 且时间戳为毫秒字符串。
+    #[tokio::test]
+    async fn devices_rows_report_real_health_fields() {
+        let state = test_state();
+        let port = spawn_server(state.clone()).await;
+
+        let (status, _, body) = http_get(port, "/api/devices").await;
+        assert_eq!(status, 200);
+        let devices: Vec<Value> = serde_json::from_str(&body).expect("array");
+        assert_eq!(devices.len(), 1);
+        let row = &devices[0];
+        assert_eq!(row["status"], "offline", "never sampled → offline");
+        assert_eq!(row["last_sample_at"], "", "never sampled → empty timestamp");
+        assert!(
+            row["success_rate"].is_number(),
+            "success_rate must be a JSON number, got: {}",
+            row["success_rate"]
+        );
+        assert_eq!(row["success_rate"], 0.0);
+        assert!(row["fail_streak"].is_number());
+        assert_eq!(row["fail_streak"], 0);
+        assert_eq!(row["point_count"], "2", "point_count is a string");
+        assert_eq!(row["group_id"], "default", "group_id defaults to `default`");
+
+        // 注入一次「刚刚成功」：设备转 online、last_sample_at 为毫秒字符串。
+        let now = health::now_ms();
+        state
+            .daemon()
+            .health_registry()
+            .record_success("dev-01", now);
+        let (_, _, body) = http_get(port, "/api/devices").await;
+        let devices: Vec<Value> = serde_json::from_str(&body).expect("array");
+        assert_eq!(devices[0]["status"], "online", "fresh success → online");
+        assert_eq!(
+            devices[0]["last_sample_at"],
+            now.to_string(),
+            "last_sample_at must be the ms timestamp string"
+        );
+        assert_eq!(devices[0]["success_rate"], 100.0);
+    }
+
+    /// QA（需求 1）：`/api/overview` 的在线设备数 / 点位总数为真实统计。
+    #[tokio::test]
+    async fn overview_uses_real_online_and_point_counts() {
+        let state = test_state();
+        let port = spawn_server(state.clone()).await;
+
+        let (_, _, body) = http_get(port, "/api/overview").await;
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["pointCount"], "2", "real point total");
+        assert_eq!(value["onlineCount"], "0", "no samples → not online");
+
+        state
+            .daemon()
+            .health_registry()
+            .record_success("dev-01", health::now_ms());
+        let (_, _, body) = http_get(port, "/api/overview").await;
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["onlineCount"], "1", "fresh success → one online");
+    }
+
+    /// QA（需求 4）：`GET /api/groups` 必含默认分组；默认分组不可改名 / 不可删除
+    /// （400 + 可解释原因）。
+    #[tokio::test]
+    async fn groups_endpoint_exposes_default_and_guards_it() {
+        let state = test_state();
+        let token = bearer_token_52(&state);
+        let port = spawn_server(state).await;
+
+        let (status, _, body) = http_get(port, "/api/groups").await;
+        assert_eq!(status, 200);
+        let groups: Vec<Value> = serde_json::from_str(&body).expect("array");
+        assert_eq!(groups.len(), 1, "default group only: {body}");
+        assert_eq!(groups[0]["id"], "default");
+        assert_eq!(groups[0]["name"], "默认分组");
+        assert_eq!(groups[0]["is_default"], true);
+        assert_eq!(groups[0]["device_count"], "1", "one device counted");
+
+        // 默认分组不可改名。
+        let (status, _, body) = http_write_json(
+            port,
+            "PUT",
+            "/api/groups/default",
+            &json!({"name": "改个名"}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "default group rename must be refused: {body}");
+        assert!(body.contains("cannot be renamed"), "{body}");
+
+        // 默认分组不可删除（即便 confirm=true）。
+        let (status, _, body) = http_write_json(
+            port,
+            "DELETE",
+            "/api/groups/default",
+            &json!({"confirm": true}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "default group delete must be refused: {body}");
+        assert!(body.contains("cannot be deleted"), "{body}");
+    }
+
+    /// QA（需求 4）：建组 → 设备迁入 → 删除分组 → 设备**回落默认分组**，配置落盘。
+    #[tokio::test]
+    async fn group_delete_rehomes_devices_to_default_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, TEST_TOML).expect("seed");
+        let config = Arc::new(GatewayConfig::parse(TEST_TOML).expect("parse"));
+        let daemon = DaemonShared::new();
+        daemon.set_config(Arc::new(crate::config::ConfigShared::new(
+            (*config).clone(),
+        )));
+        let state = MgmtState::new(daemon, config).with_config_path(&path);
+        let token = bearer_token_52(&state);
+        let port = spawn_server(state.clone()).await;
+
+        // 建组。
+        let (status, _, body) = http_write_json(
+            port,
+            "POST",
+            "/api/groups",
+            &json!({"id": "line-a", "name": "A 线"}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "group create: {body}");
+        assert!(
+            serde_json::from_str::<Value>(&body).expect("json")["config_version"].is_string(),
+            "config_version must be string-encoded (大数红线)"
+        );
+
+        // 设备迁入分组。
+        let (status, _, body) = http_write_json(
+            port,
+            "PUT",
+            "/api/devices/dev-01",
+            &json!({"group_id": "line-a"}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "device group assignment: {body}");
+        let (_, _, body) = http_get(port, "/api/groups").await;
+        let groups: Vec<Value> = serde_json::from_str(&body).expect("array");
+        let line_a = groups
+            .iter()
+            .find(|g| g["id"] == "line-a")
+            .expect("line-a present");
+        assert_eq!(line_a["device_count"], "1", "device counted in the group");
+
+        // 删除分组 → 设备回落默认分组。
+        let (status, _, body) = http_write_json(
+            port,
+            "DELETE",
+            "/api/groups/line-a",
+            &json!({"confirm": true}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "group delete: {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["id"],
+            "default",
+            "delete response reports the default group view"
+        );
+
+        let (_, _, body) = http_get(port, "/api/devices").await;
+        let devices: Vec<Value> = serde_json::from_str(&body).expect("array");
+        assert_eq!(
+            devices[0]["group_id"], "default",
+            "device must fall back to the default group"
+        );
+
+        // 落盘确认：分组已移除、设备登记行 group_id 清空。
+        let saved = GatewayConfig::load(&path).expect("reload saved config");
+        assert!(
+            saved.device_groups.iter().all(|g| g.id != "line-a"),
+            "deleted group must not be persisted"
+        );
+        let entry = saved
+            .devices
+            .iter()
+            .find(|d| d.device_id == "dev-01")
+            .expect("device registration persisted");
+        assert!(entry.group_id.is_none(), "group_id cleared on delete");
     }
 
     /// QA: 相对路径安全校验——普通/当前目录分量放行，其余（..、绝对、盘符）拒绝。

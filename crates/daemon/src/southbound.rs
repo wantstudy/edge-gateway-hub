@@ -28,12 +28,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use protocol_proto::Quality;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::codec::{DecodeSpec, ValueDecoder};
 use crate::config::GatewayConfig;
@@ -63,15 +63,72 @@ struct DevicePlan {
     point_ids: Vec<String>,
 }
 
+/// 从配置点位表推导设备计划表（一组一设备；点位按首次出现顺序去重）。
+///
+/// 设备级协议 / 接入地址取该设备**首个**点位行。纯内存推导、不失败——协议 /
+/// 地址非法性延迟到 `poll` 时按组显式报错（错误隔离，不阻断启动）。
+/// 启动期 [`DevicePollHandler::from_config`] 与热重载
+/// [`DevicePollHandler::refresh_devices`] 共用这一份推导，避免两条路径口径漂移。
+fn derive_plans(config: &GatewayConfig) -> HashMap<String, DevicePlan> {
+    // 设备级端点（让端点有唯一归属）：`device_id -> 设备登记段声明的 endpoint`。
+    let device_endpoint: HashMap<&str, Option<&str>> = config
+        .devices
+        .iter()
+        .map(|d| (d.device_id.as_str(), d.endpoint.as_deref()))
+        .collect();
+    let mut devices: HashMap<String, DevicePlan> = HashMap::new();
+    for point in &config.points {
+        // 端点归属链：点位级 `endpoint` → 设备级 `endpoint` → 点位 `address`（事实源）。
+        let dev_ep = device_endpoint
+            .get(point.device_id.as_str())
+            .copied()
+            .flatten();
+        let ep = point
+            .endpoint
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(dev_ep)
+            .unwrap_or(point.address.as_str());
+        let plan = devices
+            .entry(point.device_id.clone())
+            .or_insert_with(|| DevicePlan {
+                protocol: point.protocol.clone(),
+                address: ep.to_string(),
+                point_ids: Vec::new(),
+            });
+        if !plan.point_ids.contains(&point.point_id) {
+            plan.point_ids.push(point.point_id.clone());
+        }
+    }
+    devices
+}
+
 /// 生产轮询动作：把调度器的组轮询翻译为南向驱动批量读（一组一设备一连接）。
 ///
 /// 由 bin 装配入口构造并经 `BootstrapBuilder::with_poll_handler` 注入；多组共享
 /// 本实例（内部 `Arc` 连接表），组间互不阻塞（每设备独立互斥锁）。
 pub struct DevicePollHandler {
     /// 设备轮询计划（`device_id -> DevicePlan`；组名 = `device_id`）。
-    devices: HashMap<String, DevicePlan>,
+    ///
+    /// 内部上锁而非构造期定死：配置热重载必须能整体换掉这张表，否则重载后
+    /// 调度器认得新起的组、本表不认，新组每拍都 `unknown device group`。
+    /// 锁内数据只在 `poll` 开头短持一次并拷出使用，**不跨 `await`**。
+    devices: StdRwLock<HashMap<String, DevicePlan>>,
     /// 设备驱动连接表（惰性建连；`poll` 期间按设备锁串行，组间并行）。
-    conns: tokio::sync::Mutex<HashMap<String, DeviceConn>>,
+    conns: tokio::sync::Mutex<HashMap<String, DeviceEndpoint>>,
+}
+
+/// 一条设备连接的登记信息：连接本体 + 建连时的接入快照。
+///
+/// 记下快照是为了热重载时能判断**既有连接是否已失效**：接入地址 / 协议变了就
+/// 必须丢掉旧连接，否则下一拍会继续读旧端点（改造期静默读到错设备的数据）。
+struct DeviceEndpoint {
+    /// 建连时的协议（与 [`DevicePlan::protocol`] 同口径）。
+    protocol: String,
+    /// 建连时的接入地址（与 [`DevicePlan::address`] 同口径）。
+    address: String,
+    /// 驱动连接本体（按设备互斥，组内串行）。
+    conn: DeviceConn,
 }
 
 impl DevicePollHandler {
@@ -81,23 +138,8 @@ impl DevicePollHandler {
     /// 地址非法性延迟到 `poll` 时按组显式报错（错误隔离，不阻断启动）。
     #[must_use]
     pub fn from_config(config: &GatewayConfig) -> Self {
-        let mut order: Vec<String> = Vec::new();
-        let mut devices: HashMap<String, DevicePlan> = HashMap::new();
-        for point in &config.points {
-            let plan = devices.entry(point.device_id.clone()).or_insert_with(|| {
-                order.push(point.device_id.clone());
-                DevicePlan {
-                    protocol: point.protocol.clone(),
-                    address: point.address.clone(),
-                    point_ids: Vec::new(),
-                }
-            });
-            if !plan.point_ids.contains(&point.point_id) {
-                plan.point_ids.push(point.point_id.clone());
-            }
-        }
         Self {
-            devices,
+            devices: StdRwLock::new(derive_plans(config)),
             conns: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -105,7 +147,10 @@ impl DevicePollHandler {
     /// 配置是否声明了任何点位（bin 装配判据：无点位不注入 handler，避免噪音告警）。
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.devices.is_empty()
+        self.devices
+            .read()
+            .map(|plans| plans.is_empty())
+            .unwrap_or(true)
     }
 
     /// V1 支持的南向协议 → Modbus 帧格式（大小写不敏感；未知协议 `None`）。
@@ -145,8 +190,8 @@ impl DevicePollHandler {
     /// 取该组设备连接；缺席则按计划建连并登记（惰性，首拍或断线卸载后触发）。
     async fn get_or_connect(&self, group: &str, plan: &DevicePlan) -> DaemonResult<DeviceConn> {
         let mut conns = self.conns.lock().await;
-        if let Some(conn) = conns.get(group) {
-            return Ok(Arc::clone(conn));
+        if let Some(endpoint) = conns.get(group) {
+            return Ok(Arc::clone(&endpoint.conn));
         }
         let framing = Self::framing_for(&plan.protocol).ok_or_else(|| {
             DaemonError::ConfigError(format!(
@@ -165,23 +210,83 @@ impl DevicePollHandler {
         });
         driver.connect().await?;
         let conn: DeviceConn = Arc::new(tokio::sync::Mutex::new(Box::new(driver)));
-        conns.insert(group.to_string(), Arc::clone(&conn));
+        conns.insert(
+            group.to_string(),
+            DeviceEndpoint {
+                protocol: plan.protocol.clone(),
+                address: plan.address.clone(),
+                conn: Arc::clone(&conn),
+            },
+        );
         Ok(conn)
     }
 }
 
 #[async_trait]
 impl PollHandler for DevicePollHandler {
+    async fn refresh_devices(&self, config: &GatewayConfig) {
+        // 计划表：整体换成新配置推导结果（只有这张表持有「哪些设备 / 哪些点位」的
+        // 派生状态，重载不换它，新组就会一直 `unknown device group`）。
+        let plans = derive_plans(config);
+        match self.devices.write() {
+            Ok(mut guard) => *guard = plans.clone(),
+            Err(poisoned) => *poisoned.into_inner() = plans.clone(),
+        }
+
+        // 连接表：摘掉僵尸与失效连接，保留既有连接（见 `refresh_devices` 契约）。
+        let mut conns = self.conns.lock().await;
+        let dropped: Vec<String> = conns
+            .iter()
+            .filter(|(device_id, endpoint)| match plans.get(*device_id) {
+                // 设备没了 → 僵尸连接；地址 / 协议变了 → 旧连接指向旧端点，按新端点重连。
+                Some(plan) => {
+                    plan.protocol != endpoint.protocol || plan.address != endpoint.address
+                }
+                None => true,
+            })
+            .map(|(device_id, _)| device_id.clone())
+            .collect();
+        for device_id in dropped {
+            conns.remove(&device_id);
+            info!(
+                device_id = %device_id,
+                "southbound: device connection dropped (device removed or re-addressed by reload)"
+            );
+        }
+    }
+
     async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>> {
-        let plan = self.devices.get(group).ok_or_else(|| {
-            DaemonError::ConfigError(format!("southbound poll: unknown device group {group:?}"))
-        })?;
-        if plan.point_ids.is_empty() {
+        // 计划表短持读锁 → 拷出本拍所需字段即释放（锁绝不跨 `await`，热路径无阻塞）。
+        let (protocol, address, plan_point_ids): (String, String, Vec<String>) = {
+            let guard = match self.devices.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match guard.get(group) {
+                Some(plan) => (
+                    plan.protocol.clone(),
+                    plan.address.clone(),
+                    plan.point_ids.clone(),
+                ),
+                None => {
+                    return Err(DaemonError::ConfigError(format!(
+                        "southbound poll: unknown device group {group:?}"
+                    )))
+                }
+            }
+        };
+        if plan_point_ids.is_empty() {
             return Ok(Vec::new());
         }
 
+        let plan = DevicePlan {
+            protocol,
+            address,
+            point_ids: plan_point_ids,
+        };
+
         // 惰性建连（连接表只在取/插时短持锁；读期间按设备锁串行，组间并行）。
-        let conn = self.get_or_connect(group, plan).await?;
+        let conn = self.get_or_connect(group, &plan).await?;
         let mut driver = conn.lock().await;
 
         // 组内批量读：一次驱动请求承载全部可读点位（PollHandler 契约）。
@@ -354,14 +459,125 @@ mod tests {
         .expect("parse");
         let handler = DevicePollHandler::from_config(&config);
         assert!(!handler.is_empty());
-        assert_eq!(handler.devices.len(), 2, "one plan per device");
-        let a = &handler.devices["dev-a"];
+        let plans = handler.devices.read().expect("plan table lock").clone();
+        assert_eq!(plans.len(), 2, "one plan per device");
+        let a = &plans["dev-a"];
         assert_eq!(a.protocol, "modbus-tcp");
         assert_eq!(a.address, "10.0.0.1:502");
         assert_eq!(a.point_ids, vec!["40001".to_string()], "deduped");
 
         let empty = DevicePollHandler::from_config(&GatewayConfig::default());
         assert!(empty.is_empty(), "no points → empty plan");
+    }
+
+    /// 热重载 `refresh_devices`：新设备进表、被删设备出表、点位增减生效。
+    ///
+    /// 这是「重载后 `unknown device group` 必现」的直接修复点：调度器侧重建了组，
+    /// 南向计划表也必须同步，否则新组每拍都撞同一个错。
+    #[tokio::test]
+    async fn refresh_devices_replaces_plan_table_on_hot_reload() {
+        let old = GatewayConfig::parse(
+            "[[points]]\ndevice_id = \"dev-a\"\npoint_id = \"40001\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"10.0.0.1:502\"\n\n\
+             [[points]]\ndevice_id = \"dev-b\"\npoint_id = \"40002\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"10.0.0.2:502\"\n",
+        )
+        .expect("parse");
+        let handler = DevicePollHandler::from_config(&old);
+
+        // 新配置：dev-b 删除，dev-a 多挂一个点位，dev-c 全新出现。
+        let next = GatewayConfig::parse(
+            "[[points]]\ndevice_id = \"dev-a\"\npoint_id = \"40001\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"10.0.0.1:502\"\n\n\
+             [[points]]\ndevice_id = \"dev-a\"\npoint_id = \"40003\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"10.0.0.1:502\"\n\n\
+             [[points]]\ndevice_id = \"dev-c\"\npoint_id = \"40005\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"10.0.0.3:502\"\n",
+        )
+        .expect("parse");
+        handler.refresh_devices(&next).await;
+
+        let plans = handler.devices.read().expect("plan table lock").clone();
+        assert!(
+            !plans.contains_key("dev-b"),
+            "deleted device must leave the plan table (else zombie polling)"
+        );
+        assert!(plans.contains_key("dev-c"), "new device must appear");
+        assert_eq!(
+            plans["dev-a"].point_ids,
+            vec!["40001".to_string(), "40003".to_string()],
+            "added point must be picked up"
+        );
+
+        // 新设备立即可轮询（不再 `unknown device group`）。
+        let err = handler
+            .poll("dev-c", &["40005".to_string()])
+            .await
+            .expect_err("mock-less device fails to connect");
+        assert!(
+            !err.to_string().contains("unknown device group"),
+            "plan table must already know dev-c, got: {err}"
+        );
+    }
+
+    /// `refresh_devices` 保留同名设备的既有连接，只摘掉失效连接。
+    ///
+    /// 断言口径走 `conns` 的可观测副作用：被删设备的连接条目必须消失（僵尸南向
+    /// 连接），同名设备的条目原样保留（热重载不重建连接 = 不断流）。
+    #[tokio::test]
+    async fn refresh_devices_keeps_connections_of_unchanged_devices() {
+        let state = Arc::new(Mutex::new(MockInner {
+            holding: vec![0x1234, 0x5678],
+            requests: Vec::new(),
+        }));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_mock_server(Arc::clone(&state), Arc::clone(&connections)).await;
+
+        let two_devices = |addr: SocketAddr| {
+            format!(
+                "[[points]]\ndevice_id = \"dev-a\"\npoint_id = \"40001\"\n\
+                 protocol = \"modbus-tcp\"\naddress = \"{addr}\"\nfrequency_ms = 100\n\n\
+                 [[points]]\ndevice_id = \"dev-b\"\npoint_id = \"40002\"\n\
+                 protocol = \"modbus-tcp\"\naddress = \"{addr}\"\nfrequency_ms = 100\n"
+            )
+        };
+        let handler = DevicePollHandler::from_config(
+            &GatewayConfig::parse(&two_devices(addr)).expect("parse"),
+        );
+        // 两台设备各建一条真实连接（mock 从站可答）。
+        handler
+            .poll("dev-a", &["40001".to_string()])
+            .await
+            .expect("poll dev-a");
+        handler
+            .poll("dev-b", &["40002".to_string()])
+            .await
+            .expect("poll dev-b");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "both devices must have dialed once"
+        );
+
+        // dev-a 完全不变 → 连接原样保留；dev-b 接入地址改了 → 旧连接失效，按新端点重连。
+        let re_addressed = GatewayConfig::parse(&format!(
+            "[[points]]\ndevice_id = \"dev-a\"\npoint_id = \"40001\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"{addr}\"\nfrequency_ms = 100\n\n\
+             [[points]]\ndevice_id = \"dev-b\"\npoint_id = \"40002\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"127.0.0.1:2\"\nfrequency_ms = 100\n"
+        ))
+        .expect("parse");
+        handler.refresh_devices(&re_addressed).await;
+
+        let conns = handler.conns.lock().await;
+        assert!(
+            conns.contains_key("dev-a"),
+            "unchanged device keeps its live connection (no re-dial on reload)"
+        );
+        assert!(
+            !conns.contains_key("dev-b"),
+            "re-addressed device drops the stale connection and re-dials"
+        );
     }
 
     /// 未知组轮询 → ConfigError（可解释）。
