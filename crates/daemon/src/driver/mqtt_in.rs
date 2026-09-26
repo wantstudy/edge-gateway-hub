@@ -37,7 +37,7 @@ use serde_json::Value;
 use crate::driver::Reconnector;
 use crate::error::{DaemonError, DaemonResult};
 
-/// rumqttc 事件轮询结果（0.25 无 `rumqttc::Result` 别名，此处显式定义）。
+/// rumqttc-v4-next 事件轮询结果（该家族无 `Result` 别名，此处显式定义）。
 pub(crate) type EventOutcome = Result<Event, rumqttc::ConnectionError>;
 
 // ---- JSON 路径提取（本模块 pub，供 http.rs 复用） ----
@@ -366,14 +366,26 @@ impl MqttInDriver {
     /// # Errors
     /// 订阅请求入队失败（会话通道已关闭等）→ [`DaemonError::ProtocolError`]。
     pub async fn connect(&mut self) -> DaemonResult<()> {
+        // task 61 适配：rumqttc-next 把「host + port」合并为 `Broker`（`From<(S, u16)>`），
+        // `MqttOptions::new` 由 3 参降为 2 参；`set_keep_alive` 改收 u16 秒；
+        // `set_credentials` 口令改收 `bytes::Bytes`（此处按字节内容等价转换）。
         let mut opts = MqttOptions::new(
             self.config.client_id.as_str(),
-            self.config.host.as_str(),
-            self.config.port,
+            (self.config.host.as_str(), self.config.port),
         );
-        opts.set_keep_alive(self.config.keep_alive);
+        // 与 north/mqtt.rs 的 build_options 同一处理：先截秒（旧版也是写包时才截），
+        // 超出 u16 直接前置报错，避免静默回绕。
+        opts.set_keep_alive(
+            u16::try_from(self.config.keep_alive.as_secs()).map_err(|_| {
+                DaemonError::ConfigError(format!(
+                    "keep_alive {}s exceeds the u16 second limit (65535)",
+                    self.config.keep_alive.as_secs()
+                ))
+            })?,
+        );
         if let (Some(user), Some(pass)) = (&self.config.username, &self.config.password) {
-            opts.set_credentials(user.clone(), pass.clone());
+            // `Bytes` 要求 'static，故取自有副本（与旧版一致，是拥有语义而非借用）。
+            opts.set_credentials(user.clone(), pass.as_bytes().to_vec());
         }
         let (client, eventloop) = AsyncClient::new(opts, 10);
         for mapping in &self.config.topics {
@@ -424,10 +436,17 @@ where
     loop {
         match source.poll().await {
             Some(Ok(Event::Incoming(Packet::Publish(publish)))) => {
-                let matched: Vec<&MqttTopicMapping> = mappings
-                    .iter()
-                    .filter(|m| topic_matches(&m.topic, &publish.topic))
-                    .collect();
+                // task 61 适配：rumqttc-next 把 `Publish::topic` 从 `String` 换成 `Bytes`，
+                // 而 `topic_matches` 收 `&str`。旧版 topic 是 `String`、恒为合法 UTF-8；
+                // 新版源自网络字节，非 UTF-8 时按 fail-closed 处理——视为不匹配任何映射，
+                // 既不产出样本也不让未解码字节流入下游（绝不 panic）。
+                let matched: Vec<&MqttTopicMapping> = match std::str::from_utf8(&publish.topic) {
+                    Ok(topic) => mappings
+                        .iter()
+                        .filter(|m| topic_matches(&m.topic, topic))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
                 match serde_json::from_slice::<Value>(publish.payload.as_ref()) {
                     Ok(root) => {
                         for mapping in matched {

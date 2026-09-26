@@ -51,6 +51,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+// task 61：依赖包名已从 `rumqttc` 换成 `rumqttc-v4-next`（rumqttc-next 家族的 MQTT 3.1.1
+// 变体，用于清掉 rustls-webpki 0.102.x 的 4 条公告），但该 crate 的 `[lib] name` 仍是
+// `rumqttc`，故此处 import 路径不变——不是漏改。见 crates/daemon/Cargo.toml 的迁移说明。
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS,
     TlsConfiguration, Transport,
@@ -670,14 +673,27 @@ impl EndpointConfig {
     pub fn build_options(&self) -> DaemonResult<MqttOptions> {
         self.validate()?;
 
-        let mut options = MqttOptions::new(&self.client_id, &self.broker, self.port);
-        options.set_keep_alive(self.keep_alive);
+        // task 61 适配：rumqttc-next 把「broker + port」合并成 `Broker`（`From<(S, u16)>`），
+        // `MqttOptions::new` 由 3 参降为 2 参；`set_keep_alive` 由 `Duration` 改为 **u16 秒**；
+        // `set_credentials` 的口令类型由 `Vec<u8>` 改为 `bytes::Bytes`。
+        // 语义对齐：`(host, port)` 即旧 `new(client_id, broker, port)` 的等价展开；
+        // 口令 `as_bytes()` 与旧 `String → Vec<u8>` 的字节内容一致。
+        let mut options = MqttOptions::new(&self.client_id, (self.broker.as_str(), self.port));
+        // MQTT 的 keep alive 字段本身是 u16 秒，旧版 rumqttc 也是写包时才截断到秒，
+        // 故此处先截秒与旧行为等价；超出 u16 直接前置报错，避免静默回绕。
+        options.set_keep_alive(u16::try_from(self.keep_alive.as_secs()).map_err(|_| {
+            DaemonError::ConfigError(format!(
+                "keep_alive {}s exceeds the u16 second limit (65535)",
+                self.keep_alive.as_secs()
+            ))
+        })?);
         options.set_clean_session(self.clean_session);
         options.set_request_channel_capacity(self.request_channel_capacity);
         options.set_inflight(self.inflight);
 
         if let (Some(username), Some(password)) = (&self.username, &self.password) {
-            options.set_credentials(username, password);
+            // `Bytes` 要求 'static，故此处取自有副本（与旧版 `String → Vec<u8>` 一样是拥有语义）。
+            options.set_credentials(username, password.as_bytes().to_vec());
         }
         if let Some(tls) = &self.tls {
             options.set_transport(tls.to_transport()?);
@@ -1316,9 +1332,10 @@ impl MqttClient {
         self.retry_after
     }
 
-    /// 会话恢复后待重发的报文数（`EventLoop::pending` 长度）。
+    /// 会话恢复后待重发的报文数（`EventLoop` 待重传队列长度）；
+    /// task 61 适配：`pending` 字段已随 rumqttc-next 变私有，改用公开访问器 `pending_len()`。
     pub fn pending_requests(&self) -> usize {
-        self.eventloop.pending.len()
+        self.eventloop.pending_len()
     }
 
     /// 未确认积压（task 54）：已提交但尚未收到 PUBACK / PUBCOMP 的报文数。
