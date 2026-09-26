@@ -147,7 +147,7 @@ import { useRoute, useRouter } from 'vue-router';
 import type { FieldRule, FormInstance } from '@arco-design/web-vue';
 import { ApiError, apiLogin, apiUrl, setStoredBackendRole, setStoredToken } from '@/api/client';
 import { dataVersion, preloadRealData, refresh, repo } from '@/api/repo';
-import { mapBackendRole, session } from '@/store/session';
+import { session } from '@/store/session';
 
 const route = useRoute();
 const router = useRouter();
@@ -348,10 +348,8 @@ async function onBootstrap(): Promise<void> {
     }
     setStoredToken(body.token);
     setStoredBackendRole(body.role ?? 'system');
-    session.login(username, {
-      backendRole: body.role ?? 'system',
-      role: mapBackendRole(body.role ?? 'system'),
-    });
+    // 写会话：UI 角色由 token 的 `perms` claim 派生（拿不到时回落服务端角色映射）
+    session.login(username, { backendRole: body.role ?? 'system', token: body.token });
     refreshGatewayName();
     authState.value = 'initialized';
     errorMsg.value = '';
@@ -407,8 +405,8 @@ async function onSubmit(): Promise<void> {
     const res = await apiLogin(form.username.trim(), form.password);
     setStoredToken(res.token);
     setStoredBackendRole(res.role);
-    // 写会话（后端角色原文 + 前端可见性映射）
-    session.login(form.username.trim(), { backendRole: res.role, role: mapBackendRole(res.role) });
+    // 写会话：UI 角色由 token 的 `perms` claim 派生（拿不到时回落服务端角色映射）
+    session.login(form.username.trim(), { backendRole: res.role, token: res.token });
     refreshGatewayName();
     //
     // D-01 修复：登录成功后**立即回跳**，预取转后台执行。
