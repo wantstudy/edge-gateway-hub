@@ -56,8 +56,8 @@ export const STATUS_MAP: Readonly<Record<string, StatusView>> = Object.freeze({
   receipt_na: { label: '无（C 档）', tone: 'unknown' },
 
   // ---- 部署形态 ----
-  native: { label: 'native', tone: 'unknown' },
-  docker: { label: 'docker', tone: 'info' },
+  native: { label: '原生', tone: 'unknown' },
+  docker: { label: '容器', tone: 'info' },
 
   // ---- 处置 / 工单状态 ----
   pending: { label: '待处理', tone: 'warn' },

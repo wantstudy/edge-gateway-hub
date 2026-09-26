@@ -133,7 +133,7 @@ defineExpose({ readField });
   text-align: left;
   font-weight: 500;
   color: var(--text-2);
-  background: #fafbfc;
+  background: var(--row-alt);
   padding: 9px 12px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;

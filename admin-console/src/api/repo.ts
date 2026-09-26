@@ -204,7 +204,18 @@ export interface AdminRepo {
     note: string;
     actor: string;
   }): Promise<CodeRecord[]>;
-  revokeCode(input: { id: string; reason: string; note: string; actor: string }): Promise<boolean>;
+  /**
+   * 废弃激活码。
+   * `secondApprover` 为**双人复核**字段，未填写时以 `null` 下发（后端 `RevokeCodeRequest.second_approver`
+   * 契约：双人复核开启时必填）。接口必须原样透传，不得折进 `note` —— 三字段独立是审计可追溯的前提。
+   */
+  revokeCode(input: {
+    id: string;
+    reason: string;
+    note: string;
+    secondApprover?: string;
+    actor: string;
+  }): Promise<boolean>;
   reissueCode(input: {
     sourceId: string;
     inheritTier: string;
@@ -585,7 +596,9 @@ function buildDeviceRecord(raw: Record<string, unknown>): DeviceRecord {
     licenseStatus: lease || 'inactive',
     lastHeartbeatAt: pickStr(raw, 'last_heartbeat_at', ''),
     receiptStatus: lease ? (gapMatch ? 'receipt_gap' : 'receipt_ok') : 'receipt_na',
-    gapCount: gapMatch ? Number(gapMatch[1]) : 0,
+    // 红线 4：后端下发的 uint64 计数在 JSON 路径是**字符串**，不得经 Number() 处理（2^53-1 精度上限）。
+    // 这里保留后端原始十进制串，渲染时直接输出，绝不转换 —— 大数一旦过 Number() 就会被静默舍入。
+    gapCount: gapMatch ? gapMatch[1] : '',
     boundCodeId: null,
     boundCodeMasked: null,
     clientVersion: '—',
@@ -1009,7 +1022,8 @@ function buildRealRepo(): AdminRepo {
             note: input.note.trim(),
             // 契约：confirm_tail8 = 激活码去分隔符后的末 8 位（自动计算，绝不让用户手算）
             confirm_tail8: tail8Of(target.code),
-            second_approver: null,
+            // 契约：双人复核开启时后端要求 second_approver 必填，原样透传（不得折进 note）
+            second_approver: input.secondApprover ?? null,
           },
         });
         target.status = 'revoked';

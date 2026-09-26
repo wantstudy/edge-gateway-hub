@@ -85,7 +85,7 @@ defineProps<Props>();
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--bg-card);
   border: 2px solid var(--border);
   box-sizing: border-box;
 }

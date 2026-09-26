@@ -122,7 +122,7 @@ const COPY_ICON = ICON_COPY;
   font-family: inherit;
   font-size: var(--fs-caption);
   color: var(--text-2);
-  background: #fff;
+  background: var(--control-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 3px 8px;

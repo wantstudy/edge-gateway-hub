@@ -171,7 +171,7 @@
               <UiInput v-if="isReal" v-model="issueForm.tenant" placeholder="租户 ID，如 t-1" />
               <UiSelect v-else v-model="issueForm.tenant" :options="issueTenantOptions" />
             </UiField>
-            <UiField label="tier" required>
+            <UiField label="授权档位" required>
               <UiSelect v-model="issueForm.tier" :options="issueTierOptions" />
             </UiField>
             <UiField label="有效期起" required>
@@ -438,7 +438,7 @@ const columns: readonly TableColumn[] = [
   { key: 'status', label: '状态' },
   { key: 'tenant', label: '租户' },
   { key: 'boundDeviceSummary', label: '绑定设备', mono: true },
-  { key: 'tier', label: 'tier' },
+  { key: 'tier', label: '授权档位' },
   { key: 'validUntil', label: '有效期', mono: true },
   { key: 'trace', label: '溯源', mono: true },
 ];
@@ -622,7 +622,7 @@ const revokeTarget = computed<CodeRecord | null>(() => (revokeTargetId.value ? r
 /** 作废弹窗的对象摘要。 */
 const voidFacts = computed(() => [
   { label: '租户', value: voidTarget.value?.tenant ?? '—' },
-  { label: 'tier', value: voidTarget.value?.tier ?? '—' },
+  { label: '授权档位', value: voidTarget.value?.tier ?? '—' },
   { label: '发放时间', value: formatDateTime(voidTarget.value?.createdAt) },
   { label: '影响设备', value: '无（该码尚未绑定任何设备）' },
 ]);
@@ -678,7 +678,9 @@ async function submitRevoke(payload: { reason: string; note: string; secondAppro
   await repo.revokeCode({
     id: revokeTargetId.value,
     reason: payload.reason,
-    note: payload.secondApprover ? `${payload.note}（第二审批人：${payload.secondApprover}）` : payload.note,
+    // 三字段独立：第二审批人走 secondApprover 字段原样下发，不得折进 note（审计可追溯前提）
+    note: payload.note,
+    secondApprover: payload.secondApprover,
     actor: DEFAULT_ACTOR,
   });
   closeRevoke();

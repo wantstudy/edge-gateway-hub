@@ -91,7 +91,7 @@
 
           <!-- 3) 对象名二次校验 -->
           <UiField
-            :label="confirmLabel"
+            :label="confirmLabelResolved"
             required
             :hint="confirmHint"
             :error="tailError"
@@ -99,7 +99,7 @@
             <UiInput
               v-model="form.tail"
               :invalid="tailError.length > 0"
-              :placeholder="confirmPlaceholder"
+              :placeholder="confirmPlaceholderResolved"
             />
           </UiField>
 
@@ -174,9 +174,21 @@ interface Props {
    * 例如传入完整激活码 `IOT-2026-8C3F-1234-ABCD-A1`，用户需输入 `C3F123…` 的后 8 位。
    */
   confirmValue?: string;
-  /** 二次校验字段标签 */
+  /**
+   * 二次校验模式：
+   *  · `'tail8'`（默认）—— 取 `confirmValue` 后 8 位做**本地**校验（既有行为，零改动）；
+   *  · `'full'`  —— 对象**全名原文**，**不做本地匹配拦截**（仅要求非空），
+   *    比对交由服务端（不匹配 → 400 `confirm_mismatch`）。
+   *
+   *  ⚠ 大小写口径：**服务端做 `trim()` + 大小写不敏感精确匹配**（`str::eq_ignore_ascii_case`）：
+   *    `rules_api` `:694 / :859`、`alerts_api` `check_trio` `:270`、`remote_ops` `:632 / :742`
+   *    均为同一口径。因此二次校验输入允许前尾空格与任意大小写，不匹配才由服务端 400
+   *    `confirm_mismatch`（注意：服务端逐一字比对前也 trim，故本组件**不做**本地归一化兜底）。
+   */
+  confirmMode?: 'tail8' | 'full';
+  /** 二次校验字段标签（不传则按 `confirmMode` 取默认文案） */
   confirmLabel?: string;
-  /** 二次校验输入占位符 */
+  /** 二次校验输入占位符（不传则按 `confirmMode` 取默认文案） */
   confirmPlaceholder?: string;
   /** 确认按钮文案（必须是动词短语，如「废弃激活码」） */
   confirmText?: string;
@@ -190,9 +202,10 @@ const props = withDefaults(defineProps<Props>(), {
   facts: () => [],
   reasons: () => [],
   minNoteLength: 10,
+  confirmMode: 'tail8',
   confirmValue: '',
-  confirmLabel: '风险二次确认（输入对象后 8 位）',
-  confirmPlaceholder: '输入对象标识去分隔符后的后 8 位',
+  confirmLabel: '',
+  confirmPlaceholder: '',
   confirmText: '确认执行',
   requireSecondApprover: false,
   disabled: false,
@@ -201,8 +214,16 @@ const props = withDefaults(defineProps<Props>(), {
 const emit = defineEmits<{
   /** 关闭弹窗（取消 / 遮罩点击）——调用方必须清草稿 */
   (e: 'close'): void;
-  /** 通过全部校验后提交 */
-  (e: 'submit', payload: { reason: string; note: string; tail: string; secondApprover: string }): void;
+  /**
+   * 通过全部校验后提交。
+   *
+   * `tail` 为向后兼容保留字段（tail8 模式去尾空格；full 模式为原文）；
+   * `confirm` 恒为二次校验输入的**原文**（不 trim / 不归一化），供服务端比对。
+   */
+  (
+    e: 'submit',
+    payload: { reason: string; note: string; tail: string; secondApprover: string; confirm: string },
+  ): void;
 }>();
 
 /** 弹窗内部草稿（**只在打开时初始化，关闭时清空**）。 */
@@ -222,6 +243,24 @@ const reasonOptions = computed<readonly SelectOption[]>(() => [
 /** 期望的后 8 位（去分隔符、大写）。 */
 const expectedTail = computed(() => codeTail8(props.confirmValue));
 
+/**
+ * 是否为「全名原文 + 服务端校验」模式。
+ *
+ * 该模式下**不做任何本地匹配拦截**：输入原样透传，匹配与否由服务端判定
+ * （不匹配 → 400 `confirm_mismatch`），避免「前端看似匹配、后端判不匹配」的扯皮。
+ */
+const isFullMode = computed(() => props.confirmMode === 'full');
+
+/** 二次校验字段标签（未显式传入时按模式取默认）。 */
+const confirmLabelResolved = computed(
+  () => props.confirmLabel || (isFullMode.value ? '风险二次确认（输入对象全名）' : '风险二次确认（输入对象后 8 位）'),
+);
+
+/** 二次校验输入占位符（未显式传入时按模式取默认）。 */
+const confirmPlaceholderResolved = computed(
+  () => props.confirmPlaceholder || (isFullMode.value ? '输入对象全名' : '输入对象标识去分隔符后的后 8 位'),
+);
+
 /** 补充说明错误：有内容但字数不足才提示，避免刚打开就报红。 */
 const noteError = computed(() => {
   const len = form.note.trim().length;
@@ -231,8 +270,15 @@ const noteError = computed(() => {
   return len < props.minNoteLength ? `还差 ${props.minNoteLength - len} 字` : '';
 });
 
-/** 二次校验错误：仅在用户已输入但填错时提示。 */
+/** 二次校验错误：仅在用户已输入但填错时提示（full 模式不本地判错，交由服务端）。 */
 const tailError = computed(() => {
+  if (isFullMode.value) {
+    return '';
+  }
+  // fail-closed：拿不到比对目标就没有「二次校验」可言，必须显式报错而不是静默放行
+  if (props.confirmValue.trim().length === 0) {
+    return '对象标识缺失（confirmValue 未传入），无法执行对象名二次校验';
+  }
   const input = form.tail.trim();
   if (input.length === 0) {
     return '';
@@ -250,17 +296,21 @@ const approverError = computed(() => {
 });
 
 /** 二次校验提示：写清比对的是哪一段。 */
-const confirmHint = computed(() =>
-  expectedTail.value
-    ? `请完整填写对象标识后 8 位（去分隔符、不区分大小写），用于防止误操作`
-    : '请填写对象标识后 8 位以确认',
-);
+const confirmHint = computed(() => {
+  if (isFullMode.value) {
+    return '请完整填写对象全名（服务端 trim + 大小写不敏感精确校验）以确认';
+  }
+  return expectedTail.value
+    ? '请完整填写对象标识后 8 位（去分隔符、不区分大小写），用于防止误操作'
+    : '请填写对象标识后 8 位以确认';
+});
 
 /**
  * 提交可用性：四要素全部满足才允许提交。
  * 1) 原因已选（若提供枚举）
  * 2) 补充说明 ≥ minNoteLength
- * 3) 后 8 位完全一致
+ * 3) 二次校验：tail8 模式本地比对后 8 位（**比对目标缺失即拒绝放行**，fail-closed）；
+ *    full 模式仅要求非空（比对在服务端）
  * 4) 双人复核时第二审批人非空
  */
 const canSubmit = computed(() => {
@@ -273,8 +323,21 @@ const canSubmit = computed(() => {
   if (form.note.trim().length < props.minNoteLength) {
     return false;
   }
-  if (expectedTail.value.length > 0 && expectedTail.value !== form.tail.trim().replace(/[^A-Za-z0-9]/g, '').toUpperCase()) {
-    return false;
+  if (isFullMode.value) {
+    // 全名模式：不做本地匹配拦截，只要求输入非空（匹配交由服务端）
+    if (form.tail.trim().length === 0) {
+      return false;
+    }
+  } else {
+    // tail8 模式（fail-closed）：比对目标与用户输入**缺一不可**。
+    // 若调用方漏传 `confirmValue`，`expectedTail` 会是空串 —— 此时任何输入「看起来都匹配」，
+    // 二次校验会整体退化为摆设。这里拒绝放行，而不是跳过校验。
+    if (form.tail.trim().length === 0 || props.confirmValue.trim().length === 0) {
+      return false;
+    }
+    if (expectedTail.value !== form.tail.trim().replace(/[^A-Za-z0-9]/g, '').toUpperCase()) {
+      return false;
+    }
   }
   if (props.requireSecondApprover && form.secondApprover.trim().length === 0) {
     return false;
@@ -323,8 +386,11 @@ function submit(): void {
   const payload = {
     reason: form.reason,
     note: form.note.trim(),
-    tail: form.tail.trim(),
+    // full 模式：原文透传（服务端比对）；tail8 模式：保持既有去尾空格行为
+    tail: isFullMode.value ? form.tail : form.tail.trim(),
     secondApprover: form.secondApprover.trim(),
+    // 二次校验原文（不 trim / 不归一化），供服务端大小写不敏感精确匹配
+    confirm: form.tail,
   };
   resetDraft();
   emit('submit', payload);
@@ -335,7 +401,7 @@ function submit(): void {
 .uik-dcm__mask {
   position: fixed;
   inset: 0;
-  background: rgba(29, 33, 41, 0.45);
+  background: var(--mask);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -343,7 +409,7 @@ function submit(): void {
   padding: 24px;
 }
 .uik-dcm {
-  background: #fff;
+  background: var(--bg-card);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   width: 660px;
@@ -380,7 +446,7 @@ function submit(): void {
   border: 1px solid var(--danger-border);
   border-radius: var(--radius-sm);
   padding: 12px 14px;
-  color: #7a1418;
+  color: var(--danger-fg);
 }
 .uik-dcm__impact-title {
   margin: 0;
@@ -437,12 +503,12 @@ function submit(): void {
   padding: 6px 14px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
-  background: #fff;
+  background: var(--control-bg);
   color: var(--text-1);
   cursor: pointer;
 }
 .uik-btn:hover {
-  border-color: #c9cdd4;
+  border-color: var(--control-border-hover);
   background: var(--bg-hover);
 }
 .uik-btn--danger {

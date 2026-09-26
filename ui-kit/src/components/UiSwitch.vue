@@ -77,7 +77,7 @@ function toggle(): void {
   height: 18px;
   flex: 0 0 34px;
   border-radius: var(--radius-pill);
-  background: #c9cdd4;
+  background: var(--control-border-hover);
   transition: background 0.16s ease;
 }
 .uik-switch__thumb::after {

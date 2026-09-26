@@ -14,6 +14,17 @@ import './tokens.css';
 export { BRAND, NEUTRAL, SEMANTIC, SEMANTIC_SURFACE, SCALE } from './tokens';
 export type { Tone } from './tokens';
 
+// ---------- 明暗双主题运行时（唯一状态源，两端共用）----------
+export {
+  themeMode,
+  setThemeMode,
+  toggleThemeMode,
+  applyTheme,
+  THEME_STORAGE_KEY,
+  DARK_QUERY,
+} from './theme';
+export type { ThemeMode } from './theme';
+
 // ---------- 纯函数工具（可单测，无 Vue 依赖）----------
 export { STATUS_MAP, statusView } from './status-map';
 export type { StatusView } from './status-map';

@@ -93,7 +93,7 @@ function choose(value: string): void {
   cursor: pointer;
 }
 .uik-radio:hover {
-  border-color: #c9cdd4;
+  border-color: var(--control-border-hover);
   background: var(--bg-hover);
 }
 .uik-radio.is-on {
@@ -110,8 +110,8 @@ function choose(value: string): void {
   flex: 0 0 14px;
   margin-top: 3px;
   border-radius: 50%;
-  border: 1px solid #c9cdd4;
-  background: #fff;
+  border: 1px solid var(--control-border-hover);
+  background: var(--control-bg);
   box-sizing: border-box;
 }
 .uik-radio.is-on .uik-radio__dot {

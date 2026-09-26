@@ -331,7 +331,9 @@ async function submitRevoke(payload: { reason: string; note: string; secondAppro
   await repo.revokeCode({
     id: codeId.value,
     reason: payload.reason,
-    note: payload.secondApprover ? `${payload.note}（第二审批人：${payload.secondApprover}）` : payload.note,
+    // 三字段独立：第二审批人走 secondApprover 字段原样下发，不得折进 note（审计可追溯前提）
+    note: payload.note,
+    secondApprover: payload.secondApprover,
     actor: DEFAULT_ACTOR,
   });
   revokeOpen.value = false;

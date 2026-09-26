@@ -68,7 +68,7 @@ void props;
   font-family: inherit;
   font-size: var(--fs-table);
   color: var(--text-1);
-  background: #fff;
+  background: var(--control-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 5px 8px;

@@ -133,8 +133,12 @@ export interface DeviceRecord {
   lastHeartbeatAt: string;
   /** 回执健康状态 */
   receiptStatus: string;
-  /** 回执跳空区间数 */
-  gapCount: number;
+  /**
+   * 回执跳空区间数（**字符串口径**）。
+   * 红线 4：后端 uint64 计数在 JSON 路径是字符串，经 Number() 会在 2^53-1 处静默舍入，
+   * 因此记录层保留后端原始十进制串；无跳空时为 `''`。
+   */
+  gapCount: string;
   /** 关联激活码 id */
   boundCodeId: string | null;
   /** 关联激活码掩码显示 */
@@ -433,7 +437,7 @@ const devices: DeviceRecord[] = [
     licenseStatus: 'active',
     lastHeartbeatAt: '2026-09-23 12:25:11',
     receiptStatus: 'receipt_ok',
-    gapCount: 0,
+    gapCount: '',
     boundCodeId: 'c-001',
     boundCodeMasked: 'IOTDAQ-****-****-****-A1',
     clientVersion: 'v1.0.0 (a91f3c2)',
@@ -453,7 +457,7 @@ const devices: DeviceRecord[] = [
     licenseStatus: 'active',
     lastHeartbeatAt: '2026-09-23 12:19:40',
     receiptStatus: 'receipt_gap',
-    gapCount: 2,
+    gapCount: '2',
     boundCodeId: 'c-004',
     boundCodeMasked: 'IOTDAQ-****-****-****-Q4',
     clientVersion: 'v1.0.0 (a91f3c2)',
@@ -473,7 +477,7 @@ const devices: DeviceRecord[] = [
     licenseStatus: 'trial',
     lastHeartbeatAt: '2026-09-23 11:58:02',
     receiptStatus: 'receipt_na',
-    gapCount: 0,
+    gapCount: '',
     boundCodeId: 'c-005',
     boundCodeMasked: 'IOTDAQ-****-****-****-M2',
     clientVersion: 'v1.0.0 (a91f3c2)',
@@ -493,7 +497,7 @@ const devices: DeviceRecord[] = [
     licenseStatus: 'revoked_lease',
     lastHeartbeatAt: '2026-09-22 10:02:18',
     receiptStatus: 'receipt_missing',
-    gapCount: 0,
+    gapCount: '',
     boundCodeId: 'c-003',
     boundCodeMasked: 'IOTDAQ-****-****-****-3K',
     clientVersion: 'v0.9.4 (b21c8f1)',
@@ -513,7 +517,7 @@ const devices: DeviceRecord[] = [
     licenseStatus: 'active',
     lastHeartbeatAt: '2026-09-23 12:26:33',
     receiptStatus: 'receipt_ok',
-    gapCount: 0,
+    gapCount: '',
     boundCodeId: null,
     boundCodeMasked: null,
     clientVersion: 'v1.0.0 (a91f3c2)',

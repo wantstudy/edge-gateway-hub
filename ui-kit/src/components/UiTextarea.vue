@@ -78,7 +78,7 @@ function onInput(event: Event): void {
   font-size: var(--fs-table);
   line-height: 1.6;
   color: var(--text-1);
-  background: #fff;
+  background: var(--control-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 6px 8px;

@@ -77,7 +77,7 @@
           <template #cell-receiptStatus="{ row }">
             <StatusTag
               :status="row.receiptStatus"
-              :text="row.gapCount > 0 ? `${row.gapCount} 次跳空` : undefined"
+              :text="row.gapCount && row.gapCount !== '0' ? `${row.gapCount} 次跳空` : undefined"
             />
           </template>
           <template #actions="{ row }">
@@ -161,8 +161,8 @@ const tenantOptions = computed<readonly SelectOption[]>(() => {
 });
 const deployOptions: readonly SelectOption[] = [
   { value: '', label: '全部形态' },
-  { value: 'native', label: 'native' },
-  { value: 'docker', label: 'docker' },
+  { value: 'native', label: '原生' },
+  { value: 'docker', label: '容器' },
 ];
 const licenseOptions: readonly SelectOption[] = [
   { value: '', label: '全部状态' },

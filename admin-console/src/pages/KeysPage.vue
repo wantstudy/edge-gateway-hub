@@ -112,7 +112,12 @@
     </section>
   </div>
 
-  <!-- 轮换密钥（★ 危险，四要素） -->
+  <!--
+    轮换密钥（★ 危险，四要素）。
+    二次确认口径与默认 tail8 模式一致：组件比对的是 confirmValue 去分隔符后的后 8 位，
+    而 nextKid 形如 kid-2026Q4，实际期望 ID2026Q4。早期这里把口径写成「输入新 kid 全名」，
+    占位符示例又直接写成 kid-2026Q4，用户照抄也过不了校验，确认按钮永久禁用。
+  -->
   <DangerConfirmModal
     :open="rotateOpen"
     :title="`轮换签发密钥 → ${nextKid}`"
@@ -124,8 +129,8 @@
     :facts="rotateFacts"
     :reasons="ROTATE_REASONS"
     :confirm-value="nextKid"
-    confirm-label="风险二次确认（请输入新 kid 全名）"
-    confirm-placeholder="例如 kid-2026Q4"
+    confirm-label="风险二次确认（请输入新 kid 去分隔符后的后 8 位）"
+    confirm-placeholder="如 kid-2026Q4 → ID2026Q4"
     confirm-text="确认轮换密钥"
     @close="rotateOpen = false"
     @submit="submitRotate"
@@ -163,7 +168,7 @@ const historyKeys = computed(() => allKeys.value.filter((k) => k.status !== 'key
 
 /** 列定义。 */
 const columns: readonly TableColumn[] = [
-  { key: 'kid', label: 'kid', mono: true },
+  { key: 'kid', label: '密钥编号', mono: true },
   { key: 'status', label: '状态' },
   { key: 'activatedAt', label: '启用', mono: true },
   { key: 'retiredAt', label: '退役', mono: true },
