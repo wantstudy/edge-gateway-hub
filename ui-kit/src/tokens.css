@@ -5,7 +5,14 @@
  *              结构性说明：docs/design/ui-design-system.md §2。
  *
  * 两端（web-console / admin-console）共用本文件，禁止各应用自建第二套 token（必然漂移）。
- * 首期仅 Light 主题，不做深色切换。
+ *
+ * 明暗双主题：
+ *   · Light = 方案 A·冰川（用户确认稿，见上）；
+ *   · Dark  = 「B·石墨」石墨灰蓝深色底，**品牌色 / 圆角 / 字体与 A·冰川完全一致**
+ *             （`--brand` 恒为 #17C3B2、`--radius` 恒为 16px、`--font-*` 不变），
+ *             只替换中性底色与语义色的明度，避免「暗底上的暗字 / 白块」。
+ *   切换方式：`<html data-theme="dark">`（见 `ui-kit/src/theme.ts`），
+ *   组件库侧同时给 `<body arco-theme="dark">`（Arco 官方暗色令牌，非第二套 token）。
  *
  * 兼容性约定：既有变量名全部保留（消费方无需改动），仅按 A·冰川基准更新取值；
  * 新增 glacier 专属变量组（渐变 / 侧栏 / 圆角梯度 / 阴影梯度 / 氛围背景）与
@@ -18,6 +25,7 @@
   --brand-hover: #0fa396; /* 原型 --accent-2（加深派生） */
   --brand-active: #0d8f84; /* accent-2 再深一档（按下态派生） */
   --brand-subtle: #e2fbf7; /* 原型 --accent-soft */
+  --brand-ink: #0a7a70; /* 品牌色作**文字**时的可读版本（--brand 直用仅作填充/描边） */
   --brand-line: #a8ede4; /* 原型 --accent-line */
   --text-1: #101733; /* 原型 --text */
   --text-2: #5a6486; /* 原型 --text-2 */
@@ -27,6 +35,16 @@
   --bg-app: #f4f6fb; /* 原型 --bg */
   --bg-card: #ffffff; /* 原型 --surface */
   --bg-hover: #fafbfe; /* 原型 --surface-2（行悬浮底） */
+
+  /* ---------- 应用外壳 / 表单控件（暗色下必须换值，否则出现白块或隐形描边） ---------- */
+  --topbar-bg: rgba(255, 255, 255, 0.86); /* 顶栏毛玻璃底 */
+  --topbar-line: rgba(16, 24, 60, 0.07); /* 顶栏下边线 */
+  --mask: rgba(29, 33, 41, 0.45); /* 弹窗遮罩 */
+  --control-bg: #ffffff; /* 输入 / 按钮 / 图标按钮底 */
+  --control-bg-hover: #fff; /* 控件 hover 底（与 --bg-hover 并列保留旧名语义） */
+  --control-border-hover: #c9cdd4; /* 控件 hover 描边 */
+  --hairline: rgba(16, 24, 60, 0.12); /* 表格细线 / 环底轨等「随底走」的半透明线 */
+  --row-alt: #fafbfc; /* 表头 / 斑马底 */
 
   /* ---------- 语义状态色（工业设备语境，对齐原型 :31-36） ---------- */
   --ok: #12b76a;
@@ -72,14 +90,19 @@
   --grad-teal: linear-gradient(135deg, #2bd9c8 0%, #0fa396 100%);
   --grad-ink: linear-gradient(135deg, #4c8df6 0%, #1b4fd8 100%);
 
-  /* ---------- 深色侧栏专用（原型 :20, :77-100） ---------- */
-  --sidebar-bg: #0f1b3d; /* 深海军蓝 */
-  --sidebar-bg-2: #16244c;
-  --sidebar-line: rgba(255, 255, 255, 0.08);
-  --sidebar-text: #b9c2dc; /* 常态导航文字 */
-  --sidebar-text-active: #ffffff; /* 选中 / 悬浮文字 */
-  --sidebar-muted: #8a94b8; /* 弱化文字（副标题 / 页脚） */
-  --sidebar-active-bg: rgba(23, 195, 178, 0.16); /* 选中项青绿衬底 */
+  /* ---------- 侧栏（明色态 = 与整体主题一致的浅底深字） ----------
+     契约：白天模式下侧栏必须与 `--bg-card` 同属浅色系（深字浅底），
+     否则昼夜切换时侧栏两套主题都维持深色、与页面底色割裂。
+     暗色态覆盖见本文件 `:root[data-theme='dark']` 的侧栏段（仍是深海军蓝）。
+     配色来源：A·冰川浅色系（--bg-card / --text-2 / --brand-ink 派生）。 */
+  --sidebar-bg: #ffffff; /* 浅底：与 --bg-card 同值，靠描边与内容区分层 */
+  --sidebar-bg-2: #f4f6fb; /* 渐变起点（顶部贴近 --bg-app，避免纯白死板） */
+  --sidebar-line: rgba(16, 24, 60, 0.1); /* 侧栏描边（浅底上的细线） */
+  --sidebar-hover: rgba(16, 24, 60, 0.06); /* 导航项悬浮底（浅底上的深色微光） */
+  --sidebar-text: #5a6486; /* 常态导航文字（= --text-2） */
+  --sidebar-text-active: #0a7a70; /* 选中 / 悬浮文字（--brand-ink，浅底上 ≥ 4.5:1） */
+  --sidebar-muted: #6b7595; /* 弱化文字（分组标题 / 页脚）：自 --text-3 提亮以便浅底可读 */
+  --sidebar-active-bg: rgba(23, 195, 178, 0.16); /* 选中项青绿衬底（与暗色态同值） */
 
   /* ---------- 布局尺度 ---------- */
   --sidebar-w: 236px;
@@ -95,6 +118,86 @@
   --fs-body: 14px;
   --fs-table: 13px;
   --fs-caption: 12px;
+}
+
+/* ============================================================
+   深色主题（B·石墨 · 石墨灰蓝）
+   仅覆盖「底色 / 文字 / 语义色明度」；品牌色、圆角、字体、阴影方向一律与 A·冰川同值。
+   应用侧切换开关：document.documentElement.dataset.theme = 'dark'（见 ui-kit/src/theme.ts）。
+   ============================================================ */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* ---------- 中性底（石墨灰蓝，冷调近黑） ---------- */
+  --bg-app: #0e1116;
+  --bg-card: #161a22;
+  --bg-hover: #1c212b;
+  --border: #272d38;
+  --divider: #1f242e;
+
+  /* ---------- 文字（暗底提亮，正文 ≥ 4.5:1） ---------- */
+  --text-1: #e7ecf5;
+  --text-2: #a8b2c6;
+  --text-3: #7d879c;
+
+  /* ---------- 应用外壳 / 表单控件（随主题换底，避免暗底上的白块） ---------- */
+  --topbar-bg: rgba(22, 26, 34, 0.86);
+  --topbar-line: rgba(255, 255, 255, 0.08);
+  --mask: rgba(0, 0, 0, 0.6);
+  --control-bg: #1c212b;
+  --control-bg-hover: #222833;
+  --control-border-hover: #3a4351;
+  --hairline: rgba(255, 255, 255, 0.1);
+  --row-alt: #1a1f28;
+
+  /* ---------- 品牌派生（品牌主色不变，仅换衬底 / 描边为深调） ---------- */
+  --brand: #17c3b2; /* 与 A·冰川同值：品牌身份不允许随主题漂移 */
+  --brand-hover: #1ed3c1;
+  --brand-active: #14b3a3;
+  --brand-subtle: #0c322e;
+  --brand-ink: #2fd8c8; /* 暗底上反过来用高明度青绿 */
+  --brand-line: #14605a;
+
+  /* ---------- 语义主色（暗底提高明度，保证 ≥ 4.5:1） ---------- */
+  --ok: #2fbf87;
+  --warn: #f5a524;
+  --danger: #f9746a;
+  --info: #4c9bff;
+  --unknown: #7d879c;
+
+  /* ---------- 语义浅底（暗底改为「深衬底 + 高明度字」） ---------- */
+  --ok-bg: #0c2a20;
+  --ok-fg: #7be3b4;
+  --ok-border: #1b5c43;
+  --warn-bg: #2e2110;
+  --warn-fg: #ffc46b;
+  --warn-border: #5b4114;
+  --danger-bg: #2e1614;
+  --danger-fg: #ff9c93;
+  --danger-border: #6b2a24;
+  --info-bg: #101f33;
+  --info-fg: #8cc0ff;
+  --info-border: #1d4372;
+  --unknown-bg: #1e242e;
+  --unknown-fg: #a8b2c6;
+  --unknown-border: #2c333f;
+
+  /* ---------- 阴影（暗底用纯黑，避免灰底泛白） ---------- */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-2: 0 10px 26px -10px rgba(0, 0, 0, 0.7);
+  --shadow-3: 0 30px 70px -20px rgba(0, 0, 0, 0.8);
+  --shadow-pop: 0 24px 60px -16px rgba(0, 0, 0, 0.75);
+  --shadow: 0 10px 26px -10px rgba(0, 0, 0, 0.7);
+
+  /* ---------- 侧栏（暗色态：沿用 A·冰川深海军蓝，略压深以与石墨底分层） ---------- */
+  --sidebar-bg: #0c172f;
+  --sidebar-bg-2: #142244;
+  --sidebar-line: rgba(255, 255, 255, 0.1);
+  --sidebar-hover: rgba(255, 255, 255, 0.07);
+  --sidebar-text: #c3cce4;
+  --sidebar-text-active: #ffffff;
+  --sidebar-muted: #8e99bc;
+  --sidebar-active-bg: rgba(23, 195, 178, 0.22);
 }
 
 /* ============================================================
@@ -122,6 +225,17 @@
   background-size: 56px 56px;
   mask-image: radial-gradient(70% 60% at 40% 0%, #000, transparent 75%);
   -webkit-mask-image: radial-gradient(70% 60% at 40% 0%, #000, transparent 75%);
+}
+/* 暗色下氛围层改用白色微光：暗底上的深色网格等于看不见 */
+:root[data-theme='dark'] .uik-atmo {
+  background:
+    radial-gradient(48rem 30rem at 8% -8%, rgba(23, 195, 178, 0.12), transparent 62%),
+    radial-gradient(52rem 34rem at 102% 2%, rgba(76, 155, 255, 0.1), transparent 60%);
+}
+:root[data-theme='dark'] .uik-atmo::after {
+  opacity: 0.35;
+  background-image: linear-gradient(rgba(255, 255, 255, 0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
 }
 
 /* 按钮渐变覆盖类（ui-kit 无自有按钮组件，按钮由 Arco 提供）。

@@ -64,14 +64,19 @@ export const GRADIENT = {
   ink: 'linear-gradient(135deg, #4C8DF6 0%, #1B4FD8 100%)',
 } as const;
 
-/** 深色侧栏专用 token（原型 :20, :77-100）。 */
+/**
+ * 侧栏 token —— 明色态镜像，**取值必须与 `tokens.css` 的 `:root` 侧栏段一致**。
+ * 暗色态（深海军蓝）只在 `tokens.css` 的 `:root[data-theme='dark']` 中覆盖，
+ * 此处不另建第二套（红线：两端共用一套 token，TS 侧只做镜像）。
+ * 浅底深字：白天模式下侧栏与整体主题同色系，昼夜切换只换中性底、不换明暗极性。
+ */
 export const SIDEBAR = {
-  bg: '#0F1B3D',
-  bg2: '#16244C',
-  line: 'rgba(255,255,255,.08)',
-  text: '#B9C2DC',
-  textActive: '#FFFFFF',
-  muted: '#8A94B8',
+  bg: '#FFFFFF',
+  bg2: '#F4F6FB',
+  line: 'rgba(16,24,60,.10)',
+  text: '#5A6486',
+  textActive: '#0A7A70',
+  muted: '#6B7595',
   activeBg: 'rgba(23,195,178,.16)',
 } as const;
 

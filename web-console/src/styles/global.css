@@ -62,10 +62,10 @@ body {
   gap: 12px;
   padding: 0 16px;
   /* 原型 :104-105：半透明毛玻璃，让 .uik-atmo 氛围层透出 */
-  background: rgba(255, 255, 255, 0.86);
+  background: var(--topbar-bg);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
-  border-bottom: 1px solid rgba(16, 24, 60, 0.07);
+  border-bottom: 1px solid var(--topbar-line);
 }
 .wc-icon-btn {
   font-family: inherit;
@@ -76,7 +76,7 @@ body {
   flex: 0 0 28px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--control-bg);
   color: var(--text-2);
   cursor: pointer;
 }
@@ -121,7 +121,7 @@ body {
   padding: 2px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--control-bg);
   color: var(--text-1);
   cursor: pointer;
 }
@@ -186,7 +186,7 @@ body {
   padding: 4px 10px;
   border-radius: var(--radius-pill);
   border: 1px solid var(--border);
-  background: #fff;
+  background: var(--control-bg);
   color: var(--text-2);
   font-size: var(--fs-caption);
   white-space: nowrap;
@@ -226,7 +226,7 @@ body {
 }
 .wc-lic-ring__track {
   fill: none;
-  stroke: rgba(16, 24, 60, 0.12);
+  stroke: var(--hairline);
   stroke-width: 3;
 }
 .wc-lic-ring__arc {
@@ -293,7 +293,8 @@ body {
   min-height: 0;
 }
 
-/* ---------- 侧栏（可折叠；A·冰川：深海军蓝分区，原型 :77-100） ---------- */
+/* ---------- 侧栏（可折叠；配色由 ui-kit `--sidebar-*` token 驱动） ----------
+   明色态为浅底深字（与整体主题同色系），暗色态为深海军蓝（见 tokens.css）。 */
 .wc-sidebar {
   width: var(--sidebar-w);
   flex: 0 0 var(--sidebar-w);
@@ -345,7 +346,7 @@ body {
   transition: background 160ms ease-out, color 160ms ease-out;
 }
 .wc-nav-item:hover {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--sidebar-hover);
   color: var(--sidebar-text-active);
 }
 .wc-nav-item.is-on {
@@ -527,13 +528,13 @@ body {
   min-height: 32px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
-  background: #fff;
+  background: var(--control-bg);
   color: var(--text-1);
   cursor: pointer;
   white-space: nowrap;
 }
 .wc-btn:hover:not(:disabled) {
-  border-color: #c9cdd4;
+  border-color: var(--control-border-hover);
   background: var(--bg-hover);
 }
 .wc-btn--primary {
@@ -631,7 +632,7 @@ body {
   padding: 4px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--control-bg);
   color: var(--text-1);
   width: 100%;
 }
@@ -766,7 +767,7 @@ body {
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   font-size: var(--fs-caption);
-  background: #fff;
+  background: var(--control-bg);
   color: var(--text-2);
   white-space: nowrap;
 }
