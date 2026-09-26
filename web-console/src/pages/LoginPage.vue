@@ -21,7 +21,10 @@
     <!-- 左：品牌栏（深海军蓝，A·冰川 :20,:77-100） -->
     <aside class="wc-login__panel">
       <div class="wc-login__panel-top">
-        <span class="wc-login__logo">GW</span>
+        <!-- 品牌标识：透明底 PNG；面板为深海军蓝，故用浅底承托深色 logo 保证对比度 -->
+        <span class="wc-login__logo">
+          <img src="/logo.png" alt="IoT-DAQ" />
+        </span>
         <div class="wc-login__brand-text">
           <strong>IoT-DAQ</strong>
           <span>数据网关控制台</span>
@@ -142,7 +145,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import type { FieldRule, FormInstance } from '@arco-design/web-vue';
-import { ApiError, apiLogin, setStoredBackendRole, setStoredToken } from '@/api/client';
+import { ApiError, apiLogin, apiUrl, setStoredBackendRole, setStoredToken } from '@/api/client';
 import { dataVersion, preloadRealData, refresh, repo } from '@/api/repo';
 import { mapBackendRole, session } from '@/store/session';
 
@@ -247,7 +250,9 @@ async function loadAuthState(): Promise<void> {
   authState.value = 'loading';
   authNote.value = '';
   try {
-    const res = await fetch('/api/auth/state', { headers: { Accept: 'application/json' } });
+    const res = await fetch(apiUrl('/api/auth/state'), {
+      headers: { Accept: 'application/json' },
+    });
     if (res.ok) {
       const body = (await res.json()) as AuthStateResponse;
       authNote.value = typeof body.note === 'string' ? body.note : '';
@@ -328,7 +333,7 @@ async function onBootstrap(): Promise<void> {
   bootstrapLoading.value = true;
   errorMsg.value = '';
   try {
-    const res = await fetch('/api/auth/bootstrap', {
+    const res = await fetch(apiUrl('/api/auth/bootstrap'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password: form.password }),
@@ -486,11 +491,14 @@ async function onSubmit(): Promise<void> {
   height: 40px;
   flex: 0 0 40px;
   border-radius: var(--radius-sm);
-  background: var(--brand);
-  color: #04241f;
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+  background: #fff;
+  overflow: hidden;
+}
+.wc-login__logo img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
 }
 .wc-login__brand-text {
   display: flex;

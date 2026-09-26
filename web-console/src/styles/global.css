@@ -95,15 +95,9 @@ body {
 .wc-brand__logo {
   width: 26px;
   height: 26px;
-  border-radius: 6px;
-  background: var(--brand);
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+  flex: 0 0 26px;
+  display: block;
+  object-fit: contain;
 }
 .wc-topbar__mini {
   font-size: var(--fs-caption);

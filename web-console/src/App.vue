@@ -29,7 +29,8 @@
       </button>
 
       <div class="wc-brand">
-        <span class="wc-brand__logo">GW</span>
+        <!-- 品牌标识：透明底 PNG（web-console/public/logo.png，由设计原图抠白底生成） -->
+        <img class="wc-brand__logo" src="/logo.png" alt="IoT-DAQ" />
         <span class="wc-brand__text">数据网关控制台</span>
       </div>
 
