@@ -25,7 +25,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/iot-daq-daemon.exe": "iot-daq-daemon.exe"
+      "resources/iot-daq-daemon.exe": "iot-daq-daemon.exe",
+      "resources/config.example.toml": "config.example.toml"
     },
     "category": "Utility",
     "shortDescription": "工业边缘数据汇聚网关 · 桌面控制台",
