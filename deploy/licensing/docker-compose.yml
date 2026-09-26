@@ -1,0 +1,71 @@
+# =============================================================================
+# iot-daq 授权端（licensing-server）· 单机 docker compose 部署
+# =============================================================================
+# 用法（服务器上，部署目录 /opt/iot-daq/licensing）：
+#   1) 放置 .env（参照 .env.example，含真实凭据；绝不入库）
+#   2) 确保宿主数据目录存在且属主为容器非 root uid/gid：
+#        mkdir -p /opt/iot-daq/licensing/data
+#        chown -R 65532:65532 /opt/iot-daq/licensing/data
+#   3) docker compose up -d
+#
+# 镜像由本地 buildx 构建、docker save → 上传 → docker load 得到（服务器上绝不构建）。
+# 外网不直接暴露：端口只绑回环，由宿主 nginx 反代（deploy/nginx/iot-daq-licensing.conf）。
+# =============================================================================
+
+services:
+  licensing-server:
+    image: iot-daq-licensing-server:0.1.0
+    container_name: iot-daq-licensing-server
+    restart: unless-stopped
+
+    # 资源上限：正式服务器内存有限（~7.4G，可用 ~2.4G）
+    mem_limit: 384m
+
+    # 根文件系统只读：镜像内无任何需写入路径（数据走挂载卷，临时文件走 tmpfs）
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+
+    environment:
+      # ---- 监听与存储（存储路径必须显式指到挂载卷；默认 ./licensing.db 会写进镜像可写层）----
+      IOT_DAQ_LISTEN_ADDR: "0.0.0.0:7080"
+      IOT_DAQ_LICENSE_DB: "/data/licensing.db"
+      IOT_DAQ_LOG_LEVEL: "info"
+      # healthprobe 探针端口（须与监听端口一致）
+      IOT_DAQ_HTTP_PORT: "7080"
+
+      # ---- 管理员凭据（fail-closed：_SHA256 / _PASSWORD 皆缺 → 登录全拒）----
+      IOTDAQ_ADMIN_USER: "${IOTDAQ_ADMIN_USER:-admin}"
+      IOTDAQ_ADMIN_PASSWORD_SHA256: "${IOTDAQ_ADMIN_PASSWORD_SHA256:-}"
+      IOTDAQ_ADMIN_PASSWORD: "${IOTDAQ_ADMIN_PASSWORD:-}"
+
+      # ---- 管理端 JWT 密钥（缺省回退内置 dev 密钥并 warn；生产必配）----
+      IOTDAQ_JWT_SECRET: "${IOTDAQ_JWT_SECRET:-}"
+
+      # ---- Lease Token 签名私钥（须成对；缺省时签发端点 fail-closed）----
+      IOT_DAQ_LICENSE_SIGNING_KID: "${IOT_DAQ_LICENSE_SIGNING_KID:-}"
+      IOT_DAQ_LICENSE_SIGNING_KEY: "${IOT_DAQ_LICENSE_SIGNING_KEY:-}"
+
+    volumes:
+      # 持久卷：宿主目录须 chown 65532:65532（容器以非 root 运行）
+      - type: bind
+        source: ${IOTDAQ_DATA_DIR:-/opt/iot-daq/licensing/data}
+        target: /data
+
+    ports:
+      # 仅绑定回环：外网经宿主 nginx 反代，不直接暴露
+      - "127.0.0.1:7080:7080"
+
+    healthcheck:
+      # distroless 无 shell → exec-form 调用镜像内静态探针（TCP connect 到 7080）
+      test: ["CMD", "/usr/local/bin/healthprobe"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
