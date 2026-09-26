@@ -12,6 +12,18 @@
 import { describe, it, expect, vi } from 'vitest';
 import { API_MODE, repo, refresh, refreshAlerts, coerceRuleConditionValue } from './repo';
 import { DEFAULT_ACTOR, PROTOCOL_OPTIONS, licenseSnapshot } from './model';
+import { API_BASE } from './client';
+
+/**
+ * 把请求 URL 归一为**路径**后再断言。
+ *
+ * `client.ts` 现在使用绝对基址 `API_BASE`（默认 `http://127.0.0.1:8080`），
+ * 目的是修 Tauri 打包版的「响应不是合法 JSON」——打包页 origin 为
+ * `http://tauri.localhost`，相对路径会被资产协议接管并回退 index.html。
+ * 契约测试关心的是**请求打到了哪个路径**，与基址无关，故统一归一化，
+ * 避免基址变更被误报成契约破坏。
+ */
+const pathOf = (url: string): string => (url.startsWith(API_BASE) ? url.slice(API_BASE.length) : url);
 
 const NOTICE_KEYS = [
   'devices',
@@ -56,7 +68,7 @@ describe('repo 真实契约', () => {
   it('resolveAlarm 走 POST /api/alerts/:id/ack：四要素下发，confirm 漏传归一为告警 id（fail-closed）', async () => {
     const calls: { url: string; init?: RequestInit }[] = [];
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
+      calls.push({ url: pathOf(String(input)), init });
       return Promise.resolve(
         new Response(JSON.stringify({ ok: true, alarm: { id: 'al-1' } }), {
           status: 200,
@@ -91,7 +103,7 @@ describe('repo 真实契约', () => {
   it('resolveAlarm 默认成功后重取清单并 bump dataVersion；refetch:false 则不跟随 GET', async () => {
     const urls: string[] = [];
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
+      const url = pathOf(String(input));
       if (init?.method === 'POST') {
         urls.push(url);
       } else if (url.startsWith('/api/alerts')) {
@@ -128,7 +140,7 @@ describe('repo 真实契约', () => {
   it('createPoint 透传 endpoint（V1 正例键）；缺省不带上（address 别名语义不变）', async () => {
     const posts: { url: string; init?: RequestInit }[] = [];
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
+      const url = pathOf(String(input));
       if (init?.method === 'POST') {
         posts.push({ url, init });
       }
@@ -191,7 +203,7 @@ describe('repo 真实契约', () => {
       input: RequestInfo | URL,
       init?: RequestInit,
     ) => {
-      calls.push({ url: String(input), init });
+      calls.push({ url: pathOf(String(input)), init });
       return Promise.resolve(
         new Response(JSON.stringify({ error: 'not_implemented' }), {
           status: 404,
@@ -259,7 +271,7 @@ describe('repo 真实契约', () => {
   it('groups.remove 调用方漏传 confirm 时仍归一为布尔 true（DevicesPage 真机 400 回归）', async () => {
     const calls: { url: string; init?: RequestInit }[] = [];
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
+      calls.push({ url: pathOf(String(input)), init });
       return Promise.resolve(
         new Response(JSON.stringify({ accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
       );
@@ -283,7 +295,7 @@ describe('repo 真实契约', () => {
 
   it('checkUpdates / autostartStatus：snake → camel 透传，write_supported:false 与 registered:null 诚实保留', async () => {
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL) => {
-      const url = String(input);
+      const url = pathOf(String(input));
       const body: unknown =
         url.startsWith('/api/updates/check')
           ? {
@@ -333,7 +345,7 @@ describe('repo 真实契约', () => {
   it('putBackupPolicy：白名单 snake body + reason/note 独立下发，计数字符串透传', async () => {
     const calls: { url: string; init?: RequestInit }[] = [];
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
+      calls.push({ url: pathOf(String(input)), init });
       return Promise.resolve(
         new Response(
           JSON.stringify({ auto_before_write: true, retention_count: '30', interval_min: '60', source: 'config' }),
@@ -374,7 +386,7 @@ describe('repo 真实契约', () => {
       input: RequestInfo | URL,
       init?: RequestInit,
     ) => {
-      calls.push({ url: String(input), init });
+      calls.push({ url: pathOf(String(input)), init });
       return Promise.resolve(
         new Response(JSON.stringify({ error: 'not_implemented' }), {
           status: 404,
@@ -412,7 +424,7 @@ describe('repo 真实契约', () => {
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((
       input: RequestInfo | URL,
     ) => {
-      const url = String(input);
+      const url = pathOf(String(input));
       let body: unknown = [];
       if (url.startsWith('/api/devices')) {
         body = [DEVICE];
@@ -455,7 +467,7 @@ describe('repo 真实契约', () => {
     const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(((
       input: RequestInfo | URL,
     ) => {
-      const url = String(input);
+      const url = pathOf(String(input));
       const body: unknown = url.startsWith('/api/devices') ? [DEVICE_ROW] : [];
       return Promise.resolve(
         new Response(JSON.stringify(body), {
@@ -487,7 +499,7 @@ describe('转发规则结构化契约（/api/rules 系列；写请求不得打�
   /** 拦 fetch 并让所有请求 404（后端写接口未落地 → 结构化失败，不假装成功）。 */
   function spyFetch(calls: { url: string; init?: RequestInit }[]) {
     return vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
+      calls.push({ url: pathOf(String(input)), init });
       return Promise.resolve(
         new Response(JSON.stringify({ error: 'not_implemented' }), {
           status: 404,
