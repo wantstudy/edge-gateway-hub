@@ -11,6 +11,18 @@ authors.workspace = true
 # task 3 机器码指纹：多源锚点 + N-of-M + HMAC-SHA256（纯 Rust 栈）。
 hmac = "0.12"
 sha2 = "0.10"
+# ── 管理面口令哈希：Argon2id 加盐哈希（password-hash 0.5 的 PHC 串存储形态，
+# 形如 `$argon2id$v=19$m=19456,t=2,p=1$<b64salt>$<b64hash>`）。
+# 选型理由：替代「无盐单轮 SHA-256」——裸 sha256 可被弱口令字典直接反查。
+# **纯 Rust**：argon2 的 H 推导为纯 Rust blake2b 实现，password-hash 提供 PHC
+# 解析 / 校验 / 编码，均不引 C 依赖，符合「纯 Rust 依赖栈」红线
+#（禁 aws-lc-rs / openssl-sys / native-tls / paho-mqtt）。许可证 MIT/Apache-2.0，
+# 已在 deny.toml 白名单内。
+argon2 = { version = "0.5", features = ["password-hash"] }
+# `password-hash` 的 `getrandom` 特性：放开 rand_core（OsRng / CryptoRng），
+# 供 Argon2 生成**每账号独立随机盐**。不加该特性时 rand_core 以 default-features=false
+# 引入，`OsRng` 不存在（RustCrypto 上游的既有行为，非本仓库可绕过）。
+password-hash = { version = "0.5", features = ["getrandom"] }
 # task 34 敏感配置加密：AES-256-GCM（纯 Rust / 已在依赖图内——rustls 的 crypto provider
 # 就是 ring，Cargo.lock 已锁定 0.17.14，登记为直接依赖**零新增下载**）。
 # 禁止换成 aws-lc-rs（cmake/NASM C 构建，违反纯 Rust 依赖栈红线）。
@@ -50,7 +62,19 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros", "
 # 故关闭默认特性，仅启用 `use-rustls-no-provider`：保留 rustls 传输能力（`Transport::tls` 仍在），
 # 但**不装任何 crypto provider**，由 daemon 侧 `ensure_rustls_provider()` 显式安装 `ring`
 # （见 src/north/mqtt.rs，`to_transport` 在建连前调用）。
-rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
+#
+# task 61 / RUSTSEC-2026-0104（HIGH, GHSA-82j2-j2ch-gfr8, CVE-2026-93599「证书吊销列表解析可达 panic」）
+# 迁移：crate 家族从 `rumqttc` 迁到 `rumqttc-next`（v4 变体，`rumqttc-v4-next`，协议同为 MQTT 3.1.1，
+# 是 `rumqttc 0.25.x` 的官方后继）。
+#   - `rumqttc 0.25.1` 钉 `rustls-webpki ^0.102.8` → 命中 4 条公告（0104 HIGH / 0049 MODERATE /
+#     0098、0099 LOW）；该版本已是 crates.io 最新 `rumqttc`，无 0.26+，靠 `cargo update` 无法修。
+#   - `rumqttc-v4-next 0.29.0` 钉 `rustls-webpki ^0.103.9` → 解析到与 `rustls 0.23.45` 同一份
+#     0.103.15，4 条公告全清。
+# 版本选 0.29.0 而非家族最新 0.34.0：后者 `rust-version = 1.89`，会让本 workspace 声明的
+# `rust-version = "1.85"` 失真；0.29.0 的 `rust-version = 1.85.0` 与之一致。二者解析出的
+# rustls-webpki 同为 0.103.15，安全收益无差别。
+# 仍沿用 `use-rustls-no-provider`，红线（不引入 aws-lc-rs）与 provider 由 daemon 自装的设计不变。
+rumqttc-v4-next = { version = "0.29.0", default-features = false, features = ["use-rustls-no-provider"] }
 # task 19 mqtts 依赖修正：rumqttc/tokio-rustls 引入的 rustls 未启用任何 crypto provider，
 # `CryptoProvider::get_default()` 返回 None → mqtts 握手必然无 provider。
 # 显式启用 `ring`（纯 Rust 侧可构建；**不要选 aws-lc-rs**：cmake/NASM C 构建，违反纯 Rust 栈红线）。

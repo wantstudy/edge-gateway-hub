@@ -79,4 +79,6 @@ web_auth_enabled = true
 # [[mgmt_auth.users]]
 # name = "ops"
 # role = "ops"                           # ops / lic_ops / risk / system
-# password_hash = "<sha256(password) 的 hex>"
+# password_hash = "<Argon2id PHC 串，形如 $argon2id$v=19$m=19456,t=2,p=1$<b64salt>$<b64hash>>"
+#                                        # 新格式（加盐）。仍兼容旧的 sha256(password) hex，
+#                                        # 首次登录成功会自动升级为 Argon2id。
