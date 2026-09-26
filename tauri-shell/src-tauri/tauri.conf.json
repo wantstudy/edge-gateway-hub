@@ -26,7 +26,8 @@
     ],
     "resources": {
       "resources/iot-daq-daemon.exe": "iot-daq-daemon.exe",
-      "resources/config.example.toml": "config.example.toml"
+      "resources/config.example.toml": "config.example.toml",
+      "resources/WebView2Loader.dll": "WebView2Loader.dll"
     },
     "category": "Utility",
     "shortDescription": "工业边缘数据汇聚网关 · 桌面控制台",
