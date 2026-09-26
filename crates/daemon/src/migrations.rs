@@ -658,6 +658,222 @@ impl<T: fmt::Debug> fmt::Debug for LoadOutcome<T> {
 }
 
 // ---------------------------------------------------------------------------
+// 备份命名（新格式内嵌可读时间 + 旧格式向后兼容）
+// ---------------------------------------------------------------------------
+//
+// **新建**备份统一采用新格式：
+//   `{config}.YYYYMMDD-HHmmss-NNN.bak`
+//   · 内嵌时刻统一 **东八区（UTC+8，无夏令时）**，全进程一致；
+//   · `YYYYMMDD-HHmmss` 为 UTC+8 墙钟时间；`NNN` 为同一秒内从 `000` 起的 3 位
+//     零填充序号（保证唯一，且字典序 = 时间序）；
+//   · 例：`config.toml.20260927-011231-000.bak`。
+//
+// 旧格式（历史遗留，**继续识别**：可列出、可恢复、可参与 retention 清理）：
+//   `{config}.bak-<unix秒>` / `{config}.bak-<unix秒>-<序号>`
+//   / `{config}.bak-manual-<epoch_ms>` / `{config}.bak-periodic-<epoch_ms>`。
+
+/// 东八区相对 UTC 的秒偏移（备份文件名内嵌时刻统一 UTC+8）。
+const UTC8_OFFSET_SECS: i64 = 8 * 3600;
+
+/// 结构解析新格式 token（`YYYYMMDD-HHmmss` 或 `YYYYMMDD-HHmmss-NNN`）→ epoch 毫秒。
+///
+/// 序号 `NNN` 作为毫秒尾数并入（同秒内单调递增）；任一字段结构 / 范围不合法 → `None`。
+fn parse_readable_token(token: &str) -> Option<u64> {
+    let (date, rest) = token.split_once('-')?;
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (time, seq) = match rest.split_once('-') {
+        Some((time, seq)) => (time, Some(seq)),
+        None => (rest, None),
+    };
+    if time.len() != 6 || !time.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seq = match seq {
+        None => 0u64,
+        Some(raw) => {
+            if raw.len() != 3 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            raw.parse::<u64>().ok()?
+        }
+    };
+    let year = date.get(0..4)?.parse::<i64>().ok()?;
+    let month = date.get(4..6)?.parse::<i64>().ok()?;
+    let day = date.get(6..8)?.parse::<i64>().ok()?;
+    let hour = time.get(0..2)?.parse::<i64>().ok()?;
+    let minute = time.get(2..4)?.parse::<i64>().ok()?;
+    let second = time.get(4..6)?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let wall = days
+        .saturating_mul(86_400)
+        .saturating_add(hour * 3600 + minute * 60 + second);
+    let epoch = wall.saturating_sub(UTC8_OFFSET_SECS);
+    if epoch < 0 {
+        return None;
+    }
+    Some(
+        u64::try_from(epoch)
+            .ok()?
+            .saturating_mul(1000)
+            .saturating_add(seq),
+    )
+}
+
+/// 公历 `YYYY-MM-DD` → 自 1970-01-01 起的天数（Howard Hinnant 算法，纯整数）。
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// 自 1970-01-01 起的天数 → `(年, 月, 日)`（Howard Hinnant 算法，纯整数）。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { y + 1 } else { y }, month, day)
+}
+
+/// epoch 秒 → UTC+8 `YYYYMMDD-HHmmss`（按 `div_euclid` 处理负值，绝不 panic）。
+fn format_utc8_token(epoch_secs: i64) -> String {
+    let wall = epoch_secs.saturating_add(UTC8_OFFSET_SECS);
+    let days = wall.div_euclid(86_400);
+    let rem = wall.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let second = rem % 60;
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
+/// 判定 `name` 是否本服务自产的备份文件名（新旧两种命名都算；临时文件不算）。
+pub fn is_backup_file_name(name: &str, config_file_name: &str) -> bool {
+    if name.contains(".tmp") {
+        return false;
+    }
+    let legacy_prefix = format!("{config_file_name}.bak-");
+    if name
+        .strip_prefix(legacy_prefix.as_str())
+        .is_some_and(|rest| !rest.is_empty())
+    {
+        return true;
+    }
+    let readable_prefix = format!("{config_file_name}.");
+    name.strip_prefix(readable_prefix.as_str())
+        .and_then(|rest| rest.strip_suffix(".bak"))
+        .and_then(parse_readable_token)
+        .is_some()
+}
+
+/// 备份排序键（**epoch 毫秒**，升序 = 时间升序）。
+///
+/// 新旧两种命名统一映射到同一时间轴；不可解析 → `u64::MAX`（视为最新，retention 保留）。
+pub fn backup_sort_key(name: &str, config_file_name: &str) -> u64 {
+    if name.contains(".tmp") {
+        return u64::MAX;
+    }
+    let legacy_prefix = format!("{config_file_name}.bak-");
+    if let Some(rest) = name.strip_prefix(legacy_prefix.as_str()) {
+        // epoch 毫秒命名（manual / periodic）。
+        if let Some(ms) = rest
+            .strip_prefix("manual-")
+            .or_else(|| rest.strip_prefix("periodic-"))
+        {
+            return parse_leading_u64(ms).unwrap_or(u64::MAX);
+        }
+        // `bak-<unix秒>` / `bak-<unix秒>-<序号>`。
+        let digits = leading_digits(rest);
+        let Ok(secs) = digits.parse::<u64>() else {
+            return u64::MAX;
+        };
+        let seq = rest[digits.len()..]
+            .strip_prefix('-')
+            .and_then(parse_leading_u64)
+            .unwrap_or(0)
+            .min(999);
+        return secs.saturating_mul(1000).saturating_add(seq);
+    }
+    let readable_prefix = format!("{config_file_name}.");
+    name.strip_prefix(readable_prefix.as_str())
+        .and_then(|rest| rest.strip_suffix(".bak"))
+        .and_then(parse_readable_token)
+        .unwrap_or(u64::MAX)
+}
+
+/// 取字符串的前导 ASCII 数字段。
+fn leading_digits(text: &str) -> String {
+    text.chars().take_while(char::is_ascii_digit).collect()
+}
+
+/// 解析字符串开头的前导 ASCII 数字段为 `u64`（无数字前缀 → `None`）。
+fn parse_leading_u64(text: &str) -> Option<u64> {
+    let digits = leading_digits(text);
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// 为下一次备份构造**唯一**的新格式路径（只做命名，不落盘）。
+///
+/// 同一秒内扫描已存在的 `{base}-NNN.bak` 取 `max(N)+1`；仍冲突时继续 `+1`
+/// （有界 1000 次，绝不 panic）。
+pub fn next_backup_path(dir: &Path, config_file_name: &str) -> PathBuf {
+    let base = format!(
+        "{config_file_name}.{}",
+        format_utc8_token(unix_secs_i64())
+    );
+    let scan_prefix = format!("{base}-");
+    let mut next: u32 = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Some(fname) = entry.file_name().to_str().map(ToString::to_string) else {
+                continue;
+            };
+            let Some(seq) = fname
+                .strip_prefix(scan_prefix.as_str())
+                .and_then(|rest| rest.strip_suffix(".bak"))
+            else {
+                continue;
+            };
+            if seq.len() == 3 && seq.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(value) = seq.parse::<u32>() {
+                    next = next.max(value.saturating_add(1));
+                }
+            }
+        }
+    }
+    let mut candidate = dir.join(format!("{base}-{next:03}.bak"));
+    let mut tries = 0u32;
+    while candidate.exists() && tries < 1000 {
+        next = next.saturating_add(1);
+        tries += 1;
+        candidate = dir.join(format!("{base}-{next:03}.bak"));
+    }
+    candidate
+}
+
+// ---------------------------------------------------------------------------
 // 原子备份
 // ---------------------------------------------------------------------------
 
@@ -668,7 +884,8 @@ impl<T: fmt::Debug> fmt::Debug for LoadOutcome<T> {
 /// `rename` 到最终备份名——rename 在同一文件系统内是原子的，故备份文件
 /// 要么完整存在、要么不存在，绝不会出现写了一半的备份。
 ///
-/// 备份命名：`<原名>.bak-<unix秒>`；同名已存在时追加 `-2`、`-3`… 递增。
+/// 备份命名：见本模块「备份命名」小节（新格式 `{config}.YYYYMMDD-HHmmss-NNN.bak`，
+/// 时刻统一 UTC+8）。旧格式 `{config}.bak-<unix秒>` 仍可被识别 / 恢复。
 ///
 /// # Errors
 /// - `path` 不存在 / 不是普通文件 → `ConfigError`（2000）；
@@ -691,23 +908,16 @@ pub fn backup_before_rewrite(path: &Path) -> DaemonResult<PathBuf> {
         .and_then(|n| n.to_str())
         .unwrap_or("config")
         .to_string();
-    let secs = unix_secs_i64();
 
-    // 最终备份名（冲突则追加序号，最多尝试 1000 次）。
-    let mut backup = dir.join(format!("{file_name}.bak-{secs}"));
-    let mut seq = 1u32;
-    while backup.exists() {
-        seq += 1;
-        if seq > 1000 {
-            return Err(storage_err(
-                "backup: too many same-second backups, refusing to overwrite",
-            ));
-        }
-        backup = dir.join(format!("{file_name}.bak-{secs}-{seq}"));
-    }
+    // 最终备份名（新格式，同秒内唯一）。
+    let backup = next_backup_path(&dir, &file_name);
 
     // 临时文件 + fsync + 原子 rename。
-    let tmp = dir.join(format!("{file_name}.bak-{secs}.tmp-{}", std::process::id()));
+    let backup_file_name = backup
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.bak");
+    let tmp = dir.join(format!("{backup_file_name}.tmp-{}", std::process::id()));
     let write_result = (|| -> std::io::Result<()> {
         let mut file = File::create(&tmp)?;
         file.write_all(&data)?;
@@ -732,15 +942,17 @@ pub fn backup_before_rewrite(path: &Path) -> DaemonResult<PathBuf> {
     Ok(backup)
 }
 
-/// 备份保留策略清理：只删**本服务自产的** `{file_name}.bak-*`（与
-/// [`backup_before_rewrite`] 同一命名模式；`.tmp-` 半成品一并纳入清理范围——
-/// 同前缀，同样只可能是本服务产物）。按名字内嵌的**数字时刻**升序保留最新
-/// `retention` 份，超出部分从最旧开始删除。
+/// 备份保留策略清理：只删**本服务自产的**备份（新格式
+/// `{file_name}.YYYYMMDD-HHmmss-NNN.bak` 与旧格式 `{file_name}.bak-*` 都算，
+/// 与 [`backup_before_rewrite`] / [`is_backup_file_name`] 同一口径；`.tmp-`
+/// 半成品一并纳入清理范围——同样只可能是本服务产物）。按名字内嵌的**时刻**
+/// 升序保留最新 `retention` 份，超出部分从最旧开始删除。
 ///
-/// - 排序键 = `.bak-` 后前导数字段（`bak-<unix秒>` / `bak-manual-<ms>` /
-///   `bak-periodic-<ms>` / `bak-<秒>-<序号>` 全部命中；同一前缀下秒/毫秒
-///   长度混排时字典序 ≠ 时间序，故必须按数值比较）；
-/// - 数字段不可解析的名字排序键取 `u64::MAX`（视为最新，保留——fail-safe）；
+/// - 排序键 = [`backup_sort_key`]（统一 epoch 毫秒：新格式解析 `YYYYMMDD-HHmmss`
+///   为 UTC+8 墙钟；旧格式 `bak-<unix秒>` / `bak-manual-<ms>` / `bak-periodic-<ms>`
+///   / `bak-<秒>-<序号>` 全部命中；同一前缀下秒/毫秒混排时字典序 ≠ 时间序，
+///   故必须按数值比较）；
+/// - 不可解析的名字排序键取 `u64::MAX`（视为最新，保留——fail-safe）；
 /// - `retention == 0` → 不清理（调用方语义：0 = 保留无限份）；
 /// - 单个文件删除失败 → 记 warn 并跳过该文件继续（绝不因清理失败阻断写路径）；
 /// - **绝不匹配其它命名模式**：用户自建备份（如 `config.toml.mybak`）不受影响。
@@ -766,7 +978,6 @@ pub fn enforce_backup_retention(config_path: &Path, retention: u32) -> usize {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
-    let prefix = format!("{file_name}.bak-");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };
@@ -774,15 +985,8 @@ pub fn enforce_backup_retention(config_path: &Path, retention: u32) -> usize {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_file())
         .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
-        .filter(|name| name.starts_with(&prefix))
-        .map(|name| {
-            let digits: String = name[prefix.len()..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            let ts = digits.parse::<u64>().unwrap_or(u64::MAX);
-            (ts, name)
-        })
+        .filter(|name| is_backup_file_name(name, file_name))
+        .map(|name| (backup_sort_key(&name, file_name), name))
         .collect();
     backups.sort();
     let excess = backups.len().saturating_sub(retention as usize);
@@ -800,15 +1004,14 @@ pub fn enforce_backup_retention(config_path: &Path, retention: u32) -> usize {
     removed
 }
 
-/// 统计 `{file_name}.bak-*` 备份文件数（与 [`enforce_backup_retention`] 同一
-/// 匹配口径；目录不可读 → 0）。
+/// 统计本服务自产备份文件数（新旧两种命名，与 [`enforce_backup_retention`]
+/// 同一匹配口径；目录不可读 → 0）。
 pub fn count_backup_files(config_path: &Path) -> usize {
     let dir = backup_search_dir(config_path);
     let file_name = config_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
-    let prefix = format!("{file_name}.bak-");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };
@@ -819,7 +1022,7 @@ pub fn count_backup_files(config_path: &Path) -> usize {
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with(&prefix))
+                .is_some_and(|n| is_backup_file_name(n, file_name))
         })
         .count()
 }
@@ -1179,7 +1382,7 @@ mod tests {
         assert!(backup.is_file(), "备份文件必须存在");
         let name = backup.file_name().and_then(|n| n.to_str()).expect("name");
         assert!(
-            name.starts_with("config.toml.bak-") && !name.contains(".tmp"),
+            is_backup_file_name(name, "config.toml") && name.ends_with(".bak"),
             "备份命名: {name}"
         );
         let content = std::fs::read(&backup).expect("read backup");
@@ -1247,6 +1450,108 @@ mod tests {
         assert_eq!(
             backup_search_dir(Path::new("./config.toml")),
             PathBuf::from(".")
+        );
+    }
+
+    /// 备份命名：新格式（可读时间）与旧格式（epoch）都能识别；排序键统一到
+    /// epoch 毫秒（升序 = 时间序）；用户自建文件与临时文件绝不误判。
+    #[test]
+    fn backup_naming_recognizes_new_and_legacy_and_orders_by_time() {
+        let cfg = "config.toml";
+        // 新格式：识别 + 排序友好（字典序 = 时间序）。
+        let mut new_names = vec![
+            "config.toml.20260927-011231-002.bak",
+            "config.toml.20260927-011231-000.bak",
+            "config.toml.20260927-011231-001.bak",
+            "config.toml.20260928-000000-000.bak",
+        ];
+        for name in &new_names {
+            assert!(is_backup_file_name(name, cfg), "应识别新格式: {name}");
+        }
+        new_names.sort();
+        assert_eq!(
+            new_names,
+            vec![
+                "config.toml.20260927-011231-000.bak",
+                "config.toml.20260927-011231-001.bak",
+                "config.toml.20260927-011231-002.bak",
+                "config.toml.20260928-000000-000.bak",
+            ],
+            "字典序 = 时间序"
+        );
+        // 新格式排序键：同秒内序号单调，跨秒更大。
+        let k0 = backup_sort_key("config.toml.20260927-011231-000.bak", cfg);
+        let k1 = backup_sort_key("config.toml.20260927-011231-001.bak", cfg);
+        let k_next_day = backup_sort_key("config.toml.20260928-000000-000.bak", cfg);
+        assert!(k0 < k1 && k1 < k_next_day, "排序键时间升序");
+
+        // 旧格式全部命中，且与新格式可比较（同一 epoch 毫秒时间轴）。
+        for name in [
+            "config.toml.bak-1790441651",
+            "config.toml.bak-1790441651-2",
+            "config.toml.bak-manual-1790441651123",
+            "config.toml.bak-periodic-1790441651123",
+        ] {
+            assert!(is_backup_file_name(name, cfg), "应识别旧格式: {name}");
+        }
+        // UTC+8 转换正确性：epoch 1790441651 = 2026-09-27 00:54:11 (UTC+8)。
+        assert_eq!(format_utc8_token(1790441651), "20260927-005411");
+        assert_eq!(
+            parse_readable_token("20260927-005411"),
+            Some(1790441651 * 1000),
+            "新格式 token 必须按 UTC+8 反推回同一 epoch"
+        );
+        // 同一时刻：旧秒格式 ↔ 新格式排序键**精确相等**（统一 epoch 毫秒时间轴）。
+        let legacy = backup_sort_key("config.toml.bak-1790441651", cfg);
+        let readable = backup_sort_key("config.toml.20260927-005411-000.bak", cfg);
+        assert_eq!(
+            legacy, readable,
+            "同一时刻的新旧命名必须落在同一排序键: {legacy} vs {readable}"
+        );
+
+        // 不误判：用户自建文件 / 临时文件 / 其它配置 / 结构不合法。
+        for name in [
+            "config.toml.mybak-keepme",
+            "config.toml.20260927-011231-000.bak.tmp-1234",
+            "other.toml.20260927-011231-000.bak",
+            "config.toml.2026-0927-011231-000.bak",
+            "config.toml.bak-",
+        ] {
+            assert!(!is_backup_file_name(name, cfg), "不应识别: {name}");
+        }
+    }
+
+    /// 新命名 helper：同秒内多次备份必须唯一，且文件名内嵌 UTC+8 可读时刻。
+    #[test]
+    fn next_backup_path_is_unique_and_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = "config.toml";
+        let first = next_backup_path(dir.path(), cfg);
+        let first_name = first
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("name")
+            .to_string();
+        assert!(
+            is_backup_file_name(&first_name, cfg) && first_name.ends_with(".bak"),
+            "新命名可识别: {first_name}"
+        );
+        assert!(
+            first_name.ends_with("-000.bak"),
+            "首份同秒备份序号应为 000: {first_name}"
+        );
+        // 落第一份后，第二份必须唯一（同秒内换序号；跨秒则换时间戳）。
+        std::fs::write(&first, b"a").expect("write first");
+        let second = next_backup_path(dir.path(), cfg);
+        assert_ne!(first, second, "第二次备份必须唯一、不覆盖第一份");
+        let second_name = second
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("name")
+            .to_string();
+        assert!(
+            is_backup_file_name(&second_name, cfg) && second_name.ends_with(".bak"),
+            "第二份新命名可识别: {second_name}"
         );
     }
 

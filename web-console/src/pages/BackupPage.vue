@@ -306,8 +306,8 @@ const backupBusy = ref(false);
 /**
  * 立即备份：真实 `POST /api/settings/backups`（无 body，`device.write` 守卫）。
  *
- * 后端按 `config.toml.bak-manual-<epoch_ms>` 落盘，清单接口自动可见，
- * 成功后重拉清单（不伪造条目）。
+ * 后端按可读命名 `config.toml.YYYYMMDD-HHmmss-NNN.bak`（内嵌 UTC+8 时刻）落盘，
+ * 清单接口自动可见，成功后重拉清单（不伪造条目）。
  */
 async function backupNow(): Promise<void> {
   if (backupBusy.value) {

@@ -3,11 +3,13 @@
   UpdatePage —— 系统更新（设计 §3.7 / 原型 gateway-v2a-glacier「update」）
   =============================================================================
   真实能力边界（不许造数）：
-    · 后端**没有**更新检查 / 下载 / 应用 / 回滚 / 离线包上传端点，`GET /api/overview`
-      仅提供当前版本；因此「当前版本」为真实值，其余版本类指标诚实留空（`—`）；
-    · 通道与策略开关为**本机界面状态**（网关未开放写端点），显式标注，不伪装成已落库；
+    · 后端提供「当前版本」（`GET /api/overview`）与「更新检查」（`GET /api/updates/check`）；
+      从升级源下载 / 安装 / 版本回滚 / 离线包导入的能力尚未接入，相关指标诚实留空（`—`），
+      并在页面上用**面向用户**的话说明「现在能做什么、为什么不能、怎么办」；
+    · 通道与策略开关为**本机界面状态**（暂不保存到网关），显式标注，不伪装成已落库；
     · 回滚 / 离线包为高危动作，仍走 DangerConfirmModal 四要素确认（影响清单 + 原因必填 +
-      对象二次校验），确认后按真实结果反馈（当前为「无端点」的诚实失败）。
+      对象二次校验），确认后按真实结果反馈（当前为「能力尚未接入」的诚实说明）；
+    · 「执行更新」按钮按后端声明的真实能力禁用——**不允许点了才报错，也不允许假装可点**。
 -->
 <template>
   <div class="wc-content">
@@ -56,7 +58,7 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>更新通道与策略</h3>
-          <span class="wc-tag wc-tag--info">本机界面状态 · 网关未开放写端点</span>
+          <span class="wc-tag wc-tag--info">本机界面状态 · 暂不保存到网关</span>
         </div>
         <div class="wc-card__body">
           <UiRadio v-model="channel" :options="channelOptions" :disabled="!canEdit" />
@@ -76,7 +78,7 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>更新进度</h3>
-          <span class="wc-card__sub">—（网关未提供更新执行接口）</span>
+          <span class="wc-card__sub">{{ progressSub }}</span>
         </div>
         <div class="wc-card__body">
           <ol class="up-steps">
@@ -101,7 +103,8 @@
             <button
               type="button"
               class="wc-btn wc-btn--primary"
-              :disabled="!canEdit"
+              :disabled="!applyEnabled"
+              :title="applyEnabled ? '' : applyDisabledReason"
               data-testid="update-start"
               @click="startUpdate"
             >
@@ -117,6 +120,9 @@
               回滚到 {{ currentVersion }}
             </button>
           </div>
+          <p v-if="!applyEnabled && applyDisabledReason" class="wc-hint" data-testid="update-apply-reason">
+            {{ applyDisabledReason }}
+          </p>
         </div>
       </section>
     </div>
@@ -129,7 +135,7 @@
         </div>
         <EmptyState
           title="暂无更新记录"
-          desc="网关未提供更新历史接口，无法列出历史版本。"
+          desc="更新历史能力尚未接入，暂时无法列出历史版本；接入后这里会显示每一次更新的结果。"
         >
           <template #actions>
             <button type="button" class="wc-btn wc-btn--sm" data-testid="update-check-empty" @click="checkUpdate">检查更新</button>
@@ -190,9 +196,9 @@
 /**
  * @file UpdatePage.vue
  * @module web-console/pages/UpdatePage
- * @description 系统更新页（当前版本取自网关；其余版本类指标无端点 → 诚实留空）。
+ * @description 系统更新页（当前版本取自网关；检查状态取自后端，能力未接入时诚实降级）。
  */
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import {
   UiRadio,
   UiSwitch,
@@ -224,6 +230,34 @@ const checking = ref(false);
 /** 最近一次检查结果（未检查 = null）。 */
 const lastCheck = ref<UpdateCheckInfo | null>(null);
 
+/** 尚未检查时展示的中性说明（不假设能力可用）。 */
+const NOT_CHECKED_HINT = '尚未检查更新，暂不能执行更新；请先点击「检查更新」。';
+
+/** 后端是否声明支持更新检查（未配置升级源 / 能力未接线 → false）。 */
+const updateSupported = computed<boolean>(() => lastCheck.value?.checkSupported === true);
+
+/** 「执行更新」是否可点：后端声明支持 + 存在可升级版本 + 当前角色有权限。 */
+const applyEnabled = computed<boolean>(
+  () => canEdit.value && updateSupported.value && lastCheck.value?.updateAvailable === true,
+);
+
+/** 无法执行更新时的**真实原因**（优先取后端 `reason`；绝不假装可点）。 */
+const applyDisabledReason = computed<string>(() => {
+  if (!canEdit.value) {
+    return '当前角色无权执行系统更新。';
+  }
+  if (!lastCheck.value) {
+    return NOT_CHECKED_HINT;
+  }
+  if (!lastCheck.value.checkSupported) {
+    return lastCheck.value.reason || '暂时无法执行更新。';
+  }
+  if (!lastCheck.value.updateAvailable) {
+    return '当前已是可用版本，没有需要安装的更新。';
+  }
+  return '';
+});
+
 /** 最新可用版本（未检查 / 无更新 → 空串，页面显示 —）。 */
 const latestVersion = computed<string>(() => {
   const info = lastCheck.value;
@@ -240,12 +274,12 @@ const latestVersionSub = computed<string>(() => {
     return '尚未检查更新';
   }
   if (!info.checkSupported) {
-    return info.reason || '网关未开启更新检查';
+    return info.reason || '暂时无法检查更新。';
   }
   return info.updateAvailable ? `来自 ${info.source || '配置的更新源'}` : '当前已是最新版本';
 });
 
-/** 顶部条：真实状态（无端点时不再谎称「未提供接口」）。 */
+/** 顶部条：真实状态（能力未接入时直接展示后端给出的原因）。 */
 const updateBanner = computed<string>(() => {
   const info = lastCheck.value;
   if (checking.value) {
@@ -255,7 +289,7 @@ const updateBanner = computed<string>(() => {
     return '尚未检查更新';
   }
   if (!info.checkSupported) {
-    return info.reason || '网关未开启更新检查';
+    return info.reason || '暂时无法检查更新。';
   }
   return info.updateAvailable ? `发现新版本 ${info.availableVersion || ''}` : '当前无可用更新';
 });
@@ -293,7 +327,13 @@ const toggles = reactive([
   { label: '安装前自动备份配置', on: true, desc: '升级前自动导出配置快照，失败可回滚。' },
 ]);
 
-// ---------- 进度（无端点 → 不做假进度） ----------
+// ---------- 进度（能力未接入 → 不做假进度） ----------
+
+/** 更新进度区副文案（能力未接入时如实说明）。 */
+const progressSub = computed<string>(() =>
+  updateSupported.value ? '等待开始' : '更新执行能力尚未接入，暂无可展示的进度',
+);
+
 /** 更新步骤（流程说明，不含具体包体数据）。 */
 const steps = [
   { n: '1', label: '下载更新包', desc: '来自官方源或内网镜像' },
@@ -303,9 +343,15 @@ const steps = [
   { n: '5', label: '健康自检', desc: '采集 / 转发 / 授权 三项连通性' },
 ];
 
-/** 开始更新：网关无执行端点，如实告知。 */
+/**
+ * 「开始更新」：按钮已按后端声明的真实能力禁用（本版本 `checkSupported` 恒为 false），
+ * 正常路径不可点击；此处兜底**如实**说明原因，绝不伪造成功、绝不下发假指令。
+ *
+ * 接线提示：后端开放更新执行能力后，应在此走危险确认弹窗并提交
+ * `reason` / `note` / `confirm` 三要素（需先在 `repo.ops` 增加对应方法）。
+ */
 function startUpdate(): void {
-  actionMessage.value = '更新未开始：网关未提供更新执行接口，本次未下发任何更新指令。';
+  actionMessage.value = `更新未开始：${applyDisabledReason.value}`;
 }
 
 /**
@@ -324,7 +370,7 @@ async function checkUpdate(): Promise<void> {
     const info = await repo.ops.checkUpdates();
     lastCheck.value = info;
     if (!info.checkSupported) {
-      actionMessage.value = `未执行检查：${info.reason || '网关未开启更新检查'}`;
+      actionMessage.value = `未执行检查：${info.reason || '暂时无法检查更新。'}`;
     } else if (info.updateAvailable) {
       actionMessage.value = `发现新版本 ${info.availableVersion || ''}（当前 ${info.currentVersion}，来源 ${info.source || '—'}）。`;
     } else {
@@ -369,11 +415,11 @@ function openRollback(version: string): void {
   rollbackOpen.value = true;
 }
 
-/** 回滚提交：网关无版本回滚端点，如实告知（不伪造成功）。 */
+/** 回滚提交：版本回滚能力尚未接入，如实告知（不伪造成功）。 */
 function onRollbackSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): void {
   rollbackOpen.value = false;
   actionMessage.value =
-    `回滚未执行：网关未提供版本回滚接口（原因：${payload.reason}）。` +
+    `回滚未执行：版本回滚能力尚未接入（原因：${payload.reason}）。` +
     '如需回退配置，请到「备份与恢复」或「系统设置 · 配置回滚」。';
 }
 
@@ -404,11 +450,18 @@ function openOffline(): void {
   offlineOpen.value = true;
 }
 
-/** 离线包提交：网关无导入端点，如实告知（不伪造成功）。 */
+/** 离线包提交：离线包导入能力尚未接入，如实告知（不伪造成功）。 */
 function onOfflineSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): void {
   offlineOpen.value = false;
-  actionMessage.value = `导入未执行：网关未提供离线包导入接口（原因：${payload.reason}）。`;
+  actionMessage.value = `导入未执行：离线包导入能力尚未接入（原因：${payload.reason}）。`;
 }
+
+// ---------- 首次进入：拉取真实能力状态 ----------
+// 让顶部状态条与「执行更新」按钮的可用性在进入页面时即为**权威**（不依赖用户先点一次），
+// 未配置升级源 / 能力未接线时直接展示后端 `reason`。
+onMounted(() => {
+  void checkUpdate();
+});
 </script>
 
 <style scoped>

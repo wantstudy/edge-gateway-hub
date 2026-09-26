@@ -222,6 +222,9 @@ pub struct SettingsSection {
     /// 写前备份策略。
     #[serde(default)]
     pub backup_policy: BackupPolicy,
+    /// 升级源声明（`[settings.updates]`；缺省 = 未配置 → 更新检查 / 执行诚实降级）。
+    #[serde(default, skip_serializing_if = "UpdatesSection::is_unconfigured")]
+    pub updates: UpdatesSection,
 }
 
 /// 备份策略（`[settings.backup_policy]`；把既有「写前自动备份」行为显式化）。
@@ -251,6 +254,32 @@ impl Default for BackupPolicy {
             retention_count: default_backup_retention(),
             interval_min: 0,
         }
+    }
+}
+
+/// `[settings.updates]` 升级源声明段（**可选**；本版本只承载「声明」，运行时接线未实现）。
+///
+/// - `source_url`：升级源地址（如 `https://ota.example.com/gateway`）；`None` / 空白 =
+///   **未配置升级源** → `GET /api/updates/check` 与 `POST /api/updates/apply` 一律结构化
+///   返回 `supported:false` + **面向用户**的原因，绝不伪造「已是最新」/「升级成功」；
+/// - `signing_key`：更新包签名校验公钥（Ed25519；PEM 或 hex）；`None` = 未配置。
+///
+/// 本段只承载声明；检查 / 下载 / 安装 / 回滚的运行时能力尚未接入（诚实降级，
+/// 消费方见 `mgmt::ops_api`）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct UpdatesSection {
+    /// 升级源地址（`None` / 空白 = 未配置）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    /// 更新包签名校验公钥（Ed25519；`None` = 未配置）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
+}
+
+impl UpdatesSection {
+    /// 未配置（两字段皆 `None`）：序列化时省略该段，旧 daemon 仍可读取新写出的文件。
+    fn is_unconfigured(&self) -> bool {
+        self.source_url.is_none() && self.signing_key.is_none()
     }
 }
 
@@ -788,10 +817,11 @@ impl GatewayConfig {
     /// 保存配置到 TOML 文件（管理面写路径）：
     /// toml 序列化 → （按 `[settings.backup_policy]`）`backup_before_rewrite`
     /// 写前原子备份 + retention 清理 → 临时文件 + fsync + 同目录 rename 原子落盘。
-    /// 任一步失败即中止，原文件保持写前状态（或可从 `.bak-<unix秒>` 备份恢复）。
+    /// 任一步失败即中止，原文件保持写前状态（或可从 `.YYYYMMDD-HHmmss-NNN.bak` 备份恢复）。
     ///
     /// `auto_before_write = false` 时跳过写前备份（恢复只能靠手动备份端点）；
-    /// retention 清理只删本服务自产的 `{file_name}.bak-*`，失败仅告警不阻断写路径。
+    /// retention 清理只删本服务自产的备份（新格式 `{file_name}.YYYYMMDD-HHmmss-NNN.bak`
+    /// 与旧格式 `{file_name}.bak-*`），失败仅告警不阻断写路径。
     ///
     /// # Errors
     /// - 序列化失败 → [`DaemonError::ConfigError`]；
@@ -1564,9 +1594,8 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             .expect("read_dir")
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("config.toml.bak-")
+                let name = e.file_name();
+                crate::migrations::is_backup_file_name(&name.to_string_lossy(), "config.toml")
             })
             .collect();
         assert!(!backups.is_empty(), "backup file must be created");
@@ -1613,6 +1642,38 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         assert_eq!(policy.interval_min, 15);
     }
 
+    /// QA（更新源声明）: 旧配置无 `[settings.updates]` → 默认**未配置**（不臆造源）；
+    /// 显式段可解析；未配置时序列化省略 `updates` 键（旧 daemon 可读新文件）。
+    #[test]
+    fn updates_section_defaults_unconfigured_and_parses() {
+        // 缺省 = 未配置。
+        let config = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy");
+        assert!(config.settings.updates.source_url.is_none());
+        assert!(config.settings.updates.signing_key.is_none());
+
+        // 显式配置可解析。
+        let config = GatewayConfig::parse(
+            "[settings.updates]\nsource_url = \"https://ota.example.com/gw\"\n\
+             signing_key = \"deadbeef\"\n",
+        )
+        .expect("parse updates");
+        assert_eq!(
+            config.settings.updates.source_url.as_deref(),
+            Some("https://ota.example.com/gw")
+        );
+        assert_eq!(config.settings.updates.signing_key.as_deref(), Some("deadbeef"));
+
+        // 未配置 → 序列化省略该段（旧 daemon 仍可读新写出的文件）。
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(raw.contains("source_url"), "configured section emitted: {raw}");
+        let legacy = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy again");
+        let raw = toml::to_string_pretty(&legacy).expect("serialize legacy");
+        assert!(
+            !raw.contains("updates"),
+            "unconfigured updates section must be omitted: {raw}"
+        );
+    }
+
     /// QA（B-2）: `auto_before_write = false` → save() 不再生成写前备份；
     /// `retention_count` 超限的旧 `.bak-*` 被清理（只清本服务自产前缀文件，
     /// 用户自建文件不动）。
@@ -1642,7 +1703,7 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             .expect("read_dir")
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
-            .filter(|n| n.starts_with("config.toml.bak-"))
+            .filter(|n| crate::migrations::is_backup_file_name(n, "config.toml"))
             .collect();
         bak.sort();
         assert_eq!(
@@ -1672,7 +1733,7 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             .expect("read_dir")
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
-            .filter(|n| n.starts_with("config.toml.bak-"))
+            .filter(|n| crate::migrations::is_backup_file_name(n, "config.toml"))
             .collect();
         assert_eq!(
             bak_after.len(),

@@ -32,7 +32,7 @@
 //!    任何未知字段 → 400（`validation_failed`，字段带组前缀）；`oem` / `network`
 //!    视为已知但**只读**（不在白名单 → 400 + 原因说明）；
 //! 3. **落盘**：全进程写锁 → 从热快照克隆改字段 → `pages::persist_config`
-//!    （license 配额闸门 → 写前备份 `config.toml.bak-*` → 原子落盘 → 热快照
+//!    （license 配额闸门 → 写前备份 `config.toml.YYYYMMDD-HHmmss-NNN.bak` → 原子落盘 → 热快照
 //!    即时替换）→ 失败 fail-closed 保留原配置；
 //! 4. **生效**：落盘成功后发布 `config_reloaded` 管理事件（SSE 三源合流）；
 //! 5. **响应**：`{accepted, config_version, backup}`（`config_version` /
@@ -139,11 +139,12 @@ fn redact_secret(secret: &Option<String>) -> Value {
 
 // ---- GET /api/settings/backups ----
 
-/// `GET /api/settings/backups` → 配置目录内 `config.toml.bak-*` 清单。
+/// `GET /api/settings/backups` → 配置目录内备份清单。
 ///
 /// 每项：`{file, size_bytes, mtime_ms}`（计数 / 字节 / mtime 一律字符串——大数
-/// 红线）；按文件名升序（名字含 unix 秒备份时刻，升序 = 时间序）。目录不可读 /
-/// 未装配 config 路径时返回空列表（空列表合法，不报错）。
+/// 红线）；按备份时刻升序（新格式 `config.toml.YYYYMMDD-HHmmss-NNN.bak` 与旧格式
+/// `config.toml.bak-*` 统一经 [`crate::migrations::backup_sort_key`] 排序）。目录
+/// 不可读 / 未装配 config 路径时返回空列表（空列表合法，不报错）。
 pub async fn list_backups(State(state): State<MgmtState>) -> Response {
     let rows = match state.config_path() {
         Some(path) => backup_rows(&path),
@@ -152,7 +153,7 @@ pub async fn list_backups(State(state): State<MgmtState>) -> Response {
     Json(Value::Array(rows)).into_response()
 }
 
-/// 列出配置目录内 `{file_name}.bak-*` 备份（排除临时文件；读目录失败 = 空表）。
+/// 列出配置目录内本服务自产备份（新旧两种命名；排除临时文件；读目录失败 = 空表）。
 fn backup_rows(config_path: &Path) -> Vec<Value> {
     let dir = config_path
         .parent()
@@ -162,13 +163,12 @@ fn backup_rows(config_path: &Path) -> Vec<Value> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config.toml");
-    let prefix = format!("{file_name}.bak-");
     let mut rows: Vec<(String, u64, u64)> = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.path().is_file())
             .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
-            .filter(|name| name.starts_with(&prefix) && !name.contains(".tmp"))
+            .filter(|name| crate::migrations::is_backup_file_name(name, file_name))
             .filter_map(|name| {
                 let meta = std::fs::metadata(dir.join(&name)).ok()?;
                 let size = meta.len();
@@ -183,7 +183,11 @@ fn backup_rows(config_path: &Path) -> Vec<Value> {
             .collect(),
         Err(_) => Vec::new(),
     };
-    rows.sort();
+    // 按备份时刻升序（新旧命名统一 epoch 毫秒排序键；字典序 ≠ 时间序）。
+    rows.sort_by(|a, b| {
+        crate::migrations::backup_sort_key(&a.0, file_name)
+            .cmp(&crate::migrations::backup_sort_key(&b.0, file_name))
+    });
     rows.into_iter()
         .map(|(name, size, mtime_ms)| {
             json!({
@@ -195,7 +199,8 @@ fn backup_rows(config_path: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// 取最新备份文件名（`{file_name}.bak-*` 按名最大 = 时刻最新；无备份 → None）。
+/// 取最新备份文件名（按 [`crate::migrations::backup_sort_key`] 最大 = 时刻最新；
+/// 无备份 → None）。
 fn newest_backup_name(config_path: &Path) -> Option<String> {
     backup_rows(config_path)
         .pop()
@@ -693,14 +698,14 @@ password = "PLAINTEXT-PASS"
         GatewayConfig::load(path).expect("reload saved config")
     }
 
-    /// 列出目录内备份文件名（排除临时文件）。
+    /// 列出目录内备份文件名（新旧两种命名；排除临时文件）。
     fn backup_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .expect("read_dir")
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_file())
             .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
-            .filter(|n| n.starts_with("config.toml.bak-") && !n.contains(".tmp"))
+            .filter(|n| crate::migrations::is_backup_file_name(n, "config.toml"))
             .collect();
         names.sort();
         names
@@ -805,7 +810,7 @@ password = "PLAINTEXT-PASS"
         );
         let backup = value["backup"].as_str().expect("backup name");
         assert!(
-            backup.starts_with("config.toml.bak-"),
+            crate::migrations::is_backup_file_name(backup, "config.toml"),
             "backup name: {backup}"
         );
 
@@ -1023,10 +1028,15 @@ password = "PLAINTEXT-PASS"
         assert_eq!(status, 200);
         let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
         assert_eq!(rows.len(), 1, "one backup after one write: {body}");
-        assert!(rows[0]["file"]
-            .as_str()
-            .expect("file")
-            .starts_with("config.toml.bak-"));
+        let file = rows[0]["file"].as_str().expect("file");
+        assert!(
+            crate::migrations::is_backup_file_name(file, "config.toml"),
+            "backup file name: {file}"
+        );
+        assert!(
+            file.ends_with(".bak") && !file.contains(".tmp"),
+            "readable backup name expected: {file}"
+        );
         assert!(
             rows[0]["size_bytes"].is_string() && rows[0]["mtime_ms"].is_string(),
             "size/mtime must be strings (大数红线): {rows:?}"

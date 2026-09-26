@@ -517,11 +517,18 @@ pub fn router(state: MgmtState) -> Router {
             axum::routing::put(accounts_api::account_update).delete(accounts_api::account_remove),
         )
         .route("/api/permissions", get(accounts_api::permissions_list))
-        // 运维端点四类（E 项收口）：诚实实现——未接升级源结构化返回原因。
+        // 运维端点四类（E 项收口）：诚实实现——未接升级源 / 能力未接线时结构化返回原因。
         // 自启读写在 Windows 下真实现（HKCU Run 键增删）。读挂 OpsLogsRead、
-        // 备份写挂 DeviceWrite、自启写挂 OpsCollectors（服务运行期控制）。
+        // 备份写挂 DeviceWrite、自启写与更新执行挂 OpsCollectors（服务运行期控制）。
         // （`GET /api/settings/backups` 在 :481 已挂，这里补 POST 手动备份动作。）
         .route("/api/updates/check", get(ops_api::updates_check))
+        // 更新执行（危险操作四要素：`reason` / `note` / `confirm` 三独立字段，trim 校验 →
+        // 缺失 / 空白 / 未知字段 = 400）；执行能力未接线 → 200 + `supported:false`
+        // + 面向用户原因（绝不伪造升级成功，绝不 500）。
+        .route(
+            "/api/updates/apply",
+            axum::routing::post(ops_api::updates_apply),
+        )
         .route("/api/service/autostart", get(ops_api::service_autostart))
         .route(
             "/api/service/autostart",

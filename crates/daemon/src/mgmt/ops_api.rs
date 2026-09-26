@@ -1,10 +1,14 @@
-//! 运维端点四类（E 项收口；`GET /api/updates/check` + `GET /api/service/autostart`
-//! + `POST /api/settings/backups` + `GET /api/diagnostics/selfcheck`）
+//! 运维端点四类（E 项收口；`GET /api/updates/check` + `POST /api/updates/apply`
+//! + `GET /api/service/autostart` + `POST /api/settings/backups`
+//! + `GET /api/diagnostics/selfcheck`）
 //! + 备份策略（B-2 收口：`GET|PUT /api/settings/backup-policy` + 周期备份 + retention）。
 //!
 //! ## 诚实性红线
 //! 每个能力：实现了就真实现；没实现就**结构化返回「未实现 + 原因」**，严禁假成功。
-//! 更新检查未接升级源 → `check_supported:false` + 原因；自启注册读写在 Windows 下
+//! 更新检查未接升级源 / 能力未接线 → `check_supported:false` + **面向用户**的原因
+//! （现状 + 怎么办）；`POST /api/updates/apply` 在执行能力接线前先校验**危险操作
+//! 四要素**（`reason` / `note` / `confirm` 三独立字段），随后诚实返回
+//! `supported:false`（HTTP 200）——绝不伪造「升级成功」；自启注册读写在 Windows 下
 //! 真实现（`reg query` / `reg add|delete` HKCU Run 键），非 Windows 如实 501。
 //!
 //! ## 备份策略语义（B-2）
@@ -16,7 +20,9 @@
 //!   每拍读热快照——PUT 热重载后下一拍即按新间隔生效。
 //!
 //! ## 消费方
-//! - `UpdatePage.vue`（当前只读 `/api/overview` 的 version；本端点为其预留诚实数据源）；
+//! - `UpdatePage.vue`（读 `/api/overview` 的 version + `GET /api/updates/check`
+//!   的诚实状态；后端声明 `check_supported:false` 时页面**禁用**「执行更新」按钮并
+//!   直接展示 `reason`，不允许点了才报错）；
 //! - `StartupPage.vue`（自启状态）；
 //! - `SettingsPage.vue`（手动备份动作；清单读既有 `GET /api/settings/backups`）；
 //! - `DiagnosePage.vue`（自检清单，当前只调 `/api/health`；本端点提供逐项判定）。
@@ -43,28 +49,169 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// ---- 更新检查 ----
+// ---- 更新检查 / 执行 ----
 
-/// `GET /api/updates/check` → 更新检查（**当前未接升级源，诚实返回**）。
+/// 升级源地址（`[settings.updates].source_url`，trim 后非空才算已配置）。
+fn update_source_url(state: &MgmtState) -> Option<String> {
+    state
+        .config()
+        .settings
+        .updates
+        .source_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// **面向用户**的「未配置升级源」说明：现状 + 怎么办，不出现内部术语。
+const UPDATE_NO_SOURCE_REASON: &str = "尚未配置升级源，暂时无法检查或安装更新。\
+请在网关配置文件 config.toml 的 [settings.updates] 段填写 source_url（升级源地址）后保存，\
+配置会自动生效；随后回到本页点击「检查更新」即可。";
+
+/// **面向用户**的「已配置升级源、但能力尚未接线」说明。
+fn update_not_wired_reason(url: &str) -> String {
+    format!(
+        "已配置升级源 {url}，但本版本尚未提供从升级源下载并安装更新的能力（该功能仍在开发中），\
+因此不会下载或应用任何更新包。期间可继续使用手工离线升级流程。"
+    )
+}
+
+/// `GET /api/updates/check` → 更新检查（**诚实降级**）。
 ///
-/// 未配置升级源时：`check_supported:false` + 原因说明；绝不伪造
-/// 「已是最新版本」之类的假成功。接入升级源后本端点改为真实比对。
+/// 未配置升级源 / 能力尚未接线时：`check_supported:false` + **面向用户**的原因
+/// （现状 + 怎么办）；绝不伪造「已是最新版本」之类的假成功，也不出现「写端点 /
+/// 接口未提供」这类内部术语。
+///
+/// wire 契约（响应字段）：
+/// - `check_supported`   bool         —— 后端是否真能完成一次升级检查（当前恒 false）；
+/// - `current_version`   string       —— 当前网关版本（`CARGO_PKG_VERSION`）；
+/// - `update_available`  bool         —— 是否有可升级版本（能力未就绪时恒 false）；
+/// - `available_version` string|null  —— 可升级版本（未知 = null，不臆造）；
+/// - `source`            string       —— 升级源：已配置的地址 / `"unconfigured"`；
+/// - `source_configured` bool         —— 是否已在配置中声明升级源；
+/// - `reason`            string       —— 面向用户的说明（现状 + 怎么办）。
 pub async fn updates_check(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
     if let Err(resp) = authed.ensure(Permission::OpsLogsRead) {
         return resp.into_response();
     }
     let current = env!("CARGO_PKG_VERSION");
-    let _ = state;
+    let configured = update_source_url(&state);
+    let (source, reason) = match &configured {
+        Some(url) => (url.clone(), update_not_wired_reason(url)),
+        None => (
+            "unconfigured".to_string(),
+            UPDATE_NO_SOURCE_REASON.to_string(),
+        ),
+    };
     Json(json!({
         "check_supported": false,
         "current_version": current,
         "update_available": false,
         "available_version": Value::Null,
-        "source": "unconfigured",
-        "reason": "no update source configured (OTA source wiring pending); \
-                   nothing was downloaded or applied",
+        "source": source,
+        "source_configured": configured.is_some(),
+        "reason": reason,
     }))
     .into_response()
+}
+
+/// `POST /api/updates/apply` → 执行更新（**危险操作**；当前能力未接线，诚实返回）。
+///
+/// ## ⚠️ 危险操作四要素硬契约
+/// body 必须是 JSON 对象，且**同时**含 `reason` / `note` / `confirm` 三个**彼此
+/// 独立**的字段（`note` **绝不允许**拼进 `reason`）；三者 trim 后均须非空。
+/// 任一缺失 / 非字符串 / trim 后空白 / 出现未知字段 → **400 `validation_failed`**
+/// （不进入执行路径，fail-closed）。
+///
+/// ## wire 契约
+/// - 方法 / 路径：`POST /api/updates/apply`；
+/// - 请求体：`{"reason": string, "note": string, "confirm": string}`（三字段必填且独立）；
+/// - 鉴权：`Authorization: Bearer <JWT>`；权限 `ops.collectors`（服务运行期控制，仅 system）；
+/// - 成功（HTTP 200，**不是**「升级成功」）：
+///   `{"supported": false, "accepted": false, "applied": false, "current_version": string,
+///     "target_version": null, "source": string, "source_configured": bool, "reason": string}`
+///   —— `supported:false` 表示后端**尚未具备**执行更新的能力，`reason` 面向用户说明
+///   现状与怎么办；`applied` **恒 false**，绝不伪造升级成功；
+/// - 失败：缺字段 / 非字符串 / 空白 / 未知字段 → **400**；未带 token → 401；
+///   权限不足 → 403。
+///
+/// ## 审计挂接说明
+/// 本端点暂未接入 `remote_ops` 审计环：需要 `OpsAction` 新增独立动作字面量
+/// （`update_apply`），该枚举位于本文件域之外的 `remote_ops.rs`；待执行能力真正接线
+/// 时一并补齐（**不**复用其它动作字面量，避免污染审计语义）。当前所有失败 / 降级
+/// 路径均返回结构化原因，不产生伪造的成功痕迹。
+pub async fn updates_apply(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    const REQUIRED: &[&str] = &["reason", "note", "confirm"];
+    if let Err(rejection) = authed.ensure(Permission::OpsCollectors) {
+        return rejection.into_response();
+    }
+    let req: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => return updates_apply_bad_request("body must be a JSON object"),
+    };
+    let Some(obj) = req.as_object() else {
+        return updates_apply_bad_request("body must be a JSON object");
+    };
+    for key in obj.keys() {
+        if !REQUIRED.contains(&key.as_str()) {
+            return updates_apply_bad_request(&format!(
+                "unknown field {key:?}; allowed fields: reason | note | confirm"
+            ));
+        }
+    }
+    // 四要素：reason / note / confirm 三个独立字段，trim 后均非空。
+    for field in REQUIRED {
+        match obj.get(*field).and_then(Value::as_str).map(str::trim) {
+            Some(value) if !value.is_empty() => {}
+            Some(_) => {
+                return updates_apply_bad_request(&format!(
+                    "field {field:?} must not be blank (dangerous-op contract: `reason`, \
+                     `note` and `confirm` are three independent non-empty fields)"
+                ));
+            }
+            None => {
+                return updates_apply_bad_request(&format!(
+                    "missing required field {field:?} (dangerous-op contract: body must carry \
+                     independent `reason`, `note` and `confirm`)"
+                ));
+            }
+        }
+    }
+    // 执行能力未接线：诚实返回 supported:false + 面向用户原因，绝不伪造成功。
+    let current = env!("CARGO_PKG_VERSION");
+    let configured = update_source_url(&state);
+    let (source, reason) = match &configured {
+        Some(url) => (url.clone(), update_not_wired_reason(url)),
+        None => (
+            "unconfigured".to_string(),
+            UPDATE_NO_SOURCE_REASON.to_string(),
+        ),
+    };
+    Json(json!({
+        "supported": false,
+        "accepted": false,
+        "applied": false,
+        "current_version": current,
+        "target_version": Value::Null,
+        "source": source,
+        "source_configured": configured.is_some(),
+        "reason": reason,
+    }))
+    .into_response()
+}
+
+/// 更新执行请求校验失败 → 400（结构化错误；不进入执行路径）。
+fn updates_apply_bad_request(detail: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "validation_failed", "message": detail })),
+    )
+        .into_response()
 }
 
 // ---- 启动与自启 ----
@@ -344,8 +491,8 @@ fn autostart_audit_bad_request(state: &MgmtState, actor: &str, detail: &str) -> 
 
 /// `POST /api/settings/backups` → 手动创建一份配置备份。
 ///
-/// 复用既有备份命名空间：`config.toml.bak-manual-<epoch_ms>`（`GET
-/// /api/settings/backups` 的清单过滤 `*.bak-*` 前缀，手动备份自动可见）。
+/// 采用统一备份命名 `config.toml.YYYYMMDD-HHmmss-NNN.bak`（内嵌 UTC+8 可读时刻，
+/// 见 [`crate::migrations::next_backup_path`]；`GET /api/settings/backups` 自动可见）。
 /// 复制当前 config.toml 原文（字节级快照，不做序列化重写）。
 pub async fn create_backup(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
     let actor = authed.claims.sub.clone();
@@ -382,13 +529,13 @@ pub async fn create_backup(State(state): State<MgmtState>, authed: AuthedRole) -
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(std::path::PathBuf::new, std::borrow::ToOwned::to_owned);
+        .map_or_else(|| std::path::PathBuf::from("."), std::borrow::ToOwned::to_owned);
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config.toml")
         .to_string();
-    let target = dir.join(format!("{file_name}.bak-manual-{}", now_ms()));
+    let target = crate::migrations::next_backup_path(&dir, &file_name);
     let result = std::fs::copy(&path, &target);
     match result {
         Ok(bytes) => {
@@ -716,7 +863,7 @@ pub fn spawn_periodic_backup(state: &MgmtState) {
     });
 }
 
-/// 执行一次周期备份（`config.toml.bak-periodic-<epoch_ms>` 字节级快照 +
+/// 执行一次周期备份（`config.toml.YYYYMMDD-HHmmss-NNN.bak` 字节级快照 +
 /// retention 清理；失败仅告警——周期任务绝不打断主流程，也不假成功）。
 fn periodic_backup_once(state: &MgmtState, retention: u32) {
     let Some(path) = state.config_path() else {
@@ -734,7 +881,7 @@ fn periodic_backup_once(state: &MgmtState, retention: u32) {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config.toml");
-    let target = dir.join(format!("{file_name}.bak-periodic-{}", now_ms()));
+    let target = crate::migrations::next_backup_path(&dir, file_name);
     match std::fs::copy(&path, &target) {
         Ok(bytes) => {
             let pruned = crate::migrations::enforce_backup_retention(&path, retention);
@@ -959,16 +1106,21 @@ gateway_id = "gw-ops-test"
 data_dir = "./data"
 "#;
 
-    /// 构造绑定临时配置文件的 MgmtState（备份策略端点共用装配口径）。
-    fn make_state(dir: &tempfile::TempDir) -> (MgmtState, std::path::PathBuf) {
+    /// 以自定义 TOML 构造绑定临时配置文件的 MgmtState（各测试共用装配口径）。
+    fn make_state_with(dir: &tempfile::TempDir, toml: &str) -> (MgmtState, std::path::PathBuf) {
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, SEED_TOML).expect("seed config");
+        std::fs::write(&path, toml).expect("seed config");
         let config = Arc::new(GatewayConfig::load(&path).expect("load"));
         let daemon = DaemonShared::new();
         daemon.set_config(Arc::new(ConfigShared::new((*config).clone())));
         let state = MgmtState::new(daemon, config).with_config_path(&path);
         remote_ops::install(&state, Arc::new(remote_ops::DenyAllOpsAuthorizer));
         (state, path)
+    }
+
+    /// 构造绑定临时配置文件的 MgmtState（默认种子配置）。
+    fn make_state(dir: &tempfile::TempDir) -> (MgmtState, std::path::PathBuf) {
+        make_state_with(dir, SEED_TOML)
     }
 
     /// 以 state 的实际签名密钥签发测试 token。
@@ -1288,12 +1440,131 @@ data_dir = "./data"
             .expect("read_dir")
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
-            .filter(|n| n.starts_with("config.toml.bak-"))
+            .filter(|n| crate::migrations::is_backup_file_name(n, "config.toml"))
             .collect();
         assert_eq!(remaining.len(), 20, "exactly 20 backups remain");
         assert!(
             dir.path().join("config.toml.userbak").exists(),
             "user files never touched"
         );
+    }
+
+    // ---- 更新检查 / 执行 ----
+
+    /// QA（updates check）: 未配置升级源 → `check_supported:false` + **面向用户**原因
+    /// （指导如何配置）；已配置升级源 → `source` 反映地址、原因说明能力尚未接线；
+    /// 两种状态的 reason 都**不含**「写端点 / 未提供…接口」等内部术语。
+    #[tokio::test]
+    async fn updates_check_is_honest_and_user_facing() {
+        // ① 未配置升级源。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], false);
+        assert_eq!(value["update_available"], false);
+        assert_eq!(value["available_version"], Value::Null);
+        assert_eq!(value["source"], "unconfigured");
+        assert_eq!(value["source_configured"], false);
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("[settings.updates]") && reason.contains("source_url"),
+            "reason must tell the user how to configure a source: {reason}"
+        );
+        for term in ["写端点", "未提供更新执行接口", "接口", "端点"] {
+            assert!(
+                !reason.contains(term),
+                "reason leaked internal term {term:?}: {reason}"
+            );
+        }
+
+        // ② 已配置升级源（能力仍未接线，如实说明）。
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let toml = format!(
+            "{SEED_TOML}\n[settings.updates]\nsource_url = \"https://ota.example.com/gw\"\n"
+        );
+        let (state2, _p2) = make_state_with(&dir2, &toml);
+        let token2 = token_for(&state2, Role::System);
+        let port2 = spawn_server(state2.clone()).await;
+        let (status, body) = http(port2, "GET", "/api/updates/check", None, Some(&token2)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], false, "capability not wired yet");
+        assert_eq!(value["source"], "https://ota.example.com/gw");
+        assert_eq!(value["source_configured"], true);
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("尚未提供"),
+            "reason must state the capability is not wired yet: {reason}"
+        );
+    }
+
+    /// QA（updates apply 危险契约）: 缺 `reason`/`note`/`confirm` 任一 → 400；空白 /
+    /// 非字符串 / 未知字段 → 400；三要素齐全 → 200 + `supported:false` +
+    /// `applied:false` + 面向用户原因（**不伪造升级成功**）；无 token → 401。
+    #[tokio::test]
+    async fn updates_apply_enforces_danger_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir);
+        let system = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // 缺字段 / 空白 / 非字符串 / 未知字段 → 一律 400。
+        for body_raw in [
+            r#"{"note":"n","confirm":"c"}"#,
+            r#"{"reason":"r","confirm":"c"}"#,
+            r#"{"reason":"r","note":"n"}"#,
+            r#"{}"#,
+            r#"{"reason":"r","note":"n","confirm":"   "}"#,
+            r#"{"reason":"r","note":"n","confirm":123}"#,
+            r#"{"reason":"r","note":"n","confirm":"c","extra":"x"}"#,
+            "not-json",
+        ] {
+            let (status, body) = http(
+                port,
+                "POST",
+                "/api/updates/apply",
+                Some(body_raw),
+                Some(&system),
+            )
+            .await;
+            assert_eq!(status, 400, "{body_raw} → {body}");
+        }
+
+        // 三要素齐全 → 200 诚实降级（绝不伪造成功）。
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(
+                r#"{"reason":"月度维护窗口","note":"现场工程师要求升级到 0.2.0","confirm":"确认执行更新"}"#,
+            ),
+            Some(&system),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["supported"], false);
+        assert_eq!(value["accepted"], false);
+        assert_eq!(value["applied"], false, "must never fake a successful update");
+        assert_eq!(value["source"], "unconfigured");
+        assert!(value["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("[settings.updates]"));
+
+        // 无 token → 401（未进入校验）。
+        let (status, _) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(r#"{"reason":"r","note":"n","confirm":"c"}"#),
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
     }
 }

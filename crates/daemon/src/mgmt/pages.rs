@@ -3,7 +3,8 @@
 //! ## 端点清单（对齐 `web-console/src/mock/mock-data.ts` 契约注释）
 //! - `GET  /api/points/export`            点表 CSV 导出（读，开放）——导出即可当导入模板；
 //! - `POST /api/points/import`            点表 CSV 批量导入（`point.write`，仅 system）；
-//! - `POST /api/settings/rollback`        回滚到最近 `config.toml.bak-*` 备份（`device.write`，仅 system）；
+//! - `POST /api/settings/rollback`        回滚到最近配置备份（新格式
+//!   `config.toml.YYYYMMDD-HHmmss-NNN.bak` 或旧格式 `config.toml.bak-*`；`device.write`，仅 system）；
 //! - `POST /api/devices/test`             设备连通性探测（`device.view`，modbus-tcp/rtu 全探测）；
 //! - `GET  /api/forwarders`               北向出口列表（读，开放；= `/api/outlets` + `id` 锚点）；
 //! - `POST /api/forwarders`               出口登记（`device.write`）——**诚实 501**（写能力未落地）；
@@ -938,11 +939,15 @@ fn revalidate_rows(request: &ImportRequest, config: &GatewayConfig) -> Vec<Impor
 // 配置回滚
 // ===========================================================================
 
-/// `POST /api/settings/rollback` → 回滚到最近 `config.toml.bak-*` 备份。
+/// `POST /api/settings/rollback` → 回滚到最近配置备份。
+///
+/// 支持的备份命名（[`crate::migrations::is_backup_file_name`]）：
+/// 新格式 `config.toml.YYYYMMDD-HHmmss-NNN.bak`（内嵌 UTC+8 可读时刻）与旧格式
+/// `config.toml.bak-<unix秒>[-序号]` / `bak-manual-<ms>` / `bak-periodic-<ms>`。
 ///
 /// - 鉴权：`device.write`（仅 system——配置级高危写动作，复用既有语义）；
-/// - body（可选）：`{backup?: string, reason?: string}`；缺省取文件名字典序最大的
-///   备份（unix 秒定长，字典序 = 时间序；同秒多份 `-N` 序号最大者最新）；
+/// - body（可选）：`{backup?: string, reason?: string}`；缺省取备份时刻最新的一份
+///   （按 [`crate::migrations::backup_sort_key`]，新旧命名统一 epoch 毫秒时间轴）；
 /// - 流程：备份文件 → 解析校验（坏备份 fail-closed 拒绝）→ license 配额闸门 →
 ///   `GatewayConfig::save`（对当前配置**再做一次写前备份**，回滚自身可逆）→
 ///   热生效 → `config_reloaded` 事件 → 持久审计；
@@ -1013,7 +1018,6 @@ pub async fn settings_rollback(
         .and_then(|n| n.to_str())
         .unwrap_or("config.toml")
         .to_string();
-    let prefix = format!("{file_name}.bak-");
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1027,11 +1031,12 @@ pub async fn settings_rollback(
                     .filter_map(|e| e.ok())
                     .filter(|e| e.path().is_file())
                     .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
-                    .filter(|n| n.starts_with(&prefix) && !n.contains(".tmp"))
+                    .filter(|n| crate::migrations::is_backup_file_name(n, &file_name))
                     .collect()
             })
             .unwrap_or_default();
-        backups.sort();
+        // 新旧命名统一按 epoch 毫秒时间轴排序（字典序 ≠ 时间序）。
+        backups.sort_by_key(|name| crate::migrations::backup_sort_key(name, &file_name));
         match backups.pop() {
             Some(name) => dir.join(name),
             None => {
@@ -1048,11 +1053,11 @@ pub async fn settings_rollback(
         }
     } else {
         let name = req.backup.trim();
+        // 显式名必须是同目录内的合法备份名（防路径穿越 + 新旧命名都认）。
         let name_ok = !name.contains('/')
             && !name.contains('\\')
             && !name.contains("..")
-            && name.starts_with(&prefix)
-            && !name.contains(".tmp");
+            && crate::migrations::is_backup_file_name(name, &file_name);
         if !name_ok {
             writeapi::audit(
                 &state,
@@ -1065,7 +1070,9 @@ pub async fn settings_rollback(
             return writeapi::validation_error(
                 "backup",
                 &format!("invalid backup name {name:?}"),
-                &format!("file name matching {prefix}* within the config directory"),
+                &format!(
+                    "backup file name ({file_name}.YYYYMMDD-HHmmss-NNN.bak or legacy {file_name}.bak-*) within the config directory"
+                ),
             );
         }
         let candidate = dir.join(name);
@@ -1157,7 +1164,7 @@ fn rollback_no_backup(file_name: &str) -> Response {
         StatusCode::NOT_FOUND,
         Json(json!({
             "error": "no_backup",
-            "message": format!("no {file_name}.bak-* backup found; write a config change first (each write creates a pre-write backup)"),
+            "message": format!("no {file_name}.YYYYMMDD-HHmmss-NNN.bak (or legacy {file_name}.bak-*) backup found; write a config change first (each write creates a pre-write backup)"),
         })),
     )
         .into_response()
@@ -2352,7 +2359,7 @@ mod tests {
         assert_eq!(value["accepted"], true);
         let restored_from = value["restored_from"].as_str().expect("restored_from");
         assert!(
-            restored_from.starts_with("config.toml.bak-"),
+            crate::migrations::is_backup_file_name(restored_from, "config.toml"),
             "backup name: {restored_from}"
         );
         assert!(value["config_version"].is_string(), "大数红线: {value}");
@@ -2413,7 +2420,7 @@ mod tests {
             .expect("read_dir")
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .find(|n| n.starts_with("config.toml.bak-") && !n.contains(".tmp"))
+            .find(|n| crate::migrations::is_backup_file_name(n, "config.toml"))
             .expect("backup exists");
 
         // 显式名回滚成功。

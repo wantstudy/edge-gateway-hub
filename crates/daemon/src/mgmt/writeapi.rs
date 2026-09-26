@@ -2169,8 +2169,7 @@ frequency_ms = 100
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("config.toml.bak-") && !n.contains(".tmp"))
-                    .unwrap_or(false)
+                    .is_some_and(|n| crate::migrations::is_backup_file_name(n, "config.toml"))
             })
             .collect();
         assert_eq!(

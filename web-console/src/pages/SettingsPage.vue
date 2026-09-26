@@ -123,8 +123,8 @@
             <p v-else-if="!backups.length" class="wc-note" data-testid="backups-empty">
               <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
               <span>
-                网关 config 目录暂无备份：每次配置写入 / 回滚前会自动生成 <code>config.toml.bak-*</code>
-                写前备份；执行一次「保存」后再来查看。
+                网关 config 目录暂无备份：每次配置写入 / 回滚前会自动生成
+                <code>config.toml.YYYYMMDD-HHmmss-NNN.bak</code> 写前备份（内嵌 UTC+8 时刻）；执行一次「保存」后再来查看。
               </span>
             </p>
             <template v-else>
