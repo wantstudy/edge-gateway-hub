@@ -21,6 +21,7 @@
  *  · **mock 模式已废除**：仓库不再有 `mockRepo` 分支；`API_MODE` 恒为 `'real'`。
  */
 import { ref, type Ref } from 'vue';
+import { formatEmbeddedTimestamps, formatNanoTimestampText, formatTimestampText } from '@/utils/time';
 import { ApiError, apiRequest, apiRequestText } from './client';
 import {
   DEFAULT_ACTOR,
@@ -121,47 +122,23 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/** 毫秒时间戳 → `YYYY-MM-DD HH:mm:ss`。 */
-function formatDateTimeMs(ms: number): string {
-  const d = new Date(ms);
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
-/** epoch 秒 / 毫秒字符串 → `YYYY-MM-DD HH:mm:ss`（非纯时间戳则原样透传）。
+/** epoch 秒 / 毫秒字符串 → `YYYY-MM-DD HH:mm:ss`。
  *
- * `/api/overview` 的 `startedAt`、设备的 `last_sample_at` 等当前为 epoch 字符串，
- * 为对齐展示契约做一次**无精度损失**的格式化；若后端直接返回人类可读时间字符串，
- * 则不匹配纯数字形态、原样透传（宽容兼容）。
+ * 数字形态统一交给共享展示工具：只接受 10 位秒 / 13 位毫秒；uint64、纳秒串及
+ * 其他数字长度统一回空态，绝不把原始时间戳透传到页面。已是人类可读文本时保留。
  */
 function formatEpochText(value: string): string {
   const trimmed = value.trim();
-  if (/^\d{10}$/.test(trimmed)) {
-    return formatDateTimeMs(Number(trimmed) * 1000);
-  }
-  if (/^\d{13}$/.test(trimmed)) {
-    return formatDateTimeMs(Number(trimmed));
-  }
-  return trimmed || '—';
+  return /^\d+$/.test(trimmed) ? formatTimestampText(trimmed) : trimmed || '—';
 }
 
 /**
  * UTC 纳秒字符串 → `YYYY-MM-DD HH:mm:ss`。
  *
- * 大数红线：`ts_ns`（≈1.7e18）超出 `Number` 安全整数区间，故**只截取秒段**
- * （去掉末 9 位）再格式化，全程不把整串转成数字，避免精度损失与误用。
+ * 大数红线：绝不把纳秒整串转为 Number，只截取 10 位秒段交给共享展示工具。
  */
 function formatNsText(value: string): string {
-  const trimmed = value.trim();
-  if (!/^\d+$/.test(trimmed)) {
-    return trimmed || '—';
-  }
-  const secsText = trimmed.length > 9 ? trimmed.slice(0, -9) : '0';
-  const secs = Number(secsText);
-  if (!Number.isFinite(secs) || secs <= 0) {
-    return '—';
-  }
-  return formatDateTimeMs(secs * 1000);
+  return formatNanoTimestampText(value);
 }
 
 // ===========================================================================
@@ -396,7 +373,7 @@ function mapDevice(raw: Record<string, unknown>, idx: number): DeviceRecord {
     successRate: pickNum(raw, 'successRate', pickNum(raw, 'success_rate', 0)),
     failStreak: pickNum(raw, 'failStreak', pickNum(raw, 'fail_streak', 0)),
     offlineText: hasStatus ? offlineRaw : '状态未知（后端未上报）',
-    createdAt: pickStr(raw, 'createdAt', pickStr(raw, 'created_at', '—')),
+    createdAt: formatEpochText(pickEither(raw, 'createdAt', 'created_at')),
   };
 }
 
@@ -434,7 +411,7 @@ function mapPoint(raw: Record<string, unknown>, idx: number): PointRecord {
     value,
     valueText: pickStr(raw, 'valueText', value === null ? '——' : String(value)),
     formula: typeof raw['formula'] === 'string' ? raw['formula'] : null,
-    updatedAt: pickEither(raw, 'updatedAt', 'updated_at') || '—',
+    updatedAt: formatEpochText(pickEither(raw, 'updatedAt', 'updated_at')),
     stale: pickBool(raw, 'stale', false),
   };
 }
@@ -460,7 +437,7 @@ function mapForwarder(raw: Record<string, unknown>, idx: number): ForwarderRecor
     connectedForText: pickStr(raw, 'connectedForText', '—'),
     coveredDevices: pickNum(raw, 'coveredDevices', 0),
     recommendedDeviceLimit: pickNum(raw, 'recommendedDeviceLimit', 0),
-    lastConsistencyCheckAt: pickStr(raw, 'lastConsistencyCheckAt', '—'),
+    lastConsistencyCheckAt: formatEpochText(pickEither(raw, 'lastConsistencyCheckAt', 'last_consistency_check_at')),
     enabled: pickBool(raw, 'enabled', true),
   };
 }
@@ -501,14 +478,16 @@ const AUDIT_OUTCOME_MAP: Readonly<Record<string, string>> = {
 function mapEventAudit(raw: Record<string, unknown>, idx: number): AuditEntry {
   return {
     id: pickStr(raw, 'id', `evt-${idx}`),
-    ts: pickStr(raw, 'ts', pickStr(raw, 'time', '—')),
+    ts: formatEpochText(pickStr(raw, 'ts', pickStr(raw, 'time', ''))),
     actor: pickStr(raw, 'actor', 'system'),
     actorType: pickStr(raw, 'actorType', pickStr(raw, 'actor_type', 'system')),
     action: pickStr(raw, 'action', '—'),
     entityType: pickStr(raw, 'entityType', pickStr(raw, 'entity_type', 'system')),
     entityLabel: pickStr(raw, 'entityLabel', pickStr(raw, 'entity_label', '系统')),
     entityId: pickStr(raw, 'entityId', pickStr(raw, 'entity_id', '—')),
-    detail: pickStr(raw, 'detail', '—'),
+    // 审计 detail 是后端自由文本，可能内嵌带 epoch 的标识符（如 `dev-1790381277499`）——
+    // 统一把可判定的内嵌时间戳格式化为可读文本，绝不让原始时间戳上屏。
+    detail: formatEmbeddedTimestamps(pickStr(raw, 'detail', '—')),
     ip: pickStr(raw, 'ip', ''),
     result: pickStr(raw, 'result', 'success'),
   };
@@ -583,7 +562,7 @@ function mapRule(raw: Record<string, unknown>, idx: number): RuleRecord {
     hitCount: pickNum(raw, 'hitCount', pickNum(raw, 'hit_count', 0)),
     priority: pickNum(raw, 'priority', 0),
     enabled: pickBool(raw, 'enabled', true),
-    lastHitAt: pickStr(raw, 'lastHitAt', pickStr(raw, 'last_hit_at', '—')),
+    lastHitAt: formatEpochText(pickEither(raw, 'lastHitAt', 'last_hit_at')),
   };
 }
 
@@ -774,7 +753,7 @@ function mapStatus(raw: Record<string, unknown>): GatewayInfo {
     hostname: pickStr(raw, 'hostname', dflt.hostname),
     manageUrl: pickStr(raw, 'manageUrl', dflt.manageUrl),
     port: pickNum(raw, 'port', dflt.port),
-    startedAt: formatEpochText(pickStr(raw, 'startedAt', dflt.startedAt)),
+    startedAt: formatEpochText(pickEither(raw, 'startedAt', 'started_at') || dflt.startedAt),
     uptimeText: pickStr(raw, 'uptimeText', dflt.uptimeText),
     deviceCount: pickNum(raw, 'deviceCount', dflt.deviceCount),
     onlineCount: pickNum(raw, 'onlineCount', dflt.onlineCount),

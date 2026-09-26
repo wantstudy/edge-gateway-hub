@@ -57,7 +57,7 @@
       <div class="wc-card__head">
         <h3>自检结果</h3>
         <span class="wc-card__sub">
-          GET /api/diagnostics/selfcheck<span v-if="checkedAtRaw"> · 网关自检时刻 {{ checkedAtRaw }}</span>
+          GET /api/diagnostics/selfcheck<span v-if="checkedAtText"> · 网关自检时刻 {{ checkedAtText }}</span>
         </span>
       </div>
 
@@ -135,6 +135,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { EmptyState, StatusTag, UiTable, UiPager, type TableColumn } from '@ui-kit';
 import { repo, type SelfCheckItem } from '@/api/repo';
+import { formatTimestampText } from '@/utils/time';
 
 /** 自检项（后端原始项 → 表格行）。 */
 interface CheckRow {
@@ -196,8 +197,8 @@ const running = ref(false);
 /** 自检失败原因（诚实降级：非空即展示真实原因，绝不冒充「尚未自检」）。 */
 const loadError = ref('');
 
-/** 后端自检时刻（毫秒时间戳**字符串**；仅展示，不做任何数值转换 —— uint64 红线）。 */
-const checkedAtRaw = ref('');
+/** 后端自检时刻的可读展示文本；空值 / 非法时间统一为 `—`。 */
+const checkedAtText = ref('');
 
 /**
  * 自检结果分页（切片留在页面级 computed；UiTable 纯展示，不在组件内做局部 slice）。
@@ -270,14 +271,49 @@ function deriveResult(item: SelfCheckItem): 'pass' | 'warn' | 'error' {
   return 'pass';
 }
 
-/** detail 对象 → 可读 kv 串（数组 / 对象原样 JSON 化，绝不丢字段）。 */
+/** detail 中可判定为时间戳的精确键名。 */
+const DETAIL_TIMESTAMP_KEYS: ReadonlySet<string> = new Set(['now_ms', 'time', 'timestamp', 'ts']);
+
+/** detail 中可判定为时间戳的明确后缀；禁止用 `includes('time')` 模糊匹配。 */
+const DETAIL_TIMESTAMP_SUFFIXES: readonly string[] = ['_ms', '_at', '_ts', '_time', '_timestamp'];
+
+/** 判断 detail 键是否承载时间戳。 */
+function isDetailTimestampKey(key: string): boolean {
+  const normalized = key.trim().toLowerCase();
+  return DETAIL_TIMESTAMP_KEYS.has(normalized) || DETAIL_TIMESTAMP_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+}
+
+/** detail 单值 → 可读文本；嵌套对象也按明确时间键格式化。 */
+function formatDetailValue(key: string, value: unknown): string {
+  if (isDetailTimestampKey(key)) {
+    return formatTimestampText(typeof value === 'string' || typeof value === 'number' ? value : null);
+  }
+  if (value === null) {
+    return 'null';
+  }
+  if (typeof value === 'object') {
+    return JSON.stringify(value, (nestedKey, nestedValue) => {
+      if (!nestedKey || !isDetailTimestampKey(nestedKey)) {
+        return nestedValue;
+      }
+      return formatTimestampText(
+        typeof nestedValue === 'string' || typeof nestedValue === 'number' ? nestedValue : null,
+      );
+    });
+  }
+  return String(value);
+}
+
+/** detail 对象 → 可读 kv 串；时间键统一格式化，其余值保持原有展示语义。 */
 function formatDetail(detail: Record<string, unknown> | null): string {
   if (!detail) {
     return '—';
   }
-  return Object.entries(detail)
-    .map(([k, v]) => `${k}=${v === null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
-    .join(' · ');
+  const entries = Object.entries(detail);
+  if (entries.length === 0) {
+    return '—';
+  }
+  return entries.map(([key, value]) => `${key}=${formatDetailValue(key, value)}`).join(' · ');
 }
 
 /** 表格内详情超长截断（全文挂 `title`，信息不丢）。 */
@@ -303,16 +339,16 @@ async function rerun(): Promise<void> {
   try {
     const report = await repo.ops.selfCheck();
     checks.value = report.checks.map(toRow);
-    checkedAtRaw.value = report.checkedAt;
+    checkedAtText.value = formatTimestampText(report.checkedAt);
     checkPage.value = 1;
     lastRunText.value =
       `自检完成（本地 ${nowText()}）：共 ${report.checks.length} 项，` +
       `通过 ${passedCount.value} / 警告 ${warnCount.value} / 错误 ${errorCount.value}` +
-      `${report.checkedAt ? `，网关自检时刻 ${report.checkedAt}` : ''}。`;
+      `，网关自检时刻 ${checkedAtText.value}。`;
   } catch (cause) {
     // 诚实降级：失败就是失败，清空清单 + 展示真实原因，绝不退化成「尚未自检」的假空态。
     checks.value = [];
-    checkedAtRaw.value = '';
+    checkedAtText.value = '';
     loadError.value = cause instanceof Error ? cause.message : String(cause);
     lastRunText.value = `自检失败（${nowText()}）：${loadError.value}`;
   } finally {

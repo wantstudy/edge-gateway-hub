@@ -445,6 +445,7 @@ import {
 import { session } from '../store/session';
 import { repo } from '@/api/repo';
 import type { SettingsBackupRow, SettingsOutletRow } from '@/api/repo';
+import { formatTimestampText } from '@/utils/time';
 
 /** 页签名（原型 :2143）。 */
 const TABS = ['基础', '网络', '存储', '安全'] as const;
@@ -636,15 +637,14 @@ function formatBytes(sizeBytes: string): string {
     : `${(Number(mb / 1024n) / 1024).toFixed(1)} GB`;
 }
 
-/** 备份时刻（epoch 毫秒字符串 → 本地时间文本；非法值原样展示）。 */
+/**
+ * 备份时刻（epoch 秒 / 毫秒字符串 → 本地时间文本）。
+ *
+ * 大数红线：绝不 `Number()` 未判定位数的整串；统一走共享展示工具，
+ * 只认 10 位秒 / 13 位毫秒，其余（uint64、纳秒、非法值）一律回 `—`。
+ */
 function formatMtime(mtimeMs: string): string {
-  const ms = Number(mtimeMs);
-  if (!Number.isFinite(ms) || ms <= 0) {
-    return '—';
-  }
-  const d = new Date(ms);
-  const p = (v: number): string => String(v).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return formatTimestampText(mtimeMs);
 }
 
 /** 回滚确认弹窗状态（file 为空 = 回滚到最新备份）。 */

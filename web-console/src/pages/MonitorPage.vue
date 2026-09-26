@@ -260,6 +260,7 @@ import {
   type PointRecord,
 } from '@/api/repo';
 import { pointSnapshots, snapshotKey, streamStatus, wireQualityToDataQuality, type StreamStatus } from '@/api/stream';
+import { formatNanoTimestampText, formatTimestampText } from '@/utils/time';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -789,9 +790,14 @@ const pagedRows = computed<readonly PointRow[]>(() => {
       classes.push('is-abnormal');
     }
 
-    // 时间戳：透传 SSE 帧的纳秒字符串原文（大数红线，绝不 parseInt）；无帧则按陈旧度展示。
+    // 时间戳：SSE 帧的纳秒原文**绝不原样上屏**，一律格式化后再展示（大数红线：
+    // 纳秒串只截秒段、不整串数值化）；无帧则按陈旧度 / 本地时刻展示可读文本。
     const tsRaw = state?.tsRaw ?? '';
-    const tsText = tsRaw ? tsRaw : stale ? `${ageSec.toFixed(0)}s 前（陈旧）` : (tsMs / 1000).toFixed(3);
+    const tsText = tsRaw
+      ? formatNanoTimestampText(tsRaw)
+      : stale
+        ? `${ageSec.toFixed(0)}s 前（陈旧）`
+        : formatTimestampText(tsMs);
     const qualityCode = state?.qualityCode ?? null;
     const qualityTitle = qualityCode !== null ? `quality_code: ${qualityCode}` : '';
 
