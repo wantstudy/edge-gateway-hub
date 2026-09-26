@@ -1211,12 +1211,38 @@ export interface OpsApi {
   logs(): Promise<AuditEntry[]>;
   /** 健康检查（`GET /api/health`）。 */
   health(): Promise<{ ok: boolean; message: string }>;
+  /** 自检清单（`GET /api/diagnostics/selfcheck`，后端已落地 7 项真实检查）。 */
+  selfCheck(): Promise<SelfCheckReport>;
   /** 更新检查（`GET /api/updates/check`；**实测仅 GET**，POST → 405）。 */
   checkUpdates(): Promise<UpdateCheckInfo>;
   /** 开机自启状态（`GET /api/service/autostart`；写入未实现时 `writeSupported:false` 原样保留）。 */
   autostartStatus(): Promise<AutostartStatus>;
   /** 设置开机自启（`PUT /api/service/autostart`；后端未上线 → 诚实 405/404 失败）。 */
   setAutostart(input: { enable: boolean; reason?: string; note?: string }): Promise<{ ok: boolean; message: string }>;
+}
+
+/** `GET /api/diagnostics/selfcheck` 单条检查项。 */
+export interface SelfCheckItem {
+  /** 检查项标识（`config_writable` / `scheduler` / `alarm_engine` / `license` / `audit_logger` / `machine_code` / `clock`）。 */
+  name: string;
+  /**
+   * 该项是否通过。
+   * ⚠️ 语义边界：后端按「该检查可执行且无致命异常」判定，与业务是否就绪**不是一回事**
+   * —— 例如 `license.ok=true` 只代表授权探查跑通，`detail.north_forward_allowed` 才说明北向是否放行。
+   * 页面必须同时渲染 `detail`，禁止只用 `ok` 断言业务状态。
+   */
+  ok: boolean;
+  /** 明细；逐项结构不同，原样保留交由页面做可读化渲染（空对象 = 后端未给明细）。 */
+  detail: Record<string, unknown> | null;
+}
+
+/** `GET /api/diagnostics/selfcheck` 响应镜像。 */
+export interface SelfCheckReport {
+  /** 自检时间（毫秒时间戳，**字符串** —— uint64 红线，绝不 parseInt）。 */
+  checkedAt: string;
+  /** 整体是否通过（后端口径：全部检查项可执行）。 */
+  ok: boolean;
+  checks: SelfCheckItem[];
 }
 
 /** `GET /api/updates/check` 响应的前端镜像（camelCase 透传）。 */
@@ -1338,6 +1364,29 @@ function buildOps(): OpsApi {
         }
         return { ok: false, message: describeFailure(cause, '健康检查') };
       }
+    },
+
+    async selfCheck(): Promise<SelfCheckReport> {
+      // wire（be-rules B 组 + 真机 2026-09-26 实测）：GET /api/diagnostics/selfcheck
+      // → `{ ok, checked_at, checks:[{ name, ok, detail }] }`，7 项真实检查。
+      // ⚠️ 绝不 catch 成空清单 —— 那是「假空态」，会把「接口失败」渲染成「尚未自检」，
+      //    与诚实降级红线冲突。失败必须向上抛，由页面呈现真实原因。
+      const raw = await apiRequest<Record<string, unknown>>('/api/diagnostics/selfcheck');
+      const rows = Array.isArray(raw['checks']) ? (raw['checks'] as unknown[]) : [];
+      return {
+        // `checked_at` 是毫秒时间戳字符串（JSON 大数红线），绝不做数值转换。
+        checkedAt: pickStr(raw, 'checkedAt', pickStr(raw, 'checked_at', '')),
+        ok: pickBool(raw, 'ok', false),
+        checks: rows.map((row) => {
+          const r = asRecord(row);
+          const detail = asRecord(r['detail']);
+          return {
+            name: pickStr(r, 'name', ''),
+            ok: pickBool(r, 'ok', false),
+            detail: Object.keys(detail).length > 0 ? detail : null,
+          };
+        }),
+      };
     },
 
     async checkUpdates(): Promise<UpdateCheckInfo> {
