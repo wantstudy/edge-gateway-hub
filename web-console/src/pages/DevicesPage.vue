@@ -314,7 +314,7 @@ import {
   type TableColumn,
   type DangerFact,
 } from '@ui-kit';
-import { dataVersion, repo, PROTOCOL_OPTIONS, type DeviceGroup, type DeviceRecord } from '@/api/repo';
+import { dataVersion, refresh, repo, PROTOCOL_OPTIONS, type DeviceGroup, type DeviceRecord } from '@/api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -656,6 +656,18 @@ async function testAllConnections(): Promise<void> {
 
 onMounted(() => {
   void reload();
+  // 兜底：若首次挂载时真实缓存仍为空（例如登录后预取尚未落到本实例），
+  // 主动从网关重取一次真相再刷新，避免「总览有设备、设备列表为空」的假空态。
+  if (allDevices.value.length === 0) {
+    void (async () => {
+      try {
+        await refresh();
+      } catch {
+        /* 保持诚实空态：失败原因由 notices / 空态文案呈现 */
+      }
+      await reload();
+    })();
+  }
 });
 
 /** 筛选变化 → 回到第 1 页。 */

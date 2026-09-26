@@ -425,6 +425,7 @@ import {
 } from '@ui-kit';
 import {
   dataVersion,
+  refresh,
   repo,
   DATA_TYPE_OPTIONS,
   BYTE_ORDER_OPTIONS,
@@ -643,6 +644,18 @@ watch(devices, (list) => {
 
 onMounted(() => {
   reload();
+  // 兜底：与 DevicesPage 同源问题——若挂载时设备缓存为空（登录后预取未落到
+  // 本实例），主动重取一次真相，避免「其它页有设备、本页设备列表为空」。
+  if (devices.value.length === 0) {
+    void (async () => {
+      try {
+        await refresh();
+      } catch {
+        /* 保持诚实空态 */
+      }
+      reload();
+    })();
+  }
   const fromDevice = route.query.device;
   const devicesSnapshot = devices.value;
   if (typeof fromDevice === 'string' && fromDevice && devicesSnapshot.some((d) => d.id === fromDevice)) {

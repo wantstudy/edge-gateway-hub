@@ -143,7 +143,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import type { FieldRule, FormInstance } from '@arco-design/web-vue';
 import { ApiError, apiLogin, setStoredBackendRole, setStoredToken } from '@/api/client';
-import { dataVersion, preloadRealData, repo } from '@/api/repo';
+import { dataVersion, preloadRealData, refresh, repo } from '@/api/repo';
 import { mapBackendRole, session } from '@/store/session';
 
 const route = useRoute();
@@ -406,13 +406,25 @@ async function onSubmit(): Promise<void> {
     session.login(form.username.trim(), { backendRole: res.role, role: mapBackendRole(res.role) });
     refreshGatewayName();
     //
-    // D-01 修复：登录成功后**立即回跳**，preload 转后台执行。
+    // D-01 修复：登录成功后**立即回跳**，预取转后台执行。
     // 旧实现 `await preloadRealData()` 混入了 `/api/events`（无限 SSE 流，
     // `res.text()` 永不 resolve）→ 登录按钮永久 loading、页面卡在登录页。
-    // preload 内部另有 8s 超时护栏，完成后由 `dataVersion` 驱动页面刷新。
-    void preloadRealData().catch((cause: unknown) => {
-      console.warn('[web-console] 登录后预取真实数据失败，页面按诚实空态呈现', cause);
-    });
+    //
+    // D-02 修复（真机实证）：仅 `preloadRealData()` 时，SPA 路由进入设备列表 /
+    // 点位与映射页仍读到**空缓存**（总览却有数据）。原因：`preloadRealData()`
+    // 填充的实例与页面读取的实例不一致，实测缓存全程为 0；同一模块实例的
+    // `refresh()` 则稳定填充并驱动页面刷新。这里改为「先 refresh 落真数据，
+    // 再补跑 preload（SSE 等附加通道）」，两者都是幂等读，不产生副作用。
+    void (async () => {
+      try {
+        await refresh();
+      } catch (cause) {
+        console.warn('[web-console] 登录后刷新真实数据失败，页面按诚实空态呈现', cause);
+      }
+      await preloadRealData().catch((cause: unknown) => {
+        console.warn('[web-console] 登录后预取真实数据失败，页面按诚实空态呈现', cause);
+      });
+    })();
     const redirect = typeof route.query.redirect === 'string' && route.query.redirect ? route.query.redirect : '/overview';
     await router.replace(redirect);
   } catch (cause) {

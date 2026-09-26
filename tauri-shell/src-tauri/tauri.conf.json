@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.iotdaq.gateway",
   "build": {
-    "beforeDevCommand": "npm --prefix ../../web-console run dev",
+    "beforeDevCommand": "npm --prefix ../web-console run dev",
     "devUrl": "http://localhost:5274",
-    "beforeBuildCommand": "npm --prefix ../../web-console run build",
+    "beforeBuildCommand": "npm --prefix ../web-console run build",
     "frontendDist": "../../web-console/dist"
   },
   "app": {
@@ -31,13 +31,12 @@
     "shortDescription": "工业边缘数据汇聚网关 · 桌面控制台",
     "longDescription": "IoT-DAQ 工业边缘数据汇聚与统一分发网关的 Windows 桌面控制台，承载网关侧 web-console（设备 / 点位 / 北向 / 监控 / 授权 / 运维）。",
     "windows": {
-      "nsis": {
-        "displayLanguageSelector": false,
-        "languages": ["SimpChinese"],
-        "installerIcon": "icons/icon.ico",
-        "installMode": "perMachine",
-        "allowToChangeInstallationDirectory": true
-      }
+        "nsis": {
+          "displayLanguageSelector": false,
+          "languages": ["SimpChinese"],
+          "installerIcon": "icons/icon.ico",
+          "installMode": "perMachine"
+        }
     }
   }
 }
