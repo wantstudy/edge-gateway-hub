@@ -872,6 +872,194 @@ pub async fn backup_policy_put(
     }
 }
 
+// ---- 计划重启（每日定时） ----
+
+/// 计划重启的二次确认固定对象名（与对象全名口径一致，写入审计）。
+pub(crate) const SCHEDULED_RESTART_CONFIRM: &str = "scheduled-restart";
+
+/// `GET /api/ops/scheduled-restart` → 当前计划重启配置与已触发状态。
+///
+/// **读开放**（仅回显配置里的一个时间字符串，无可推断的运维动作面；写侧才要
+/// `ops.restart`）。`last_fired` 取自 `[ops] last_restart_date`（已落盘，进程
+/// 重启后由新进程重新装载），未触发过为 `null`。
+pub async fn scheduled_restart_get(State(state): State<MgmtState>) -> Response {
+    let ops = state.config().ops.clone();
+    Json(json!({
+        "enabled": ops.scheduled_restart_enabled(),
+        "at": ops.scheduled_restart_at.clone(),
+        "last_fired": if ops.last_restart_date.is_empty() { Value::Null } else { json!(ops.last_restart_date) },
+        "timezone": "local",
+        "note": "每日定时重启；命中后走与 POST /api/ops/restart 相同的优雅停机通道，\
+                 同日只触发一次。",
+    }))
+    .into_response()
+}
+
+/// `PUT /api/ops/scheduled-restart` → 设置 / 清除每日定时重启（P0-8 危险操作三要素）。
+///
+/// body：`{at: "HH:MM" | "", reason, note?, confirm}`，`confirm` 固定回显
+/// `scheduled-restart`（trim + 大小写不敏感）。`at` 空串 = 关闭定时重启；
+/// 非法时刻（非 `HH:MM`）→ 400 `validation_failed`。落盘后调度器下一拍（≤30s）
+/// 按新值生效。权限与立即重启同档（`ops.restart`）。
+#[allow(clippy::too_many_lines)]
+pub async fn scheduled_restart_put(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    let actor = authed.claims.sub.clone();
+    if let Err(rejection) = authed.ensure(Permission::OpsRestart) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::Restart,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let req = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(obj)) => obj,
+        Ok(_) | Err(_) => {
+            return audit_policy_bad_request(
+                &state,
+                &actor,
+                "malformed json body",
+                validation_error(
+                    "body",
+                    "body must be a JSON object",
+                    "object {at, reason, note?, confirm}",
+                ),
+            );
+        }
+    };
+    for key in req.keys() {
+        if !["at", "reason", "note", "confirm"].contains(&key.as_str()) {
+            return audit_policy_bad_request(
+                &state,
+                &actor,
+                "body carries unknown fields",
+                validation_error(
+                    &format!("body.{key}"),
+                    &format!("unknown field {key:?}"),
+                    "allowed fields: at | reason | note | confirm",
+                ),
+            );
+        }
+    }
+    // 三要素：`reason` 必填、`note` 非空则 ≥10 字、`confirm` = scheduled-restart。
+    let reason = req
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if reason.is_empty() {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "reason is required",
+            validation_error(
+                "reason",
+                "reason must not be empty",
+                "non-empty change reason",
+            ),
+        );
+    }
+    let note = req
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !note.is_empty() && note.chars().count() < 10 {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "note is too short",
+            validation_error(
+                "note",
+                "note must be at least 10 characters when non-empty",
+                "≥10 characters",
+            ),
+        );
+    }
+    let confirm = req
+        .get("confirm")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if confirm.is_empty() {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "confirm is required",
+            validation_error(
+                "confirm",
+                "confirm is required (echo the fixed target `scheduled-restart`)",
+                SCHEDULED_RESTART_CONFIRM,
+            ),
+        );
+    }
+    if !confirm.eq_ignore_ascii_case(SCHEDULED_RESTART_CONFIRM) {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "confirm mismatch",
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "confirm_mismatch",
+                    "field": "confirm",
+                    "reason": format!(
+                        "confirm does not match {:?}",
+                        SCHEDULED_RESTART_CONFIRM
+                    ),
+                    "allowed": SCHEDULED_RESTART_CONFIRM,
+                })),
+            )
+                .into_response(),
+        );
+    }
+    // `at`：空串 = 关闭；否则必须能解析成 `HH:MM`。
+    let raw_at = req
+        .get("at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !raw_at.is_empty() && crate::scheduler::scheduled_restart::parse_at(raw_at).is_none() {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "invalid scheduled restart time",
+            validation_error(
+                "at",
+                &format!("not a valid daily time: {raw_at:?}"),
+                "HH:MM in 24-hour local time; empty string disables the schedule",
+            ),
+        );
+    }
+    let _guard = write_guard();
+    let mut config = (*state.config()).clone();
+    config.ops.scheduled_restart_at = raw_at.to_string();
+    let detail = format!(
+        "set scheduled restart at {:?} (reason: {reason}; note: {note})",
+        raw_at
+    );
+    match super::pages::persist_config(&state, config, &actor, OpsAction::SettingsWrite, &detail) {
+        Ok(version) => {
+            state.publish(super::MgmtEvent::ConfigReloaded { version });
+            Json(json!({
+                "accepted": true,
+                "enabled": !raw_at.is_empty(),
+                "at": raw_at,
+                "config_version": version.to_string(),
+            }))
+            .into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
 /// 备份策略 PUT 校验失败：入审计（bad_request）后返回 400。
 fn audit_policy_bad_request(
     state: &MgmtState,
@@ -1699,5 +1887,159 @@ data_dir = "./data"
         )
         .await;
         assert_eq!(status, 401);
+    }
+
+    /// 计划重启：`GET` 回显当前配置；`PUT` 校验非法时刻 / 三要素缺失，合法则落盘。
+    #[tokio::test]
+    async fn scheduled_restart_get_and_put_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, path) = make_state(&dir);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // ① 初始（未配置）→ enabled=false、at 空、last_fired=null。
+        let (status, body) = http(port, "GET", "/api/ops/scheduled-restart", None, None).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["at"].as_str(), Some(""));
+        assert_eq!(value["last_fired"], Value::Null);
+
+        // ② 缺 `reason` → 400 validation_failed。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(r#"{"at":"02:30","confirm":"scheduled-restart"}"#),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"].as_str(),
+            Some("reason")
+        );
+
+        // ③ `note` 不足 10 字 → 400 validation_failed。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护","note":"太短","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"].as_str(),
+            Some("note")
+        );
+
+        // ④ 非法时刻 → 400 validation_failed（落盘零变更）。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"25:99","reason":"每日维护窗口","note":"时刻超出合法值域范围","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"].as_str(),
+            Some("at")
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("config")
+                .contains("scheduled_restart_at"),
+            "非法时刻不得落盘（空值不写段，避免旧版 daemon 读到脏配置）"
+        );
+
+        // ⑤ `confirm` 不匹配 → 400 confirm_mismatch。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护窗口","note":"每日凌晨例行重启窗口","confirm":"02:30"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "confirm_mismatch");
+        assert_eq!(value["allowed"], SCHEDULED_RESTART_CONFIRM);
+
+        // ⑥ 合法 → 200 落盘（复核配置文件）。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护窗口","note":"每日凌晨例行重启窗口","confirm":"SCHEDULED-RESTART"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let saved = std::fs::read_to_string(&path).expect("config");
+        assert!(
+            saved.contains("scheduled_restart_at = \"02:30\""),
+            "{saved}"
+        );
+
+        // ⑦ 读回显已启用。
+        let (status, body) = http(port, "GET", "/api/ops/scheduled-restart", None, None).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["at"].as_str(), Some("02:30"));
+        assert_eq!(value["last_fired"], Value::Null);
+
+        // ⑧ 空 `at` = 关闭。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"","reason":"取消定时","note":"取消定时改为手动运维","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["enabled"], false);
+        // 空值不落字段（`skip_serializing_if`）：配置里只剩空的 `[ops]` 段，
+        // 缺省装载 = 关闭，语义等价且不会给旧版 daemon 留脏字段。
+        let saved = std::fs::read_to_string(&path).expect("config");
+        assert!(!saved.contains("scheduled_restart_at"), "{saved}");
+    }
+
+    /// 计划重启写：无 `ops.restart` 权限的角色 → 403（与立即重启同档）。
+    #[tokio::test]
+    async fn scheduled_restart_put_denied_without_ops_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _) = make_state(&dir);
+        let ops = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, _) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护窗口","note":"每日凌晨例行重启窗口","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&ops),
+        )
+        .await;
+        assert_eq!(status, 403);
     }
 }

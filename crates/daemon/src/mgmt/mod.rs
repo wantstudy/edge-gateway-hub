@@ -426,6 +426,12 @@ pub fn router(state: MgmtState) -> Router {
             axum::routing::post(remote_ops::collectors),
         )
         .route("/api/ops/logs", get(remote_ops::logs))
+        // 计划重启（每日 `[ops] scheduled_restart_at`）：读开放，写走 ops.restart
+        // 权限（permission_for_ops_action 已含本路径，见下方动作映射）。
+        .route(
+            "/api/ops/scheduled-restart",
+            get(ops_api::scheduled_restart_get).put(ops_api::scheduled_restart_put),
+        )
         .route_layer(from_fn_with_state(state.clone(), ops_guard));
 
     Router::new()
@@ -714,6 +720,12 @@ async fn ops_guard(State(state): State<MgmtState>, req: Request, next: Next) -> 
         ("POST", "/api/ops/restart") => "restart",
         ("POST", "/api/ops/stop") => "stop",
         ("POST", "/api/ops/collectors") => "collectors_pause",
+        // 计划重启的**写**与「立即重启」同档（`ops.restart`）——能改自动重启时刻
+        // 与能停机重启是同一运维高危面，不另开权限项。
+        // ⚠️ `GET` 故意**不入**本映射：读只回显配置里的一个时间字符串，落到 `_`
+        //    分支透传路由器（读开放）；写侧 handler 内另有 `ensure(OpsRestart)`
+        //    二次校验（防御纵深）。
+        ("PUT", "/api/ops/scheduled-restart") => "restart",
         ("GET", "/api/ops/logs") => "logs_read",
         _ => "",
     };

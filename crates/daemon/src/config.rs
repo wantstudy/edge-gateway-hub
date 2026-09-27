@@ -227,6 +227,30 @@ pub struct SettingsSection {
     pub updates: UpdatesSection,
 }
 
+/// `[ops]` 运维段（**可选**：缺省 = 不启用计划重启；管理面
+/// `PUT /api/ops/scheduled-restart` 写入，进程重启后重新装载）。
+///
+/// - `scheduled_restart_at`：每日定时重启时刻（`"HH:MM"`，24 小时制，本地时区）；
+///   空串 / 未配置 = 关闭。同一天只生效一次（`last_restart_date` 记录已重启的
+///   日期，跨日后自动恢复）。
+/// - `last_restart_date`：最近一次计划重启的日期（`YYYY-MM-DD`；空 = 从未触发）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct OpsSection {
+    /// 每日定时重启时刻（`"HH:MM"`；空 = 不启用）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scheduled_restart_at: String,
+    /// 最近一次计划重启日期（`YYYY-MM-DD`；空 = 从未触发）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_restart_date: String,
+}
+
+impl OpsSection {
+    /// 是否启用每日定时重启（`scheduled_restart_at` 非空即为启用）。
+    pub fn scheduled_restart_enabled(&self) -> bool {
+        !self.scheduled_restart_at.trim().is_empty()
+    }
+}
+
 /// 备份策略（`[settings.backup_policy]`；把既有「写前自动备份」行为显式化）。
 ///
 /// - `auto_before_write`：`GatewayConfig::save` 落盘前是否自动备份（默认 `true`
@@ -789,6 +813,9 @@ pub struct GatewayConfig {
     /// `[settings]` 管理面设置段（**可选**；缺省 = 备份策略全默认，旧配置兼容）。
     #[serde(default)]
     pub settings: SettingsSection,
+    /// `[ops]` 运维段（**可选**；缺省 = 不启用计划重启，旧配置兼容）。
+    #[serde(default)]
+    pub ops: OpsSection,
 }
 
 impl GatewayConfig {

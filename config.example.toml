@@ -148,3 +148,17 @@ gateway_id = "gw-local-dev"
 # id = "viewer"                          # 角色唯一标识
 # name = "只读"                          # 角色显示名
 # permissions = ["device.view", "audit.view"]   # 权限 id（见 rbac::Permission）
+
+# ── 运维（计划重启，可选；不配 = 不启用）──
+# [ops]
+# scheduled_restart_at = "02:30"                # 每日定时重启时刻（本地时区，24 小时制 HH:MM）；
+#                                               # 空串 / 不配 = 关闭。同一天只生效一次——
+#                                               # 触发后日期写入 last_restart_date，次日自动恢复。
+#                                               # 命中后走与 `POST /api/ops/restart` 完全相同的
+#                                               # 优雅停机通道，由 Supervisor / 服务管理器拉起。
+# last_restart_date = ""                        # 最近一次计划重启日期（YYYY-MM-DD；由调度器写入，勿手改）
+#
+# 管理面读写（需 ops.restart 权限）：
+#   GET  /api/ops/scheduled-restart   → {enabled, at, last_fired, timezone}
+#   PUT  /api/ops/scheduled-restart   → body {at: "HH:MM"|"", reason, note?, confirm}
+#                                       confirm 固定回显 `scheduled-restart`

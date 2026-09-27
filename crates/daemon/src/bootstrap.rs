@@ -121,6 +121,9 @@ struct DaemonSharedInner {
     config: RwLock<Arc<ConfigShared>>,
     /// 配置版本广播：热重载成功后 bootstrap 转发新版本号（mgmt SSE 消费）。
     reload_tx: watch::Sender<u64>,
+    /// **配置文件路径**（计划重启调度落 `[ops] last_restart_date` 用；`None` =
+    /// 未装配 `BootstrapBuilder::with_config_path` → 该路径 fail-closed 不触发）。
+    config_path: RwLock<Option<std::path::PathBuf>>,
     /// 停机请求：`true` = 请求优雅停机（信号监听 / 编程式 `request_shutdown` 共用）。
     shutdown_tx: watch::Sender<bool>,
     /// 优雅停机是否超宽限期被中止（诊断 / 测试观测）。
@@ -186,6 +189,7 @@ impl DaemonShared {
                 started_at: Instant::now(),
                 last_heartbeat_ns: AtomicU64::new(0),
                 config: RwLock::new(Arc::new(ConfigShared::new(GatewayConfig::default()))),
+                config_path: RwLock::new(None),
                 reload_tx,
                 shutdown_tx,
                 shutdown_timed_out: AtomicBool::new(false),
@@ -260,6 +264,25 @@ impl DaemonShared {
     /// 当前配置快照（便捷读侧）。
     pub fn config_snapshot(&self) -> Arc<GatewayConfig> {
         self.config_shared().snapshot()
+    }
+
+    /// 挂载配置文件路径（计划重启调度落日期标记用；`None` = 未挂载）。
+    pub fn set_config_path(&self, path: impl Into<std::path::PathBuf>) {
+        let mut guard = self
+            .inner
+            .config_path
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(path.into());
+    }
+
+    /// 当前配置文件路径（`None` = 未装配；计划重启判定 fail-closed 的依据）。
+    pub fn config_path(&self) -> Option<std::path::PathBuf> {
+        self.inner
+            .config_path
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// 当前配置版本号（每次成功热重载 +1）。
@@ -599,6 +622,14 @@ impl BootstrapBuilder {
         self
     }
 
+    /// 注入配置文件路径（计划重启调度落 `[ops] last_restart_date` 标记用；
+    /// 未注入 ⇒ 调度侧 fail-closed，不触发重启）。
+    #[must_use]
+    pub fn with_config_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config_path = path.into();
+        self
+    }
+
     /// 注入数据根目录（task-61 验收 D-08 修复）：审计库随之落到
     /// `<data_dir>/audit.db`（与设备签名密钥 / 试用标记同一持久卷）。
     ///
@@ -828,7 +859,12 @@ impl BootstrapBuilder {
             None => ConfigHotReloader::spawn(&self.config_path)?,
         };
         shared.set_config(config_shared.clone());
+        // 计划重启调度要落 `[ops] last_restart_date`，与热重载监听同一个配置文件。
+        shared.set_config_path(self.config_path.clone());
         shared.notify_config_reload(config_shared.version());
+
+        // 计划重启调度（每日 `[ops] scheduled_restart_at`；未配置 = 空转不触发）。
+        let restart_task = crate::scheduler::scheduled_restart::spawn(shared.clone());
 
         // ②-b 免费版配额闸门（**启动装配期**，fail-closed）：Degraded（免费版）
         //     状态下配置超额（设备数 > 8 / 非 Modbus / 间隔 < 1s）→ 拒绝启动，
@@ -1012,6 +1048,7 @@ impl BootstrapBuilder {
         // ⑧ 清理后台任务与热重载线程。
         watchdog_task.abort();
         reload_task.abort();
+        restart_task.abort();
         reloader.stop();
 
         info!("bootstrap: daemon stopped");

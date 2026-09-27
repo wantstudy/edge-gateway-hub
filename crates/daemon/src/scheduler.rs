@@ -1409,3 +1409,276 @@ mod tests {
         ));
     }
 }
+
+/// 网关**计划重启**调度（配置 `[ops] scheduled_restart_at = "HH:MM"`，每日定时；
+/// 空 / 未配置 = 不启用）。
+///
+/// ## 语义
+/// - `at` 为**本机本地时区**的每日时刻（`HH:MM`）；
+/// - 每 [`TICK_SECS`] 检查一次，命中即走与 `POST /api/ops/restart` 完全相同的
+///   优雅停机通道（`DaemonShared::request_shutdown`），由 Supervisor / 服务管理器
+///   负责拉起；重启后配置重新装载，调度自然生效；
+/// - **同日只触发一次**：命中后把日期写进 `[ops] last_restart_date`，当日后续
+///   检查一律跳过；跨日（日期键变化）自动恢复。
+///
+/// ## 安全口径（fail-closed）
+/// 配置路径未装配（无法落盘日期标记）或标记落盘失败时**绝不触发**重启——否则
+/// 标记无法持久化，会导致每 tick 反复重启。
+pub mod scheduled_restart {
+    use std::sync::Arc;
+
+    use tokio::task::JoinHandle;
+    use tokio::time::{interval, Duration};
+    use tracing::{info, warn};
+
+    use crate::bootstrap::DaemonShared;
+
+    /// 检查周期（秒）。
+    const TICK_SECS: u64 = 30;
+
+    /// 本机本地墙钟（格式化后的本地时间；`HH:MM` 命中判定与日期键的依据）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LocalClock {
+        pub year: u16,
+        pub month: u8,
+        pub day: u8,
+        pub hour: u8,
+        pub minute: u8,
+    }
+
+    /// 生成本地墙钟（不引第三方时间库：Windows 走 `kernel32!GetLocalTime`，
+    /// 其余平台走 POSIX `localtime_r`）。
+    pub fn local_clock() -> LocalClock {
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            #[derive(Default, Clone, Copy)]
+            struct WinSystemTime {
+                w_year: u16,
+                w_month: u16,
+                w_day_of_week: u16,
+                w_day: u16,
+                w_hour: u16,
+                w_minute: u16,
+                _w_second: u16,
+                _w_milliseconds: u16,
+            }
+            extern "system" {
+                fn GetLocalTime(lp_system_time: *mut WinSystemTime);
+            }
+            let mut st = WinSystemTime::default();
+            unsafe { GetLocalTime(&mut st) };
+            LocalClock {
+                year: st.w_year,
+                month: (st.w_month as u8).clamp(1, 12),
+                day: (st.w_day as u8).clamp(1, 31),
+                hour: (st.w_hour as u8).clamp(0, 23),
+                minute: (st.w_minute as u8).clamp(0, 59),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            use std::ffi::c_int;
+
+            /// POSIX `struct tm` 的前 9 个成员（`localtime_r` 只写这些，够拼日期键）。
+            #[repr(C)]
+            #[derive(Default, Clone, Copy)]
+            struct PosixTm {
+                tm_sec: c_int,
+                tm_min: c_int,
+                tm_hour: c_int,
+                tm_mday: c_int,
+                tm_mon: c_int,
+                tm_year: c_int,
+                tm_wday: c_int,
+                tm_yday: c_int,
+                tm_isdst: c_int,
+            }
+            extern "C" {
+                fn time(timep: *mut i64) -> i64;
+                fn localtime_r(timep: *const i64, result: *mut PosixTm) -> *mut PosixTm;
+            }
+            let mut raw: i64 = 0;
+            let secs = unsafe { time(&mut raw) };
+            let secs = if secs == -1 { 0 } else { secs };
+            let mut tm = PosixTm::default();
+            let ptr = unsafe { localtime_r(&secs, &mut tm) };
+            let field = |get: fn(&PosixTm) -> c_int, fallback: u8| -> u8 {
+                if ptr.is_null() {
+                    fallback
+                } else {
+                    // 只读合法值域，越界回退兜底（绝不 panic）。
+                    u8::try_from(get(unsafe { &*ptr })).unwrap_or(fallback)
+                }
+            };
+            LocalClock {
+                year: 1900 + u16::try_from(field(|t| t.tm_year, 0)).unwrap_or(0),
+                month: field(|t| t.tm_mon + 1, 1),
+                day: field(|t| t.tm_mday, 1),
+                hour: field(|t| t.tm_hour, 0),
+                minute: field(|t| t.tm_min, 0),
+            }
+        }
+    }
+
+    /// 解析每日时刻 `"HH:MM"`（允许前后空格与 `H:MM` 简写）→ `(hour, minute)`；
+    /// 非法 → `None`。
+    pub fn parse_at(raw: &str) -> Option<(u8, u8)> {
+        let s = raw.trim();
+        let (h, m) = s.split_once(':')?;
+        let hour = h.parse::<u8>().ok()?;
+        let minute = m.parse::<u8>().ok()?;
+        if hour > 23 || minute > 59 {
+            return None;
+        }
+        Some((hour, minute))
+    }
+
+    /// 本地日期键 `"YYYY-MM-DD"`（同日判定的依据）。
+    pub fn date_key(now: &LocalClock) -> String {
+        format!("{:04}-{:02}-{:02}", now.year, now.month, now.day)
+    }
+
+    /// 是否**应当**触发：`at` 合法 + 当前本地时刻正好命中 + 当日尚未触发过。
+    ///
+    /// 纯函数（时间由调用方注入），便于单测覆盖「当日已触发不重复」口径。
+    pub fn should_fire(at: &str, last_restart_date: &str, now: &LocalClock) -> bool {
+        let Some((hour, minute)) = parse_at(at) else {
+            return false;
+        };
+        if now.hour != hour || now.minute != minute {
+            return false;
+        }
+        // 日期键相同 = 同一天，已触发过 → 不再重复。
+        !last_restart_date
+            .trim()
+            .eq_ignore_ascii_case(&date_key(now))
+    }
+
+    /// 启动计划重启后台任务（返回 `JoinHandle`，循环不退出直到进程停机）。
+    pub fn spawn(daemon: DaemonShared) -> JoinHandle<()> {
+        tokio::spawn(run(Arc::new(daemon)))
+    }
+
+    async fn run(daemon: Arc<DaemonShared>) {
+        let mut ticker = interval(Duration::from_secs(TICK_SECS));
+        // 首拍立即等一个周期（`interval` 首拍是瞬时），避免装配期多余检查。
+        loop {
+            ticker.tick().await;
+            once(&daemon);
+        }
+    }
+
+    /// 单趟检查（同步执行：落盘 + 停机请求都是非 `await` 阻塞操作）。
+    ///
+    /// `true` = 本趟已请求重启。
+    fn once(daemon: &Arc<DaemonShared>) -> bool {
+        let snapshot = daemon.config_snapshot();
+        let at = snapshot.ops.scheduled_restart_at.clone();
+        if at.trim().is_empty() {
+            return false;
+        }
+        let Some(path) = daemon.config_path() else {
+            warn!(
+                at = %at.trim(),
+                "scheduled restart: config path not bound; refusing to fire (fail-closed)"
+            );
+            return false;
+        };
+        let now = local_clock();
+        if !should_fire(&at, &snapshot.ops.last_restart_date, &now) {
+            return false;
+        }
+        // 先落盘日期标记：落盘失败 ⇒ 不重启（避免每 tick 反复重启）。
+        let mut next = (*snapshot).clone();
+        next.ops.last_restart_date = date_key(&now);
+        if let Err(err) = next.save(&path) {
+            warn!(
+                error = %err,
+                at = %at.trim(),
+                "scheduled restart: date marker not persisted; restart withheld"
+            );
+            return false;
+        }
+        let version = daemon.config_shared().replace(next);
+        audit_scheduled_restart(daemon, "graceful shutdown requested by scheduled restart");
+        info!(
+            at = %at.trim(),
+            date = %date_key(&now),
+            config_version = version,
+            "scheduled restart: graceful shutdown requested"
+        );
+        daemon.request_shutdown();
+        true
+    }
+
+    /// 计划重启的持久审计落点（actor 固定为调度器自身，可与管理面重启区分）。
+    fn audit_scheduled_restart(daemon: &Arc<DaemonShared>, detail: &str) {
+        if let Some(logger) = daemon.audit_logger() {
+            if let Err(err) = logger.record(
+                "scheduled_restart",
+                crate::audit::AuditEventType::ConfigChange,
+                "accepted",
+                detail,
+            ) {
+                warn!(error = %err, "scheduled restart: persistent audit record failed");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 构造一个本地时刻（测试夹具）。
+        fn clock(year: u16, month: u8, day: u8, hour: u8, minute: u8) -> LocalClock {
+            LocalClock {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+            }
+        }
+
+        #[test]
+        fn parse_at_accepts_hh_mm_and_rejects_garbage() {
+            assert_eq!(parse_at("02:30"), Some((2, 30)));
+            assert_eq!(parse_at("  23:59  "), Some((23, 59)));
+            assert_eq!(parse_at("7:5"), Some((7, 5)));
+            assert_eq!(parse_at("24:00"), None, "hour must be < 24");
+            assert_eq!(parse_at("02:60"), None, "minute must be < 60");
+            assert_eq!(parse_at(""), None, "empty = disabled");
+            assert_eq!(parse_at("0200"), None, "must be HH:MM");
+            assert_eq!(parse_at("2-30"), None);
+        }
+
+        #[test]
+        fn fires_only_on_exact_time_and_once_per_day() {
+            // 配置 02:30；当天 02:31 → 不触发（只按整刻命中，不做区间判定）。
+            assert!(!should_fire("02:30", "", &clock(2026, 9, 27, 2, 31)));
+            // 02:30 命中且当日未触发 → 触发。
+            assert!(should_fire("02:30", "", &clock(2026, 9, 27, 2, 30)));
+            // 当日已触发（日期键相同）→ 不重复。
+            assert!(!should_fire(
+                "02:30",
+                "2026-09-27",
+                &clock(2026, 9, 27, 2, 30)
+            ));
+            // 跨日 → 恢复（新的一天）。
+            assert!(should_fire(
+                "02:30",
+                "2026-09-27",
+                &clock(2026, 9, 28, 2, 30)
+            ));
+            // 非法时刻永不触发。
+            assert!(!should_fire("nope", "", &clock(2026, 9, 27, 2, 30)));
+        }
+
+        #[test]
+        fn date_key_zero_pads_local_date() {
+            assert_eq!(date_key(&clock(2026, 9, 27, 2, 30)), "2026-09-27");
+            assert_eq!(date_key(&clock(2026, 1, 5, 2, 30)), "2026-01-05");
+        }
+    }
+}
