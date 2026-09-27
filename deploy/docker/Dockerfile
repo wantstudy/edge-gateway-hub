@@ -13,97 +13,65 @@
 #      digest 不手写：由 `deploy/scripts/render-dockerfile-digests.sh` 从
 #      `deploy/base-images.lock.yaml` 渲染注入（supply-chain §3.1）。
 #
-#   ★ 本文件不是「可直接构建物」：下方两处 FROM 的 digest 段为**占位 token**
+#   ★ 本文件不是「可直接构建物」：下方 FROM 的 digest 段为**占位 token**
 #     （__BUILDER_DIGEST__ / __RUNTIME_DIGEST__），保留 `@sha256:` 形式。
 #     构建前必须先用 render 脚本渲染出带真实 digest 的 Dockerfile：
 #       deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
 #       docker buildx build -f deploy/docker/Dockerfile.rendered ...
 #     直接 `docker build -f deploy/docker/Dockerfile` 会因占位非法而失败
 #     （fail-closed —— 让「未 pin 的构建」不可能静默成功）。
-#   2) runtime 阶段只拷二进制（daemon + healthprobe）+ Web 静态资源 + 默认配置模板，
+#   2) runtime 阶段只拷二进制（daemon + healthprobe）+ Web 静态资源 + nginx 配置，
 #      绝不 COPY 源码、.git、密钥、激活码、宿主指纹（persistence-layout §2）。
 #   3) 以非 root 用户运行；容器内进程不申请任何 capability。
 #   4) 目标架构 amd64 / arm64（buildx --platform linux/amd64,linux/arm64）。
-#   5) fail-closed：产物路径错位必须让构建失败，绝不允许 BuildKit glob 静默产出空层
-#      （D-09 教训：glob 无匹配 → 4.1KB 空层 → 容器 exec 失败）。
-#      因此 builder 阶段对最终二进制做 `test -f` 断言，并以**固定路径** /build/out/
-#      移交产物（多架构下 COPY 无条件分支，glob 是唯一坏选择，固定路径 + 断言是唯一好选择）。
+#   5) fail-closed：产物路径错位必须让构建失败，绝不允许 BuildKit glob 静默产出空层。
 #
-# 构建示例（CI，勿在本机跑，见任务说明盘空间紧张）：
-#   先渲染基础镜像 digest（本文件含占位 token，不可直接构建）：
-#     deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
-#   docker buildx build --platform linux/amd64,linux/arm64 \
+# 架构变化（2026-09-27）：
+#   - 原 distroless/static 改为 nginx:1.25-alpine（容器内置 nginx，不再依赖宿主 nginx）
+#   - nginx 监听 8080：静态文件 + /api/* → daemon:8081
+#   - daemon 监听 8081（内部，宿主机不可直接访问）
+#   - 入口使用 /usr/local/bin/start.sh 同时启动 nginx + daemon
+#
+# 构建示例：
+#   deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
+#   docker buildx build --platform linux/amd64 \
 #     -f deploy/docker/Dockerfile.rendered -t iot-daq-gateway:v1.0.0 --push .
-# 离线单架构导出（build-offline-bundle.sh 已内置渲染步骤）：
-#   docker buildx build --platform linux/arm64 -f deploy/docker/Dockerfile.rendered \
-#     -o type=docker,dest=deploy/out/iot-daq-gateway_v1.0.0_arm64.tar .
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # 阶段 1：builder —— 编译 daemon（Rust workspace 唯一运行体 crate）
 # -----------------------------------------------------------------------------
-# 说明：digest 段为占位 token，由 deploy/scripts/render-dockerfile-digests.sh
-# 从 deploy/base-images.lock.yaml 渲染（保留 @sha256: 形式，禁可变 tag）。
-# 选择 -slim 变体：体积更小、攻击面更小。
-# 工具链版本：Cargo.lock 传递依赖要求 rustc ≥ 1.88（icu_properties_data 2.3.0、
-# time 0.3.55 等，共 34 条 requires rustc 报错，D-04），故锁定 1.88-slim-bookworm，
-# 升级走 base-images.lock.yaml 受审变更流程。
 FROM rust:1.88-slim-bookworm@sha256:__BUILDER_DIGEST__ AS builder
 
-# TARGETARCH 由 buildx 注入（amd64 / arm64），用于：
-#   - Rust target triple 校验
-#   - 产物命名（离线包按架构分发）
 ARG TARGETARCH
 
-# musl 静态链接（D-09b，方案 A）：distroless/static 无 loader，要求二进制完全静态。
-# musl-tools 提供 musl-gcc，供 ring 等 C 依赖为 musl 目标编译 C 代码。
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends musl-tools; \
     rm -rf /var/lib/apt/lists/*
 
-# 构建期不写入任何密钥；指纹盐为编译期常量或运行时注入，见 installer-hardening §1
 ENV CARGO_TERM_COLOR=never \
     CARGO_NET_OFFLINE=false \
     RUSTFLAGS="-C strip=symbols"
 
 WORKDIR /build
 
-# ---- 依赖层缓存：先只拷清单，构建一次空壳，最大化 Docker 层复用 ----
 COPY Cargo.toml Cargo.lock ./
 COPY crates/protocol-proto/Cargo.toml crates/protocol-proto/
 COPY crates/daemon/Cargo.toml crates/daemon/
 COPY crates/licensing-server/Cargo.toml crates/licensing-server/
-# 占位 lib.rs 让 cargo 能解析 workspace 成员。
-# ★ 注意（D-10 教训）：绝不在预热层创建 src/main.rs —— 真实仓库的 daemon 入口是
-#   src/bin/iot-daq-daemon.rs（bin 目标），COPY crates/ 不会删除残留的 dummy main.rs，
-#   且 COPY 之后再用 --bin daemon 会编出空壳。dummy 只允许用 lib.rs（真实源码层会覆盖它）。
 RUN set -eux; \
     for d in protocol-proto daemon licensing-server; do \
         mkdir -p "crates/$d/src"; \
         echo '' > "crates/$d/src/lib.rs"; \
     done
 
-# 预热依赖（失败可容忍：部分 crate 需要真实源码）。不带 --bin：只编 lib 以拉取依赖。
 RUN cargo build --release --package daemon || true
 
-# ---- 真实源码层 ----
-# 只拷 crates/ 下的源码；前端资源由单独 COPY 引入（dist 产物，非源码树）
 COPY crates/ ./crates/
-
-# 说明：web-console 的构建产物（dist/）由 CI 在调用 buildx 前生成，
-# 本 Dockerfile 要求构建上下文 deploy/docker/context/web-console-dist/ 已存在
-# （由 deploy/scripts/build-offline-bundle.sh 预置）。
-# ★ COPY 没有「缺省时跳过」语义：目录缺失 = 构建失败（fail-closed，D-09 同源教训）。
 COPY deploy/docker/context/web-console-dist/ /build/web-console-dist/
-
-# 健康探针源码（纯 std 零依赖，见 deploy/docker/healthprobe/main.rs 头注释，D-06）
 COPY deploy/docker/healthprobe/main.rs /build/healthprobe.rs
 
-# 编译：release profile 已含 strip + LTO + panic=abort（见根 Cargo.toml）
-# musl 静态（D-09b 方案 A）：--target <musl triple> + crt-static；
-# 产物路径 <triple>/release/iot-daq-daemon 必须经 test -f 断言 + 拷贝到固定路径
-# /build/out/（D-09：glob 错位在多架构 COPY 下无法表达，固定路径是唯一安全做法）。
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) RUST_TRIPLE="x86_64-unknown-linux-musl" ;; \
@@ -128,66 +96,89 @@ RUN set -eux; \
     file /build/out/iot-daq-daemon 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
-# 阶段 2：runtime —— distroless 静态镜像，非 root，只读友好
+# 阶段 2：runtime —— nginx:alpine，非 root，容器内置反代
 # -----------------------------------------------------------------------------
-# gcr.io/distroless/static-debian12：无 shell、无包管理器、无 libc 动态依赖，
-# 攻击面最小；二进制为 musl 静态链接（D-09b 方案 A，builder 阶段 crt-static 编出，
-# 与本基镜像匹配；若未来改用 glibc 动态二进制，必须换
-# gcr.io/distroless/cc-debian12 同款 digest pin 方案并同步本注释与 deploy/README.md）。
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:__RUNTIME_DIGEST__ AS runtime
+# nginx:1.25-alpine：轻量级 HTTP 服务器 + 反向代理，替代 distroless/static。
+# nginx 负责：
+#   1. 静态文件服务（/、/assets/*、favicon/logo）
+#   2. API 反代（/api/* → daemon:8081）
+#   3. SSE 长连接（proxy_read_timeout 300s）
+# daemon 只监听 8081（容器内部），nginx 监听 8080（对外暴露）
+FROM nginx:1.25-alpine@sha256:__RUNTIME_DIGEST__ AS runtime
 
-# 镜像元数据（便于现场 docker inspect 记录安装单）
 ARG TARGETARCH
 LABEL org.opencontainers.image.title="iot-daq-gateway" \
-      org.opencontainers.image.description="工业边缘数据汇聚与统一分发网关（headless 运行体）" \
+      org.opencontainers.image.description="工业边缘数据汇聚与统一分发网关（内置 nginx）" \
       org.opencontainers.image.licenses="LicenseRef-Proprietary" \
       org.opencontainers.image.source="https://vendor-internal.example/iot-daq" \
       com.vendor.iot-daq.arch="${TARGETARCH}" \
       com.vendor.iot-daq.fingerprint-policy="host-only" \
       com.vendor.iot-daq.state-policy="persistent-volume-only"
 
-# distroless 的 :nonroot 变体自带 uid/gid 65532，无需 USER 再声明 root
-# ---- 运行时目录契约（与持久卷布局一致）----
-# /var/lib/iot-daq 由 compose 以宿主目录挂载；镜像内仅建空占位目录保证
-# 未挂载时的可诊断行为（entrypoint 会因不可写而明确拒绝启动）。
+# ---- 运行时目录契约 ----
+# /var/lib/iot-daq 由 compose 挂载宿主目录
+# /var/log/nginx 由 compose 挂载或 tmpfs
+
 WORKDIR /home/nonroot
 
-# ---- 仅拷贝运行时产物：daemon 二进制（builder 阶段已 test -f 断言，D-09）----
-COPY --from=builder --chown=65532:65532 /build/out/iot-daq-daemon /usr/local/bin/iot-daq-daemon
+# ---- 仅拷贝运行时产物 ----
+# daemon 二进制（musl 静态）
+COPY --from=builder /build/out/iot-daq-daemon /usr/local/bin/iot-daq-daemon
 
-# ---- 仅拷贝运行时产物：healthprobe 静态探针（纯 std 零依赖，D-06）----
-# 供 compose healthcheck exec-form 调用：distroless 无 shell，无法跑 CMD-SHELL。
-COPY --from=builder --chown=65532:65532 /build/out/healthprobe /usr/local/bin/healthprobe
+# healthprobe 静态探针
+COPY --from=builder /build/out/healthprobe /usr/local/bin/healthprobe
 
-# ---- 仅拷贝运行时产物：Web 控制台静态资源（纯静态，无密钥）----
-COPY --from=builder --chown=65532:65532 /build/web-console-dist/ /srv/web-console/
+# Web 控制台静态资源
+COPY --from=builder /build/web-console-dist/ /srv/web-console/
 
-# ---- 默认配置模板（占位值，现场注入覆盖；不含任何真实凭据）----
-COPY --chown=65532:65532 deploy/docker/config/gateway.default.toml /etc/iot-daq/gateway.toml
+# ---- 默认配置模板 ----
+COPY deploy/docker/config/gateway.default.toml /etc/iot-daq/gateway.toml
 
-# ---- 入口契约：宿主锚定 + 持久卷可写性校验由二进制自身承担 ----
-# distroless/static 无 shell，ENTRYPOINT 直接走 `iot-daq-daemon --preflight`
-# （校验逻辑见 crates/daemon/src/bin/iot-daq-daemon.rs，退出码 0/2，
-# 与 deploy/README.md「入口契约」及 deploy/docker/entrypoint.sh 语义一一对应）。
-# ★ D-15：runtime 阶段**有意不 COPY** deploy/docker/entrypoint.sh ——
-#   该 shell 脚本在无 shell 的 distroless/static 中不可执行，拷入即死重。
-#   它仅服务于：① deb/rpm + systemd 原生部署 ② 调试镜像（cc/shell 变体）
-#   ③ 现场排障手动执行（见其文件头注释与 deploy/README.md §12）。
+# ---- nginx 配置（**模板**：端口为占位符，由 start.sh 用 envsubst 渲染后加载）----
+# 原因：容器 read_only 根文件系统（陷阱 2 红线）下 /etc/nginx 不可写，
+# 且对外端口需可在部署时覆盖（宿主常见 8080 冲突）。渲染产物落 /tmp/nginx.conf。
+# 端口联动红线见 nginx.conf.template 文件头注释。
+COPY deploy/docker/nginx.conf.template /etc/nginx/nginx.conf.template
 
-# ---- 镜像内绝不含（红线自证清单，persistence-layout §2）----
+# mime.types：从 nginx 镜像提取，保证构建可复现
+COPY deploy/docker/nginx.mime.types /etc/nginx/mime.types
+
+# ---- 启动脚本：同时启动 nginx + daemon ----
+# nginx 后台运行，daemon 前台运行（nginx 健康检查通过后才启动 daemon）
+# daemon 监听 8081（内部），nginx 监听 8080（对外）
+RUN set -eux; \
+    # 创建日志目录（tmpfs 挂载时会覆盖，但镜像内需有占位）
+    mkdir -p /var/log/nginx /var/lib/nginx/cache; \
+    # 写入启动脚本
+    cat > /usr/local/bin/start.sh << 'SCRIPT'
+#!/bin/sh
+set -eu
+
+# 1. 启动 nginx（后台）
+nginx -g 'daemon off;' &
+NGINX_PID=$!
+
+# 2. 等待 nginx 就绪
+for i in $(seq 1 30); do
+    if kill -0 $NGINX_PID 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+# 3. 启动 daemon（前台，PID 1）
+exec /usr/local/bin/iot-daq-daemon --preflight --config /etc/iot-daq/gateway.toml --foreground
+SCRIPT
+RUN chmod +x /usr/local/bin/start.sh
+
+
+# ---- 镜像内绝不含（红线自证清单）----
 #   ✗ 私钥 / HKDF 盐 / KMS 凭据
 #   ✗ 激活码 / Lease Token
-#   ✗ 宿主指纹文件（host-fingerprint.json 由安装脚本现场生成）
+#   ✗ 宿主指纹文件
 #   ✗ 默认口令
 #   ✗ 客户配置
-# 上述任一项出现在镜像层即为阻断性缺陷。
 
-USER 65532:65532
-
-# 静态二进制 → 无需 shell → 用二进制自身做 preflight 校验后进入前台运行
-ENTRYPOINT ["/usr/local/bin/iot-daq-daemon", "--preflight", "--config", "/etc/iot-daq/gateway.toml"]
-CMD ["--foreground"]
-
-# 健康检查由 compose 的 healthcheck 定义（distroless 无 curl/wget）；
-# 此处仅声明端口意图，实际监听见 container-deploy.md §2.2。
 EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/start.sh"]

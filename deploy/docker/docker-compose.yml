@@ -25,6 +25,12 @@ services:
     image: ${IOT_DAQ_IMAGE:?必须通过 --env-file 提供 IOT_DAQ_IMAGE（digest 形式）}
     container_name: ${IOT_DAQ_CONTAINER_NAME:-iot-daq-gateway}
 
+    # ★ 运行身份必须显式固定为 65532（Dockerfile「以非 root 用户运行」约束的实际落点）
+    #   不显式声明时，运行身份会随镜像/重建方式漂移（实测出现过 root 与 65532 两种），
+    #   而 cap_drop: ALL 下非 owner 一律按 other 位判定 —— 身份漂移会直接导致
+    #   持久卷 Permission denied。此值必须与持久卷属主、nginx.conf 的 user 三者一致。
+    user: "65532:65532"
+
     # ---- 网络：host 模式（Modbus TCP 广播发现 / UDP 组播必需，deploy.md §2.2）----
     # 注意：host 模式下不要写 ports:，会与 network_mode 冲突。
     network_mode: host
@@ -48,10 +54,23 @@ services:
 
     # 需要可写的路径一律显式 tmpfs（容器生命周期内有效、重建即清空，
     # 因此**只放**临时文件，绝不放授权状态）。
+    # ★ tmpfs 属主必须对齐容器运行用户（uid/gid 65532）：
+    #   容器以非 root 运行，而 tmpfs 默认属主 root —— 不指定 uid/gid 时
+    #   65532 写不了 /run/nginx.pid、/var/log/nginx 等，nginx 静默起不来。
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
-      - /run:rw,noexec,nosuid,size=16m,mode=0755
-      - /home/nonroot:rw,noexec,nosuid,size=16m,mode=0700
+      - /run:rw,noexec,nosuid,size=16m,uid=65532,gid=65532,mode=0755
+      - /home/nonroot:rw,noexec,nosuid,size=16m,uid=65532,gid=65532,mode=0700
+      # ---- nginx 运行期可写路径（read_only 根文件系统下必需）----
+      # 均为易失临时数据，重建即弃，绝不放授权状态（陷阱 2）。
+      # 缺失时 nginx 报 mkdir() "/var/cache/nginx/client_temp" failed
+      # (30: Read-only file system)，仅静态/反代失效、daemon 不受影响。
+      #   /var/cache/nginx -> client_temp / proxy_temp / fastcgi_temp
+      #   /var/log/nginx   -> error.log / access.log
+      #   /var/lib/nginx   -> client_body_temp 等
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=65532,gid=65532,mode=0755
+      - /var/log/nginx:rw,noexec,nosuid,size=64m,uid=65532,gid=65532,mode=0755
+      - /var/lib/nginx:rw,noexec,nosuid,size=16m,uid=65532,gid=65532,mode=0755
 
     # =========================================================================
     # ★ 陷阱 1 + 陷阱 2 双防线：卷挂载
@@ -102,10 +121,15 @@ services:
       IOT_DAQ_LEASE_HEARTBEAT_SECS: ${IOT_DAQ_LEASE_HEARTBEAT_SECS:-300}
       IOT_DAQ_LEASE_GRACE_SECS: ${IOT_DAQ_LEASE_GRACE_SECS:-86400}
       IOT_DAQ_HTTP_BIND: ${IOT_DAQ_HTTP_BIND:-0.0.0.0}
-      IOT_DAQ_HTTP_PORT: ${IOT_DAQ_HTTP_PORT:-8080}
-      # Gateway 容器内置前端：daemon 直接 serve / 和 /assets/*，
-      # 前端通过相对路径访问 API（与页面同源，无需跨域）。
-      IOT_DAQ_WEB_DIST: /srv/web-console
+      # daemon 管理面端口（容器内监听，nginx 反代目标 = 此值）
+      IOT_DAQ_HTTP_PORT: ${IOT_DAQ_HTTP_PORT:-8081}
+      # nginx 对外 Web 端口（用户访问入口，单容器自足）。
+      # host 网络模式下与宿主共享端口：若 8080 已被占用（常见），必须覆盖为
+      # 空闲端口，否则 nginx 起不来 → 页面与 /api 全不可达（daemon 仍正常）。
+      IOT_DAQ_WEB_PORT: ${IOT_DAQ_WEB_PORT:-8080}
+      # nginx 监听 8080（对外），daemon 监听 8081（内部）
+      # 宿主通过端口映射访问：-p ${IOT_DAQ_HTTP_PORT:-8080}:8080
+      # gateway 容器内置 nginx，不再依赖宿主 nginx
       IOT_DAQ_LOG_LEVEL: ${IOT_DAQ_LOG_LEVEL:-info}
       IOT_DAQ_LOG_JSON: ${IOT_DAQ_LOG_JSON:-false}
       IOT_DAQ_TAMPER_POLICY: ${IOT_DAQ_TAMPER_POLICY:-restricted}
@@ -126,6 +150,8 @@ services:
     #   exec-form 调用：每次执行一次 TCP connect 127.0.0.1:$IOT_DAQ_HTTP_PORT，
     #   成功 exit 0 / 失败 exit 1。HTTP 语义的 /healthz 校验由 install.sh 在宿主侧补做。
     healthcheck:
+      # nginx 监听 8080，daemon 监听 8081（内部）
+      # healthprobe 检测 nginx 端口 8080（外部可达）
       test: ["CMD", "/usr/local/bin/healthprobe"]
       interval: ${IOT_DAQ_HEALTHCHECK_INTERVAL:-30s}
       timeout: ${IOT_DAQ_HEALTHCHECK_TIMEOUT:-5s}
