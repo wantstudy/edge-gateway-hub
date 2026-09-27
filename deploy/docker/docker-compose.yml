@@ -92,7 +92,13 @@ services:
 
       # ---- 指纹 HMAC 盐：只读 secret，绝不进镜像层 ----
       # 现场由 install.sh 交互式写入宿主机，权限 0600，属主 = 数据目录属主。
-      - ${IOT_DAQ_FINGERPRINT_KEY_FILE:-/run/secrets/iot-daq-fingerprint-key}:/run/secrets/iot-daq-fingerprint-key:ro
+      # ---- 指纹 HMAC 盐：只读 secret，绝不进镜像层 ----
+      # ★ 宿主侧路径必须是**持久**目录：原默认 /run/secrets/... 在多数宿主上是 tmpfs，
+      #   重启即丢 → daemon 报「fingerprint key unavailable」并按 fail-closed 停北向。
+      #   属主 = 容器运行 uid（65532）、权限 0600；由 install.sh 生成。
+      # 缺失后果：授权装配 fail-closed（northbound stays closed），且 /api/auth/state
+      #   因拿不到 license_runtime 而报 trial_enabled=false + 「授权模块未就绪」。
+      - ${IOT_DAQ_FINGERPRINT_KEY_FILE:-/opt/iot-daq/gateway/secrets/iot-daq-fingerprint-key}:/run/secrets/iot-daq-fingerprint-key:ro
 
     # ---- 安全加固 ----
     security_opt:
