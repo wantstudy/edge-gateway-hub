@@ -65,71 +65,28 @@
     <div class="dv-ctx">
       <span>当前设备类型</span>
       <span class="wc-tag wc-tag--info">{{ protocolLabel }}</span>
-      <span>· 连接参数 <b>{{ currentProtoFields.length }}</b> 个</span>
+      <span class="dv-ctx__hint" data-testid="wz-ctx-meta">连接参数 {{ currentProtoFields.length }} 个</span>
       <button v-if="currentStep > 1" type="button" class="wc-btn wc-btn--sm" @click="gotoStep(1)">
         回到第 1 步改类型
       </button>
-      <span class="dv-ctx__hint">类型选错不会报错，只会一直读不出数据；保存后改类型需重新校准点表。</span>
     </div>
 
-    <!-- ══ ① 选择设备类型 ══ -->
+    <!-- ══ ① 选择设备类型（双列 + 可滚动，容纳持续扩充的类型清单）══ -->
     <div v-show="currentStep === 1">
-      <div class="wc-grid wc-grid--1-2">
-        <section class="wc-card">
-          <div class="wc-card__head">
-            <h3>① 选择设备类型</h3>
-            <span class="wc-card__sub">决定下一步需要填哪些连接参数</span>
-          </div>
-          <div class="wc-card__body">
-            <UiRadio v-model="protocol" :options="protocolRadioOptions" />
-          </div>
-        </section>
-
-        <section class="wc-card">
-          <div class="wc-card__head">
-            <h3>当前选择</h3>
-            <span class="wc-card__sub">{{ protocolLabel }}</span>
-          </div>
-          <div class="wc-card__body">
-            <dl class="wc-kv">
-              <dt>协议</dt>
-              <dd><span class="wc-tag wc-tag--info">{{ protocolLabel }}</span></dd>
-              <dt>典型接入对象</dt>
-              <dd>{{ protoMeta.use }}</dd>
-              <dt>连接参数字段</dt>
-              <dd class="wc-mono">{{ currentProtoFields.length }} 个</dd>
-              <dt>差异字段</dt>
-              <dd class="wc-mono">{{ protoMeta.keyField }}</dd>
-              <dt>多从站</dt>
-              <dd>
-                <span class="wc-tag" :class="protoMeta.multi ? 'wc-tag--ok' : 'wc-tag--info'">
-                  {{ protoMeta.multi ? '支持' : '单设备' }}
-                </span>
-              </dd>
-              <dt>推荐采集频率</dt>
-              <dd class="wc-mono">{{ protoMeta.freq }}</dd>
-              <dt>点表模板</dt>
-              <dd>
-                <span class="wc-tag" :class="protoTemplate.length ? 'wc-tag--ok' : 'wc-tag--info'">
-                  {{ protoTemplate.length ? '可用' : '暂缺' }}
-                </span>
-              </dd>
-            </dl>
-            <p class="dv-sub-h">{{ protocolLabel }} 最常见的三个坑</p>
-            <ul class="dv-tips">
-              <li v-for="(tip, i) in protoMeta.tips" :key="i">{{ tip }}</li>
-            </ul>
-          </div>
-        </section>
-      </div>
-
-      <div class="dv-impact">
-        <p class="dv-impact__title"><span aria-hidden="true">⚠</span>设备类型选错的后果</p>
-        <ul>
-          <li>字段按类型裁剪：Modbus RTU 才出现串口与波特率，S7 才出现机架号与槽号，OPC UA 才出现 Endpoint 与安全策略。</li>
-          <li>类型选错<b>不会报错</b>，只会一直读不出数据；保存后改类型，地址风格随之改变（DB1.0 ↔ 40001），需重新校准点表。</li>
-        </ul>
-      </div>
+      <section class="wc-card">
+        <div class="wc-card__head">
+          <h3>① 选择设备类型</h3>
+          <span class="wc-card__sub">决定下一步需要填哪些连接参数</span>
+        </div>
+        <div class="wc-card__body dv-type-scroll">
+          <UiRadio
+            v-model="protocol"
+            class="dv-type-grid"
+            data-testid="device-type-list"
+            :options="protocolRadioOptions"
+          />
+        </div>
+      </section>
     </div>
 
     <!-- ══ ② 连接参数（随协议整块替换）══ -->
@@ -194,72 +151,19 @@
           </div>
         </template>
 
-        <p v-if="protocol !== ''" class="wc-note">
-          <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-          <span>「下一步」不落库，第 4 步才一次性保存；已填的值在步骤间来回切换<b>不会丢</b>。</span>
-        </p>
         </template>
       </div>
     </section>
 
-    <!-- ══ ③ 点表映射 ══ -->
+    <!-- ══ ③ 点表准备（点位不在向导内配置，创建后到「点位与映射」页维护）══ -->
     <section v-show="currentStep === 3" class="wc-card">
       <div class="wc-card__head">
-        <h3>③ 点表映射</h3>
-        <span class="wc-card__sub">没有点表的设备采不到任何数据</span>
+        <h3>③ 点表准备</h3>
       </div>
       <div class="wc-card__body">
-        <UiRadio v-model="pointSource" :options="pointSourceOptions" />
-
-        <p class="dv-sub-h">模板预览 · {{ protocolLabel }}</p>
-        <div v-if="protoTemplate.length" class="dv-wrap">
-          <table class="wc-table">
-            <thead>
-              <tr><th>地址</th><th>数据类型</th><th>字节序</th><th>点位名</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in protoTemplate" :key="row.addr">
-                <td class="wc-mono">{{ row.addr }}</td>
-                <td class="wc-mono">{{ row.dt }}</td>
-                <td class="wc-mono">{{ row.bo }}</td>
-                <td>{{ row.name }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p v-else class="wc-note">
-          <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-          <span>{{ protocolLabel }} 暂无协议模板，请先手动添加点位或在「点位与映射」页维护。</span>
-        </p>
-
-        <template v-if="pointSource === 'import'">
-          <p class="dv-sub-h">导入前先拿模板</p>
-          <div class="dv-foot">
-            <button type="button" class="wc-btn wc-btn--sm" @click="downloadTemplate">下载 {{ protocolLabel }} 导入模板（CSV）</button>
-            <span class="dv-foot__hint">
-              设备尚未创建，导入在保存后进行：保存完到「点位与映射」页选中这台设备再导入。
-            </span>
-          </div>
-          <p class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>
-              XLSX：<b>支持但需要后端启用</b> —— 桌面网关未内置表格解析库，请先用 Excel 另存为 CSV；
-              校验失败会给出「行号 + 原因 + 允许值」。
-            </span>
-          </p>
-        </template>
-
-        <p v-if="pointSource === 'later'" class="wc-note wc-note--warn">
-          <span class="wc-note__icon" aria-hidden="true">⚠</span>
-          <span>选择「稍后再配」将只保存连接参数，设备会显示「已连接 · 未配点表」，<b>不产生任何数据</b>。</span>
-        </p>
-
         <p class="wc-note">
           <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-          <span>
-            同一物理量在不同协议下地址<b>完全不同</b>（S7 是 <code>DB1.0</code>、Modbus 是 <code>40001</code>、OPC UA 是
-            <code>ns=2;s=…</code>）。模板只是起点，务必对照手册逐点校准。
-          </span>
+          <span>设备保存后，到「点位与映射」页选中该设备即可添加点位或导入点表。</span>
         </p>
       </div>
     </section>
@@ -306,10 +210,10 @@
           </div>
         </section>
 
-        <!-- 保存前确认 -->
+        <!-- 设备信息 -->
         <section class="wc-card">
           <div class="wc-card__head">
-            <h3>保存前确认</h3>
+            <h3>设备信息</h3>
             <span class="wc-card__sub">保存后按「启用时机」决定是否立即采集</span>
           </div>
           <div class="wc-card__body">
@@ -334,7 +238,7 @@
                 </span>
               </UiField>
 
-              <UiField label="分组" hint="面向 ISV 交付，后端暂无对应字段，见下方说明">
+              <UiField label="分组" hint="面向 ISV 交付的展示分组">
                 <UiSelect v-model="group" :options="groupOptions" />
               </UiField>
 
@@ -366,42 +270,9 @@
               </div>
               <button type="button" class="wc-btn wc-btn--sm" @click="addCustomParam">新增自定义参数</button>
             </div>
-
-            <p class="wc-note">
-              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-              <span>
-                <b>诚实降级：</b>设备 ID / 分组 / 备注 / 自定义参数是交付版表单项，后端当前未开放对应写入端
-                口 —— 本页仅做<b>界面预览与录入</b>，保存时不会写入设备记录（保存成功的只有名称、协议、连接参
-                数与采集频率）。<b>变更原因</b>则会随本次接入进入审计留痕。
-              </span>
-            </p>
           </div>
         </section>
       </div>
-
-      <!-- 最后一步：核对后保存（原型 :1215-1222） -->
-      <section class="wc-card">
-        <div class="wc-card__head">
-          <h3>最后一步：核对后保存</h3>
-          <span v-if="isEdit && !protocolChanged" class="wc-card__sub">未改协议，无需重新核对点表</span>
-          <span v-else class="wc-card__sub">未勾选则「{{ isEdit ? '保存修改' : '保存并开始采集' }}」不可点</span>
-        </div>
-        <div class="wc-card__body">
-          <div class="dv-confirm">
-            <div class="dv-confirm__text">
-              <div class="dv-confirm__title">
-                我已逐点核对地址与字节序
-                <span class="wc-tag wc-tag--warn">保存前必选</span>
-              </div>
-              <div class="dv-confirm__desc">
-                地址错位不会报错，只会悄悄读出错误数值；这也是现场最难排查的一类问题。网关只能验证「读得到」，
-                验证不了「读得对」。
-              </div>
-            </div>
-            <UiSwitch v-model="checked" on-text="已核对" off-text="未核对" />
-          </div>
-        </div>
-      </section>
     </div>
 
     <!-- 提交成功 -->
@@ -410,7 +281,9 @@
       <span>{{ createdNote }}</span>
       <span class="wc-banner__ops">
         <button type="button" class="wc-btn wc-btn--sm" @click="go('devices')">查看设备列表</button>
-        <button v-if="!isEdit" type="button" class="wc-btn wc-btn--sm" @click="go('points')">去点位与映射</button>
+        <button v-if="!isEdit && createdId" type="button" class="wc-btn wc-btn--sm" data-test="goto-points" @click="goPoints(createdId)">
+          去点位与映射
+        </button>
         <button v-if="!isEdit" type="button" class="wc-btn wc-btn--sm" @click="resetWizard">继续新增</button>
       </span>
     </div>
@@ -422,10 +295,10 @@
           <span class="dv-foot__txt">
             第 <b>{{ currentStep }}</b> / {{ STEPS.length }} 步 · {{ STEPS[currentStep - 1] }}
             <span v-if="isEdit && currentStep === 4 && !canSubmitEdit" class="dv-foot__warn">
-              需完成设备名称 + 变更原因{{ protocolChanged ? '，并勾选「我已逐点核对地址与字节序」' : '' }}才能保存修改
+              需完成设备名称 + 变更原因{{ protocolChanged ? '，并重新填写连接参数' : '' }}才能保存修改
             </span>
             <span v-else-if="!isEdit && currentStep === 4 && !canSaveAndStart" class="dv-foot__warn">
-              需完成名称 + 变更原因，并勾选「我已逐点核对地址与字节序」才能保存并开始采集
+              需完成设备名称 + 变更原因才能保存
             </span>
           </span>
           <button type="button" class="wc-btn" @click="go('devices')">取消</button>
@@ -484,7 +357,6 @@ import {
   UiInput,
   UiRadio,
   UiSelect,
-  UiSwitch,
   RoleGate,
   type RadioOption,
   type SelectOption,
@@ -503,7 +375,7 @@ const router = useRouter();
 const route = useRoute();
 
 /** 步骤标题（原型 WZ_NAMES :1204）。 */
-const STEPS = ['选择设备类型', '连接参数', '点表映射', '测试并保存'] as const;
+const STEPS = ['选择设备类型', '连接参数', '点表准备', '测试并保存'] as const;
 
 // ---------------------------------------------------------------------------
 // 编辑态（`/device-new?device=<id>`，设备列表「编辑」入口）
@@ -536,7 +408,7 @@ const pageTitle = computed(() => (isEdit.value ? '编辑设备' : '新增设备'
 const pageDescription = computed(() =>
   isEdit.value
     ? `正在编辑「${editDevice.value?.name ?? editId.value}」：可修改设备名称与协议；改协议后需重新核对点表。`
-    : '单页四步：选设备类型 → 填连接参数 → 配点表映射 → 测试并保存。连接参数字段随协议整块替换；「下一步」不落库，最后一步才保存。',
+    : '单页四步：选设备类型 → 填连接参数 → 确认点表安排 → 测试并保存。连接参数字段随协议整块替换；保存一步到位。',
 );
 
 // ---------------------------------------------------------------------------
@@ -546,94 +418,16 @@ const pageDescription = computed(() =>
 interface ProtoMeta {
   /** 典型接入对象 */
   use: string;
-  /** 推荐采集频率 */
-  freq: string;
-  /** 是否支持多从站 */
-  multi: boolean;
-  /** 该协议的差异字段（换协议时断言「字段真的变了」） */
-  keyField: string;
-  /** 常见坑 */
-  tips: readonly string[];
 }
 
 const PROTO_META: Readonly<Record<ProtocolType, ProtoMeta>> = Object.freeze({
-  'modbus-tcp': {
-    use: '仪表 / 电表 / 变频器',
-    freq: '200 ms ~ 1 s',
-    multi: true,
-    keyField: '从站号（Unit ID）',
-    tips: [
-      '从站号（Unit ID）在同网段内必须唯一，冲突会读到别人的数据',
-      '功能码 03 保持寄存器可读可写、04 输入寄存器只读，选错会写坏设备',
-      '地址 40001 与偏移 0 的对应关系因厂家而异，务必对照手册',
-    ],
-  },
-  'modbus-rtu': {
-    use: '老式仪表 / 温控器 / 电表',
-    freq: '1 s ~ 5 s',
-    multi: false,
-    keyField: '串口设备',
-    tips: [
-      '波特率与校验位必须与从站完全一致，不一致表现为「整条总线无响应」',
-      '同一串口上所有从站的串口参数必须相同，只有从站号可不同',
-      'RS-485 必须手拉手接线，星型拓扑会造成偶发丢包',
-    ],
-  },
-  'opc-ua': {
-    use: 'SCADA / 空压机 / 数控机床',
-    freq: '500 ms ~ 2 s',
-    multi: false,
-    keyField: '端点地址',
-    tips: [
-      '安全策略选 None 仅限内网调试，生产环境必须签名加密',
-      '命名空间索引由服务端分配、重启可能变化，建议用命名空间 URI 而非索引',
-      '开启数据变更订阅比轮询省带宽且更实时',
-    ],
-  },
-  s7: {
-    use: 'S7-1200 / S7-1500 / S7-300',
-    freq: '200 ms ~ 1 s',
-    multi: true,
-    keyField: '槽号（Slot）',
-    tips: [
-      'S7-1200/1500 通常为机架 0 / 槽 1，填错会卡在握手阶段',
-      '优化块（Optimized Block）不支持绝对地址，需关闭优化或改用符号寻址',
-      'PDU 长度决定单次可读长度，过长会返回错误码而不是自动分包',
-    ],
-  },
-  mc: {
-    use: '三菱 FX / Q / iQ-R 系列',
-    freq: '100 ms ~ 500 ms',
-    multi: true,
-    keyField: '报文格式',
-    tips: [
-      '3E/4E 帧格式与二进制 / ASCII 必须与 PLC 侧设置一致',
-      '以太网直连场景网络号 / PC 号 / 站号通常为 0 / 255 / 1',
-      '软元件 D 与 W 的寻址范围不同，超范围读取会返回错误码',
-    ],
-  },
-  http: {
-    use: '相机 / 称重 / 第三方系统',
-    freq: '1 s ~ 5 s',
-    multi: false,
-    keyField: '取值表达式',
-    tips: [
-      '轮询间隔过短会被对端限流，建议不小于 1 秒',
-      'Webhook 模式需网关对端可达，注意防火墙与反向代理配置',
-      'JSONPath 表达式因后端实现而异，保存前先用连通性测试确认取值',
-    ],
-  },
-  mqtt: {
-    use: '其它网关 / 无线传感器',
-    freq: '1 s ~ 10 s',
-    multi: false,
-    keyField: '订阅 Topic',
-    tips: [
-      '客户端 ID 重复会互相顶掉连接，表现为反复掉线',
-      '通配符 # 订阅整棵子树，流量可能远超预期',
-      'QoS 2 开销大，多数工业场景 QoS 1 已足够',
-    ],
-  },
+  'modbus-tcp': { use: '仪表 / 电表 / 变频器' },
+  'modbus-rtu': { use: '老式仪表 / 温控器 / 电表' },
+  'opc-ua': { use: 'SCADA / 空压机 / 数控机床' },
+  s7: { use: 'S7-1200 / S7-1500 / S7-300' },
+  mc: { use: '三菱 FX / Q / iQ-R 系列' },
+  http: { use: '相机 / 称重 / 第三方系统' },
+  mqtt: { use: '其它网关 / 无线传感器' },
 });
 
 // ---------------------------------------------------------------------------
@@ -771,59 +565,6 @@ const PROTO_FIELDS: Readonly<Record<ProtocolType, readonly ProtoField[]>> = Obje
 });
 
 // ---------------------------------------------------------------------------
-// 点表模板（地址风格随协议变化；原型 ptTmpl :1224-1232）
-// ---------------------------------------------------------------------------
-
-interface TemplateRow {
-  /** 地址 */
-  addr: string;
-  /** 数据类型 */
-  dt: string;
-  /** 字节序 */
-  bo: string;
-  /** 点位名 */
-  name: string;
-}
-
-const PT_TEMPLATE: Readonly<Record<ProtocolType, readonly TemplateRow[]>> = Object.freeze({
-  'modbus-tcp': [
-    { addr: '40001', dt: 'uint16', bo: 'CD AB', name: '料筒温度1' },
-    { addr: '40003', dt: 'uint16', bo: 'CD AB', name: '注射压力' },
-    { addr: '40005', dt: 'uint32', bo: 'CD AB', name: '累计产量' },
-  ],
-  'modbus-rtu': [
-    { addr: '40001', dt: 'uint16', bo: 'CD AB', name: '温度' },
-    { addr: '40002', dt: 'uint16', bo: 'CD AB', name: '湿度' },
-    { addr: '40003', dt: 'uint32', bo: 'CD AB', name: '电度' },
-  ],
-  s7: [
-    { addr: 'DB1.0', dt: 'float32', bo: 'AB CD', name: '料筒温度1' },
-    { addr: 'DB1.4', dt: 'float32', bo: 'AB CD', name: '注射压力' },
-    { addr: 'DB2.0', dt: 'float32', bo: 'CD AB', name: '锁模力' },
-  ],
-  'opc-ua': [
-    { addr: 'ns=2;s=Machine.BarrelTemp', dt: 'float32', bo: '—', name: '料筒温度1' },
-    { addr: 'ns=2;s=Machine.InjPressure', dt: 'float32', bo: '—', name: '注射压力' },
-    { addr: 'ns=2;s=Machine.ClampForce', dt: 'float32', bo: '—', name: '锁模力' },
-  ],
-  mc: [
-    { addr: 'D100', dt: 'int16', bo: 'AB CD', name: '料筒温度1' },
-    { addr: 'D102', dt: 'int16', bo: 'AB CD', name: '注射压力' },
-    { addr: 'D200', dt: 'int32', bo: 'AB CD', name: '累计产量' },
-  ],
-  http: [
-    { addr: '$.data.temperature', dt: 'float32', bo: '—', name: '温度' },
-    { addr: '$.data.pressure', dt: 'float32', bo: '—', name: '压力' },
-    { addr: '$.data.count', dt: 'uint32', bo: '—', name: '计数' },
-  ],
-  mqtt: [
-    { addr: 'plant/line1/temp', dt: 'float32', bo: '—', name: '温度' },
-    { addr: 'plant/line1/humi', dt: 'float32', bo: '—', name: '湿度' },
-    { addr: 'plant/line1/count', dt: 'uint32', bo: '—', name: '计数' },
-  ],
-});
-
-// ---------------------------------------------------------------------------
 // 连接摘要（按协议把字段拼成可读串，落库用）
 // ---------------------------------------------------------------------------
 
@@ -863,10 +604,7 @@ const maxReached = ref(1);
 const protocol = ref<ProtocolType | ''>('');
 const conn = reactive<Record<string, string>>({});
 
-/** ③ 点表来源。 */
-const pointSource = ref<'template' | 'import' | 'manual' | 'later'>('template');
-
-/** ④ 保存前确认字段。 */
+/** ④ 保存信息字段。 */
 const name = ref('');
 const deviceId = ref(`dev-${String(Date.now())}`);
 const intervalMs = ref('200');
@@ -874,8 +612,6 @@ const group = ref('未分组');
 const enableWhen = ref('保存后立即启用采集');
 const memo = ref('');
 const changeReason = ref('');
-/** 「我已逐点核对地址与字节序」。 */
-const checked = ref(false);
 /** 自定义参数行（交付版表单项，当前不入后端，已诚实标注）。 */
 const customParams = ref<{ k: string; v: string }[]>([]);
 
@@ -885,6 +621,8 @@ const saveTouched = ref(false);
 
 const createdName = ref('');
 const createdNote = ref('');
+/** 新建成功的设备 id（用于直达「点位与映射」并预选该设备）。 */
+const createdId = ref('');
 
 /**
  * 编辑态回填：读取设备记录并填充**可回填字段**。
@@ -912,6 +650,7 @@ watch(
       saveTouched.value = false;
       createdName.value = '';
       createdNote.value = '';
+      createdId.value = '';
       return;
     }
     const found = repo.getDevice(id);
@@ -934,18 +673,6 @@ watch(
 /** 协议中文名。 */
 const protocolLabel = computed(
   () => PROTOCOL_OPTIONS.find((p) => p.value === protocol.value)?.label ?? '未选择',
-);
-
-/** 当前协议的元数据（未选协议时给占位，不伪造内容）。 */
-const protoMeta = computed<ProtoMeta>(() =>
-  protocol.value
-    ? PROTO_META[protocol.value]
-    : { use: '—（请先选择设备类型）', freq: '—', multi: false, keyField: '—', tips: [] },
-);
-
-/** 当前协议的点表模板。 */
-const protoTemplate = computed<readonly TemplateRow[]>(() =>
-  protocol.value ? PT_TEMPLATE[protocol.value] : [],
 );
 
 /** 当前协议的连接字段。 */
@@ -979,22 +706,6 @@ const protocolRadioOptions = computed<readonly RadioOption[]>(() =>
     desc: PROTO_META[p.value].use,
   })),
 );
-
-/** 点表来源四选项（原型 :1592-1597）。 */
-const pointSourceOptions = computed<readonly RadioOption[]>(() => [
-  {
-    value: 'template',
-    label: '使用协议模板生成',
-    desc: `按 ${protocolLabel.value} 预生成标准点表（含地址风格与字节序），再逐点校准。适合首次接入。`,
-  },
-  {
-    value: 'import',
-    label: '导入 CSV / XLSX 点表',
-    desc: '用「下载模板」导出的文件填写后回传；校验失败会给出「行号 + 原因 + 允许值」，导出文件可直接当导入模板。',
-  },
-  { value: 'manual', label: '手动添加点位', desc: '点位少于 10 个时最快；保存后可在「点位与映射」继续维护。' },
-  { value: 'later', label: '稍后再配', desc: '只保存连接参数。设备会显示「已连接 · 未配点表」，不产生任何数据。' },
-]);
 
 const groupOptions: readonly SelectOption[] = [
   { value: '生产分组 › 注塑车间', label: '生产分组 › 注塑车间' },
@@ -1072,18 +783,18 @@ const reasonValid = computed(() => changeReason.value.trim().length >= 4);
 
 /** ④ 「保存并开始采集」的全部前置条件。 */
 const canSaveAndStart = computed(
-  () => nameValid.value && intervalValid.value && reasonValid.value && checked.value && step2Valid.value,
+  () => nameValid.value && intervalValid.value && reasonValid.value && step2Valid.value,
 );
 
 /**
- * 编辑态提交条件：名称 + 变更原因；若改了协议，还需重填连接参数并重新勾选点表核对。
- * 未改协议时不必再走点表核对（点表与连接参数均未变更）。
+ * 编辑态提交条件：名称 + 变更原因；若改了协议，还需重填连接参数。
+ * 未改协议时连接参数与点表均未变更，无需重填。
  */
 const canSubmitEdit = computed(() => {
   if (!nameValid.value || !reasonValid.value) {
     return false;
   }
-  return protocolChanged.value ? step2Valid.value && checked.value : true;
+  return protocolChanged.value ? step2Valid.value : true;
 });
 
 const stepValid = computed(() => {
@@ -1282,29 +993,6 @@ function prev(): void {
 }
 
 // ---------------------------------------------------------------------------
-// ③ 模板下载
-// ---------------------------------------------------------------------------
-
-/** 下载当前协议的导入模板（CSV；字段口径与「点位与映射」页一致）。 */
-function downloadTemplate(): void {
-  const header = ['地址', '点位名', '数据类型', '字节序', '单位', '死区', '目标点名'];
-  const rows: string[][] = [header];
-  for (const row of protoTemplate.value) {
-    rows.push([row.addr, row.name, row.dt, row.bo, '', '0', row.addr.replace(/[^A-Za-z0-9]/g, '_')]);
-  }
-  const csv = '﻿' + rows.map((r) => r.join(',')).join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `points-template-${protocolLabel.value}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-// ---------------------------------------------------------------------------
 // ④ 保存
 // ---------------------------------------------------------------------------
 
@@ -1368,6 +1056,7 @@ async function submit(mode: 'save' | 'saveAndStart'): Promise<void> {
   }
   const created = result.data;
   createdName.value = created.name;
+  createdId.value = created.id;
   createdNote.value =
     mode === 'saveAndStart'
       ? `设备「${created.name}」已提交并开始采集（变更原因：${changeReason.value.trim()}）。设备是否真正连通由网关侧判定，可在设备列表查看状态。`
@@ -1390,7 +1079,6 @@ function resetWizard(): void {
   for (const key of Object.keys(conn)) {
     delete conn[key];
   }
-  pointSource.value = 'template';
   name.value = '';
   deviceId.value = `dev-${String(Date.now())}`;
   intervalMs.value = '200';
@@ -1398,12 +1086,12 @@ function resetWizard(): void {
   enableWhen.value = '保存后立即启用采集';
   memo.value = '';
   changeReason.value = '';
-  checked.value = false;
   customParams.value = [];
   connTouched.value = false;
   saveTouched.value = false;
   createdName.value = '';
   createdNote.value = '';
+  createdId.value = '';
   testResult.value = null;
   testUnsupported.value = false;
   resetTestSteps();
@@ -1412,6 +1100,11 @@ function resetWizard(): void {
 /** 跳转。 */
 function go(name: string): void {
   void router.push({ name });
+}
+
+/** 去点位与映射并预选该设备（成功横幅入口）。 */
+function goPoints(deviceId: string): void {
+  void router.push({ name: 'points', query: { device: deviceId } });
 }
 
 resetTestSteps();
@@ -1504,41 +1197,22 @@ resetTestSteps();
   color: var(--text-3);
 }
 
-/* 「三个坑」列表（原型 .tips） */
-.dv-tips {
-  margin: 8px 0 0;
-  padding-left: 18px;
-  font-size: var(--fs-caption);
-  color: var(--text-2);
-  line-height: 1.72;
+/* ① 设备类型：双列卡片网格 + 可滚动（容纳持续扩充的类型清单） */
+.dv-type-scroll {
+  max-height: 480px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
-.dv-tips li {
-  margin-bottom: 4px;
+/* class 落在 UiRadio 根元素（.uik-radio-row）上，直接覆写为双列网格 */
+.dv-type-grid.uik-radio-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
-.dv-tips li::marker {
-  color: var(--brand);
-}
-
-/* 影响块（原型 .impact） */
-.dv-impact {
-  margin-top: 16px;
-  padding: 12px 14px;
-  border: 1px solid var(--warn-border);
-  background: var(--warn-bg);
-  border-radius: var(--radius);
-}
-.dv-impact__title {
-  margin: 0;
-  font-size: var(--fs-table);
-  font-weight: 600;
-  color: var(--warn-fg);
-}
-.dv-impact ul {
-  margin: 6px 0 0;
-  padding-left: 18px;
-  font-size: var(--fs-caption);
-  color: var(--text-2);
-  line-height: 1.75;
+@media (max-width: 960px) {
+  .dv-type-grid.uik-radio-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* 表单分组标题 + 单位后缀 */
@@ -1658,42 +1332,6 @@ resetTestSteps();
   grid-template-columns: minmax(120px, 200px) minmax(160px, 1fr) auto;
   gap: 8px;
   align-items: center;
-}
-
-/* 「我已逐点核对」开关行（原型 .sw-row） */
-.dv-confirm {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding: 12px 14px;
-  border: 1px dashed var(--warn-border);
-  border-radius: var(--radius);
-  background: var(--warn-bg);
-}
-.dv-confirm__text {
-  flex: 1 1 320px;
-}
-.dv-confirm__title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: var(--fs-body);
-  font-weight: 600;
-  color: var(--text-1);
-}
-.dv-confirm__desc {
-  margin-top: 4px;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  line-height: 1.6;
-}
-
-.dv-wrap {
-  max-height: 220px;
-  overflow: auto;
-  border: 1px solid var(--divider);
-  border-radius: var(--radius-sm);
 }
 
 .dv-foot {

@@ -119,6 +119,7 @@
                 <button type="button" class="wc-btn wc-btn--sm" @click="exportTemplate">导出点表</button>
                 <RoleGate :allowed="canWrite">
                   <button type="button" class="wc-btn wc-btn--sm" @click="applyProtocolTemplate">使用协议模板</button>
+                  <button type="button" class="wc-btn wc-btn--sm" data-testid="download-point-template" @click="downloadImportTemplate">下载模板</button>
                 </RoleGate>
               </span>
             </div>
@@ -159,6 +160,7 @@
                 <RoleGate :allowed="canWrite">
                   <button type="button" class="wc-btn wc-btn--primary" @click="triggerImport">导入 CSV 点表</button>
                   <button type="button" class="wc-btn" @click="applyProtocolTemplate">使用 {{ selected.protocolLabel }} 协议模板</button>
+                  <button type="button" class="wc-btn" @click="downloadImportTemplate">下载模板</button>
                   <button type="button" class="wc-btn" @click="openPointForm(null)">手动新增点位</button>
                 </RoleGate>
               </template>
@@ -170,6 +172,9 @@
                   <span class="wc-tag" :class="row.pointType === 'derived' ? 'wc-tag--warn' : 'wc-tag--info'">
                     {{ row.pointType === 'derived' ? '计算点' : '物理点' }}
                   </span>
+                </template>
+                <template #cell-address="{ row }">
+                  <span class="wc-mono">{{ displayAddress(row) }}</span>
                 </template>
                 <template #cell-push="{ row }">
                   <UiSwitch
@@ -336,6 +341,18 @@
                 data-testid="point-modal-address"
               />
             </UiField>
+            <UiField
+              label="设备连接地址"
+              required
+              hint="设备访问地址 host:port（如 192.168.1.10:502）；寄存器地址（如 40001）应填在「地址」列"
+              :error="formTouched && !formValid.endpoint ? '必填，如 192.168.1.10:502' : ''"
+            >
+              <UiInput
+                v-model="pointForm.endpoint"
+                placeholder="如 192.168.1.10:502"
+                data-testid="point-modal-endpoint"
+              />
+            </UiField>
             <UiField label="数据类型" :error="formTouched && !formValid.dataType ? `须为 ${DATA_TYPE_OPTIONS.join(' / ')}` : ''">
               <UiSelect v-model="pointForm.dataType" :options="dataTypeOptions" />
             </UiField>
@@ -345,7 +362,7 @@
             >
               <UiSelect v-model="pointForm.byteOrder" :options="byteOrderOptions" :disabled="pointForm.pointType === 'derived'" />
             </UiField>
-            <UiField label="单位" :error="formTouched && !formValid.unit ? '必填' : ''">
+            <UiField label="单位" hint="选填，如 ℃ / MPa">
               <UiInput v-model="pointForm.unit" placeholder="如 ℃ / MPa" />
             </UiField>
             <UiField label="死区" hint="≥ 0" :error="formTouched && !formValid.deadband ? '须为 ≥ 0 的数值' : ''">
@@ -578,7 +595,7 @@ const filteredPoints = computed<readonly PointRecord[]>(() => {
     if (qualityFilter.value && p.quality !== qualityFilter.value) {
       return false;
     }
-    if (kw && !`${p.name} ${p.targetKey} ${p.address}`.toLowerCase().includes(kw)) {
+    if (kw && !`${p.name} ${p.targetKey} ${p.id} ${p.address}`.toLowerCase().includes(kw)) {
       return false;
     }
     return true;
@@ -701,7 +718,8 @@ const calcCount = computed(() => selectedPoints.value.filter((p) => p.pointType 
 /** 地址区间（不算公式点 —— 公式点没有 PLC 地址）。 */
 const addrRangeText = computed(() => {
   const raw = selectedPoints.value.filter((p) => p.pointType !== 'derived');
-  return raw.length ? `${raw[0].address} – ${raw[raw.length - 1].address}` : '—';
+  // 展示 point_id（寄存器 / 表达式）—— address 列在后端语义里是设备连接端点。
+  return raw.length ? `${displayAddress(raw[0])} – ${displayAddress(raw[raw.length - 1])}` : '—';
 });
 
 /** target 前缀（取全部 targetKey 的最长公共前缀；无共同前缀则诚实给「—」）。 */
@@ -721,6 +739,70 @@ const targetPrefixText = computed(() => {
   }
   return prefix.length > 0 ? `${prefix}…` : '—（无公共前缀）';
 });
+
+// ---------------------------------------------------------------------------
+// 设备连接地址（endpoint）解析
+//
+// 后端契约（fail-closed，勿改后端）：
+//   · `endpoint` = 设备访问地址 host:port（寄存器地址如 40001 一律放 `point_id`）；
+//   · endpoint 填了纯数字寄存器地址 → 400（`pages.rs` / `writeapi.rs` 双重校验）；
+//   · 单位 unit 允许为空（后端 `unit: Option<String>`，空 = 缺省）。
+//
+// 设备记录本身不含 endpoint，按可信度依次从：该设备既有点位行（后端 address
+// 列即端点事实源）→ 连接摘要首段（host:port 形态）带出；都取不到则由用户在
+// 表单/模板 CSV 中填写。
+// ---------------------------------------------------------------------------
+
+/** 寄存器形态（纯数字，如 40001）——绝不能当 endpoint。 */
+function isRegisterShape(value: string): boolean {
+  return /^\d+$/.test(value.trim());
+}
+
+/** 端点形态：非空、非占位符、非纯数字寄存器。 */
+function isEndpointShape(value: string): boolean {
+  const v = value.trim();
+  return v.length > 0 && v !== '—' && !isRegisterShape(v);
+}
+
+/** 从该设备既有点位行带出设备连接地址（后端 address 列 = 端点事实源）。 */
+function endpointFromPoints(deviceId: string): string {
+  for (const p of points.value) {
+    if (p.deviceId !== deviceId) {
+      continue;
+    }
+    if (isEndpointShape(p.address)) {
+      return p.address.trim();
+    }
+  }
+  return '';
+}
+
+/** 从连接摘要首段带出（形如 `192.168.1.10:502 · 从站 1`）。 */
+function endpointFromSummary(device: DeviceRecord): string {
+  const first = device.connectionSummary.split('·')[0]?.trim() ?? '';
+  return first.includes(':') && !isRegisterShape(first) ? first : '';
+}
+
+/** 当前选中设备的连接地址（表单预填 / 模板与导入共用）。 */
+const deviceEndpoint = computed<string>(() => {
+  const dev = selected.value;
+  if (!dev) {
+    return '';
+  }
+  return endpointFromPoints(dev.id) || endpointFromSummary(dev);
+});
+
+/** 点位行展示地址：物理点显示 point_id（寄存器 / 表达式），计算点显示 —。 */
+function displayAddress(row: PointRecord): string {
+  if (row.pointType === 'derived') {
+    return '—';
+  }
+  const id = row.id.trim();
+  if (id.length > 0 && id !== '—' && !id.startsWith('pt-real-')) {
+    return id;
+  }
+  return row.address === '—' ? '—' : row.address;
+}
 
 // ---------------------------------------------------------------------------
 // 协议模板（起点点位，务必再校准）
@@ -795,6 +877,12 @@ async function applyProtocolTemplate(): Promise<void> {
     note(`${dev.protocolLabel} 暂无协议模板。`, 'warn');
     return;
   }
+  // fail-closed：endpoint 取不到时不猜、不写（后端必校验非空）。
+  const endpoint = deviceEndpoint.value;
+  if (!endpoint) {
+    note(`无法从设备记录确定「设备连接地址」：请先手动新增一个点位并填写该地址（host:port），再使用模板。`, 'warn');
+    return;
+  }
   let created = 0;
   for (const row of rows) {
     const draft: PointDraft = {
@@ -802,6 +890,7 @@ async function applyProtocolTemplate(): Promise<void> {
       name: row.name,
       pointType: 'physical',
       address: row.addr,
+      endpoint,
       dataType: row.dt,
       byteOrder: row.bo === '—' ? 'AB CD' : (row.bo as PointDraft['byteOrder']),
       unit: '',
@@ -820,7 +909,7 @@ async function applyProtocolTemplate(): Promise<void> {
     created += 1;
   }
   reload();
-  note(`已按 ${dev.protocolLabel} 模板追加 ${created} 个起点点位。`);
+  note(`已按 ${dev.protocolLabel} 模板追加 ${created} 个起点点位（连接地址 ${endpoint}）。`);
 }
 
 // ---------------------------------------------------------------------------
@@ -832,7 +921,10 @@ interface PointForm {
   id: string;
   pointType: 'physical' | 'derived';
   name: string;
+  /** 寄存器地址 / 表达式（后端 `point_id`，物理点必填） */
   address: string;
+  /** 设备连接地址 host:port（后端 `endpoint`，fail-closed 必填） */
+  endpoint: string;
   dataType: string;
   byteOrder: string;
   unit: string;
@@ -854,9 +946,9 @@ const formValid = computed(() => {
     return {
       name: false,
       address: false,
+      endpoint: false,
       dataType: false,
       byteOrder: false,
-      unit: false,
       deadband: false,
       targetKey: false,
       formula: false,
@@ -867,9 +959,11 @@ const formValid = computed(() => {
   return {
     name: f.name.trim().length > 0,
     address: !isPhysical || f.address.trim().length > 0,
+    // 后端对 endpoint 做 fail-closed 校验（非空且不得是寄存器号）。
+    endpoint: isEndpointShape(f.endpoint),
     dataType: DATA_TYPE_OPTIONS.includes(f.dataType),
     byteOrder: !isPhysical || (BYTE_ORDER_OPTIONS as readonly string[]).includes(f.byteOrder),
-    unit: f.unit.trim().length > 0,
+    // 单位允许为空（后端 `unit: Option<String>`，空 = 缺省）。
     deadband: f.deadband.trim() !== '' && Number.isFinite(deadband) && deadband >= 0,
     targetKey:
       f.targetKey.trim().length > 0 &&
@@ -880,7 +974,7 @@ const formValid = computed(() => {
 
 const formOk = computed(() => {
   const v = formValid.value;
-  return v.name && v.address && v.dataType && v.byteOrder && v.unit && v.deadband && v.targetKey && v.formula;
+  return v.name && v.address && v.endpoint && v.dataType && v.byteOrder && v.deadband && v.targetKey && v.formula;
 });
 
 /** 由表单草稿构造点位草稿（pushEnabled 由调用方决定）。 */
@@ -891,6 +985,8 @@ function draftFromForm(f: PointForm, deviceId: string, pushEnabled: boolean): Po
     name: f.name.trim(),
     pointType: f.pointType,
     address: isPhysical ? f.address.trim() : '',
+    // 设备连接地址：后端 `endpoint` 正例键；缺省即 400。
+    endpoint: f.endpoint.trim(),
     dataType: f.dataType,
     byteOrder: isPhysical ? (f.byteOrder as PointDraft['byteOrder']) : '—',
     unit: f.unit.trim(),
@@ -905,12 +1001,25 @@ function draftFromForm(f: PointForm, deviceId: string, pushEnabled: boolean): Po
 /** 打开表单弹窗（row 为空 = 新增）。 */
 function openPointForm(row: PointRecord | null): void {
   formTouched.value = false;
+  // 设备连接地址优先从记录带出；既有点位的 address 列即端点事实源（后端契约）。
+  const recordEndpoint = row && isEndpointShape(row.address) ? row.address : deviceEndpoint.value;
+  // 地址输入框承载寄存器 / 表达式（落库到 point_id）：物理点取记录 id（后端 point_id）。
+  const recordAddress = row
+    ? row.pointType === 'physical'
+      ? row.id.trim().length > 0 && row.id !== '—'
+        ? row.id
+        : isRegisterShape(row.address)
+          ? row.address
+          : ''
+      : ''
+    : '';
   pointForm.value = row
     ? {
         id: row.id,
         pointType: row.pointType,
         name: row.name,
-        address: row.address === '—' ? '' : row.address,
+        address: recordAddress,
+        endpoint: recordEndpoint,
         dataType: row.dataType,
         byteOrder: row.byteOrder === '—' ? 'AB CD' : row.byteOrder,
         unit: row.unit,
@@ -924,6 +1033,7 @@ function openPointForm(row: PointRecord | null): void {
         pointType: 'physical',
         name: '',
         address: '',
+        endpoint: deviceEndpoint.value,
         dataType: 'uint16',
         byteOrder: 'AB CD',
         unit: '',
@@ -988,11 +1098,22 @@ async function copyPoint(row: PointRecord): Promise<void> {
     suffix += 1;
     targetKey = `${row.targetKey}_copy${suffix}`;
   }
+  // 地址列承载寄存器 / 表达式（落库 point_id）；连接地址从记录或设备带出。
+  const copyAddress =
+    row.pointType === 'physical'
+      ? row.id.trim().length > 0 && row.id !== '—' && !row.id.startsWith('pt-real-')
+        ? row.id
+        : isRegisterShape(row.address)
+          ? row.address
+          : ''
+      : '';
+  const copyEndpoint = isEndpointShape(row.address) ? row.address : deviceEndpoint.value;
   const draft: PointDraft = {
     deviceId: dev.id,
     name: `${row.name} 副本`,
     pointType: row.pointType,
-    address: row.address === '—' ? '' : row.address,
+    address: copyAddress,
+    endpoint: copyEndpoint,
     dataType: row.dataType,
     byteOrder: row.byteOrder === '—' ? '—' : row.byteOrder,
     unit: row.unit,
@@ -1033,6 +1154,8 @@ async function togglePush(row: PointRecord, next: boolean): Promise<void> {
       name: row.name,
       pointType: row.pointType,
       address: row.address === '—' ? '' : row.address,
+      // 显式带端点（address 别名列承载的是端点事实，仍显式传 endpoint 防别名歧义）。
+      endpoint: isEndpointShape(row.address) ? row.address : deviceEndpoint.value || undefined,
       dataType: row.dataType,
       byteOrder: row.byteOrder,
       unit: row.unit,
@@ -1072,6 +1195,8 @@ function openFormula(row: PointRecord): void {
 
 /** 新格式表头（导入 / 导出一致：导出即可当导入模板）。 */
 const CSV_HEADER = ['地址', '点位名', '数据类型', '字节序', '单位', '死区', '目标点名', '公式'];
+/** 扩展表头：末列「设备连接地址」（host:port，后端 fail-closed 必填）。 */
+const CSV_HEADER_WITH_ENDPOINT = [...CSV_HEADER, '设备连接地址'];
 /** 旧格式表头（含设备列，向后兼容此前导出的文件）。 */
 const CSV_HEADER_LEGACY = ['设备', '点位名', '类型', '地址', '数据类型', '字节序', '单位', '死区', '北向目标点名', '公式'];
 
@@ -1149,8 +1274,13 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
 
   const head = rows[0]?.join(',').replace(/﻿/g, '') ?? '';
   const legacy = head === CSV_HEADER_LEGACY.join(',');
-  const hasHeader = legacy || head === CSV_HEADER.join(',');
+  const withEndpoint = head === CSV_HEADER_WITH_ENDPOINT.join(',');
+  const hasHeader = legacy || withEndpoint || head === CSV_HEADER.join(',');
   const data = hasHeader ? rows.slice(1) : rows;
+  // 设备连接地址（endpoint）：优先取行内「设备连接地址」列，缺省从该设备既有点位
+  // （后端 address 列 = 端点事实源）或连接摘要带出；取不到则该行判错 —— 后端对
+  // endpoint fail-closed（非空且不得是寄存器号）。
+  const deviceEndpointForCsv = endpointFromPoints(dev.id) || endpointFromSummary(dev);
 
   data.forEach((row, i) => {
     const line = i + 1;
@@ -1163,6 +1293,7 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
     const deadbandRaw = (legacy ? row[7] : row[5] ?? '').trim();
     const targetKey = (legacy ? row[8] : row[6] ?? '').trim();
     const formula = (legacy ? row[9] : row[7] ?? '').trim();
+    const endpoint = (withEndpoint && !legacy ? row[CSV_HEADER.length] ?? '' : '').trim() || deviceEndpointForCsv;
 
     const pointType: PointDraft['pointType'] =
       typeRaw === 'physical' ? 'physical' : typeRaw === 'derived' || typeRaw === 'calc' ? 'derived' : formula ? 'derived' : 'physical';
@@ -1183,8 +1314,12 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
     if (pointType === 'physical' && !(BYTE_ORDER_OPTIONS as readonly string[]).includes(byteOrder)) {
       push(`字节序非法：${byteOrder || '（空）'}`, BYTE_ORDER_OPTIONS.join(' / '));
     }
-    if (!unit) {
-      push('单位必填', '任意非空文本（无量纲填 无）');
+    // 设备连接地址：后端 fail-closed 必填（host:port），不得是寄存器号。
+    if (!isEndpointShape(endpoint)) {
+      push(
+        '设备连接地址（endpoint）缺失',
+        'host:port（如 192.168.1.10:502）；可先为该设备手动新增一个点位补全连接地址',
+      );
     }
     const deadband = Number(deadbandRaw);
     if (deadbandRaw === '' || !Number.isFinite(deadband) || deadband < 0) {
@@ -1209,6 +1344,7 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
       name,
       pointType,
       address: pointType === 'physical' ? address : '',
+      endpoint,
       dataType,
       byteOrder: pointType === 'physical' ? (byteOrder as PointDraft['byteOrder']) : '—',
       unit,
@@ -1224,9 +1360,12 @@ function validateCsv(text: string, dev: DeviceRecord): ImportResult {
 }
 
 /**
- * 提交导入：真实走 `repo.replacePointsOfDevice`（按设备覆盖；任一步失败即展示真实原因）。
+ * 提交导入：按后端导入契约（列 `device_id,point_id,protocol,endpoint,frequency_ms,push`）
+ * 自组 CSV 走 `repo.actions.importPoints`（按设备覆盖；任一行失败整批拒绝，零落盘）。
  *
- * 存在异常行时**整批拒绝**（`fail-closed`），与页面提示一致。
+ * 说明：`repo.replacePointsOfDevice` 组装的 CSV 无 `endpoint` 列（后端必需列），
+ * 必被整批拒绝，故由本页直接组正确列序的 CSV —— point_id 放寄存器、endpoint 放
+ * 设备连接地址（host:port），与后端 `pages.rs` 导入契约一致。
  */
 async function commitImport(): Promise<void> {
   const result = importResult.value;
@@ -1243,21 +1382,41 @@ async function commitImport(): Promise<void> {
   }
   importBusy.value = true;
   try {
-    const res = await repo.replacePointsOfDevice({
-      deviceId: result.deviceId,
-      rows: result.validRows,
-      actor: session.state.displayName,
-    });
+    const csvCell = (v: string): string => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+    const frequency = String(Math.max(dev.intervalMs > 0 ? dev.intervalMs : 1000, 100));
+    const csv = [
+      'device_id,point_id,protocol,endpoint,frequency_ms,push',
+      ...result.validRows.map((row) => {
+        // point_id = 寄存器 / 表达式（物理点取地址）；endpoint = 设备连接地址。
+        const pointId =
+          row.pointType === 'physical' && row.address.trim().length > 0 ? row.address.trim() : row.targetKey;
+        return [
+          dev.id,
+          csvCell(pointId),
+          dev.protocol,
+          csvCell(row.endpoint ?? ''),
+          frequency,
+          row.pushEnabled === false ? '0' : '1',
+        ].join(',');
+      }),
+    ].join('\n');
+    const res = await repo.actions.importPoints({ csv, deviceId: dev.id, replace: true });
     if (!res.ok) {
       importDone.value = 0;
-      note(`导入失败（未落盘）：${res.message}`, 'warn');
+      const first = res.errors[0];
+      note(
+        first
+          ? `导入被整批拒绝（零落盘）：${res.errors.length} 行不合法；首条 第 ${first.line} 行 —— ${first.reason}${first.allowed ? `（允许值：${first.allowed}）` : ''}`
+          : `导入失败（未落盘）：${res.message}`,
+        'warn',
+      );
       return;
     }
     importResult.value = null;
-    importDone.value = res.data?.imported ?? result.validRows.length;
+    importDone.value = Number(res.imported) || result.validRows.length;
     page.value = 1;
     reload();
-    note(`已覆盖导入 ${importDone.value} 个点位。`);
+    note(`已覆盖导入 ${importDone.value} 个点位（endpoint 已随行写入）。`);
   } finally {
     importBusy.value = false;
   }
@@ -1276,6 +1435,46 @@ async function exportTemplate(): Promise<void> {
     return;
   }
   note(result.message || '已导出点表 CSV（可直接当导入模板）。');
+}
+
+/**
+ * 下载点表导入模板（CSV，前端 Blob 直下，无需后端）。
+ *
+ * 表头与 `validateCsv` 解析列一致（另含末列「设备连接地址」）；含 2 行示例数据，
+ * 地址风格随所选设备协议取自协议模板。
+ */
+function downloadImportTemplate(): void {
+  const dev = selected.value;
+  const protocol = dev?.protocol ?? 'modbus-tcp';
+  const endpoint = dev ? deviceEndpoint.value || '192.168.1.10:502' : '192.168.1.10:502';
+  const rows = (PT_TEMPLATE[protocol] ?? PT_TEMPLATE['modbus-tcp']).slice(0, 2);
+  const lines: string[] = [CSV_HEADER_WITH_ENDPOINT.join(',')];
+  for (const row of rows) {
+    lines.push(
+      [
+        row.addr,
+        row.name,
+        row.dt,
+        row.bo,
+        '',
+        '0',
+        `${dev?.id ?? 'dev-01'}_${row.addr.replace(/[^A-Za-z0-9.]/g, '_')}`,
+        '',
+        endpoint,
+      ].join(','),
+    );
+  }
+  const csv = '﻿' + lines.join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'points-import-template.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  note(`已下载 ${dev ? dev.protocolLabel : 'Modbus TCP'} 点表导入模板（含表头与 ${rows.length} 行示例）。`);
 }
 
 // ---------------------------------------------------------------------------
