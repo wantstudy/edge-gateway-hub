@@ -28,9 +28,11 @@
 #
 # 架构变化（2026-09-27）：
 #   - 原 distroless/static 改为 nginx:1.25-alpine（容器内置 nginx，不再依赖宿主 nginx）
-#   - nginx 监听 8080：静态文件 + /api/* → daemon:8081
-#   - daemon 监听 8081（内部，宿主机不可直接访问）
-#   - 入口使用 /usr/local/bin/start.sh 同时启动 nginx + daemon
+#   - nginx 默认监听 8080：静态文件 + /api/* → daemon:$IOT_DAQ_HTTP_PORT
+#   - daemon 默认监听 8081（容器内部）
+#   - 两者均由 env 覆盖且同源联动（IOT_DAQ_WEB_PORT / IOT_DAQ_HTTP_PORT），
+#     宿主 8080 被占用时只改前者即可（实测该场景常见：宝塔 / Java 服务占坑）
+#   - 入口 /usr/local/bin/start.sh（COPY 自 deploy/docker/start.sh）同时启动 nginx + daemon
 #
 # 构建示例：
 #   deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/Dockerfile.rendered
@@ -103,7 +105,8 @@ RUN set -eux; \
 #   1. 静态文件服务（/、/assets/*、favicon/logo）
 #   2. API 反代（/api/* → daemon:8081）
 #   3. SSE 长连接（proxy_read_timeout 300s）
-# daemon 只监听 8081（容器内部），nginx 监听 8080（对外暴露）
+# daemon 默认监听 8081（容器内部），nginx 默认监听 8080（对外暴露）；
+# 实际端口由 IOT_DAQ_HTTP_PORT / IOT_DAQ_WEB_PORT 决定，且 nginx 反代目标与之同源
 FROM nginx:1.25-alpine@sha256:__RUNTIME_DIGEST__ AS runtime
 
 ARG TARGETARCH
@@ -144,32 +147,19 @@ COPY deploy/docker/nginx.conf.template /etc/nginx/nginx.conf.template
 COPY deploy/docker/nginx.mime.types /etc/nginx/mime.types
 
 # ---- 启动脚本：同时启动 nginx + daemon ----
-# nginx 后台运行，daemon 前台运行（nginx 健康检查通过后才启动 daemon）
-# daemon 监听 8081（内部），nginx 监听 8080（对外）
+# ★ 必须由仓库文件 deploy/docker/start.sh 提供（唯一事实源），
+#   **严禁**在 Dockerfile 内再内联一份副本：内联副本不含 envsubst 渲染，
+#   nginx.conf.template 的 ${IOT_DAQ_WEB_PORT} / ${IOT_DAQ_HTTP_PORT} 占位符不会被替换，
+#   表现为「模板被 nginx 直接加载而失败」；若回退到写死 8081 的静态配置，
+#   则退化为端口错配（页面打得开、所有 /api 502）。
+# start.sh 职责：渲染 nginx 模板（/etc/nginx 在 read_only 根下不可写 → 产物落 /tmp/nginx.conf）、
+#   后台起 nginx、前台 exec daemon（PID 1，SIGTERM 直通）。
+# 默认端口：对外 Web 8080 / daemon 8081，均可通过 env 覆盖且两者同源联动（见 start.sh 头注释）。
+COPY deploy/docker/start.sh /usr/local/bin/start.sh
 RUN set -eux; \
-    # 创建日志目录（tmpfs 挂载时会覆盖，但镜像内需有占位）
-    mkdir -p /var/log/nginx /var/lib/nginx/cache; \
-    # 写入启动脚本
-    cat > /usr/local/bin/start.sh << 'SCRIPT'
-#!/bin/sh
-set -eu
-
-# 1. 启动 nginx（后台）
-nginx -g 'daemon off;' &
-NGINX_PID=$!
-
-# 2. 等待 nginx 就绪
-for i in $(seq 1 30); do
-    if kill -0 $NGINX_PID 2>/dev/null; then
-        break
-    fi
-    sleep 0.1
-done
-
-# 3. 启动 daemon（前台，PID 1）
-exec /usr/local/bin/iot-daq-daemon --preflight --config /etc/iot-daq/gateway.toml --foreground
-SCRIPT
-RUN chmod +x /usr/local/bin/start.sh
+    # 日志 / 缓存目录占位（运行期由 compose tmpfs 覆盖，镜像内须先存在）
+    mkdir -p /var/log/nginx /var/lib/nginx/cache /var/cache/nginx; \
+    chmod 0755 /usr/local/bin/start.sh
 
 
 # ---- 镜像内绝不含（红线自证清单）----

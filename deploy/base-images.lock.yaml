@@ -39,15 +39,30 @@ images:
     approver: "deploy-fix (task-61-fix / D-04)"
     reason: "Cargo.lock 传递依赖要求 rustc>=1.88（icu_properties_data 2.3.0 / time 0.3.55 / idna_adapter 等 34 条），1.85 容器内编译必失败；升级至 1.88-slim-bookworm 并 pin 实测拉取 digest"
 
-  # ---- 运行阶段基础镜像（distroless 静态、非 root）----
-  # 二进制为 musl 静态链接（D-09b 方案 A：--target <musl triple> + crt-static）。
-  # 若改用 glibc 动态二进制，换成 gcr.io/distroless/cc-debian12（同款 digest 方案），
-  # 并同步 Dockerfile 注释与 deploy/README.md。
-  - name: runtime-distroless
+  # ---- 运行阶段基础镜像（nginx:alpine，内置反代）----
+  # nginx:1.25-alpine 轻量级 HTTP 服务器，负责：
+  #   1. 静态文件服务（/、/assets/*）
+  #   2. API 反代（/api/* → daemon:8081）
+  #   3. SSE 长连接（proxy_read_timeout 300s）
+  # digest: sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00
+  - name: runtime-nginx
+    repository: docker.io/library/nginx
+    tag: 1.25-alpine
+    digest: "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00"
+    stage: runtime
+    locked_at: "2026-09-27T21:17:00+08:00"
+    approver: "team-lead (task-container-nginx)"
+    reason: "容器内置 nginx 反代，替代 distroless/static；不再依赖宿主 nginx，消除跨域与单点故障"
+
+  # ---- 历史运行时基础镜像（已弃用，仅留审计记录）----
+  # 原 distroless/static-debian12:nonroot（sha256:afa5c872...），已替换为 nginx:1.25-alpine。
+  # ⚠️ stage 必须为 runtime-deprecated 而非 runtime：render 脚本按 stage 精确取值，
+  #    两条同为 stage: runtime 时只会取到文件中靠前的那条（顺序依赖 = 静默选错镜像）。
+  - name: runtime-distroless-deprecated
     repository: gcr.io/distroless/static-debian12
     tag: nonroot
     digest: "sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab"
-    stage: runtime
-    locked_at: "2026-09-25T13:16:38+08:00"
-    approver: "deploy-fix (task-61-fix / D-09b)"
-    reason: "D-09b 落实 musl 静态链接决策：builder 按 --target <musl> + crt-static 编出完全静态二进制，匹配 distroless/static（无 loader）；digest 实测拉取（daocloud 镜像源，内容寻址一致）"
+    stage: runtime-deprecated
+    locked_at: ""
+    approver: ""
+    reason: "已弃用，替换为 nginx:1.25-alpine（container-nginx 任务，2026-09-27）"
