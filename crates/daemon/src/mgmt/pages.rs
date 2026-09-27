@@ -1486,7 +1486,8 @@ pub async fn forwarders_list(State(state): State<MgmtState>) -> Response {
 /// 出口名最大长度（防超长 id 写塌 TOML 行；与规则 id 同口径）。
 const MAX_OUTLET_NAME_LEN: usize = 64;
 /// 出口名安全字符集（`[A-Za-z0-9_-]`）：唯一键锚点，拒绝空白 / 控制 / 其它字符。
-const OUTLET_NAME_CHARSET: &str = "outlet name only allows [A-Za-z0-9_-] (ascii letters / digits / underscore / hyphen)";
+const OUTLET_NAME_CHARSET: &str =
+    "outlet name only allows [A-Za-z0-9_-] (ascii letters / digits / underscore / hyphen)";
 /// `note` 最小字数（与 `DangerConfirmModal` 的 `min-note-length` 一致）。
 const MIN_OUTLET_NOTE_LEN: usize = 10;
 
@@ -1821,7 +1822,12 @@ fn build_outlet(
     qos: u8,
     encoding: OutletEncoding,
 ) -> OutletConfig {
-    let trimmed = |s: &Option<String>| s.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from);
+    let trimmed = |s: &Option<String>| {
+        s.as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
     OutletConfig {
         name: name.to_string(),
         broker: req.broker.trim().to_string(),
@@ -2195,7 +2201,12 @@ pub async fn forwarder_update(
         }
     };
 
-    let trimmed = |s: &Option<String>| s.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from);
+    let trimmed = |s: &Option<String>| {
+        s.as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
     let updated = OutletConfig {
         name: current.name.clone(),
         broker,
@@ -2203,7 +2214,8 @@ pub async fn forwarder_update(
         qos,
         tls: effective_tls,
         ca_cert_path: trimmed(&req.ca_cert_path).or_else(|| current.ca_cert_path.clone()),
-        client_cert_path: trimmed(&req.client_cert_path).or_else(|| current.client_cert_path.clone()),
+        client_cert_path: trimmed(&req.client_cert_path)
+            .or_else(|| current.client_cert_path.clone()),
         client_key_path: trimmed(&req.client_key_path).or_else(|| current.client_key_path.clone()),
         server_name: trimmed(&req.server_name).or_else(|| current.server_name.clone()),
         alpn: if req.alpn.is_empty() {

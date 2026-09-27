@@ -1332,10 +1332,11 @@ mod tests {
     #[test]
     fn builtin_role_wire_excludes_licensing_ids() {
         let users: Vec<Value> = vec![];
-        let gateway: Vec<String> = crate::mgmt::rbac::permissions_of_scope(PermissionScope::Gateway)
-            .iter()
-            .map(|p| p.as_str().to_string())
-            .collect();
+        let gateway: Vec<String> =
+            crate::mgmt::rbac::permissions_of_scope(PermissionScope::Gateway)
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect();
         let licensing_ids: Vec<String> =
             crate::mgmt::rbac::permissions_of_scope(PermissionScope::Licensing)
                 .iter()
