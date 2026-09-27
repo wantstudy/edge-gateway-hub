@@ -10,9 +10,9 @@
   -->
   <div class="ac-login">
     <form class="ac-login__card" data-testid="login-card" @submit.prevent="submit">
-      <!-- 品牌区：纯文字品牌，沿用 AppShell 的 .ac-brand 写法，不引入任何图片 -->
+      <!-- 品牌区：logo 图片 + 文字（沿用 web-console 的 logo-white.png 白底版本） -->
       <div class="ac-login__brand">
-        <span class="ac-brand__logo">LIC</span>
+        <img class="ac-login__logo-img" src="/logo-white.png" alt="IoT-DAQ" />
         <span>IoT-DAQ 授权管理</span>
       </div>
       <p class="ac-login__desc">
@@ -209,6 +209,15 @@ async function submit(): Promise<void> {
   font-weight: 600;
   font-size: 16px;
   color: var(--text-1);
+}
+.ac-login__logo-img {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  /* 登录页左侧面板为深海军蓝底，白底 PNG 承托 logo 深色笔画 */
+  background: #fff;
+  border-radius: 5px;
+  padding: 2px;
 }
 .ac-login__desc {
   margin: 0;

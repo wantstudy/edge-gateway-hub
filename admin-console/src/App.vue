@@ -14,7 +14,7 @@
       <!-- 顶栏：应用标识 | 角色切换 | 全局状态胶囊 | 账号 -->
       <header class="ac-topbar">
         <div class="ac-brand">
-          <span class="ac-brand__logo">LIC</span>
+          <img class="ac-brand__logo" src="/logo-white.png" alt="IoT-DAQ" />
           <span>IoT-DAQ 授权管理后台</span>
         </div>
         <span class="ac-topbar__mini">厂商侧 · 运营与售后</span>
