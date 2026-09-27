@@ -81,6 +81,11 @@ async fn query_impl(
         Ok(query) => query,
         Err(message) => return bad_request(&message),
     };
+    // ③′ 呈现口径「最新在前」：审计日志对用户应是「 newest 在最前 」，否则
+    // `limit` 永远只从最旧处起算，本次进程产生的事件被截断在末尾，读起来像
+    // 拿到了 stale 数据-seq。`offset` 随之为「从最新往后翻页」。
+    // （审计语义 / 哈希链 / outcome·event 判定均不受影响，仅排列方向。）
+    let query = query.with_order_desc(true);
 
     // ④ 查询。
     let rows = match logger.query(&query) {
@@ -414,8 +419,9 @@ frequency_ms = 100
             assert!(row["seq"].is_string(), "seq must be string: {row}");
             assert!(row["ts_ns"].is_string(), "ts_ns must be string: {row}");
         }
-        assert_eq!(rows[0]["event"], "login");
-        assert_eq!(rows[2]["event"], "config_change");
+        // 呈现口径「最新在前」：rows[0] 为最新事件，rows[2] 为最旧。
+        assert_eq!(rows[0]["event"], "config_change");
+        assert_eq!(rows[2]["event"], "login");
 
         // 事件过滤：login_failed → 1 条。
         let (status, _, body) =
@@ -425,13 +431,14 @@ frequency_ms = 100
         assert_eq!(value["count"], "1");
         assert_eq!(value["rows"][0]["actor"], "bob");
 
-        // 分页：limit=2&offset=1 → 第 2、3 条。
+        // 分页：呈现口径「最新在前」，limit=2&offset=1 → 跳过最新一条后为
+        // 首次查询的 audit_read（ops-admin）与 carol。
         let (status, _, body) =
             http_get_bearer(port, "/api/audit?limit=2&offset=1", Some(&risk)).await;
         assert_eq!(status, 200, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["count"], "2");
-        assert_eq!(value["rows"][0]["actor"], "bob");
+        assert_eq!(value["rows"][0]["actor"], "ops-admin");
         assert_eq!(value["rows"][1]["actor"], "carol");
     }
 
@@ -502,6 +509,48 @@ frequency_ms = 100
                 .expect("verify")
                 .ok
         );
+    }
+
+    /// QA: 在线查询默认「最新在前」——本进程新产生的事件必须出现在首屏。
+    ///
+    /// 回归背景：排序缺省为 `seq ASC` 时，`?limit=2` 永远命中**最旧**的两条，
+    /// 本次进程产生的事件被截断在末尾，管理面看起来像「读取侧拿到 stale 数据」。
+    #[tokio::test]
+    async fn list_returns_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = make_state(dir.path());
+        let logger = state.daemon().audit_logger();
+        let seed = logger.as_ref().expect("logger");
+        seed_events(seed);
+        let risk = token_for(&state, Role::Risk);
+        let port = spawn_server(state).await;
+
+        let (status, _, body) = http_get_bearer(port, "/api/audit?limit=2", Some(&risk)).await;
+        assert_eq!(status, 200, "body: {body}");
+
+        let value = serde_json::from_str::<Value>(&body).expect("json body");
+        let rows = value["rows"].as_array().expect("rows array");
+        assert_eq!(rows.len(), 2, "body: {body}");
+        let seqs: Vec<String> = rows
+            .iter()
+            .map(|r| r["seq"].as_str().expect("seq 大数红线：字符串").to_string())
+            .collect();
+        assert_eq!(seqs, vec!["3".to_string(), "2".to_string()], "默认须最新在前: {seqs:?}");
+        assert_eq!(rows[0]["actor"], "carol");
+        assert_eq!(rows[0]["detail"], "device_create");
+        assert_eq!(rows[1]["actor"], "bob");
+
+        // 再查一次：本次「查询行为自身」入链的 audit_read 应排在最前。
+        let (status, _, body) = http_get_bearer(port, "/api/audit?limit=1", Some(&risk)).await;
+        assert_eq!(status, 200, "body: {body}");
+        let value = serde_json::from_str::<Value>(&body).expect("json body");
+        let rows = value["rows"].as_array().expect("rows array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["event"], "audit_read",
+            "本次进程的查询记录应在首行: {body}"
+        );
+        assert_eq!(rows[0]["actor"], "ops-admin");
     }
 
     /// QA 安全: export 门控——risk（持 audit.view 但不持 audit.export）→ 403；

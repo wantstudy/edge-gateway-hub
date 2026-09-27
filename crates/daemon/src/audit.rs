@@ -170,6 +170,12 @@ pub struct AuditQuery {
     pub until_ns: Option<u64>,
     /// 事件类型过滤（精确匹配 [`AuditEventType::as_str`]；`None` = 全类型）。
     pub event: Option<String>,
+    /// 排序方向：`true` = 最新在前（`seq` 降序），`false` = 最旧在前（时间正序）。
+    ///
+    /// 缺省为 `false`（与存储同序）：归档 / 回放场景按时间正序阅读更自然，
+    /// 且既有调用点的分页断言语义不变。管理面读取侧（`/api/audit`）会显式
+    /// 覆写为 `true`——「最新在前」是审计查询对用户呈现的口径。
+    pub order_desc: bool,
 }
 
 impl Default for AuditQuery {
@@ -180,6 +186,7 @@ impl Default for AuditQuery {
             since_ns: None,
             until_ns: None,
             event: None,
+            order_desc: false,
         }
     }
 }
@@ -227,6 +234,13 @@ impl AuditQuery {
     #[must_use]
     pub fn with_event(mut self, event: impl Into<String>) -> Self {
         self.event = Some(event.into());
+        self
+    }
+
+    /// 设置排序方向（缺省 `false` = 最旧在前；置 `true` 为最新在前）。
+    #[must_use]
+    pub fn with_order_desc(mut self, order_desc: bool) -> Self {
+        self.order_desc = order_desc;
         self
     }
 }
@@ -531,13 +545,20 @@ impl AuditLogger {
         let since = i64::try_from(query.since_ns.unwrap_or(0)).unwrap_or(0);
         let until = i64::try_from(query.until_ns.unwrap_or(u64::MAX)).unwrap_or(i64::MAX);
         let event_filter = query.event.clone().unwrap_or_default();
+        // 排序方向只取本函数内的字面量分支（无外部输入参与拼装），无注入面。
+        let order = if query.order_desc {
+            "seq DESC"
+        } else {
+            "seq ASC"
+        };
+        let sql = format!(
+            "SELECT seq, ts_ns, actor, event, outcome, detail, prev_hash, entry_hash \
+             FROM audit_log \
+             WHERE ts_ns >= ?1 AND ts_ns <= ?2 AND (?3 = '' OR event = ?3) \
+             ORDER BY {order} LIMIT ?4 OFFSET ?5"
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT seq, ts_ns, actor, event, outcome, detail, prev_hash, entry_hash \
-                 FROM audit_log \
-                 WHERE ts_ns >= ?1 AND ts_ns <= ?2 AND (?3 = '' OR event = ?3) \
-                 ORDER BY seq LIMIT ?4 OFFSET ?5",
-            )
+            .prepare(&sql)
             .map_err(|e| DaemonError::StorageError(format!("audit query prepare: {e}")))?;
         let rows = stmt
             .query_map(
@@ -819,7 +840,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].detail, "row-2");
 
-        // 分页：limit=2 offset=2 → 第 3、4 条。
+        // 分页：limit=2 offset=2 → 第 3、4 条（缺省时间正序口径）。
         let rows = logger
             .query(&AuditQuery::new().with_limit(2).with_offset(2))
             .expect("page");
@@ -827,11 +848,66 @@ mod tests {
         assert_eq!(rows[0].detail, "row-2");
         assert_eq!(rows[1].detail, "row-3");
 
+        // 同一条件显式取最新在前（管理面读取侧口径）：跳过最新 2 条 → row-2、row-1。
+        let rows = logger
+            .query(&AuditQuery::new().with_limit(2).with_offset(2).with_order_desc(true))
+            .expect("page desc");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].detail, "row-2");
+        assert_eq!(rows[1].detail, "row-1");
+
         // limit 超上限被钳制。
         let rows = logger
             .query(&AuditQuery::new().with_limit(u32::MAX))
             .expect("clamped");
         assert_eq!(rows.len(), 5);
+    }
+
+    /// QA: `order_desc = true` 时查询「最新在前」——保证本进程新写入的事件
+    /// 立刻出现在首屏。
+    ///
+    /// 回归背景：管理面曾因 `LIMIT n` 只从最旧处起算，新事件被截断在末尾，
+    /// 用户看到的一直是旧数据（表现为「读取侧 stale」）。
+    #[test]
+    fn newest_first_query_puts_fresh_events_on_top() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(1_000);
+        let logger = open_logger(dir.path(), &clock);
+
+        for i in 0..4 {
+            logger
+                .record(
+                    "a",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("row-{i}"),
+                )
+                .expect("record");
+            clock.advance(100);
+        }
+
+        let rows = logger
+            .query(&AuditQuery::new().with_order_desc(true))
+            .expect("query");
+        assert_eq!(rows.len(), 4);
+        let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![4, 3, 2, 1], "必须 seq 降序: {seqs:?}");
+        assert_eq!(rows[0].detail, "row-3");
+
+        // 追加一条后立刻出现在首位（模拟「本次进程的事件应可见」）。
+        logger
+            .record(
+                "b",
+                AuditEventType::AuditRead,
+                OUTCOME_ACCEPTED,
+                "fresh",
+            )
+            .expect("record");
+        let rows = logger
+            .query(&AuditQuery::new().with_order_desc(true).with_limit(1))
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail, "fresh", "新写入的事件必须在首行");
     }
 
     /// QA（计划验收：日志追加不可篡改——正向）: 多条记录后整链校验通过。
