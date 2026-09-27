@@ -765,18 +765,14 @@ impl BootstrapBuilder {
         info!("bootstrap: daemon starting");
 
         // ①-a2 安全审计库（task 26 最小接线）：尝试打开配置同目录 audit.db 并
-        // 挂载到共享态（IKM 优先 env 部署密钥，回退授权机器码）。失败只记
-        // error 不阻断启动（fail-safe：审计缺失可观测、采集不受影响）。
-        let audit_machine_code = self
-            .license
-            .as_ref()
-            .map(|cfg| cfg.client.machine_code().to_string());
+        // 挂载到共享态（IKM 只认 env 部署密钥 `IOT_DAQ_AUDIT_SECRET`；**不掺授权
+        // 机器码**，理由见 `audit::resolve_audit_ikm` 文档）。失败只记 error 不阻断
+        // 启动（fail-safe：审计缺失可观测、采集不受影响）。
         mount_audit_logger(
             &shared,
             &self.config_path,
             self.data_dir.as_deref(),
             self.audit_logger.take(),
-            audit_machine_code.as_deref(),
         );
 
         // ①-a 完整性自检（task 50 接线）：早期执行、fail-safe 不 panic、
@@ -1191,15 +1187,14 @@ pub fn offline_flush_hook(queue: Arc<OfflineQueue>) -> StopHook {
 ///
 /// 装配顺序：外部注入优先（测试 / 嵌入式）；否则按
 /// **`data_dir`（D-08：持久卷根）→ 回退「配置同目录」** 解析 `audit.db` 路径，
-/// IKM 由 [`crate::audit::resolve_audit_ikm`] 解析（env 部署密钥 → 授权
-/// 机器码 → 无 → 盐自派生降级）。共享态已挂载时跳过（幂等）；开库失败只记
-/// `error!` 不阻断启动（fail-safe：审计缺失可观测，采集数据面不受影响）。
+/// IKM 由 [`crate::audit::resolve_audit_ikm`] 解析（只认 env 部署密钥；无 → 盐
+/// 自派生降级）。共享态已挂载时跳过（幂等）；开库失败只记 `error!` 不阻断启动
+/// （fail-safe：审计缺失可观测，采集数据面不受影响）。
 fn mount_audit_logger(
     shared: &DaemonShared,
     config_path: &Path,
     data_dir: Option<&Path>,
     injected: Option<Arc<crate::audit::AuditLogger>>,
-    machine_code: Option<&str>,
 ) {
     if shared.audit_logger().is_some() {
         return; // 装配方已挂载，幂等跳过。
@@ -1223,7 +1218,7 @@ fn mount_audit_logger(
             dir.join(crate::audit::AUDIT_DB_FILE_NAME)
         }
     };
-    let ikm = crate::audit::resolve_audit_ikm(machine_code);
+    let ikm = crate::audit::resolve_audit_ikm();
     match crate::audit::AuditLogger::open(&db_path, ikm.as_deref()) {
         Ok(logger) => {
             shared.set_audit_logger(Arc::new(logger));

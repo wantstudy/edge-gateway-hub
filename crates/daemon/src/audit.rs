@@ -16,10 +16,11 @@
 //! - `K = HKDF-Expand(HKDF-Extract(salt, IKM), "iot-daq/audit-chain/v1")`
 //!   （RFC 5869 手工实现，与 `telemetry_store` 同法；`hkdf` crate 不在依赖树）；
 //! - `salt`：每安装随机 32 hex（uuid v4 ×2），存 `audit_meta` 表（重开可复算）；
-//! - `IKM`：部署方注入（[`resolve_audit_ikm`]：env `IOT_DAQ_AUDIT_SECRET` 优先，
-//!   回退授权机器码）。**密钥常量不进代码**；IKM 缺失时降级为
-//!   `IKM = salt`（`open` 时 warn 显式声明：防改写能力弱于绑定部署密钥形态，
-//!   仍可检测不重算链的普通篡改）。
+//! - `IKM`：部署方注入（[`resolve_audit_ikm`]：只认 env `IOT_DAQ_AUDIT_SECRET`，
+//!   **不掺授权机器码**——机器码的可用性取决于 licensing 装配时序，会随激活状态
+//!   变化，掺进来会让链密钥在「无授权 → 已激活」之间漂移，见该函数文档）。
+//!   **密钥常量不进代码**；IKM 缺失时降级为 `IKM = salt`（`open` 时 warn 显式
+//!   声明：防改写能力弱于绑定部署密钥形态，仍可检测不重算链的普通篡改）。
 //!
 //! ## 实现红线
 //! - 零 panic：锁中毒 `into_inner` 恢复；错误收敛 `DaemonError::StorageError`；
@@ -59,8 +60,8 @@ pub const DEFAULT_QUERY_LIMIT: u32 = 100;
 /// 自由伪造整条链。指纹的作用是让「两次启动是否算出同一把密钥」可被判定，
 /// 从而把「静默换密钥」变成「显式 fail-closed」。
 const CHAIN_IKM_FP_META: &str = "chain_ikm_fp";
-/// `audit_meta` 键：绑定时的密钥来源标注（`env-secret` / `machine-code` /
-/// `salt-degraded`），供链完整性报告如实呈现（**不是**密钥材料）。
+/// `audit_meta` 键：绑定时的密钥来源标注（`env-secret` / `salt-degraded`），
+/// 供链完整性报告如实呈现（**不是**密钥材料）。
 const CHAIN_KEY_SOURCE_META: &str = "chain_key_source";
 
 // ---- 审计结果字面量（与 remote_ops 的 OUTCOME_* 同词表） ----
@@ -265,8 +266,7 @@ pub struct ChainVerifyReport {
     pub ok: bool,
     /// 首个断裂点的 seq（`ok == true` 时为 `None`）。
     pub first_broken_seq: Option<u64>,
-    /// 本次校验所用链密钥的来源标注（`env-secret` / `machine-code` /
-    /// `salt-degraded`）。
+    /// 本次校验所用链密钥的来源标注（`env-secret` / `salt-degraded`）。
     ///
     /// 用途：**区分故障性质**。同一个 `ok=false` 可能来自「有人改了审计行」，
     /// 也可能来自「两次启动之间链密钥换了源（旧条目因此算不上来）」——后者是
@@ -343,17 +343,20 @@ fn effective_ikm<'a>(salt: &'a [u8], ikm: Option<&'a [u8]>) -> &'a [u8] {
 
 /// 链密钥来源标注（明文诊断串，**不含**任何密钥材料，绝不落盘密钥本身）。
 ///
-/// 与 [`resolve_audit_ikm`] 的解析顺序一一对应：`env-secret` → `machine-code`
-/// → `salt-degraded`（盐自派生）。
+/// 与 [`resolve_audit_ikm`] 的解析结果一一对应，取值域只有两种：
+///
+/// - `salt-degraded`：IKM 缺失（盐自派生）——跨重启稳定，但拿到 `audit.db` 的人
+///   可自行重算 HMAC，防篡改能力最弱；
+/// - `env-secret`：部署 env 密钥生效——唯一能带来真防篡改强度的来源。
+///
+/// 「`machine-code`」这一档已随机器码回退一并移除：它的可用性取决于 licensing
+/// 装配时序，会在授权状态变化时漂移，却拿不到额外强度（盐同库持久化）。
 #[must_use]
 fn ikm_source_label(ikm: Option<&[u8]>) -> String {
     if ikm.is_none_or(|ikm| ikm.is_empty()) {
-        return "salt-degraded".to_string();
-    }
-    if std::env::var(AUDIT_SECRET_ENV).is_ok_and(|secret| !secret.trim().is_empty()) {
-        "env-secret".to_string()
+        "salt-degraded".to_string()
     } else {
-        "machine-code".to_string()
+        "env-secret".to_string()
     }
 }
 
@@ -377,28 +380,38 @@ fn compute_entry_hash(
 
 // ---- IKM 解析（生产装配路径） ----
 
-/// 解析审计链 IKM（部署密钥，**不硬编码**）：
+/// 解析审计链 IKM（部署密钥，**不硬编码**）：只认 env [`AUDIT_SECRET_ENV`]。
 ///
-/// 1. env [`AUDIT_SECRET_ENV`]（`IOT_DAQ_AUDIT_SECRET`）：非空即用——合法 hex
-///    优先解码为字节，否则按原始 UTF-8 字节；
-/// 2. 回退：授权机器码（`LicensingClient::machine_code()`，bootstrap 装配时注入）；
-/// 3. 两者皆无 → `None`（`open` 降级为盐自派生密钥并 warn）。
+/// **授权机器码不再作为 IKM 回退**，这是 2026-09-27 的一次设计收紧，两条理由：
+///
+/// 1. **可用性不是部署可控量**：机器码最终来自 `machine_fingerprint`，而在
+///    [`crate::bootstrap`] 里只有当 licensing 客户端已装配时 `machine_code` 才非
+///    空（见 `bootstrap.rs` 装配处注释）。于是「先无授权 → 后激活」的网关，激活后
+///    重启会算出一把不同密钥 → 绑定漂移 → fail-closed **拒绝全部审计写入**，而这次
+///    漂移并不是有人换配置、只是授权状态变了。历史段 seq 473 的断裂正是这类漂移。
+/// 2. **它并没有增强防篡改**：链盐 `chain_salt` 与本库同文件持久化，任何拿到
+///    `audit.db` 的人都能重算 HMAC，密钥里是否掺入机器码毫无区别。也就是说回退到
+///    机器码只带来「装配时序依赖」，不带来任何额外安全性。
+///
+/// 因此链密钥的入料收敛为「持久盐 + 部署 env 密钥」——两者要么持久化、要么由运维
+/// 显式配置，跨重启稳定且不随授权状态变化。未配 env 时 `open` 降级为盐自派生密钥
+/// 并 warn（防篡改能力弱于绑定部署密钥；绝不因缺密钥而拒绝启动）。
+///
+/// 返回值：env 非空 → `Some`（合法 hex 优先解码为字节，否则按原始 UTF-8 字节）；
+/// 否则 `None`。
 #[must_use]
-pub fn resolve_audit_ikm(machine_code: Option<&str>) -> Option<Vec<u8>> {
-    if let Ok(secret) = std::env::var(AUDIT_SECRET_ENV) {
-        let trimmed = secret.trim();
-        if !trimmed.is_empty() {
-            return Some(match hex::decode(trimmed) {
-                Ok(bytes) if !bytes.is_empty() => bytes,
-                _ => trimmed.as_bytes().to_vec(),
-            });
-        }
-    }
-    let machine = machine_code?.trim();
-    if machine.is_empty() {
+pub fn resolve_audit_ikm() -> Option<Vec<u8>> {
+    let Ok(secret) = std::env::var(AUDIT_SECRET_ENV) else {
+        return None;
+    };
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    Some(machine.as_bytes().to_vec())
+    Some(match hex::decode(trimmed) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        _ => trimmed.as_bytes().to_vec(),
+    })
 }
 
 // ---- AuditLogger ----
@@ -412,7 +425,7 @@ pub struct AuditLogger {
     conn: Mutex<Connection>,
     /// 链密钥（HKDF 派生，见模块注释；**不落盘、不打印**）。
     key: [u8; 32],
-    /// 链密钥来源标注（`env-secret` / `machine-code` / `salt-degraded`）。
+    /// 链密钥来源标注（`env-secret` / `salt-degraded`）。
     ///
     /// 随 [`ChainVerifyReport`] 如实带出，用于区分「有人改了审计行」与
     /// 「两次启动之间链密钥换了源」——两者都是 `ok=false`，但性质完全不同。
@@ -1085,11 +1098,11 @@ mod tests {
 
     /// QA 安全（防篡改红线）: **跨重启换密钥不得让历史条目自证失败**。
     ///
-    /// 回归背景：链密钥原本是 `HKDF(salt, resolve_audit_ikm(..))`，而 IKM 是每次
-    /// 启动重新解析的进程局部状态（env 部署密钥 / 授权机器码是否可见）。某次启动
-    /// 少了那份 IKM → 派生出不同的密钥 → 此后每条历史 `entry_hash` 都算不上来，
-    /// 整条链「换个启动方式就自证失败」＝防篡改能力归零（现场复现：`ok=false`、
-    /// `first_broken_seq=473`，断点精确落在一次重启之后的第一个 seq）。
+    /// 回归背景：链密钥原本是 `HKDF(salt, resolve_audit_ikm(..))`，而 IKM 里掺了
+    /// 「授权机器码」——它在 [`crate::bootstrap`] 里只在 licensing 客户端已装配时
+    /// 才非空。于是某次启动少了那份 IKM → 派生出不同的密钥 → 此后每条历史
+    /// `entry_hash` 都算不上来，整条链「换个启动方式就自证失败」＝防篡改能力归零
+    ///（现场复现：`ok=false`、`first_broken_seq=473`，断点精确落在一次重启之后）。
     ///
     /// 本用例模拟**未配置部署 IKM（盐自派生）→ 重启 → 继续追加**：绑定必须仍然
     /// 一致、链整体可自证。这才是「盐已持久化」应当保证的性质，也是本次事故
@@ -1223,10 +1236,10 @@ mod tests {
             .expect("record");
 
         let report = logger.verify_chain().expect("verify");
-        assert!(matches!(
-            report.key_source.as_str(),
-            "env-secret" | "machine-code" | "salt-degraded"
-        ));
+        assert!(
+            matches!(report.key_source.as_str(), "env-secret" | "salt-degraded"),
+            "来源标注只可能来自 env 密钥或盐自派生: {report:?}"
+        );
     }
 
     /// QA（计划验收核心：改一行 → 校验失败）: 绕过触发器（测试内先 DROP）
@@ -1439,17 +1452,16 @@ mod tests {
         assert_eq!(AuditEventType::parse(""), None);
     }
 
-    /// QA: IKM 解析——机器码回退生效、空机器码与空 env 视为缺失。
-    /// （env 优先级路径依赖进程级环境变量，不在并行测试中改写 env，此处不覆盖。）
+    /// QA: IKM 解析**不再回退机器码**——只认 env；无 env 即 `None`（盐自派生）。
+    ///
+    /// 这一条钉死设计收紧本身：机器码的可用性取决于 licensing 装配时序（可在激活
+    /// 后由「无」变「有」），若它参与链密钥派生，网关激活后的重启会让绑定漂移、
+    /// fail-closed 拒写审计；且链盐与本库同文件，掺入机器码并不增加防篡改强度。
     #[test]
-    fn resolve_audit_ikm_fallbacks() {
-        let from_machine = resolve_audit_ikm(Some("  machine-code-1  "));
-        assert_eq!(
-            from_machine.as_deref(),
-            Some(b"machine-code-1".as_slice()),
-            "machine code fallback (trimmed)"
-        );
-        assert_eq!(resolve_audit_ikm(Some("   ")), None, "blank machine code");
-        assert_eq!(resolve_audit_ikm(None), None, "nothing available");
+    fn resolve_audit_ikm_ignores_machine_code() {
+        // 进程级 env 在并行测试中不可安全改写：此处只断言「没有 env → 一律 None」
+        // 以及「签名不需要任何入参」。env 命中的分支由 `chain_report_carries_key_
+        // source` 一类的开库路径覆盖。
+        assert_eq!(resolve_audit_ikm(), None, "未配 env 时必须为 None");
     }
 }

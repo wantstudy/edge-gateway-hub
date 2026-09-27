@@ -51,10 +51,9 @@ pub async fn list(
 /// 响应额外携带 `chain` 字段：`{ok, total, verified, first_broken_seq, key_source}`——
 /// 导出方（数据出境面）应当同时拿到「这份导出是否完整可信」的证明。
 ///
-/// `key_source` 如实标出本次校验所用链密钥的来源（`env-secret` / `machine-code` /
-/// `salt-degraded`）：`ok=false` 到底是「有人改了审计行」还是「两次启动之间链密钥
-/// 换了源（旧条目因此算不上来）」，靠这一字段才能区分——前者是篡改，后者是配置
-/// 漂移，处置方式完全不同。
+/// `key_source` 如实标出本次校验所用链密钥的来源（`env-secret` / `salt-degraded`）：
+/// `ok=false` 到底是「有人改了审计行」还是「两次启动之间链密钥换了源（旧条目因此
+/// 算不上来）」，靠这一字段才能区分——前者是篡改，后者是配置漂移，处置方式完全不同。
 pub async fn export(
     State(state): State<MgmtState>,
     authed: AuthedRole,
