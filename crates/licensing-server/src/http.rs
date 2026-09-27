@@ -115,6 +115,16 @@ pub fn router(service: SharedService, auth: Arc<AdminAuth>) -> Router {
         .route("/admin/receipts/anomalies", get(admin_receipt_anomalies))
         .route("/admin/keys", get(admin_keys))
         .route("/admin/audit/logs", get(admin_audit_logs))
+        // 管理端：账号 / 角色可配置（缺口 #9；账号读写仅 system，角色清单任意角色）。
+        .route(
+            "/admin/accounts",
+            get(admin_list_accounts).post(admin_create_account),
+        )
+        .route(
+            "/admin/accounts/:account",
+            put(admin_update_account).delete(admin_delete_account),
+        )
+        .route("/admin/roles", get(admin_roles))
         // 管理端：高危写（lic_ops / system）。
         .route("/admin/codes/issue", post(issue_codes))
         .route("/admin/codes/:code_id/revoke", post(revoke_code))
@@ -227,15 +237,28 @@ const ROLES_TENANT_ADMIN: [Role; 1] = [Role::System];
 /// 凭据来源见 [`crate::admin_auth`]（env 注入初始管理员，fail-closed：零账号全拒）。
 /// 未知用户 / 错误口令 / 请求体非法一律**同一 401**（不区分原因，防账号枚举）。
 async fn admin_login(State(state): State<AppState>, body: Json<AdminLoginRequest>) -> Response {
-    let outcome = state
+    let store = state.service.store();
+    // 账号 / 角色可配置：登录**实时读 store** 账号表（不再只读内存账号表）。
+    let accounts = match store.list_admin_accounts() {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let username = body.username.trim();
+    match state
         .auth
-        .login(body.username.trim(), &body.password)
-        .map(|(token, role)| AdminLoginResponse {
-            token,
-            role: role.as_str().to_string(),
-        });
-    match outcome {
-        Some(resp) => ok_json(resp),
+        .login_with_accounts(username, &body.password, &accounts)
+    {
+        Some((token, role)) => {
+            // best-effort 记录最近登录时刻（失败不影响登录结果）。
+            if let Some(acct) = accounts.iter().find(|a| a.account == username) {
+                let _ = store
+                    .touch_admin_account_login(&acct.account, crate::admin_auth::now_unix_secs());
+            }
+            ok_json(AdminLoginResponse {
+                token,
+                role: role.as_str().to_string(),
+            })
+        }
         None => error_response(&LicenseError::unauthorized("invalid credentials")),
     }
 }
@@ -481,6 +504,152 @@ async fn admin_update_tenant_policy(
         Ok(()) => ok_json(()),
         Err(e) => error_response(&e),
     }
+}
+
+// ============================================================================
+// 管理端：账号 / 角色（可配置；缺口 #9 修复）
+// ============================================================================
+
+/// 仅 system 可管理的账号端点角色集。
+const ROLES_ACCOUNT_ADMIN: [Role; 1] = [Role::System];
+/// 任意已认证角色（角色清单为只读元数据）。
+const ROLES_ANY: [Role; 4] = [Role::Ops, Role::LicOps, Role::Risk, Role::System];
+
+/// store 账号行 → 下发条目（**口令摘要绝不下发**）。
+fn admin_account_item(a: &crate::admin_auth::AdminAccount) -> proto::AdminAccountItem {
+    proto::AdminAccountItem {
+        account: a.account.clone(),
+        display_name: a.display_name.clone(),
+        role: a.role.clone(),
+        status: a.status.clone(),
+        last_login_at: a.last_login_at.map(|v| v.to_string()),
+        created_at: a.created_at.to_string(),
+        updated_at: a.updated_at.to_string(),
+    }
+}
+
+/// 角色清单（与 ui-kit `ROLES` / `ROLE_META` 同一套 id 与中文名）。
+fn role_catalog() -> proto::AdminRolesResponse {
+    let item = |id: &str, label: &str, full_label: &str| proto::AdminRoleItem {
+        id: id.to_string(),
+        label: label.to_string(),
+        full_label: full_label.to_string(),
+    };
+    proto::AdminRolesResponse {
+        items: vec![
+            item("ops", "运营", "运营（只读 + 发放）"),
+            item("lic_ops", "授权运营", "授权运营（发放 / 废弃 / 重发）"),
+            item("risk", "风控", "风控（回执异常 / 审计只读 + 标记异常）"),
+            item("system", "系统", "系统（全部权限）"),
+        ],
+    }
+}
+
+/// `GET /admin/accounts`：管理员账号列表（仅 system；口令摘要绝不下发）。
+async fn admin_list_accounts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_ACCOUNT_ADMIN, "list admin accounts") {
+        return resp;
+    }
+    let rows = match state.service.admin_list_admin_accounts() {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let items: Vec<proto::AdminAccountItem> = rows.iter().map(admin_account_item).collect();
+    let total = items.len() as u64;
+    let page_size = items.len().max(1) as u32;
+    ok_json(paged(items, total, 1, page_size))
+}
+
+/// `POST /admin/accounts`：创建管理员账号（仅 system）。
+async fn admin_create_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<proto::CreateAdminAccountRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_ACCOUNT_ADMIN, "create admin account") {
+        return resp;
+    }
+    match state.service.admin_create_admin_account(
+        &req.account,
+        &req.display_name,
+        &req.role,
+        &req.password,
+        &authed.sub,
+    ) {
+        Ok(acct) => ok_json(admin_account_item(&acct)),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `PUT /admin/accounts/:account`：更新账号（显示名 / 角色 / 口令 / 状态；仅 system）。
+async fn admin_update_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account): Path<String>,
+    Json(req): Json<proto::UpdateAdminAccountRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_ACCOUNT_ADMIN, "update admin account") {
+        return resp;
+    }
+    match state.service.admin_update_admin_account(
+        &account,
+        req.display_name.as_deref(),
+        req.role.as_deref(),
+        req.password.as_deref(),
+        req.status.as_deref(),
+        req.note.as_deref().unwrap_or(""),
+        &authed.sub,
+    ) {
+        Ok(()) => ok_json(()),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `DELETE /admin/accounts/:account`：删除账号（仅 system）。
+async fn admin_delete_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account): Path<String>,
+    Json(req): Json<proto::DeleteAdminAccountRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_ACCOUNT_ADMIN, "delete admin account") {
+        return resp;
+    }
+    match state
+        .service
+        .admin_delete_admin_account(&account, req.note.as_deref().unwrap_or(""), &authed.sub)
+    {
+        Ok(()) => ok_json(()),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `GET /admin/roles`：角色清单（任意已认证角色）。
+async fn admin_roles(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_ANY, "list roles") {
+        return resp;
+    }
+    ok_json(role_catalog())
 }
 
 /// `GET /admin/devices`：设备列表 / 筛选 / 分页（设计 §2.6；机器码掩码）。
@@ -1092,6 +1261,9 @@ mod tests {
     }
 
     /// 构造带内存库 + 已注册**已知测试密钥**的服务（测试专用）。
+    ///
+    /// 账号表预置 admin/system + oliver/ops：HTTP 登录**实时读 store**（缺口 #9），
+    /// 故测试库必须与内存账号表同源（否则 `/admin/auth/login` 会 401）。
     fn build_service() -> SharedService {
         let store = Store::open_in_memory().expect("open in-memory store");
         let tenant = Tenant::new(
@@ -1101,6 +1273,24 @@ mod tests {
             now_unix_secs(),
         );
         store.insert_tenant(&tenant).expect("seed tenant");
+        let seeded_at = now_unix_secs();
+        for (account, role, password) in [
+            ("admin", "system", TEST_ONLY_ADMIN_PASSWORD),
+            ("oliver", "ops", TEST_ONLY_OPS_PASSWORD),
+        ] {
+            store
+                .insert_admin_account(&crate::admin_auth::AdminAccount {
+                    account: account.to_string(),
+                    display_name: String::new(),
+                    role: role.to_string(),
+                    password_sha256: crate::admin_auth::sha256_hex(password),
+                    status: "active".to_string(),
+                    last_login_at: None,
+                    created_at: seeded_at,
+                    updated_at: seeded_at,
+                })
+                .expect("seed admin account");
+        }
         let keyring = KeyRing::empty();
         keyring
             .register_from_b64("k-test", &B64.encode(TEST_ONLY_SEED), None, 1_700_000_000)
@@ -1927,6 +2117,112 @@ mod tests {
             assert_eq!(status, StatusCode::from_u16(401).unwrap(), "{body}");
             assert_eq!(body["code"], "SESSION_EXPIRED");
         }
+    }
+
+    // ---------------- 账号 / 角色可配置（缺口 #9 修复） ----------------
+
+    /// **缺口 #9**：账号 / 角色可配置端到端。
+    ///
+    /// 覆盖：GET 列表（含种子账号 + **绝不泄露口令摘要**）→ POST 新增 →
+    /// PUT 停用（停用账号登录被拒）→ DELETE 删除 → 列表不再出现；
+    /// 角色清单任意角色可读；非系统角色访问账号端点 → 403 `ADMIN_ONLY`。
+    #[tokio::test]
+    async fn http_admin_accounts_crud_end_to_end() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+
+        // ① 列表：含种子 admin；响应**绝不含口令摘要**。
+        let (status, body) = call_with(&svc, "GET", "/admin/accounts", json!(null), &authed).await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body["data"]["items"].as_array().expect("items");
+        assert!(items.iter().any(|i| i["account"] == "admin"), "{body}");
+        let raw = body.to_string();
+        assert!(!raw.contains("password_sha256"), "响应泄露口令摘要字段");
+        assert!(
+            !raw.contains(&crate::admin_auth::sha256_hex(TEST_ONLY_ADMIN_PASSWORD)),
+            "响应泄露口令摘要值"
+        );
+
+        // ② 新增账号（risk 角色）。
+        let (status, created) = call_with(
+            &svc,
+            "POST",
+            "/admin/accounts",
+            json!({"account": "new.guy", "display_name": "新人", "role": "risk",
+                   "password": "pw-new-guy-1"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["data"]["account"], "new.guy");
+        assert_eq!(created["data"]["role"], "risk");
+        assert_eq!(created["data"]["status"], "active");
+
+        // ②b 重复账号 → 400。
+        let (status, _) = call_with(
+            &svc,
+            "POST",
+            "/admin/accounts",
+            json!({"account": "new.guy", "display_name": "重复", "role": "ops",
+                   "password": "pw-new-guy-2"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+
+        // ③ 停用（PUT status=disabled）→ 该账号登录被拒。
+        let (status, _) = call_with(
+            &svc,
+            "PUT",
+            "/admin/accounts/new.guy",
+            json!({"status": "disabled", "note": "停用测试（补充说明）"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call_with(
+            &svc,
+            "POST",
+            "/admin/auth/login",
+            json!({"username": "new.guy", "password": "pw-new-guy-1"}),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::from_u16(401).unwrap(),
+            "停用账号必须拒绝登录: {body}"
+        );
+
+        // ④ 删除 → 列表不再出现。
+        let (status, _) = call_with(
+            &svc,
+            "DELETE",
+            "/admin/accounts/new.guy",
+            json!({"reason": "清理", "note": "测试清理（补充说明）", "confirm": "new.guy"}),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, after) = call_with(&svc, "GET", "/admin/accounts", json!(null), &authed).await;
+        let items2 = after["data"]["items"].as_array().expect("items");
+        assert!(
+            !items2.iter().any(|i| i["account"] == "new.guy"),
+            "{after}"
+        );
+
+        // ⑤ 角色清单（任意角色可访问，四角色）。
+        let (status, roles) = call_with(&svc, "GET", "/admin/roles", json!(null), &authed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(roles["data"]["items"].as_array().unwrap().len(), 4);
+
+        // ⑥ 非系统角色（ops）访问账号端点 → 403 ADMIN_ONLY。
+        let ops = ops_token();
+        let (status, body) =
+            call_with(&svc, "GET", "/admin/accounts", json!(null), &[bearer(&ops)]).await;
+        assert_eq!(status, StatusCode::from_u16(403).unwrap(), "{body}");
+        assert_eq!(body["code"], "ADMIN_ONLY");
     }
 
     /// 无 token / 坏 token 调受保护端点 → 401 `SESSION_EXPIRED`。

@@ -768,6 +768,103 @@ pub struct SigningKeyItem {
     pub retired_at: Option<String>,
 }
 
+// ----------------------------------------------------------------------------
+// §2.0b 管理端账号 / 角色（account & role 可配置；缺口 #9 修复）
+// ----------------------------------------------------------------------------
+
+/// 管理端账号条目（`GET /admin/accounts`；**口令摘要绝不下发**）。
+///
+/// 时间字段一律 **String**（大数红线：unix 秒不进 JSON number）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAccountItem {
+    /// 账号（登录名，主键）。
+    pub account: String,
+    /// 展示名（姓名）。
+    pub display_name: String,
+    /// 规范角色（`ops / lic_ops / risk / system`）。
+    pub role: String,
+    /// 状态（`active` / `disabled`）。
+    pub status: String,
+    /// 最近登录时刻（UTC 秒，**String**；从未登录为 `None`）。
+    pub last_login_at: Option<String>,
+    /// 创建时刻（UTC 秒，**String**）。
+    pub created_at: String,
+    /// 更新时刻（UTC 秒，**String**）。
+    pub updated_at: String,
+}
+
+/// `POST /admin/accounts` 请求体（仅 system。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateAdminAccountRequest {
+    /// 账号（登录名）。
+    #[serde(default)]
+    pub account: String,
+    /// 展示名（姓名，可空）。
+    #[serde(default)]
+    pub display_name: String,
+    /// 规范角色（`ops / lic_ops / risk / system`）。
+    #[serde(default)]
+    pub role: String,
+    /// 明文口令（服务端即刻摘要，明文不落盘不落日志）。
+    #[serde(default)]
+    pub password: String,
+}
+
+/// `PUT /admin/accounts/:account` 请求体（仅 system；字段缺省 = 不改该项）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateAdminAccountRequest {
+    /// 展示名（缺省不改）。
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// 规范角色（缺省不改）。
+    #[serde(default)]
+    pub role: Option<String>,
+    /// 新明文口令（缺省不改；非空才重置）。
+    #[serde(default)]
+    pub password: Option<String>,
+    /// 状态（`active` / `disabled`；缺省不改）。
+    #[serde(default)]
+    pub status: Option<String>,
+    /// 危险操作原因（可选；写入审计详情）。
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// 危险操作补充说明（可选；写入审计详情）。
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `DELETE /admin/accounts/:account` 请求体（危险操作四要素的补充说明）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeleteAdminAccountRequest {
+    /// 原因（可空）。
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// 补充说明（可空）。
+    #[serde(default)]
+    pub note: Option<String>,
+    /// 对象名二次校验（可空）。
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+/// 角色条目（`GET /admin/roles`；与 ui-kit `ROLES` / `ROLE_META` 同一套 id）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminRoleItem {
+    /// 规范角色 id（`ops / lic_ops / risk / system`）。
+    pub id: String,
+    /// 角色中文名（短）。
+    pub label: String,
+    /// 角色全称。
+    pub full_label: String,
+}
+
+/// `GET /admin/roles` 响应体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminRolesResponse {
+    /// 角色清单。
+    pub items: Vec<AdminRoleItem>,
+}
+
 // ============================================================================
 // 统一响应包裹
 // ============================================================================

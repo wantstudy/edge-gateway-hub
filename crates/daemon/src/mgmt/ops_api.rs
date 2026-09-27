@@ -27,6 +27,7 @@
 //! - `SettingsPage.vue`（手动备份动作；清单读既有 `GET /api/settings/backups`）；
 //! - `DiagnosePage.vue`（自检清单，当前只调 `/api/health`；本端点提供逐项判定）。
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Bytes;
@@ -260,19 +261,59 @@ fn updates_apply_bad_request(state: &MgmtState, actor: &str, detail: &str) -> Re
 
 // ---- 启动与自启 ----
 
-/// Windows：读取 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的
-/// `iot-daq` 值（`reg query`，本机只读操作；按 **exit code** 判定——0 = 注册表
-/// 命中，1 = 未注册，其他 = 查询失败。不解析 stderr 文案，避免本地化差异）。
-/// GET 与 PUT（写后回读）共用该形状。
+/// 自启注册表键（HKCU Run；桌面用户自启，按当前登录用户作用域）。
+const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_VALUE: &str = "iot-daq";
+
+/// 解析自启注册目标：优先 `IOTDAQ_SHELL_EXE`（Tauri 壳注入；须指向**存在的文件**），
+/// 否则回退 `current_exe()`（保持既有「注册 daemon 自身」行为不回归）。
+/// 返回 (路径, 目标类型)：`"shell"` = 壳、`"daemon"` = daemon 自身。
+fn resolve_autostart_target() -> (PathBuf, &'static str) {
+    if let Ok(val) = std::env::var("IOTDAQ_SHELL_EXE") {
+        if !val.is_empty() {
+            let p = PathBuf::from(val);
+            if p.is_file() {
+                return (p, "shell");
+            }
+        }
+    }
+    (std::env::current_exe().unwrap_or_default(), "daemon")
+}
+
+/// 纯函数：目标路径 → `reg` argv（add / delete）。供单测断言（不真写注册表）。
+/// `enable=false` 一律返回 delete argv（幂等注销）。
+fn autostart_registry_args(target: &Path, enable: bool) -> Vec<String> {
+    if enable {
+        let cmd_value = format!("\"{}\"", target.display());
+        vec![
+            "add".into(),
+            AUTOSTART_RUN_KEY.into(),
+            "/v".into(),
+            AUTOSTART_VALUE.into(),
+            "/t".into(),
+            "REG_SZ".into(),
+            "/d".into(),
+            cmd_value,
+            "/f".into(),
+        ]
+    } else {
+        vec![
+            "delete".into(),
+            AUTOSTART_RUN_KEY.into(),
+            "/v".into(),
+            AUTOSTART_VALUE.into(),
+            "/f".into(),
+        ]
+    }
+}
+
+/// Windows：读取 `HKCU\...\Run` 的 `iot-daq` 值（`reg query`，按 **exit code** 判定——
+/// 0 = 命中，1 = 未注册，其他 = 查询失败）。GET 与 PUT（写后回读）共用该形状；
+/// 新增 `target`（实际将注册 / 已注册路径）与 `target_kind`（`"shell"` / `"daemon"`）。
 #[cfg(target_os = "windows")]
 fn autostart_status_body() -> Value {
     let output = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            "iot-daq",
-        ])
+        .args(["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
         .output();
     let (registered, command, query_error) = match output {
         Ok(out) if out.status.success() => {
@@ -294,10 +335,13 @@ fn autostart_status_body() -> Value {
         ),
         Err(err) => (Value::Null, Value::Null, json!(err.to_string())),
     };
+    let (intended, kind) = resolve_autostart_target();
     json!({
         "supported": true,
         "registered": registered,
         "command": command,
+        "target": intended.display().to_string(),
+        "target_kind": kind,
         "source": "registry-hkcu-run",
         "query_error": query_error,
     })
@@ -318,9 +362,13 @@ pub async fn service_autostart(State(state): State<MgmtState>, authed: AuthedRol
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let (target, kind) = resolve_autostart_target();
         Json(json!({
             "supported": false,
             "registered": Value::Null,
+            "command": Value::Null,
+            "target": target.display().to_string(),
+            "target_kind": kind,
             "source": "unimplemented",
             "reason": "autostart status is only implemented for Windows (registry HKCU Run)",
             "write_supported": false,
@@ -383,38 +431,14 @@ pub async fn service_autostart_put(
         .unwrap_or("<unspecified>");
 
     let _guard = write_guard();
-    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let (target, kind) = resolve_autostart_target();
     let result = if enable {
-        let exe = match std::env::current_exe() {
-            Ok(path) => path,
-            Err(err) => {
-                audit(
-                    &state,
-                    &actor,
-                    OpsAction::AutostartWrite,
-                    false,
-                    OUTCOME_FAILED,
-                    &format!("autostart enable failed: current_exe unavailable: {err}"),
-                );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": "autostart_write_failed",
-                        "message": format!("current exe path unavailable: {err}"),
-                    })),
-                )
-                    .into_response();
-            }
-        };
-        let cmd_value = format!("\"{}\"", exe.display());
         std::process::Command::new("reg")
-            .args([
-                "add", run_key, "/v", "iot-daq", "/t", "REG_SZ", "/d", &cmd_value, "/f",
-            ])
+            .args(autostart_registry_args(&target, true))
             .output()
     } else {
         std::process::Command::new("reg")
-            .args(["delete", run_key, "/v", "iot-daq", "/f"])
+            .args(autostart_registry_args(&target, false))
             .output()
     };
     match result {
@@ -434,6 +458,8 @@ pub async fn service_autostart_put(
             let mut body = autostart_status_body();
             body["accepted"] = json!(true);
             body["write_supported"] = json!(true);
+            body["target"] = json!(target.display().to_string());
+            body["target_kind"] = json!(kind);
             Json(body).into_response()
         }
         Ok(out) => {
@@ -504,11 +530,16 @@ pub async fn service_autostart_put(
         OUTCOME_BAD_REQUEST,
         "autostart write is only implemented for Windows (registry HKCU Run)",
     );
+    let (target, kind) = resolve_autostart_target();
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
             "error": "not_supported",
             "message": "autostart registration is only implemented for Windows (registry HKCU Run)",
+            "target": target.display().to_string(),
+            "target_kind": kind,
+            "write_supported": false,
+            "write_reason": "autostart registration is only implemented for Windows",
         })),
     )
         .into_response()
@@ -573,7 +604,10 @@ pub async fn create_backup(State(state): State<MgmtState>, authed: AuthedRole) -
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| std::path::PathBuf::from("."), std::borrow::ToOwned::to_owned);
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::borrow::ToOwned::to_owned,
+        );
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1450,6 +1484,58 @@ data_dir = "./data"
         assert_eq!(value["write_supported"], true);
     }
 
+    /// QA（task B 纯函数）：目标路径 → `reg` argv 形状（不真写注册表）。
+    #[test]
+    fn autostart_registry_args_shape() {
+        let target = std::path::Path::new(r"C:\Program Files\iot\shell.exe");
+        let add = autostart_registry_args(target, true);
+        assert_eq!(add[0], "add");
+        assert!(add.contains(&AUTOSTART_RUN_KEY.to_string()));
+        assert!(add.contains(&AUTOSTART_VALUE.to_string()));
+        assert!(add.contains(&"/d".to_string()));
+        // 值带引号（Run 键含空格路径惯例）。
+        let d = add
+            .iter()
+            .find(|a| a.starts_with('"'))
+            .expect("quoted /d value");
+        assert!(d.starts_with("\"C:\\Program Files\\iot\\shell.exe\""));
+        assert!(add.iter().any(|a| a == "/f"));
+
+        let del = autostart_registry_args(target, false);
+        assert_eq!(del[0], "delete");
+        assert!(del.contains(&AUTOSTART_RUN_KEY.to_string()));
+        assert!(del.contains(&AUTOSTART_VALUE.to_string()));
+        assert!(del.iter().any(|a| a == "/f"));
+    }
+
+    /// QA（task B 目标解析）：无 env / 不存在文件 → `"daemon"`；存在文件 → `"shell"`。
+    #[test]
+    fn autostart_resolve_target_kind() {
+        std::env::remove_var("IOTDAQ_SHELL_EXE");
+        let (path, kind) = resolve_autostart_target();
+        assert_eq!(kind, "daemon");
+        assert!(
+            !path.as_os_str().is_empty(),
+            "daemon fallback = current_exe"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shell = dir.path().join("shell.exe");
+        std::fs::write(&shell, b"x").expect("seed shell");
+        std::env::set_var("IOTDAQ_SHELL_EXE", shell.as_os_str());
+        let (resolved, kind) = resolve_autostart_target();
+        assert_eq!(kind, "shell");
+        assert_eq!(resolved, shell);
+
+        // 指向不存在文件 → 回退 daemon。
+        let missing = dir.path().join("nope.exe");
+        std::env::set_var("IOTDAQ_SHELL_EXE", missing.as_os_str());
+        let (_, kind) = resolve_autostart_target();
+        assert_eq!(kind, "daemon");
+
+        std::env::remove_var("IOTDAQ_SHELL_EXE");
+    }
+
     /// QA（retention 实证）: 造 25 个假 `.bak-*`（自产前缀）→ PUT retention=20
     /// → 响应 pruned="6"（25 旧 + 1 新写前备份 = 26 → 删 6 留 20）；
     /// 用户自建前缀文件不动。
@@ -1593,7 +1679,10 @@ data_dir = "./data"
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["supported"], false);
         assert_eq!(value["accepted"], false);
-        assert_eq!(value["applied"], false, "must never fake a successful update");
+        assert_eq!(
+            value["applied"], false,
+            "must never fake a successful update"
+        );
         assert_eq!(value["source"], "unconfigured");
         assert!(value["reason"]
             .as_str()

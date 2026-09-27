@@ -21,9 +21,9 @@
     <!-- 左：品牌栏（深海军蓝，A·冰川 :20,:77-100） -->
     <aside class="wc-login__panel">
       <div class="wc-login__panel-top">
-        <!-- 品牌标识：透明底 PNG；面板为深海军蓝，故用浅底承托深色 logo 保证对比度 -->
+        <!-- 品牌标识：白底 PNG（web-console/public/logo-white.png，由透明 logo 合成纯白底）；面板为深海军蓝，白底承托深色 logo 保证对比度 -->
         <span class="wc-login__logo">
-          <img src="/logo.png" alt="IoT-DAQ" />
+          <img src="/logo-white.png" alt="IoT-DAQ" />
         </span>
         <div class="wc-login__brand-text">
           <strong>IoT-DAQ</strong>

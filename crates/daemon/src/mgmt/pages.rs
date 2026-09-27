@@ -48,13 +48,11 @@ use serde_json::{json, Value};
 use tokio::net::TcpStream;
 
 use super::rbac::{AuthedRole, Permission};
-use super::remote_ops::{
-    self, OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED, OUTCOME_NOT_IMPLEMENTED,
-};
+use super::remote_ops::{self, OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED};
 use super::writeapi;
 use super::{MgmtEvent, MgmtState};
 use crate::auth::client::LicenseState;
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, OutletConfig, OutletEncoding};
 use crate::driver::modbus::{ModbusConfig, ModbusDriver, ModbusFraming};
 use crate::driver::{Driver, PointAddressParser, ReadPoint};
 
@@ -1485,22 +1483,885 @@ pub async fn forwarders_list(State(state): State<MgmtState>) -> Response {
     Json(Value::Array(rows)).into_response()
 }
 
-/// `POST /api/forwarders` → 出口登记（诚实 501：鉴权与审计管线就绪，
-/// 写能力未落地——出口写涉及 TLS 证书字段校验，待北向配置写任务收口）。
+/// 出口名最大长度（防超长 id 写塌 TOML 行；与规则 id 同口径）。
+const MAX_OUTLET_NAME_LEN: usize = 64;
+/// 出口名安全字符集（`[A-Za-z0-9_-]`）：唯一键锚点，拒绝空白 / 控制 / 其它字符。
+const OUTLET_NAME_CHARSET: &str = "outlet name only allows [A-Za-z0-9_-] (ascii letters / digits / underscore / hyphen)";
+/// `note` 最小字数（与 `DangerConfirmModal` 的 `min-note-length` 一致）。
+const MIN_OUTLET_NOTE_LEN: usize = 10;
+
+/// 危险操作三要素（`reason` / `note` / `confirm` **独立字段**，禁止拼接）。
+#[derive(Debug, Default, serde::Deserialize)]
+struct ForwarderDangerBody {
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    confirm: String,
+}
+
+/// `POST /api/forwarders` / `PUT /api/forwarders/:id` 出口配置主体（可选子集
+/// 部分更新语义：`None` / 缺省 = 不改；新增时 `broker` 必填）。
+///
+/// 字段别名：`broker` 与 `target` 等价（前端 GET 契约用 `target`，历史 create
+/// 用 `broker`，两者都接受）；`tls` 缺省由 `broker` scheme 推导
+/// （`mqtts://` ⇒ true，`mqtt://` ⇒ false），但一旦显式给定就**必须一致**。
+#[derive(Debug, Default, serde::Deserialize)]
+struct ForwarderUpsertBody {
+    #[serde(default)]
+    name: String,
+    /// broker URL；别名 `target`（GET 契约字段）同样接受。
+    #[serde(default, alias = "target")]
+    broker: String,
+    #[serde(default)]
+    topic_prefix: Option<String>,
+    #[serde(default)]
+    qos: Option<Value>,
+    #[serde(default)]
+    tls: Option<bool>,
+    #[serde(default)]
+    encoding: Option<String>,
+    #[serde(default)]
+    ca_cert_path: Option<String>,
+    #[serde(default)]
+    client_cert_path: Option<String>,
+    #[serde(default)]
+    client_key_path: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    alpn: Vec<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+// ---- 危险操作四要素校验（先于一切业务分支 / 提前 return） ----
+
+/// `reason`：必填（自由文本；新增 / 修改 / 删除都要求变更原因）。
+#[allow(clippy::result_large_err)]
+fn check_forwarder_reason(reason: &str) -> Result<(), Response> {
+    if reason.trim().is_empty() {
+        return Err(writeapi::validation_error(
+            "reason",
+            "reason is required",
+            "non-empty change reason",
+        ));
+    }
+    Ok(())
+}
+
+/// `note`：独立补充说明。空 = 未填（前端表单可选项）；非空则 ≥ [`MIN_OUTLET_NOTE_LEN`] 字。
+#[allow(clippy::result_large_err)]
+fn check_forwarder_note(note: &str) -> Result<(), Response> {
+    let text = note.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let len = text.chars().count();
+    if len < MIN_OUTLET_NOTE_LEN {
+        return Err(writeapi::validation_error(
+            "note",
+            &format!("note must be at least {MIN_OUTLET_NOTE_LEN} characters ({len} given)"),
+            &format!(
+                "≥{MIN_OUTLET_NOTE_LEN} characters, kept independent from `reason` (never append it to `reason`)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `confirm`：必填（对象全名二次确认的输入侧）。
+#[allow(clippy::result_large_err)]
+fn check_forwarder_confirm_present(confirm: &str) -> Result<(), Response> {
+    if confirm.trim().is_empty() {
+        return Err(writeapi::validation_error(
+            "confirm",
+            "confirm is required (echo the full outlet name)",
+            "the full outlet name",
+        ));
+    }
+    Ok(())
+}
+
+/// `confirm` 回显值不匹配：`confirm` 必须逐字等于出口**名**。
+fn forwarder_confirm_mismatch(expected: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "confirm_mismatch",
+            "field": "confirm",
+            "reason": format!("confirm does not match the outlet name {expected:?}"),
+            "allowed": expected,
+        })),
+    )
+        .into_response()
+}
+
+// ---- 业务校验（fail-closed：任何非法 → 400 且绝不落盘） ----
+
+/// 校验出口名（非空 + 长度 + 字符集 `[A-Za-z0-9_-]`）。
+#[allow(clippy::result_large_err)]
+fn validate_outlet_name(name: &str) -> Result<(), Response> {
+    let text = name.trim();
+    if text.is_empty() {
+        return Err(writeapi::validation_error(
+            "name",
+            "outlet name is required",
+            OUTLET_NAME_CHARSET,
+        ));
+    }
+    if text.chars().count() > MAX_OUTLET_NAME_LEN {
+        return Err(writeapi::validation_error(
+            "name",
+            &format!("outlet name exceeds {MAX_OUTLET_NAME_LEN} characters"),
+            OUTLET_NAME_CHARSET,
+        ));
+    }
+    if text
+        .chars()
+        .any(|ch| !ch.is_ascii() || !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+    {
+        return Err(writeapi::validation_error(
+            "name",
+            "outlet name contains illegal characters",
+            OUTLET_NAME_CHARSET,
+        ));
+    }
+    Ok(())
+}
+
+/// 校验 broker URL + tls 一致性；返回**推导后的** tls（scheme 决定，且与显式
+/// tls 冲突时 400，绝不猜测意图）。
+#[allow(clippy::result_large_err)]
+fn validate_broker(broker: &str, tls_hint: Option<bool>) -> Result<bool, Response> {
+    let text = broker.trim();
+    if text.is_empty() {
+        return Err(writeapi::validation_error(
+            "broker",
+            "broker url is required (scheme://host[:port])",
+            "mqtt://host:port | mqtts://host:port",
+        ));
+    }
+    let (scheme, effective_tls) = if let Some(rest) = text.strip_prefix("mqtts://") {
+        if rest.is_empty() {
+            return Err(writeapi::validation_error(
+                "broker",
+                "mqtts:// requires a host",
+                "mqtts://host[:port]",
+            ));
+        }
+        ("mqtts", true)
+    } else if let Some(rest) = text.strip_prefix("mqtt://") {
+        if rest.is_empty() {
+            return Err(writeapi::validation_error(
+                "broker",
+                "mqtt:// requires a host",
+                "mqtt://host[:port]",
+            ));
+        }
+        ("mqtt", false)
+    } else {
+        return Err(writeapi::validation_error(
+            "broker",
+            "broker scheme must be mqtt:// or mqtts://",
+            "mqtt://host:port | mqtts://host:port",
+        ));
+    };
+    if let Some(tls) = tls_hint {
+        if tls != effective_tls {
+            return Err(writeapi::validation_error(
+                "tls",
+                &format!("tls={tls} conflicts with broker scheme {scheme}://"),
+                &format!("set tls={effective_tls} to match {scheme}:// (or switch scheme)"),
+            ));
+        }
+    }
+    Ok(effective_tls)
+}
+
+/// `qos` 校验：接受 number 或 string（大数红线），解析为 0/1/2；缺省 1。
+#[allow(clippy::result_large_err)]
+fn validate_qos(raw: Option<&Value>) -> Result<u8, Response> {
+    let Some(raw) = raw else {
+        return Ok(1);
+    };
+    let q = match raw {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    match q {
+        Some(v @ 0..=2) => Ok(v as u8),
+        _ => Err(writeapi::validation_error(
+            "qos",
+            "qos must be 0, 1 or 2",
+            "0 | 1 | 2 (number or string)",
+        )),
+    }
+}
+
+/// `encoding` 校验：字符串 `protobuf` | `json`；缺省 protobuf。
+#[allow(clippy::result_large_err)]
+fn validate_encoding(raw: Option<&str>) -> Result<OutletEncoding, Response> {
+    match raw.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => Ok(OutletEncoding::Protobuf),
+        Some("protobuf") => Ok(OutletEncoding::Protobuf),
+        Some("json") => Ok(OutletEncoding::Json),
+        Some(other) => Err(writeapi::validation_error(
+            "encoding",
+            &format!("unknown encoding {other:?}"),
+            "protobuf | json",
+        )),
+    }
+}
+
+/// mTLS / 口令成对校验 + 证书文件存在性（fail-closed：缺失证书会让 TLS 握手
+/// 直接失败，绝不静默接受；绝无「跳过校验」字段）。
+#[allow(clippy::result_large_err)]
+fn validate_secure_fields(body: &ForwarderUpsertBody) -> Result<(), Response> {
+    let has_cert = body
+        .client_cert_path
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let has_key = body
+        .client_key_path
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if has_cert != has_key {
+        return Err(writeapi::validation_error(
+            "client_cert_path",
+            "client_cert_path and client_key_path must be provided together (mTLS is pairwise)",
+            "provide both, or omit both",
+        ));
+    }
+    for (field, path) in [
+        ("ca_cert_path", &body.ca_cert_path),
+        ("client_cert_path", &body.client_cert_path),
+        ("client_key_path", &body.client_key_path),
+    ] {
+        if let Some(p) = path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !std::path::Path::new(p).is_file() {
+                return Err(writeapi::validation_error(
+                    field,
+                    &format!("cert file does not exist: {p:?}"),
+                    "an existing PEM file path (absolute or config-relative)",
+                ));
+            }
+        }
+    }
+    // 口令须与用户名成对（绝不接受「只给口令无用户名」）。
+    if body
+        .password
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .is_some()
+        && body
+            .username
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(writeapi::validation_error(
+            "password",
+            "password requires username (MQTT auth is pairwise)",
+            "provide both username and password, or omit both",
+        ));
+    }
+    Ok(())
+}
+
+/// 字段级「是否变更」判定（`OutletConfig` 未 derive `PartialEq`，这里逐字段比
+/// 较，避免对含口令的结构体派生 `PartialEq`）。
+fn outlet_touched(a: &OutletConfig, b: &OutletConfig) -> bool {
+    a.broker != b.broker
+        || a.topic_prefix != b.topic_prefix
+        || a.qos != b.qos
+        || a.tls != b.tls
+        || a.ca_cert_path != b.ca_cert_path
+        || a.client_cert_path != b.client_cert_path
+        || a.client_key_path != b.client_key_path
+        || a.server_name != b.server_name
+        || a.alpn != b.alpn
+        || a.encoding != b.encoding
+        || a.username != b.username
+        || a.password != b.password
+}
+
+/// 出口配置 → GET /api/forwarders 同行形状（**绝不**携带 username / password）。
+fn outlet_to_wire(outlet: &OutletConfig) -> Value {
+    let encoding = match outlet.encoding {
+        OutletEncoding::Protobuf => "protobuf",
+        OutletEncoding::Json => "json",
+    };
+    json!({
+        "id": outlet.name,
+        "name": outlet.name,
+        "target": outlet.broker,
+        "topic_prefix": outlet.topic_prefix,
+        "qos": outlet.qos.to_string(),
+        "tls": outlet.tls,
+        "encoding": encoding,
+    })
+}
+
+/// 由请求体 + 已校验的派生值构造 [`OutletConfig`]。
+fn build_outlet(
+    name: &str,
+    req: &ForwarderUpsertBody,
+    effective_tls: bool,
+    qos: u8,
+    encoding: OutletEncoding,
+) -> OutletConfig {
+    let trimmed = |s: &Option<String>| s.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from);
+    OutletConfig {
+        name: name.to_string(),
+        broker: req.broker.trim().to_string(),
+        topic_prefix: trimmed(&req.topic_prefix).unwrap_or_else(|| "telemetry".to_string()),
+        qos,
+        tls: effective_tls,
+        ca_cert_path: trimmed(&req.ca_cert_path),
+        client_cert_path: trimmed(&req.client_cert_path),
+        client_key_path: trimmed(&req.client_key_path),
+        server_name: trimmed(&req.server_name),
+        alpn: req
+            .alpn
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        encoding,
+        username: trimmed(&req.username),
+        password: trimmed(&req.password),
+    }
+}
+
+/// `POST /api/forwarders` → 出口登记（落盘 + 热生效 + 审计）。
+///
+/// 写路径：鉴权（`device.write`）→ 危险操作四要素 → 字段校验（name 字符集 /
+/// broker scheme + tls 一致性 / qos / encoding / mTLS 成对 + 文件存在 / 口令成对）
+/// → 唯一性 → 全进程写锁 → `persist_config`（写前备份 + 原子落盘 + 热快照推送）
+/// → 审计。任何校验失败均 400 且**绝不落盘**（fail-closed）。
 pub async fn forwarder_create(
     State(state): State<MgmtState>,
     authed: AuthedRole,
     body: Bytes,
 ) -> Response {
-    not_implemented_write(
+    if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
+        writeapi::audit(
+            &state,
+            &authed.claims.sub,
+            OpsAction::ForwarderCreate,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let actor = authed.claims.sub.clone();
+    let req: ForwarderUpsertBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &format!("malformed json body: {err}"),
+            );
+            return writeapi::validation_error(
+                "body",
+                &format!("malformed JSON: {err}"),
+                "object {name, broker|target, topic_prefix?, qos?, tls?, encoding?, ca_cert_path?, \
+                 client_cert_path?, client_key_path?, server_name?, alpn?, username?, password?, reason?, note?, confirm?}",
+            );
+        }
+    };
+    let danger: ForwarderDangerBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &format!("malformed danger body: {err}"),
+            );
+            return writeapi::validation_error(
+                "body",
+                &format!("malformed JSON: {err}"),
+                "object {..., reason?, note?, confirm?}",
+            );
+        }
+    };
+    // 四要素先于一切业务分支。
+    if let Err(resp) = check_forwarder_reason(&danger.reason) {
+        return resp;
+    }
+    if let Err(resp) = check_forwarder_note(&danger.note) {
+        return resp;
+    }
+    if let Err(resp) = check_forwarder_confirm_present(&danger.confirm) {
+        return resp;
+    }
+
+    let name = req.name.trim().to_string();
+    if let Err(resp) = validate_outlet_name(&name) {
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderCreate,
+            true,
+            OUTCOME_BAD_REQUEST,
+            "invalid outlet name",
+        );
+        return resp;
+    }
+    if let Err(resp) = validate_secure_fields(&req) {
+        return resp;
+    }
+    let effective_tls = match validate_broker(&req.broker, req.tls) {
+        Ok(v) => v,
+        Err(resp) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                "invalid broker / tls",
+            );
+            return resp;
+        }
+    };
+    let qos = match validate_qos(req.qos.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                "invalid qos",
+            );
+            return resp;
+        }
+    };
+    let encoding = match validate_encoding(req.encoding.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderCreate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                "invalid encoding",
+            );
+            return resp;
+        }
+    };
+    // confirm 精确匹配出口名原文（创建即确认即将写入的名称）。
+    if danger.confirm.trim() != name {
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderCreate,
+            true,
+            OUTCOME_BAD_REQUEST,
+            "confirm mismatch for new outlet",
+        );
+        return forwarder_confirm_mismatch(&name);
+    }
+
+    let _guard = writeapi::write_guard();
+    let mut config = (*state.config()).clone();
+    if config.outlets.iter().any(|o| o.name == name) {
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderCreate,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("duplicate outlet {name:?}"),
+        );
+        return writeapi::validation_error(
+            "name",
+            &format!("outlet {name:?} already exists"),
+            "unique outlet name (charset [A-Za-z0-9_-])",
+        );
+    }
+    let outlet = build_outlet(&name, &req, effective_tls, qos, encoding);
+    // 关键：新出口必须真正 append 进待持久化的配置，否则 persist_config 只会
+    // 落盘旧配置 → 接口 201 但出口静默丢失（诚实降级红线：绝不伪造成功）。
+    config.outlets.push(outlet.clone());
+    match persist_config(
         &state,
-        authed,
-        body.as_ref(),
+        config,
+        &actor,
         OpsAction::ForwarderCreate,
-        "forwarder registration via mgmt API is not implemented yet",
-        "北向出口登记写接口未落地（TLS 证书字段校验待收口）；鉴权与审计管线已就绪",
-    )
-    .await
+        &format!(
+            "create outlet {name:?} (broker={:?}, tls={effective_tls}, encoding={encoding:?})",
+            req.broker.trim()
+        ),
+    ) {
+        Ok(version) => {
+            // 出口写改变北向投递拓扑，即时推送热快照（读侧立即可见）。
+            state.publish(MgmtEvent::ConfigReloaded { version });
+            // persist_config 已把新配置推入 ConfigShared，但新出口行需 append 到
+            // 当前 in-memory 克隆才能回显完整对象——重新从快照取回。
+            let stored = state
+                .config()
+                .outlets
+                .iter()
+                .find(|o| o.name == name)
+                .cloned()
+                .unwrap_or(outlet);
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "forwarder": outlet_to_wire(&stored),
+                    "config_version": version.to_string(),
+                })),
+            )
+                .into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// `PUT /api/forwarders/:id` → 出口可选子集部分更新（含启停 `enabled` 暂未建模，
+/// 本端点覆盖 broker / topic_prefix / qos / tls / encoding / 证书 / 认证字段）。
+///
+/// 危险操作四要素 + 字段校验同上；`broker` 缺省 = 不改（保留原 scheme/tls）；
+/// `tls` 缺省 = 继承原值（但一旦与现有 broker scheme 冲突仍 400）。
+pub async fn forwarder_update(
+    State(state): State<MgmtState>,
+    AxumPath(id): AxumPath<String>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
+        writeapi::audit(
+            &state,
+            &authed.claims.sub,
+            OpsAction::ForwarderUpdate,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let actor = authed.claims.sub.clone();
+    let req: ForwarderUpsertBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderUpdate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &format!("malformed json body: {err}"),
+            );
+            return writeapi::validation_error(
+                "body",
+                &format!("malformed JSON: {err}"),
+                "object {broker?, topic_prefix?, qos?, tls?, encoding?, ca_cert_path?, \
+                 client_cert_path?, client_key_path?, server_name?, alpn?, username?, password?, reason?, note?, confirm?}",
+            );
+        }
+    };
+    let danger: ForwarderDangerBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderUpdate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &format!("malformed danger body: {err}"),
+            );
+            return writeapi::validation_error(
+                "body",
+                &format!("malformed JSON: {err}"),
+                "object {..., reason?, note?, confirm?}",
+            );
+        }
+    };
+    if let Err(resp) = check_forwarder_reason(&danger.reason) {
+        return resp;
+    }
+    if let Err(resp) = check_forwarder_note(&danger.note) {
+        return resp;
+    }
+    if let Err(resp) = check_forwarder_confirm_present(&danger.confirm) {
+        return resp;
+    }
+
+    let outlet_id = id.trim().to_string();
+    let _guard = writeapi::write_guard();
+    let mut config = (*state.config()).clone();
+    let position = config.outlets.iter().position(|o| o.name == outlet_id);
+    let Some(position) = position else {
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderUpdate,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("unknown outlet {outlet_id:?}"),
+        );
+        return writeapi::not_found(&format!("forwarder {outlet_id:?} not found"));
+    };
+    let current = config.outlets[position].clone();
+    // confirm 精确匹配现有出口名（二次确认回显对象全名）。
+    if danger.confirm.trim() != current.name {
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderUpdate,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("confirm mismatch for outlet {outlet_id:?}"),
+        );
+        return forwarder_confirm_mismatch(&current.name);
+    }
+    if let Err(resp) = validate_secure_fields(&req) {
+        return resp;
+    }
+
+    // 派生 broker / tls：broker 缺省 = 不改（沿用 current.broker / current.tls）。
+    let (broker, effective_tls) = if req.broker.trim().is_empty() {
+        (current.broker.clone(), current.tls)
+    } else {
+        // 仅当显式给出 tls 时才参与冲突判定；否则跟随 scheme 推导。
+        match validate_broker(&req.broker, req.tls) {
+            Ok(v) => (req.broker.trim().to_string(), v),
+            Err(resp) => {
+                writeapi::audit(
+                    &state,
+                    &actor,
+                    OpsAction::ForwarderUpdate,
+                    true,
+                    OUTCOME_BAD_REQUEST,
+                    "invalid broker / tls",
+                );
+                return resp;
+            }
+        }
+    };
+    let qos = match validate_qos(req.qos.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderUpdate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                "invalid qos",
+            );
+            return resp;
+        }
+    };
+    let encoding = match validate_encoding(req.encoding.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderUpdate,
+                true,
+                OUTCOME_BAD_REQUEST,
+                "invalid encoding",
+            );
+            return resp;
+        }
+    };
+
+    let trimmed = |s: &Option<String>| s.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from);
+    let updated = OutletConfig {
+        name: current.name.clone(),
+        broker,
+        topic_prefix: trimmed(&req.topic_prefix).unwrap_or_else(|| current.topic_prefix.clone()),
+        qos,
+        tls: effective_tls,
+        ca_cert_path: trimmed(&req.ca_cert_path).or_else(|| current.ca_cert_path.clone()),
+        client_cert_path: trimmed(&req.client_cert_path).or_else(|| current.client_cert_path.clone()),
+        client_key_path: trimmed(&req.client_key_path).or_else(|| current.client_key_path.clone()),
+        server_name: trimmed(&req.server_name).or_else(|| current.server_name.clone()),
+        alpn: if req.alpn.is_empty() {
+            current.alpn.clone()
+        } else {
+            req.alpn
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        },
+        encoding,
+        username: trimmed(&req.username).or_else(|| current.username.clone()),
+        password: trimmed(&req.password).or_else(|| current.password.clone()),
+    };
+    let touched = outlet_touched(&current, &updated);
+    config.outlets[position] = updated.clone();
+    if !touched {
+        // 空更新：如实说明「未改动」，不伪造成功。
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderUpdate,
+            true,
+            OUTCOME_ACCEPTED,
+            &format!("empty partial update for outlet {outlet_id:?}; nothing changed"),
+        );
+        return Json(json!({
+            "ok": true,
+            "updated": false,
+            "forwarder": outlet_to_wire(&current),
+            "note": "no updatable field received; outlet unchanged",
+        }))
+        .into_response();
+    }
+    match persist_config(
+        &state,
+        config,
+        &actor,
+        OpsAction::ForwarderUpdate,
+        &format!(
+            "update outlet {outlet_id:?} (broker={:?}, tls={effective_tls}, encoding={encoding:?})",
+            updated.broker
+        ),
+    ) {
+        Ok(version) => {
+            state.publish(MgmtEvent::ConfigReloaded { version });
+            Json(json!({
+                "ok": true,
+                "updated": true,
+                "forwarder": outlet_to_wire(&updated),
+                "config_version": version.to_string(),
+            }))
+            .into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// `DELETE /api/forwarders/:id` → 删除北向出口（三独立字段二次确认）。
+///
+/// `reason` 必填、`note` ≥ 10 字、`confirm` 必须逐字回显出口名。任一不满足 →
+/// 400（含审计），**绝不做部分删除**。
+pub async fn forwarder_delete(
+    State(state): State<MgmtState>,
+    AxumPath(id): AxumPath<String>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
+        writeapi::audit(
+            &state,
+            &authed.claims.sub,
+            OpsAction::ForwarderDelete,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let actor = authed.claims.sub.clone();
+    let danger: ForwarderDangerBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            writeapi::audit(
+                &state,
+                &actor,
+                OpsAction::ForwarderDelete,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &format!("malformed json body: {err}"),
+            );
+            return writeapi::validation_error(
+                "body",
+                &format!("malformed JSON: {err}"),
+                "object {reason, note, confirm}",
+            );
+        }
+    };
+    if let Err(resp) = check_forwarder_reason(&danger.reason) {
+        return resp;
+    }
+    if let Err(resp) = check_forwarder_note(&danger.note) {
+        return resp;
+    }
+    if let Err(resp) = check_forwarder_confirm_present(&danger.confirm) {
+        return resp;
+    }
+
+    let outlet_id = id.trim().to_string();
+    let _guard = writeapi::write_guard();
+    let mut config = (*state.config()).clone();
+    let Some(position) = config.outlets.iter().position(|o| o.name == outlet_id) else {
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderDelete,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("unknown outlet {outlet_id:?}"),
+        );
+        return writeapi::not_found(&format!("forwarder {outlet_id:?} not found"));
+    };
+    let removed = config.outlets.remove(position);
+    // confirm 精确匹配出口名（删除最严口径，回显对象全名）。
+    if danger.confirm.trim() != removed.name {
+        // 失败路径绝不留下半改状态：把已摘除的行放回去。
+        config.outlets.insert(position, removed.clone());
+        writeapi::audit(
+            &state,
+            &actor,
+            OpsAction::ForwarderDelete,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("confirm mismatch for outlet {outlet_id:?}"),
+        );
+        return forwarder_confirm_mismatch(&removed.name);
+    }
+    match persist_config(
+        &state,
+        config,
+        &actor,
+        OpsAction::ForwarderDelete,
+        &format!(
+            "delete outlet {outlet_id:?} (reason={:?} note={:?})",
+            danger.reason, danger.note
+        ),
+    ) {
+        Ok(version) => {
+            state.publish(MgmtEvent::ConfigReloaded { version });
+            Json(json!({
+                "ok": true,
+                "deleted": true,
+                "id": outlet_id,
+                "config_version": version.to_string(),
+            }))
+            .into_response()
+        }
+        Err(resp) => resp,
+    }
 }
 
 /// `POST /api/forwarders/:id/test` → 出口 TCP 可达性探测（`id` = 出口名）。
@@ -1627,63 +2488,6 @@ pub async fn rules_list() -> Response {
     .into_response()
 }
 
-/// 诚实 501 通用路径：鉴权（`device.write`，仅 system）→ 审计（not_implemented）
-/// → 501 结构化响应（对齐 remote_ops::collectors 的「管线先于能力」模式）。
-async fn not_implemented_write(
-    state: &MgmtState,
-    authed: AuthedRole,
-    body: &[u8],
-    action: OpsAction,
-    planned: &str,
-    reason_cn: &str,
-) -> Response {
-    if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
-        writeapi::audit(
-            state,
-            &authed.claims.sub,
-            action,
-            false,
-            OUTCOME_DENIED,
-            &rejection.to_string(),
-        );
-        return rejection.into_response();
-    }
-    let actor = authed.claims.sub.clone();
-    // body 仅做 JSON 结构探测（内容不参与判定；能力未落地无从消费字段）。
-    let body_ok = body.is_empty()
-        || serde_json::from_slice::<Value>(body)
-            .map(|v| v.is_object())
-            .unwrap_or(false);
-    if !body_ok {
-        writeapi::audit(
-            state,
-            &actor,
-            action,
-            true,
-            OUTCOME_BAD_REQUEST,
-            "malformed json body",
-        );
-        return writeapi::validation_error("body", "malformed JSON", "object (fields reserved)");
-    }
-    writeapi::audit(
-        state,
-        &actor,
-        action,
-        true,
-        OUTCOME_NOT_IMPLEMENTED,
-        planned,
-    );
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "not_implemented",
-            "planned": planned,
-            "reason": reason_cn,
-        })),
-    )
-        .into_response()
-}
-
 // ===========================================================================
 // 授权状态
 // ===========================================================================
@@ -1793,12 +2597,12 @@ pub async fn license_activate(
     let code = req
         .get("code")
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(|s| s.trim())
         .unwrap_or("");
     let reason = req
         .get("reason")
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .unwrap_or("<unspecified>");
     if code.is_empty() {
@@ -2667,7 +3471,7 @@ mod tests {
         .await;
         assert_eq!(status, 401);
 
-        // POST /api/forwarders → 诚实 501（写能力未落地）。
+        // POST /api/forwarders → 危险四要素缺失 → 400（写能力已落地，不再 501）。
         let (status, _, body) = post_json(
             port,
             "/api/forwarders",
@@ -2675,9 +3479,40 @@ mod tests {
             &token,
         )
         .await;
-        assert_eq!(status, 501, "{body}");
+        assert_eq!(status, 400, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(value["error"], "not_implemented");
+        assert_eq!(value["error"], "validation_failed");
+        assert_eq!(value["field"], "reason");
+
+        // confirm 不回显出口名 → 400 confirm_mismatch（二次确认在业务分支前）。
+        let (status, _, body) = post_json(
+            port,
+            "/api/forwarders",
+            r#"{"name":"x","broker":"mqtt://127.0.0.1:1883","reason":"smoke","confirm":"y"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "confirm_mismatch");
+
+        // 完整四要素 → 201，且新出口**真正落盘**（列表由 1 行变 2 行）。
+        let (status, _, body) = post_json(
+            port,
+            "/api/forwarders",
+            r#"{"name":"x","broker":"mqtt://127.0.0.1:1883","reason":"smoke","confirm":"x"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["forwarder"]["id"], "x", "{value}");
+
+        let (status, _, body) = http_get(port, "/api/forwarders").await;
+        assert_eq!(status, 200);
+        let rows: Vec<Value> = serde_json::from_str(&body).expect("array");
+        assert_eq!(rows.len(), 2, "created outlet must be persisted: {body}");
+        assert!(rows.iter().any(|r| r["id"] == "x"), "{body}");
     }
 
     // ---- 诚实空态 / 占位 / 授权状态 / logs 别名 ----

@@ -1661,11 +1661,17 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             config.settings.updates.source_url.as_deref(),
             Some("https://ota.example.com/gw")
         );
-        assert_eq!(config.settings.updates.signing_key.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            config.settings.updates.signing_key.as_deref(),
+            Some("deadbeef")
+        );
 
         // 未配置 → 序列化省略该段（旧 daemon 仍可读新写出的文件）。
         let raw = toml::to_string_pretty(&config).expect("serialize");
-        assert!(raw.contains("source_url"), "configured section emitted: {raw}");
+        assert!(
+            raw.contains("source_url"),
+            "configured section emitted: {raw}"
+        );
         let legacy = GatewayConfig::parse(EXAMPLE_TOML).expect("parse legacy again");
         let raw = toml::to_string_pretty(&legacy).expect("serialize legacy");
         assert!(

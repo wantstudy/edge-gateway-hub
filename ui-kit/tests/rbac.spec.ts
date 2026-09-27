@@ -13,11 +13,11 @@ describe('页面级门控 canSeePage', () => {
     }
   });
 
-  it('激活码管理仅 ops / lic_ops 可见', () => {
+  it('激活码管理 ops / lic_ops / system 可见（系统管理员全权）', () => {
     expect(canSeePage('ops', 'codes')).toBe(true);
     expect(canSeePage('lic_ops', 'codes')).toBe(true);
     expect(canSeePage('risk', 'codes')).toBe(false);
-    expect(canSeePage('system', 'codes')).toBe(false);
+    expect(canSeePage('system', 'codes')).toBe(true);
   });
 
   it('租户与策略 / 密钥管理 / 账号与角色仅 system 可见', () => {
@@ -49,13 +49,14 @@ describe('页面级门控 canSeePage', () => {
 });
 
 describe('操作级门控 can', () => {
-  it('废弃 / 重发仅 lic_ops 与显式授予者可用', () => {
+  it('废弃 / 重发 lic_ops 与 system 可用（系统管理员全权）', () => {
     expect(can('lic_ops', 'code.revoke')).toBe(true);
     expect(can('lic_ops', 'code.reissue')).toBe(true);
     expect(can('ops', 'code.revoke')).toBe(false);
     expect(can('ops', 'code.reissue')).toBe(false);
     expect(can('risk', 'code.revoke')).toBe(false);
-    expect(can('system', 'code.revoke')).toBe(false);
+    expect(can('system', 'code.revoke')).toBe(true);
+    expect(can('system', 'code.reissue')).toBe(true);
   });
 
   it('发放激活码 ops / lic_ops 可用，且不包含废弃权限', () => {

@@ -27,6 +27,7 @@
 //! - **G5 幂等键归一**：存储 / 查询前对 `idempotency_key` 做 `trim()` 归一，避免尾部空白割裂同一逻辑键。
 
 use crate::audit::{BatchOutcome, BatchRecord, ReceiptLedger};
+use crate::admin_auth::{sha256_hex, AdminAccount, Role};
 use crate::device_auth;
 use crate::error::{LicenseError, LicenseResult, PrebindKind};
 use crate::keys::KeyRing;
@@ -598,6 +599,143 @@ impl LicensingService {
             "tenant",
             tenant_id,
             now_unix_secs(),
+        )?;
+        Ok(())
+    }
+
+    // ----------------------------- 管理端账号（可配置账号 / 角色） -----------------------------
+
+    /// 列出全部管理员账号（口令摘要**绝不下发**，由 http 层映射为 `AdminAccountItem`）。
+    pub fn admin_list_admin_accounts(&self) -> LicenseResult<Vec<AdminAccount>> {
+        self.store.list_admin_accounts()
+    }
+
+    /// 创建管理员账号（仅 system 可调用；账号唯一、角色规范、口令即刻摘要）。
+    pub fn admin_create_admin_account(
+        &self,
+        account: &str,
+        display_name: &str,
+        role_raw: &str,
+        password: &str,
+        actor_id: &str,
+    ) -> LicenseResult<AdminAccount> {
+        let account = account.trim();
+        if account.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "create admin account requires non-empty account".into(),
+            ));
+        }
+        if password.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "create admin account requires non-empty password".into(),
+            ));
+        }
+        let role = Role::from_str(role_raw.trim())
+            .ok_or_else(|| LicenseError::KeyStateIllegal(format!("unknown role: {role_raw}")))?;
+        if self.store.get_admin_account(account)?.is_some() {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "admin account already exists: {account}"
+            )));
+        }
+        let now = now_unix_secs();
+        let acct = AdminAccount {
+            account: account.to_string(),
+            display_name: display_name.trim().to_string(),
+            role: role.as_str().to_string(),
+            password_sha256: sha256_hex(password),
+            status: "active".to_string(),
+            last_login_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.insert_admin_account(&acct)?;
+        self.audit(
+            "",
+            actor_id,
+            "admin_account_create",
+            "admin_account",
+            account,
+            now,
+        )?;
+        Ok(acct)
+    }
+
+    /// 更新管理员账号（显示名 / 角色 / 口令 / 状态；缺省项保持原值）。
+    ///
+    /// `note` 为危险操作补充说明（可选），非空时写入审计详情（缺省 `""`）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn admin_update_admin_account(
+        &self,
+        account: &str,
+        display_name: Option<&str>,
+        role_raw: Option<&str>,
+        password: Option<&str>,
+        status_raw: Option<&str>,
+        note: &str,
+        actor_id: &str,
+    ) -> LicenseResult<()> {
+        let existing = self.store.get_admin_account(account)?.ok_or_else(|| {
+            LicenseError::KeyStateIllegal(format!("admin account not found: {account}"))
+        })?;
+        let role = match role_raw {
+            Some(r) if !r.trim().is_empty() => Role::from_str(r.trim())
+                .ok_or_else(|| LicenseError::KeyStateIllegal(format!("unknown role: {r}")))?
+                .as_str()
+                .to_string(),
+            _ => existing.role.clone(),
+        };
+        let status = match status_raw {
+            Some(s) if !s.trim().is_empty() => {
+                let s = s.trim();
+                if s != "active" && s != "disabled" {
+                    return Err(LicenseError::KeyStateIllegal(format!(
+                        "invalid account status: {s}"
+                    )));
+                }
+                s.to_string()
+            }
+            _ => existing.status.clone(),
+        };
+        let password_sha256 = match password {
+            Some(p) if !p.is_empty() => sha256_hex(p),
+            _ => existing.password_sha256.clone(),
+        };
+        let name = match display_name {
+            Some(n) => n.trim().to_string(),
+            None => existing.display_name.clone(),
+        };
+        let now = now_unix_secs();
+        self.store
+            .update_admin_account(account, &name, &role, &password_sha256, &status, now)?;
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            "admin_account_update",
+            "admin_account",
+            account,
+            note,
+            now,
+        )?;
+        Ok(())
+    }
+
+    /// 删除管理员账号（`note` 写入审计详情）。
+    pub fn admin_delete_admin_account(
+        &self,
+        account: &str,
+        note: &str,
+        actor_id: &str,
+    ) -> LicenseResult<()> {
+        let now = now_unix_secs();
+        self.store.delete_admin_account(account)?;
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            "admin_account_delete",
+            "admin_account",
+            account,
+            note,
+            now,
         )?;
         Ok(())
     }

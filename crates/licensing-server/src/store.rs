@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::admin_auth::AdminAccount;
 use crate::error::{LicenseError, LicenseResult};
 use crate::model::{
     now_unix_secs, ActivationCode, ActorType, AuditLog, AuditReceipt, CodeStatus, DeployMode,
@@ -234,6 +235,17 @@ const SCHEMA: &[&str] = &[
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id)"#,
+    // 管理端账号表（可配置账号 / 角色；口令只存 64-hex SHA-256 摘要，明文绝不落盘）。
+    r#"CREATE TABLE IF NOT EXISTS admin_account (
+        account         TEXT PRIMARY KEY,
+        display_name    TEXT NOT NULL DEFAULT '',
+        role            TEXT NOT NULL,
+        password_sha256 TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'active',
+        last_login_at   INTEGER,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL
+    )"#,
 ];
 
 // ---- 行映射辅助 ----
@@ -418,6 +430,20 @@ fn row_to_signing_key(row: &Row<'_>) -> rusqlite::Result<SigningKey> {
         hsm_ref: row.get(3)?,
         enabled_at: row.get(4)?,
         retired_at: row.get(5)?,
+    })
+}
+
+/// 从行读取 `AdminAccount`。
+fn row_to_admin_account(row: &Row<'_>) -> rusqlite::Result<AdminAccount> {
+    Ok(AdminAccount {
+        account: row.get(0)?,
+        display_name: row.get(1)?,
+        role: row.get(2)?,
+        password_sha256: row.get(3)?,
+        status: row.get(4)?,
+        last_login_at: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -1717,6 +1743,127 @@ impl Store {
         let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let count: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0))?;
         to_u64(count, "audit count")
+    }
+
+    // ================= admin_account（可配置账号 / 角色） =================
+
+    /// 列出全部管理员账号（按 `created_at` 升序，再按账号名）。
+    pub fn list_admin_accounts(&self) -> LicenseResult<Vec<AdminAccount>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT account, display_name, role, password_sha256, status,
+                    last_login_at, created_at, updated_at
+             FROM admin_account ORDER BY created_at ASC, account ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_admin_account)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 按账号查单条（不存在 → `None`）。
+    pub fn get_admin_account(&self, account: &str) -> LicenseResult<Option<AdminAccount>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT account, display_name, role, password_sha256, status,
+                        last_login_at, created_at, updated_at
+                 FROM admin_account WHERE account = ?1",
+                params![account],
+                row_to_admin_account,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 统计管理员账号数。
+    pub fn count_admin_accounts(&self) -> LicenseResult<u64> {
+        let conn = self.conn.lock();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM admin_account", [], |row| row.get(0))?;
+        to_u64(count, "admin_account count")
+    }
+
+    /// 插入管理员账号（主键冲突 → [`LicenseError::Storage`]）。
+    pub fn insert_admin_account(&self, acct: &AdminAccount) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO admin_account
+               (account, display_name, role, password_sha256, status,
+                last_login_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                acct.account,
+                acct.display_name,
+                acct.role,
+                acct.password_sha256,
+                acct.status,
+                acct.last_login_at,
+                acct.created_at,
+                acct.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 更新管理员账号（显示名 / 角色 / 口令摘要 / 状态；不存在 → 400）。
+    pub fn update_admin_account(
+        &self,
+        account: &str,
+        display_name: &str,
+        role: &str,
+        password_sha256: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        let affected = conn.execute(
+            "UPDATE admin_account
+                SET display_name = ?2, role = ?3, password_sha256 = ?4,
+                    status = ?5, updated_at = ?6
+              WHERE account = ?1",
+            params![
+                account,
+                display_name,
+                role,
+                password_sha256,
+                status,
+                updated_at
+            ],
+        )?;
+        if affected == 0 {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "admin account not found: {account}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 记录最近登录时刻（best-effort：账号不存在也不报错）。
+    pub fn touch_admin_account_login(&self, account: &str, ts: i64) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE admin_account SET last_login_at = ?2 WHERE account = ?1",
+            params![account, ts],
+        )?;
+        Ok(())
+    }
+
+    /// 删除管理员账号（不存在 → 400）。
+    pub fn delete_admin_account(&self, account: &str) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        let affected = conn.execute(
+            "DELETE FROM admin_account WHERE account = ?1",
+            params![account],
+        )?;
+        if affected == 0 {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "admin account not found: {account}"
+            )));
+        }
+        Ok(())
     }
 }
 

@@ -265,37 +265,107 @@ describe('DangerConfirmModal —— 草稿隔离（血泪教训）', () => {
   });
 });
 
-describe('DangerConfirmModal —— confirmMode="full"（全名原文 + 服务端校验）', () => {
-  it('中文全名非空即可提交（不做本地匹配拦截；错误与否由服务端判定）', async () => {
-    const { submitBtn, noteArea, textInputs, bodyText } = setup({ confirmMode: 'full', confirmValue: '值班长' });
-    await setNativeValue(noteArea()!, '岗位职责调整需要重建该角色');
+describe('DangerConfirmModal —— confirmMode="full" 本地 fail-fast 精确匹配', () => {
+  // ① 正确全名 → 无本地错误，按钮可用
+  it('① 输入与 confirmValue 完全一致的全名 → 无错误且可提交', async () => {
+    const { submitBtn, noteArea, textInputs, bodyText } = setup({ confirmMode: 'full', confirmValue: 'zhangsan' });
+    await setNativeValue(noteArea()!, '岗位职责调整需要重置该账号');
     const inputs = textInputs();
-    // 未输入时禁用
-    expect(submitBtn()!.disabled).toBe(true);
-    await setNativeValue(inputs[inputs.length - 1], '值班长');
+    expect(submitBtn()!.disabled).toBe(true); // 未输入时仍禁用
+    await setNativeValue(inputs[inputs.length - 1], 'zhangsan');
     expect(submitBtn()!.disabled).toBe(false);
-    // 不得出现 tail8 的本地判错文案
+    expect(bodyText()).not.toContain('与对象全名不一致');
     expect(bodyText()).not.toContain('与对象标识后 8 位不一致');
   });
 
-  it('任意非空文本都允许提交（full 模式无本地匹配拦截）', async () => {
+  it('① 中文全名一致 → 可提交', async () => {
     const { submitBtn, noteArea, textInputs } = setup({ confirmMode: 'full', confirmValue: '值班长' });
     await setNativeValue(noteArea()!, '岗位职责调整需要重建该角色');
     const inputs = textInputs();
-    await setNativeValue(inputs[inputs.length - 1], '这不是正确全名也能提交');
+    await setNativeValue(inputs[inputs.length - 1], '值班长');
     expect(submitBtn()!.disabled).toBe(false);
   });
 
-  it('空输入（含纯空白）不允许提交', async () => {
-    const { submitBtn, noteArea, textInputs } = setup({ confirmMode: 'full', confirmValue: '值班长' });
-    await setNativeValue(noteArea()!, '岗位职责调整需要重建该角色');
+  it('① full 模式默认标签 / 提示为「全名」口径，并明确宣称「大小写不敏感」', () => {
+    const { bodyText } = setup({ confirmMode: 'full', confirmValue: 'zhangsan' });
+    expect(bodyText()).toContain('风险二次确认（输入对象全名）');
+    expect(bodyText()).toContain('请完整填写对象全名');
+    // 与实现对齐：`rules_api:694/:859`、`alerts_api:270 check_trio`、`remote_ops:632/742`
+    // 一律是 `trim()` + `eq_ignore_ascii_case`，故提示文案必须明确宣称「不区分大小写」。
+    expect(bodyText()).toContain('大小写不敏感');
+  });
+
+  // ② 错误名称 → 字段级错误 + 禁用
+  it('② 完全不同的名称 → 本地错误且禁用', async () => {
+    const { submitBtn, noteArea, textInputs, bodyText } = setup({ confirmMode: 'full', confirmValue: 'zhangsan' });
+    await setNativeValue(noteArea()!, '岗位职责调整需要重置该账号');
     const inputs = textInputs();
-    await setNativeValue(inputs[inputs.length - 1], '   ');
+    await setNativeValue(inputs[inputs.length - 1], 'lisi');
+    expect(submitBtn()!.disabled).toBe(true);
+    expect(bodyText()).toContain('与对象全名不一致');
+  });
+
+  it('② 大小写不同但字母相同 → 仍匹配（大小写不敏感）', async () => {
+    const { submitBtn, noteArea, textInputs } = setup({ confirmMode: 'full', confirmValue: 'ZhangSan' });
+    await setNativeValue(noteArea()!, '岗位职责调整需要重置该账号');
+    const inputs = textInputs();
+    await setNativeValue(inputs[inputs.length - 1], 'zhangsan');
+    expect(submitBtn()!.disabled).toBe(false);
+  });
+
+  it('② 仅首尾空格差异 → 仍匹配（本地先 trim）', async () => {
+    const { submitBtn, noteArea, textInputs } = setup({ confirmMode: 'full', confirmValue: 'zhangsan' });
+    await setNativeValue(noteArea()!, '岗位职责调整需要重置该账号');
+    const inputs = textInputs();
+    await setNativeValue(inputs[inputs.length - 1], '  zhangsan  ');
+    expect(submitBtn()!.disabled).toBe(false);
+  });
+
+  it('② 子串 / 超集不匹配 → 禁用（不做子串、不做分隔符剥离）', async () => {
+    const { submitBtn, noteArea, textInputs } = setup({ confirmMode: 'full', confirmValue: 'zhang-san' });
+    await setNativeValue(noteArea()!, '岗位职责调整需要重置该账号');
+    const inputs = textInputs();
+    // 输入去掉分隔符的 "zhangsan" 不应匹配含分隔符的全名（不做分隔符剥离）
+    await setNativeValue(inputs[inputs.length - 1], 'zhangsan');
     expect(submitBtn()!.disabled).toBe(true);
   });
 
-  it('提交 payload：confirm 为原文（不 trim），tail 亦为原文；note 仍 trim', async () => {
-    const { wrapper, submitBtn, noteArea, textInputs } = setup({ confirmMode: 'full', confirmValue: '值班长' });
+  it('② 空输入（含纯空白）→ 禁用，但无「不一致」错误（仅因非空校验）', async () => {
+    const { submitBtn, noteArea, textInputs, bodyText } = setup({ confirmMode: 'full', confirmValue: 'zhangsan' });
+    await setNativeValue(noteArea()!, '岗位职责调整需要重置该账号');
+    const inputs = textInputs();
+    await setNativeValue(inputs[inputs.length - 1], '   ');
+    expect(submitBtn()!.disabled).toBe(true);
+    expect(bodyText()).not.toContain('与对象全名不一致');
+  });
+
+  // ③ confirmValue 为空 → 退化为仅校验非空
+  it('③ confirmValue 漏传（空）→ 有非空输入即放行（本地不做匹配，交服务端兜底）', async () => {
+    const { submitBtn, noteArea, textInputs, bodyText } = setup({ confirmMode: 'full', confirmValue: '' });
+    await setNativeValue(noteArea()!, '岗位职责调整需要重置该账号');
+    const inputs = textInputs();
+    expect(submitBtn()!.disabled).toBe(true); // 空输入禁用
+    await setNativeValue(inputs[inputs.length - 1], '任意非空文本');
+    expect(submitBtn()!.disabled).toBe(false);
+    expect(bodyText()).not.toContain('与对象全名不一致');
+  });
+
+  // ④ tail8 回归：既有行为零改动
+  it('④ tail8 默认标签仍是「后 8 位」口径（零回归）', () => {
+    const { bodyText } = setup();
+    expect(bodyText()).toContain('风险二次确认（输入对象后 8 位）');
+  });
+
+  it('④ tail8 模式仍按后 8 位本地校验（不区分大小写 / 容忍分隔符）', async () => {
+    const { submitBtn, noteArea, textInputs } = setup(); // 默认 tail8
+    await setNativeValue(noteArea()!, '客户主板损坏已寄回厂商检修');
+    const inputs = textInputs();
+    await setNativeValue(inputs[inputs.length - 1], '90abcd3k'); // 小写
+    expect(submitBtn()!.disabled).toBe(false);
+  });
+
+  it('④ full 模式 payload：confirm 为原文（不 trim），tail 亦为原文；note 仍 trim', async () => {
+    const { wrapper, submitBtn, noteArea, textInputs } = setup({ confirmMode: 'full', confirmValue: ' 值班长 ' });
     await setNativeValue(noteArea()!, '岗位职责调整需要重建该角色');
     const inputs = textInputs();
     await setNativeValue(inputs[inputs.length - 1], ' 值班长 ');
@@ -306,20 +376,5 @@ describe('DangerConfirmModal —— confirmMode="full"（全名原文 + 服务�
     expect(payload.tail).toBe(' 值班长 ');
     expect(payload.note).toBe('岗位职责调整需要重建该角色');
     expect(payload.reason).toBe('客户更换硬件');
-  });
-
-  it('full 模式默认标签 / 提示为「全名」口径，且不谎称「不区分大小写」', () => {
-    const { bodyText } = setup({ confirmMode: 'full', confirmValue: '值班长' });
-    expect(bodyText()).toContain('风险二次确认（输入对象全名）');
-    expect(bodyText()).toContain('请完整填写对象全名（服务端 trim + 大小写不敏感精确校验）以确认');
-    // 与实现对齐：`rules_api:694/:859`、`alerts_api:270 check_trio`、`remote_ops:632/742`
-    // 一律是 `trim()` + `eq_ignore_ascii_case`，故提示文案必须明确宣称「不区分大小写」，
-    // 否则会让操作者以为大小写敏感而反复重试。
-    expect(bodyText()).toContain('大小写不敏感');
-  });
-
-  it('tail8 模式默认标签仍是「后 8 位」口径（零回归）', () => {
-    const { bodyText } = setup();
-    expect(bodyText()).toContain('风险二次确认（输入对象后 8 位）');
   });
 });

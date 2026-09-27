@@ -29,7 +29,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use licensing_server::admin_auth::AdminAuth;
+use licensing_server::admin_auth::{AdminAccount, AdminAuth};
 use licensing_server::http;
 use licensing_server::keys::KeyRing;
 use licensing_server::service::LicensingService;
@@ -114,6 +114,53 @@ fn register_signing_key_from_env(keyring: &KeyRing) {
     }
 }
 
+/// 首次运行 seeding：账号表为空且 env 提供初始管理员 → 落一个 system 账号。
+///
+/// fail-closed：env 无凭据 / 摘要非法 → 不落任何账号（`/admin/accounts` 保持空，
+/// 需显式配置凭据后才能登录）。已有账号 → 不动（不覆盖运营改过的口令 / 角色）。
+fn seed_admin_account(store: &Store) {
+    let existing = match store.list_admin_accounts() {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("[licensing-server] admin account seeding: list failed: {err}");
+            return;
+        }
+    };
+    if !existing.is_empty() {
+        return;
+    }
+    let Some((account, password_sha256, _role)) =
+        AdminAuth::bootstrap_from_env_fn(&|k| std::env::var(k).ok())
+    else {
+        tracing::warn!(
+            "licensing-server: no initial admin credentials provided; \
+             /admin/accounts stays empty until seeded (fail-closed)"
+        );
+        return;
+    };
+    let now = now_unix_secs();
+    let acct = AdminAccount {
+        account,
+        display_name: String::new(),
+        role: "system".to_string(),
+        password_sha256,
+        status: "active".to_string(),
+        last_login_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    match store.insert_admin_account(&acct) {
+        Ok(()) => tracing::info!(
+            account = %acct.account,
+            "licensing-server: seeded initial admin account"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "licensing-server: admin account seeding failed"
+        ),
+    }
+}
+
 /// 装配并运行服务（错误收敛为可读消息，由 main 映射退出码）。
 ///
 /// 管理端凭据经环境变量注入（[`AdminAuth::from_env_fn`]：`IOTDAQ_ADMIN_PASSWORD`
@@ -125,6 +172,8 @@ fn register_signing_key_from_env(keyring: &KeyRing) {
 async fn run(listen: String, db_path: PathBuf) -> Result<(), String> {
     let store =
         Store::open(&db_path).map_err(|e| format!("open license db {}: {e}", db_path.display()))?;
+    seed_admin_account(&store);
+
     let keyring = KeyRing::empty();
     register_signing_key_from_env(&keyring);
     let service = Arc::new(LicensingService::new(store, keyring));

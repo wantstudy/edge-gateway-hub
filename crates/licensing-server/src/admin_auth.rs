@@ -218,6 +218,14 @@ fn sha256_bytes(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+/// 口令 → 64 位小写 hex SHA-256 摘要（`admin_account.password_sha256` 的存取形态）。
+pub fn sha256_hex(input: &str) -> String {
+    sha256_bytes(input.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// 恒时字节比较（XOR 折叠，无提前退出；与 daemon `auth_login.rs` 同一口径）。
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -276,6 +284,42 @@ pub struct AuthedAdmin {
     pub sub: String,
     /// 规范角色。
     pub role: Role,
+}
+
+/// 管理员账号行（store `admin_account` 表的内存视图；口令只存 64-hex SHA-256 摘要）。
+///
+/// 这是**账号 / 角色可配置**的持久化单元：`login` 实时读本表判定，`/admin/accounts*`
+/// 端点对其增删改查。字段与 `store::admin_account` 表一一对应。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminAccount {
+    /// 账号（登录名，主键）。
+    pub account: String,
+    /// 展示名（姓名）。
+    pub display_name: String,
+    /// 规范角色字面量（`ops / lic_ops / risk / system`）。
+    pub role: String,
+    /// `SHA-256(password)` 的 64-hex 摘要（明文绝不落盘）。
+    pub password_sha256: String,
+    /// 状态（`active` / `disabled`）。
+    pub status: String,
+    /// 最近登录时刻（UTC 秒；从未登录为 `None`）。
+    pub last_login_at: Option<i64>,
+    /// 创建时刻（UTC 秒）。
+    pub created_at: i64,
+    /// 更新时刻（UTC 秒）。
+    pub updated_at: i64,
+}
+
+impl AdminAccount {
+    /// 账号是否处于启用态（仅启用态可登录）。
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
+    }
+
+    /// 口令摘要字节（hex 非法时 `None`，调用方退化为哑哈希比对）。
+    fn password_bytes(&self) -> Option<Vec<u8>> {
+        hex_decode_32(&self.password_sha256).map(|b| b.to_vec())
+    }
 }
 
 /// 管理端登录器：账号表 + JWT 签发密钥（注入式，不做 IO）。
@@ -342,7 +386,21 @@ impl AdminAuth {
         self.key
     }
 
-    /// 登录判定：恒时比对口令摘要 → 签发 JWT。
+    /// 签发一枚管理员 JWT（HS256，1h TTL）。
+    pub fn issue_token(&self, sub: &str, role: Role) -> Option<String> {
+        let now = now_unix_secs();
+        let claims = JwtClaims {
+            sub: sub.to_string(),
+            role: role.as_str().to_string(),
+            exp: now.saturating_add(TOKEN_TTL_SECS),
+            iat: now,
+            jti: now_ns_id("jti"),
+        };
+        jwt_sign(&claims, self.key).ok()
+    }
+
+    /// 登录判定：恒时比对口令摘要 → 签发 JWT（**内存账号表路径**；真实部署走
+    /// [`AdminAuth::login_with_accounts`] 实时读 store）。
     ///
     /// 成功返回 `(token, role)`；用户不存在 / 口令错 / 签发失败一律 `None`
     /// （调用方统一转 401，不区分原因，防账号枚举）。
@@ -358,16 +416,37 @@ impl AdminAuth {
             return None;
         }
         let user = user?;
-        let now = now_unix_secs();
-        let claims = JwtClaims {
-            sub: user.name.clone(),
-            role: user.role.as_str().to_string(),
-            exp: now.saturating_add(TOKEN_TTL_SECS),
-            iat: now,
-            jti: now_ns_id("jti"),
+        Some((self.issue_token(&user.name, user.role)?, user.role))
+    }
+
+    /// 实时登录：对 **store 账号表**判定（口令恒时比对），命中**启用态**账号才签发 JWT。
+    ///
+    /// 账号不存在 / 口令错 / 账号停用 / 角色非法 / 摘要损坏 / 签发失败一律 `None`
+    /// （调用方统一转 401，不区分原因，防账号枚举）。
+    pub fn login_with_accounts(
+        &self,
+        username: &str,
+        password: &str,
+        accounts: &[AdminAccount],
+    ) -> Option<(String, Role)> {
+        let username = username.trim();
+        let user = accounts
+            .iter()
+            .find(|a| a.account == username && a.is_active());
+        let supplied = sha256_bytes(password.as_bytes());
+        // 无匹配账号时对固定哑哈希做一次恒时比对（时长与命中路径对齐）。
+        let stored = match user {
+            Some(u) => u
+                .password_bytes()
+                .unwrap_or_else(|| sha256_bytes(DUMMY_HASH_INPUT)),
+            None => sha256_bytes(DUMMY_HASH_INPUT),
         };
-        let token = jwt_sign(&claims, self.key).ok()?;
-        Some((token, user.role))
+        if !ct_eq(&supplied, &stored) {
+            return None;
+        }
+        let user = user?;
+        let role = Role::from_str(&user.role)?;
+        Some((self.issue_token(&user.account, role)?, role))
     }
 
     /// 校验 Bearer token 并返回已认证身份（签名 / 结构 / 时间窗任一失败 → `None`）。
@@ -436,6 +515,39 @@ impl AdminAuth {
             tracing::warn!("admin auth: dev JWT signing key in use (LOCAL ONLY)");
         }
         auth
+    }
+
+    /// 从环境变量解析初始管理员凭据（**store 首次 seeding 用**）。
+    ///
+    /// 返回 `(username, password_sha256_hex, role)`；凭据缺失 / 摘要非法 → `None`
+    /// （fail-closed：绝不落弱凭证）。摘要路优先，明文路兜底（内存内即刻摘要）。
+    pub fn bootstrap_from_env_fn(
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<(String, String, Role)> {
+        let username = env(ADMIN_USER_ENV)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
+        let hash_env = env(ADMIN_PASSWORD_HASH_ENV)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let pass_env = env(ADMIN_PASSWORD_ENV)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(hex) = hash_env {
+            if hex_decode_32(&hex).is_some() {
+                return Some((username, hex.to_lowercase(), Role::System));
+            }
+            tracing::warn!(
+                "admin auth: {ADMIN_PASSWORD_HASH_ENV} is not a valid 64-hex digest; \
+                 admin account seeding skipped (fail-closed)"
+            );
+            return None;
+        }
+        if let Some(pass) = pass_env {
+            return Some((username, sha256_hex(&pass), Role::System));
+        }
+        None
     }
 }
 

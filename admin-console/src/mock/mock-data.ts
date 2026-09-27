@@ -1443,6 +1443,77 @@ export const repo = {
     return true;
   },
 
+  /** 新增管理员账号（账号唯一；mock 不下发明文口令）。 */
+  createUser(input: { account: string; name: string; role: string; actor: string }): boolean {
+    const account = input.account.trim();
+    if (!account || users.some((u) => u.account === account)) {
+      return false;
+    }
+    users.push({
+      account,
+      name: input.name.trim() || account,
+      role: input.role,
+      status: 'user_enabled',
+      lastLoginAt: '—',
+    });
+    pushAudit({
+      actor: input.actor,
+      actorType: 'human',
+      action: '新增账号',
+      entityType: 'admin_user',
+      entityId: account,
+      entityLabel: '管理员账号',
+      detail: `${input.name || account}（${input.role}）`,
+      result: 'success',
+    });
+    return true;
+  },
+
+  /** 修改管理员账号的资料 / 角色（mock 不处理口令）。 */
+  updateUser(input: { account: string; name?: string; role?: string; actor: string }): boolean {
+    const user = users.find((u) => u.account === input.account);
+    if (!user) {
+      return false;
+    }
+    if (input.name !== undefined && input.name.trim() !== '') {
+      user.name = input.name.trim();
+    }
+    if (input.role !== undefined && input.role !== '') {
+      user.role = input.role;
+    }
+    pushAudit({
+      actor: input.actor,
+      actorType: 'human',
+      action: '修改账号',
+      entityType: 'admin_user',
+      entityId: user.account,
+      entityLabel: '管理员账号',
+      detail: `${user.name}（${user.role}）`,
+      result: 'success',
+    });
+    return true;
+  },
+
+  /** 删除管理员账号。 */
+  deleteUser(input: { account: string; actor: string }): boolean {
+    const idx = users.findIndex((u) => u.account === input.account);
+    if (idx < 0) {
+      return false;
+    }
+    const [removed] = users.splice(idx, 1);
+    pushAudit({
+      actor: input.actor,
+      actorType: 'human',
+      action: '删除账号',
+      entityType: 'admin_user',
+      entityId: removed.account,
+      entityLabel: '管理员账号',
+      detail: `${removed.name}（${removed.role}）`,
+      result: 'success',
+    });
+    return true;
+  },
+
   // ---------- 仪表盘聚合 ----------
   /** 总览页所需的聚合数据。 */
   overview(): {

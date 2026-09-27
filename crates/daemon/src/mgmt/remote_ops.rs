@@ -95,8 +95,12 @@ pub enum OpsAction {
     SettingsRollback,
     /// 设备连通性探测（`POST /api/devices/test`）。
     DeviceTest,
-    /// 北向出口登记（`POST /api/forwarders`；诚实 501 占位动作）。
+    /// 北向出口登记（`POST /api/forwarders`；落盘 + 热生效 + 审计）。
     ForwarderCreate,
+    /// 北向出口修改（`PUT /api/forwarders/:id`；部分更新语义）。
+    ForwarderUpdate,
+    /// 北向出口删除（`DELETE /api/forwarders/:id`；三独立字段二次确认）。
+    ForwarderDelete,
     /// 北向出口连通性探测（`POST /api/forwarders/{id}/test`）。
     ForwarderTest,
     /// 告警规则整体保存（`PUT /api/alerts/rules`；`rules` 即全量）。
@@ -160,6 +164,8 @@ impl OpsAction {
             OpsAction::SettingsRollback => "settings_rollback",
             OpsAction::DeviceTest => "device_test",
             OpsAction::ForwarderCreate => "forwarder_create",
+            OpsAction::ForwarderUpdate => "forwarder_update",
+            OpsAction::ForwarderDelete => "forwarder_delete",
             OpsAction::ForwarderTest => "forwarder_test",
             OpsAction::AlarmRulesWrite => "alarm_rules_write",
             OpsAction::AlarmRuleUpdate => "alarm_rule_update",

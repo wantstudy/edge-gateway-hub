@@ -1,9 +1,11 @@
 <template>
   <!--
     AccountsPage —— 账号与角色（页面清单第 12 项，仅「系统」角色可见）。
-    核心交付：**四角色权限矩阵的真实展示**（页面级 + 操作级）。
-    该矩阵不是装饰 —— 它由 `@ui-kit` 导出的 RBAC 常量为唯一数据源，
-    与路由守卫 / 菜单过滤 / 按钮门控**同源**，因此展示与实际行为必然一致。
+    核心交付：
+      1) **四角色权限矩阵的真实展示**（页面级 + 操作级）——由 `@ui-kit` 的 RBAC
+         常量为唯一数据源，与路由守卫 / 菜单过滤 / 按钮门控同源；
+      2) **管理员账号可配置**：真实拉取 `GET /admin/accounts`（缺口 #9 修复），
+         并支持新增 / 编辑 / 启停 / 删除（危险动作走 DangerConfirmModal 四要素）。
   -->
   <PageHeader
     crumb="系统 / 账号与角色"
@@ -99,6 +101,11 @@
       <div class="ac-card__head">
         <h3>管理员账号</h3>
         <span class="ac-card__sub">共 {{ users.length }} 个账号</span>
+        <span class="ac-head-actions">
+          <button type="button" class="ac-btn ac-btn--sm ac-btn--primary" @click="openCreate">
+            新增账号
+          </button>
+        </span>
       </div>
       <UiTable :columns="columns" :rows="users" row-key-field="account">
         <template #cell-account="{ row }">
@@ -114,15 +121,25 @@
           <span class="ac-mono">{{ row.lastLoginAt }}</span>
         </template>
         <template #actions="{ row }">
-          <!-- 按钮文案按当前状态取反：启用中 → 「停用」 -->
-          <button
-            type="button"
-            class="ac-btn ac-btn--sm"
-            :class="{ 'ac-btn--danger': row.status === 'user_enabled' }"
-            @click="toggleUser(row)"
-          >
-            {{ row.status === 'user_enabled' ? '停用' : '启用' }}
-          </button>
+          <span class="ac-row-actions">
+            <button type="button" class="ac-btn ac-btn--sm" @click="openEdit(row)">编辑</button>
+            <!-- 按钮文案按当前状态取反：启用中 → 「停用」 -->
+            <button
+              type="button"
+              class="ac-btn ac-btn--sm"
+              :class="{ 'ac-btn--danger': row.status === 'user_enabled' }"
+              @click="askToggle(row)"
+            >
+              {{ row.status === 'user_enabled' ? '停用' : '启用' }}
+            </button>
+            <button
+              type="button"
+              class="ac-btn ac-btn--sm ac-btn--danger"
+              @click="askDelete(row)"
+            >
+              删除
+            </button>
+          </span>
         </template>
       </UiTable>
     </section>
@@ -131,25 +148,83 @@
       <span class="ac-note__icon">ⓘ</span>
       <span>
         前端 RBAC 仅作可见性 / 可用性控制，<b>不承担授权判定</b>；
-        服务端仍会独立校验（非管理员调用 <span class="ac-mono">/admin/*</span> 返回 403 ADMIN_ONLY）。
-        审计页可见「访客尝试废弃激活码 → 拒绝 403」记录，即双层防护的体现。
+        服务端仍会独立校验（非系统角色调用 <span class="ac-mono">/admin/accounts</span> 返回 403 ADMIN_ONLY）。
+        账号口令只存 SHA-256 摘要，明文不落盘、不下发。
       </span>
     </p>
   </div>
+
+  <!-- 新增 / 编辑账号弹窗（自包含，草稿仅存在于本页） -->
+  <Teleport to="body">
+    <div v-if="formOpen" class="ac-modal__mask" @click.self="formOpen = false">
+      <div class="ac-modal" role="dialog" aria-modal="true" :aria-label="editing ? '编辑账号' : '新增账号'">
+        <h3 class="ac-modal__title">{{ editing ? '编辑账号' : '新增账号' }}</h3>
+        <div class="ac-modal__body">
+          <UiField label="账号" required hint="登录名，全局唯一">
+            <UiInput v-model="form.account" :disabled="!!editing" placeholder="如 wang.gong" />
+          </UiField>
+          <UiField label="姓名">
+            <UiInput v-model="form.name" placeholder="如 王工" />
+          </UiField>
+          <UiField label="角色" required>
+            <UiSelect v-model="form.role" :options="roleOptions" />
+          </UiField>
+          <UiField
+            :label="editing ? '重置口令（留空不改）' : '初始口令'"
+            :required="!editing"
+            hint="口令即刻摘要，明文不落盘"
+          >
+            <UiInput v-model="form.password" type="password" placeholder="输入口令" />
+          </UiField>
+          <p v-if="formError" class="ac-modal__error">{{ formError }}</p>
+        </div>
+        <div class="ac-modal__foot">
+          <button type="button" class="ac-btn ac-btn--sm" @click="formOpen = false">取消</button>
+          <button
+            type="button"
+            class="ac-btn ac-btn--sm ac-btn--primary"
+            :disabled="saving"
+            @click="saveForm"
+          >
+            {{ saving ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- 危险二次确认（四要素：影响清单 / 原因 / 补充说明≥10字 / 对象名全名二次校验） -->
+  <DangerConfirmModal
+    :open="dangerOpen"
+    :title="dangerTitle"
+    :impacts="dangerImpacts"
+    :facts="dangerFacts"
+    :reasons="dangerReasons"
+    confirm-mode="full"
+    :confirm-value="dangerRow?.account ?? ''"
+    :confirm-text="dangerConfirmText"
+    :min-note-length="10"
+    @close="dangerOpen = false"
+    @submit="onDangerSubmit"
+  />
 </template>
 
 <script setup lang="ts">
 /**
  * @file AccountsPage.vue
  * @module admin-console/pages/AccountsPage
- * @description 账号与角色页（含权限矩阵展示）。
+ * @description 账号与角色页（权限矩阵展示 + 管理员账号可配置）。
  */
-import { computed, ref } from 'vue';
+import { computed, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   PageHeader,
   UiTable,
   StatusTag,
+  DangerConfirmModal,
+  UiField,
+  UiInput,
+  UiSelect,
   ROLES,
   ROLE_META,
   PAGES,
@@ -160,8 +235,10 @@ import {
   type Role,
   type Action,
   type TableColumn,
+  type SelectOption,
+  type DangerFact,
 } from '@ui-kit';
-import { repo, DEFAULT_ACTOR } from '../api/repo';
+import { repo, DEFAULT_ACTOR, type AdminUser } from '../api/repo';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -169,11 +246,17 @@ const router = useRouter();
 /** 刷新触发器。 */
 const reloadKey = ref(0);
 
-/** 账号列表。 */
+/** 账号列表（来自 repo 缓存：real = GET /admin/accounts；mock = 内置样例）。 */
 const users = computed(() => {
   void reloadKey.value;
   return repo.allUsers();
 });
+
+/** 角色下拉选项（与后端 `GET /admin/roles` 同一套 id / 中文名）。 */
+const roleOptions: readonly SelectOption[] = ROLES.map((r) => ({
+  value: r,
+  label: ROLE_META[r].label,
+}));
 
 /** 主页面（排除详情页，矩阵更清晰）。 */
 const mainPages = computed(() => PAGES.filter((p) => !p.detailOnly));
@@ -243,10 +326,179 @@ function switchTo(role: Role): void {
   void router.push({ name: firstAllowedPage(role) });
 }
 
-/** 启用 / 停用账号（按钮文案随状态取反）。 */
-function toggleUser(row: { account: string; status: string }): void {
-  void repo.setUserStatus({ account: row.account, enabled: row.status !== 'user_enabled', actor: DEFAULT_ACTOR });
-  reloadKey.value += 1;
+// ---------------------------------------------------------------------------
+// 新增 / 编辑账号
+// ---------------------------------------------------------------------------
+
+/** 弹窗开关。 */
+const formOpen = ref(false);
+/** 正在编辑的账号（null = 新增）。 */
+const editing = ref<AdminUser | null>(null);
+/** 保存中标记（防重复提交）。 */
+const saving = ref(false);
+/** 表单级错误提示。 */
+const formError = ref('');
+/** 表单草稿（仅存在于本页，关闭即弃）。 */
+const form = reactive({ account: '', name: '', role: 'ops' as string, password: '' });
+
+/** 打开「新增账号」。 */
+function openCreate(): void {
+  editing.value = null;
+  form.account = '';
+  form.name = '';
+  form.role = 'ops';
+  form.password = '';
+  formError.value = '';
+  formOpen.value = true;
+}
+
+/** 打开「编辑账号」。 */
+function openEdit(row: AdminUser): void {
+  editing.value = row;
+  form.account = row.account;
+  form.name = row.name;
+  form.role = row.role;
+  form.password = '';
+  formError.value = '';
+  formOpen.value = true;
+}
+
+/** 提交新增 / 编辑表单。 */
+async function saveForm(): Promise<void> {
+  formError.value = '';
+  const account = form.account.trim();
+  if (!account) {
+    formError.value = '账号不能为空。';
+    return;
+  }
+  if (!editing.value && !form.password) {
+    formError.value = '新增账号必须设置初始口令。';
+    return;
+  }
+  saving.value = true;
+  const ok = editing.value
+    ? await repo.updateUser({
+        account: editing.value.account,
+        name: form.name,
+        role: form.role,
+        password: form.password || undefined,
+        actor: DEFAULT_ACTOR,
+      })
+    : await repo.createUser({
+        account,
+        name: form.name,
+        role: form.role,
+        password: form.password,
+        actor: DEFAULT_ACTOR,
+      });
+  saving.value = false;
+  if (ok) {
+    formOpen.value = false;
+    reloadKey.value += 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 启停 / 删除（危险动作 → DangerConfirmModal 四要素）
+// ---------------------------------------------------------------------------
+
+/** 危险弹窗开关。 */
+const dangerOpen = ref(false);
+/** 危险动作类别。 */
+const dangerMode = ref<'enable' | 'disable' | 'delete'>('disable');
+/** 危险动作目标行。 */
+const dangerRow = ref<AdminUser | null>(null);
+
+/** 目标账号名。 */
+const dangerAccount = computed(() => dangerRow.value?.account ?? '');
+
+/** 弹窗标题（含对象名，便于操作者确认）。 */
+const dangerTitle = computed(() => {
+  const verb = dangerMode.value === 'delete' ? '删除' : dangerMode.value === 'enable' ? '启用' : '停用';
+  return `${verb}账号 ${dangerAccount.value}`;
+});
+
+/** 影响清单（写清后果与恢复路径）。 */
+const dangerImpacts = computed<readonly string[]>(() =>
+  dangerMode.value === 'delete'
+    ? [
+        '该账号记录将被永久删除，不可恢复。',
+        '若它是最后一个「系统」管理员，删除后将无人可管理本后台，请先确保还有其他系统管理员。',
+        '该账号的登录会话最长 1 小时后失效，期间仍可能有效。',
+      ]
+    : dangerMode.value === 'enable'
+      ? [
+          '该账号将恢复登录管理后台的能力（本操作可逆）。',
+          '请确认该账号当前确由在职人员持有。',
+        ]
+      : [
+          '该账号将立即无法登录管理后台；已签发的会话 token 最长 1 小时后失效。',
+          '本操作可逆：随时可重新启用该账号。',
+        ],
+);
+
+/** 操作对象摘要。 */
+const dangerFacts = computed<readonly DangerFact[]>(() => [
+  { label: '账号', value: dangerAccount.value },
+  { label: '角色', value: dangerRow.value ? roleLabel(dangerRow.value.role) : '—' },
+]);
+
+/** 必选原因枚举。 */
+const dangerReasons = computed<readonly string[]>(() =>
+  dangerMode.value === 'delete'
+    ? ['人员离职且账号不再需要', '重复 / 误建账号清理', '安全事件处置']
+    : dangerMode.value === 'enable'
+      ? ['人员到岗 / 恢复访问', '安全排查结束恢复', '误停用纠正']
+      : ['账号泄露 / 疑似异常登录', '人员离职 / 岗位调整', '临时停用排查'],
+);
+
+/** 确认按钮文案（动词短语）。 */
+const dangerConfirmText = computed(() =>
+  dangerMode.value === 'delete' ? '删除账号' : dangerMode.value === 'enable' ? '启用账号' : '停用账号',
+);
+
+/** 打开「启停」危险确认。 */
+function askToggle(row: AdminUser): void {
+  dangerRow.value = row;
+  dangerMode.value = row.status === 'user_enabled' ? 'disable' : 'enable';
+  dangerOpen.value = true;
+}
+
+/** 打开「删除」危险确认。 */
+function askDelete(row: AdminUser): void {
+  dangerRow.value = row;
+  dangerMode.value = 'delete';
+  dangerOpen.value = true;
+}
+
+/** 危险确认提交（四要素已在前端校验通过）。 */
+async function onDangerSubmit(payload: {
+  reason: string;
+  note: string;
+  tail: string;
+  secondApprover: string;
+  confirm: string;
+}): Promise<void> {
+  const row = dangerRow.value;
+  if (!row) {
+    dangerOpen.value = false;
+    return;
+  }
+  const common = {
+    account: row.account,
+    reason: payload.reason,
+    note: payload.note,
+    confirm: payload.confirm,
+    actor: DEFAULT_ACTOR,
+  };
+  const ok =
+    dangerMode.value === 'delete'
+      ? await repo.deleteUser(common)
+      : await repo.setUserStatus({ ...common, enabled: dangerMode.value === 'enable' });
+  dangerOpen.value = false;
+  if (ok) {
+    reloadKey.value += 1;
+  }
 }
 </script>
 
@@ -270,6 +522,16 @@ function toggleUser(row: { account: string; status: string }): void {
   background: var(--brand-subtle);
   color: var(--info-fg);
   border: 1px solid var(--info-border);
+}
+.ac-head-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 8px;
+}
+.ac-row-actions {
+  display: inline-flex;
+  gap: 6px;
+  white-space: nowrap;
 }
 .ac-table-wrap {
   overflow-x: auto;
@@ -309,5 +571,60 @@ function toggleUser(row: { account: string; status: string }): void {
 .ac-matrix-group {
   font-size: 11px;
   color: var(--text-3);
+}
+
+/* 账号表单弹窗（自包含） */
+.ac-modal__mask {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(15 27 61 / 45%);
+}
+.ac-modal {
+  width: min(440px, 92vw);
+  background: var(--surface, #fff);
+  border-radius: var(--radius-md, 12px);
+  box-shadow: 0 18px 48px rgb(15 27 61 / 28%);
+  overflow: hidden;
+}
+.ac-modal__title {
+  margin: 0;
+  padding: 16px 20px;
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-1);
+  border-bottom: 1px solid var(--divider);
+}
+.ac-modal__body {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ac-modal__error {
+  margin: 0;
+  font-size: var(--fs-caption);
+  color: var(--danger-fg, #c0392b);
+}
+.ac-modal__foot {
+  padding: 12px 20px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--divider);
+  background: #fafbfc;
+}
+.ac-btn--primary {
+  background: var(--brand, #17c3b2);
+  color: #fff;
+  border-color: var(--brand, #17c3b2);
+}
+.ac-btn--primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 </style>

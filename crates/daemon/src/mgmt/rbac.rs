@@ -294,53 +294,38 @@ pub fn permissions_of_scope(scope: PermissionScope) -> Vec<Permission> {
 ///
 /// 顺序镜像 rbac.ts 各角色数组（便于人工 diff 审查）；`system` 末尾追加的
 /// `ops.*` 三项为 mgmt 面权限（前端矩阵无对应页面，见模块注释）。
-const PERMS_OPS: &[Permission] = &[
-    Permission::CodeView,
-    Permission::CodeIssue,
-    Permission::DeviceView,
-    Permission::ReceiptView,
-    Permission::ReceiptMark,
-];
+// ⚠️ 网关侧收口（task 57/A）：仅含 `PermissionScope::Gateway` 项，客户端矩阵
+// 不得出现任何厂商侧（licensing）权限 id（激活码 / 租户 / 密钥 / 回执 / 换机 / 台账）。
+//
+// ⚠️ 最小权限红线（由 `audit_api` / `remote_ops` / 本模块 QA 测试共同固化，改动须同步）：
+//   - `audit.export` **仅 system**（数据出境动作收敛单一角色；risk 虽可 view 但不可 export）；
+//   - `audit.view` 仅 risk + system（ops / lic_ops 既不可 view 也不可 export）；
+//   - `device.write` / `point.write` **仅 system**（高危配置写）；
+//   - `ops.restart` **仅 system**；`ops.collectors` 仅 lic_ops + system；
+//     `ops.logs_read` 仅 lic_ops + system —— 即 `ops` 角色**不持**任何 `ops.*`。
+const PERMS_OPS: &[Permission] = &[Permission::DeviceView];
 
 const PERMS_LIC_OPS: &[Permission] = &[
-    Permission::CodeView,
-    Permission::CodeIssue,
-    Permission::CodeRevoke,
-    Permission::CodeReissue,
-    Permission::CodeReveal,
     Permission::DeviceView,
-    Permission::DeviceMarkAnomaly,
-    Permission::ReceiptView,
-    Permission::ReceiptMark,
-    Permission::TransferView,
-    Permission::TransferProcess,
+    Permission::OpsCollectors,
+    Permission::OpsLogsRead,
 ];
 
-const PERMS_RISK: &[Permission] = &[
-    Permission::ReceiptView,
-    Permission::ReceiptMark,
-    Permission::AuditView,
-    Permission::DeviceView,
-    Permission::CodeView,
-];
+const PERMS_RISK: &[Permission] = &[Permission::DeviceView, Permission::AuditView];
 
+// 网关侧全部 10 项（= `permissions_of_scope(Gateway)`）→ 客户端管理员默认具备
+// 客户端所有权限（用户诉求「管理员具备全部权限」）。
+// ⚠️ 顺序必须与 `Permission::ALL` 一致：`permissions_of_scope` 按 `ALL` 顺序过滤，
+// 两者被 QA 断言逐元素相等（`permission_matrix_matches_frontend_action_matrix`）。
 const PERMS_SYSTEM: &[Permission] = &[
-    Permission::TenantView,
-    Permission::TenantPolicyUpdate,
-    Permission::KeyView,
-    Permission::KeyRotate,
+    Permission::DeviceView,
     Permission::AuditView,
     Permission::AuditExport,
     Permission::AccountView,
     Permission::AccountUpdate,
-    Permission::CodeReveal,
-    Permission::DeviceView,
-    Permission::ReceiptView,
-    // mgmt 面运维权限（remote_ops 动作；仅 system 档可授）。
     Permission::OpsRestart,
     Permission::OpsCollectors,
     Permission::OpsLogsRead,
-    // mgmt 面配置写权限（设备/点位 CRUD；仅 system 档可授，与前端同步见 Permission 注释）。
     Permission::DeviceWrite,
     Permission::PointWrite,
 ];
@@ -685,45 +670,20 @@ mod tests {
     /// 前端适配时须同步进 Action / ACTION_MATRIX，见 Permission 注释）。
     #[test]
     fn permission_matrix_matches_frontend_action_matrix() {
-        let expected_ops: &[Permission] = &[
-            Permission::CodeView,
-            Permission::CodeIssue,
-            Permission::DeviceView,
-            Permission::ReceiptView,
-            Permission::ReceiptMark,
-        ];
+        let expected_ops: &[Permission] = &[Permission::DeviceView];
         let expected_lic_ops: &[Permission] = &[
-            Permission::CodeView,
-            Permission::CodeIssue,
-            Permission::CodeRevoke,
-            Permission::CodeReissue,
-            Permission::CodeReveal,
             Permission::DeviceView,
-            Permission::DeviceMarkAnomaly,
-            Permission::ReceiptView,
-            Permission::ReceiptMark,
-            Permission::TransferView,
-            Permission::TransferProcess,
+            Permission::OpsCollectors,
+            Permission::OpsLogsRead,
         ];
-        let expected_risk: &[Permission] = &[
-            Permission::ReceiptView,
-            Permission::ReceiptMark,
-            Permission::AuditView,
-            Permission::DeviceView,
-            Permission::CodeView,
-        ];
+        let expected_risk: &[Permission] = &[Permission::DeviceView, Permission::AuditView];
+        // 网关侧全 10 项（= permissions_of_scope(Gateway)，顺序镜像 `Permission::ALL`）。
         let expected_system: &[Permission] = &[
-            Permission::TenantView,
-            Permission::TenantPolicyUpdate,
-            Permission::KeyView,
-            Permission::KeyRotate,
+            Permission::DeviceView,
             Permission::AuditView,
             Permission::AuditExport,
             Permission::AccountView,
             Permission::AccountUpdate,
-            Permission::CodeReveal,
-            Permission::DeviceView,
-            Permission::ReceiptView,
             Permission::OpsRestart,
             Permission::OpsCollectors,
             Permission::OpsLogsRead,
@@ -737,21 +697,39 @@ mod tests {
         assert_eq!(permissions_of(Role::System), expected_system);
 
         // 关键最小权限抽查（高危动作不越档）。
-        assert!(!authorize(Role::Ops, Permission::CodeRevoke));
-        assert!(authorize(Role::LicOps, Permission::CodeRevoke));
+        // 收口后 lic_ops 不再含厂商侧 code.*（激活码发放反查授权端菜单消失）。
+        assert!(!authorize(Role::LicOps, Permission::CodeRevoke));
+        assert!(!authorize(Role::Ops, Permission::CodeIssue));
         assert!(!authorize(Role::Risk, Permission::CodeIssue));
-        assert!(!authorize(Role::Ops, Permission::KeyRotate));
-        assert!(authorize(Role::System, Permission::KeyRotate));
-
-        // 配置写权限仅 system 可授（设备/点位写 = 高危配置动作，见 Permission 注释）。
+        // system 仍掌全部网关侧写/运维。
         assert!(authorize(Role::System, Permission::DeviceWrite));
         assert!(authorize(Role::System, Permission::PointWrite));
+        assert!(authorize(Role::System, Permission::OpsRestart));
+        // 配置写仅 system 可授（设备/点位写 = 高危配置）。
         assert!(!authorize(Role::Ops, Permission::DeviceWrite));
         assert!(!authorize(Role::LicOps, Permission::DeviceWrite));
         assert!(!authorize(Role::Risk, Permission::DeviceWrite));
         assert!(!authorize(Role::Ops, Permission::PointWrite));
         assert!(!authorize(Role::LicOps, Permission::PointWrite));
         assert!(!authorize(Role::Risk, Permission::PointWrite));
+
+        // ⚠️ 网关侧收口硬断言（task A）：每个网关角色权限集与厂商侧全集交集为空。
+        let licensing = permissions_of_scope(PermissionScope::Licensing);
+        for role in [Role::Ops, Role::LicOps, Role::Risk, Role::System] {
+            for p in permissions_of(role) {
+                assert!(
+                    !licensing.contains(p),
+                    "{:?} must carry no licensing permission (got {:?})",
+                    role,
+                    p.as_str()
+                );
+            }
+        }
+        // 管理员 = 网关侧全集（客户端全权）。
+        assert_eq!(
+            permissions_of(Role::System),
+            permissions_of_scope(PermissionScope::Gateway).as_slice()
+        );
     }
 
     /// QA: remote_ops 动作字面量 → mgmt 面权限映射稳定（task 57 全量接线依据）；
@@ -777,16 +755,23 @@ mod tests {
         assert_eq!(permission_for_ops_action("nuke"), None);
         assert_eq!(permission_for_ops_action(""), None);
 
-        for permission in [
-            Permission::OpsRestart,
-            Permission::OpsCollectors,
-            Permission::OpsLogsRead,
-        ] {
-            assert!(authorize(Role::System, permission));
-            assert!(!authorize(Role::Ops, permission));
-            assert!(!authorize(Role::LicOps, permission));
-            assert!(!authorize(Role::Risk, permission));
-        }
+        // OpsRestart 仅 system（最高危：重启网关）。
+        assert!(authorize(Role::System, Permission::OpsRestart));
+        assert!(!authorize(Role::Ops, Permission::OpsRestart));
+        assert!(!authorize(Role::LicOps, Permission::OpsRestart));
+        assert!(!authorize(Role::Risk, Permission::OpsRestart));
+
+        // OpsCollectors 授予 system + lic_ops。
+        assert!(authorize(Role::System, Permission::OpsCollectors));
+        assert!(authorize(Role::LicOps, Permission::OpsCollectors));
+        assert!(!authorize(Role::Ops, Permission::OpsCollectors));
+        assert!(!authorize(Role::Risk, Permission::OpsCollectors));
+
+        // OpsLogsRead 授予 system + lic_ops（ops 不持 —— 见 remote_ops QA 契约）。
+        assert!(authorize(Role::System, Permission::OpsLogsRead));
+        assert!(authorize(Role::LicOps, Permission::OpsLogsRead));
+        assert!(!authorize(Role::Ops, Permission::OpsLogsRead));
+        assert!(!authorize(Role::Risk, Permission::OpsLogsRead));
     }
 
     /// QA 红线（两端隔离）: `PermissionScope` 对 [`Permission::ALL`] 构成完备划分
@@ -802,9 +787,25 @@ mod tests {
             Permission::ALL.len(),
             "scope partition must cover every permission"
         );
+        // 端规模守恒（防将来误加项导致客户端矩阵越界）。
+        assert_eq!(
+            gateway.len(),
+            10,
+            "Gateway scope must contain exactly 10 permissions"
+        );
+        assert_eq!(
+            licensing.len(),
+            14,
+            "Licensing scope must contain exactly 14 permissions"
+        );
         for p in Permission::ALL {
             let hit = gateway.contains(p) as usize + licensing.contains(p) as usize;
-            assert_eq!(hit, 1, "permission {:?} must be in exactly one scope", p.as_str());
+            assert_eq!(
+                hit,
+                1,
+                "permission {:?} must be in exactly one scope",
+                p.as_str()
+            );
         }
 
         // 成员逐项核对（顺序镜像 Permission::ALL，防分端被误改）。
@@ -933,17 +934,19 @@ mod tests {
     async fn extractor_403_on_insufficient_permission_or_unknown_role() {
         let state = test_state();
 
-        // ops 持 code.issue，不持 key.rotate。
+        // ops 持 device.view（网关侧只读），不持 device.write（高危配置写仅 system）。
         let token = sign(&claims_for(Role::Ops), TEST_KEY).expect("sign");
         let authed = AuthedRole::from_request_parts(&mut parts_with(Some(&token)), &state)
             .await
             .expect("valid token must pass");
         assert_eq!(authed.role, Some(Role::Ops));
         assert_eq!(authed.claims.sub, "user-1");
-        authed.ensure(Permission::CodeIssue).expect("ops may issue");
+        authed
+            .ensure(Permission::DeviceView)
+            .expect("ops may view devices");
         let rejection = authed
-            .ensure(Permission::KeyRotate)
-            .expect_err("ops must not rotate keys");
+            .ensure(Permission::DeviceWrite)
+            .expect_err("ops must not write devices");
         assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
 
         // risk 可读审计但不可导出（audit.export 红线走 403 路径）。

@@ -4,8 +4,8 @@
 
     真实能力边界（不许造数）：
       · 运行信息取自 `GET /api/overview`（部署形态 / 主机名 / 端口 / 版本 / 标识）；
-      · 网关**未提供**容器 / 原生形态识别、启动策略写、计划重启端点，
-        这些一律诚实留空或标注为「本机界面状态」；
+      · 容器 / 原生形态识别、计划重启等能力由后端按需提供，页面只展示真实可得字段；
+      · 守护进程（崩溃重启 / 看门狗 / 启动失败保护）为桌面端能力，浏览器访问时诚实降级；
       · 危险动作契约不变（P0-6）：重启 / 停止走 ui-kit `DangerConfirmModal`
         —— 影响清单 + 原因必填 + **服务名二次校验**；real 模式调真实
         `POST /api/ops/restart` / `POST /api/ops/stop`，body `{actor, confirm, reason}`，
@@ -32,7 +32,7 @@
     <section class="wc-card">
       <div class="wc-card__head">
         <h3>运行信息</h3>
-        <span class="wc-tag wc-tag--info">容器 / 原生形态识别：网关未提供该接口</span>
+        <span class="wc-tag wc-tag--neutral">实时运行数据</span>
       </div>
       <div class="wc-card__body">
         <dl class="wc-kv">
@@ -60,11 +60,11 @@ journalctl -u iot-daq-gateway.service -f</pre>
     </section>
 
     <div class="wc-grid wc-grid--2">
-      <!-- 启动策略（本机界面状态） -->
+      <!-- 启动策略（自启写入能力以真实 GET / PUT /api/service/autostart 为准） -->
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>启动策略</h3>
-          <span class="wc-tag wc-tag--info">本机界面状态 · 网关未开放写端点</span>
+          <span class="wc-tag" :class="autostartCapability.cls">{{ autostartCapability.text }}</span>
         </div>
         <div class="wc-card__body">
           <div class="su-row">
@@ -94,7 +94,16 @@ journalctl -u iot-daq-gateway.service -f</pre>
               <div class="su-row__title">崩溃自动重启</div>
               <div class="su-row__desc">进程异常退出后自动重启，指数退避（1s→2s→4s，上限 60s）。</div>
             </div>
-            <UiSwitch v-model="crashRestart" on-text="已启用" off-text="已关闭" />
+            <RoleGate :allowed="canManage">
+              <UiSwitch
+                :model-value="crashRestart"
+                :disabled="!shellAvailable || svBusy"
+                on-text="已启用"
+                off-text="已关闭"
+                @update:model-value="(v: boolean) => onSupervisor('crash_restart', v)"
+              />
+            </RoleGate>
+            <span v-if="!shellAvailable" class="wc-tag wc-tag--neutral">桌面端能力</span>
           </div>
 
           <div class="su-row">
@@ -102,7 +111,16 @@ journalctl -u iot-daq-gateway.service -f</pre>
               <div class="su-row__title">看门狗</div>
               <div class="su-row__desc">心跳超时 90s 判定为假死，自动重启进程（panic 隔离）。</div>
             </div>
-            <UiSwitch v-model="watchdog" on-text="已启用" off-text="已关闭" />
+            <RoleGate :allowed="canManage">
+              <UiSwitch
+                :model-value="watchdog"
+                :disabled="!shellAvailable || svBusy"
+                on-text="已启用"
+                off-text="已关闭"
+                @update:model-value="(v: boolean) => onSupervisor('watchdog', v)"
+              />
+            </RoleGate>
+            <span v-if="!shellAvailable" class="wc-tag wc-tag--neutral">桌面端能力</span>
           </div>
 
           <div class="su-row">
@@ -110,16 +128,33 @@ journalctl -u iot-daq-gateway.service -f</pre>
               <div class="su-row__title">启动失败保护</div>
               <div class="su-row__desc">连续 5 次启动失败后暂停自启并触发告警，避免无限重启循环。</div>
             </div>
-            <UiSwitch v-model="bootFailureGuard" on-text="已启用" off-text="已关闭" />
+            <RoleGate :allowed="canManage">
+              <UiSwitch
+                :model-value="bootFailureGuard"
+                :disabled="!shellAvailable || svBusy"
+                on-text="已启用"
+                off-text="已关闭"
+                @update:model-value="(v: boolean) => onSupervisor('boot_failure_guard', v)"
+              />
+            </RoleGate>
+            <span v-if="!shellAvailable" class="wc-tag wc-tag--neutral">桌面端能力</span>
           </div>
+
+          <p v-if="shellAvailable && supervisor" class="su-sv">
+            守护状态：{{ supervisor.supported ? '支持' : '不支持' }} · 运行中 {{ supervisor.running ? '是' : '否' }} ·
+            已重启 {{ supervisor.restarts }} 次 · 连续失败 {{ supervisor.consecutive_failures }} 次 · 上次退出 {{ supervisor.last_exit || '—' }}
+          </p>
+          <p v-else-if="!shellAvailable" class="su-hint">
+            崩溃自动重启 / 看门狗 / 启动失败保护 随桌面端（IoT-DAQ Gateway）提供，当前为浏览器访问，状态不可得。
+          </p>
         </div>
       </section>
 
-      <!-- 计划重启（无端点） -->
+      <!-- 计划重启（后端暂无对应端点，本区为界面预览，不生效） -->
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>计划重启</h3>
-          <span class="wc-tag wc-tag--info">网关未提供计划重启端点</span>
+          <span class="wc-tag wc-tag--neutral">计划重启端点暂未接入，本区为界面预览，不生效</span>
         </div>
         <div class="wc-card__body">
           <div class="su-form-grid">
@@ -138,9 +173,9 @@ journalctl -u iot-daq-gateway.service -f</pre>
           </div>
           <dl class="wc-kv">
             <dt>下次执行</dt>
-            <dd class="wc-mono">—（网关未提供计划重启端点，本表单不生效）</dd>
+            <dd class="wc-mono">—</dd>
             <dt>上次执行</dt>
-            <dd class="wc-mono">—（网关未提供计划重启端点）</dd>
+            <dd class="wc-mono">—</dd>
           </dl>
         </div>
       </section>
@@ -232,6 +267,7 @@ import {
   type SelectOption,
 } from '@ui-kit';
 import { dataVersion, repo, type AutostartStatus, type GatewayInfo } from '@/api/repo';
+import { shellAvailable, supervisorStatus, setSupervisor, type SupervisorStatus } from '@/api/shell';
 import { session } from '../store/session';
 
 /** 网关信息（真实：`GET /api/overview`）。 */
@@ -277,13 +313,86 @@ const serviceStatusSub = computed(() => '最近一次 /api/overview 应答正常
 const canManage = computed(() => session.state.role === 'admin');
 
 // ---------------------------------------------------------------------------
-// 启动策略（本机界面状态；网关未开放写端点）
+// 启动策略（自启写入以真实 GET / PUT /api/service/autostart 为准）
 // ---------------------------------------------------------------------------
 
 const autostartEnabled = ref(true);
-const crashRestart = ref(true);
-const watchdog = ref(true);
-const bootFailureGuard = ref(true);
+
+// ---------------------------------------------------------------------------
+// 守护进程（崩溃重启 / 看门狗 / 启动失败保护）—— 桌面端真实能力，浏览器诚实降级
+// ---------------------------------------------------------------------------
+
+/** 守护真实状态（非桌面端为 null，开关禁用）。 */
+const supervisor = ref<SupervisorStatus | null>(null);
+
+/** 守护写进行中（防重复下发）。 */
+const svBusy = ref(false);
+
+/** 三个守护开关的当前值（由 supervisorStatus 真实填充，非假绑定）。 */
+const crashRestart = ref(false);
+const watchdog = ref(false);
+const bootFailureGuard = ref(false);
+
+/** 读取真实守护状态（浏览器端 supervisorStatus 直接返回 null）。 */
+async function loadSupervisor(): Promise<void> {
+  try {
+    const status = await supervisorStatus();
+    supervisor.value = status;
+    if (status) {
+      crashRestart.value = status.crash_restart;
+      watchdog.value = status.watchdog;
+      bootFailureGuard.value = status.boot_failure_guard;
+    }
+  } catch {
+    supervisor.value = null;
+  }
+}
+
+/** 把后端返回的真实状态写回本地开关。 */
+function applySupervisor(s: SupervisorStatus): void {
+  crashRestart.value = s.crash_restart;
+  watchdog.value = s.watchdog;
+  bootFailureGuard.value = s.boot_failure_guard;
+  supervisor.value = s;
+}
+
+/**
+ * 守护开关变更：真实 `setSupervisor`（桌面端）。
+ *
+ * 开关用 `:model-value` 单向绑定，仅成功返回后由 `applySupervisor` 回写，
+ * 因此失败无需手动回滚；失败时把真实原因展示给用户，绝不伪造成功。
+ */
+async function onSupervisor(
+  field: 'crash_restart' | 'watchdog' | 'boot_failure_guard',
+  next: boolean,
+): Promise<void> {
+  if (svBusy.value || !shellAvailable) {
+    return;
+  }
+  svBusy.value = true;
+  try {
+    const patch: { crash_restart?: boolean; watchdog?: boolean; boot_failure_guard?: boolean } = {};
+    if (field === 'crash_restart') {
+      patch.crash_restart = next;
+    } else if (field === 'watchdog') {
+      patch.watchdog = next;
+    } else {
+      patch.boot_failure_guard = next;
+    }
+    const result = await setSupervisor(patch);
+    if (result.ok) {
+      applySupervisor(result.state);
+      note(result.message, 'ok');
+    } else {
+      note(`守护配置未变更：${result.message}`, 'warn');
+    }
+  } catch (cause) {
+    const raw = cause instanceof Error ? cause.message : String(cause);
+    note(`守护配置未变更：${raw}`, 'warn');
+  } finally {
+    svBusy.value = false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 开机自启（真实：GET / PUT /api/service/autostart）
@@ -297,6 +406,18 @@ const autostartBusy = ref(false);
 
 /** 后端是否具备写入能力（诚实：`writeSupported:false` → 开关禁用 + 展示原因）。 */
 const autostartWritable = computed<boolean>(() => autostartStatus.value?.writeSupported === true);
+
+/** 启动策略卡头能力标签：以真实 writeSupported 为准，false 时展示后端真实原因。 */
+const autostartCapability = computed<{ text: string; cls: string }>(() => {
+  const status = autostartStatus.value;
+  if (!status) {
+    return { text: '自启能力状态未知', cls: 'wc-tag--neutral' };
+  }
+  if (status.writeSupported) {
+    return { text: '可写入自启配置', cls: 'wc-tag--ok' };
+  }
+  return { text: status.writeReason || '本端当前未开放自启写入能力', cls: 'wc-tag--warn' };
+});
 
 /** 自启状态短标签（未注册 / 已注册 / 未知）。 */
 const autostartStateText = computed<string>(() => {
@@ -322,12 +443,19 @@ const autostartDesc = computed<string>(() => {
     gateway.value.deployMode === 'docker'
       ? '对应 compose 的 restart: unless-stopped，宿主重启/断电后自动拉起。'
       : '对应系统自启注册表，宿主开机时自动拉起。';
+  // 注册目标（容错读 target / targetKind，缺失不报错）
+  const targetText = status.target
+    ? ` 注册目标：${status.target}${status.targetKind ? `（${status.targetKind}）` : ''}`
+    : '';
   const command = status.command.trim();
-  const real = status.registered === null ? '当前平台未提供自启查询。' : `${base} 自启命令：${command || '—'}`;
+  const real =
+    status.registered === null
+      ? '当前平台未提供自启查询。'
+      : `${base} 自启命令：${command || '—'}${targetText}`;
   if (!status.writeSupported) {
-    return `${real} ${status.writeReason || '网关未开放自启写入能力'}。`;
+    return `（${real}）${status.writeReason || '本端当前未开放自启写入能力'}`;
   }
-  return real;
+  return `（${real}）`;
 });
 
 /** 读取真实自启状态。 */
@@ -380,6 +508,9 @@ async function onAutostart(next: boolean): Promise<void> {
 
 onMounted(() => {
   void loadAutostart();
+  if (shellAvailable) {
+    void loadSupervisor();
+  }
 });
 
 /** 最近一次操作反馈。 */
@@ -394,7 +525,7 @@ function note(text: string, kind: 'ok' | 'warn' = 'ok'): void {
 
 
 // ---------------------------------------------------------------------------
-// 计划重启（本机界面状态；网关无端点，不推算下次执行）
+// 计划重启（后端暂无对应端点，仅作界面预览）
 // ---------------------------------------------------------------------------
 
 const plan = reactive({
@@ -636,5 +767,19 @@ async function confirmStop(payload: { reason: string; note: string; confirm: str
   border-color: var(--warn-border);
   background: var(--warn-bg);
   color: var(--warn-fg);
+}
+
+/* 守护状态 / 浏览器降级提示 */
+.su-sv,
+.su-hint {
+  margin: 8px 0 0;
+  font-size: var(--fs-caption);
+  line-height: 1.6;
+}
+.su-sv {
+  color: var(--text-2);
+}
+.su-hint {
+  color: var(--text-3);
 }
 </style>

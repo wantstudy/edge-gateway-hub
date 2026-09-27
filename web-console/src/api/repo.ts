@@ -1250,6 +1250,10 @@ export interface AutostartStatus {
   /** 后端诚实声明（当前 false = 自启写入未实现）；repo 原样保留，绝不冒充可写。 */
   writeSupported: boolean;
   writeReason: string;
+  /** 自启注册目标（如 systemd unit / shell 命令标识）；后端按需返回，可能缺省。 */
+  target?: string | null;
+  /** 注册目标形态；后端按实际守护类型返回，可能缺省。 */
+  targetKind?: 'shell' | 'daemon' | null;
 }
 
 /** `GET|PUT /api/settings/backup-policy` 的备份策略。

@@ -48,11 +48,12 @@ use super::MgmtState;
 
 /// 内置角色（id → 显示名）。permissions 由 [`Role::as_str`] + `permissions_of` 动态取，
 /// 保证与授权判定同源。
+// id 不变（JWT 兼容红线）；展示名按网关侧语义重述。
 const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("ops", "运维"),
-    ("lic_ops", "授权运维"),
-    ("risk", "风控审计"),
-    ("system", "系统管理"),
+    ("lic_ops", "高级运维"),
+    ("risk", "审计"),
+    ("system", "系统管理员（全部权限）"),
 ];
 
 /// 权限目录（`GET /api/permissions`；label / group 为展示文案，id 即
@@ -285,10 +286,14 @@ fn custom_role_to_wire(id: &str, name: &str, permissions: &[String], users: &[Va
 }
 
 /// 内置角色行 → wire（permissions 从 `permissions_of` 动态取，与授权判定同源）。
+///
+/// ⚠️ 双保险：输出 `permissions` 显式过滤 `scope() == Gateway`，确保客户端角色矩阵
+/// 绝不出现厂商侧权限 id（如 `code.issue`），即使底层矩阵被误配也不会泄漏。
 fn builtin_role_to_wire(id: &str, name: &str, users: &[Value]) -> Value {
     let role = Role::from_str(id).unwrap_or(Role::Ops);
     let perms: Vec<&str> = super::rbac::permissions_of(role)
         .iter()
+        .filter(|p| p.scope() == PermissionScope::Gateway)
         .map(|p| p.as_str())
         .collect();
     let count = users.iter().filter(|u| u["role"] == *id).count();
@@ -1291,7 +1296,9 @@ mod tests {
     #[tokio::test]
     async fn validate_permissions_rejects_licensing_and_unknown() {
         // 网关侧权限放行。
-        assert!(validate_permissions(&["device.view".to_string(), "account.view".to_string()]).is_ok());
+        assert!(
+            validate_permissions(&["device.view".to_string(), "account.view".to_string()]).is_ok()
+        );
 
         // 厂商侧任一权限被拒（逐项覆盖，防漏）。
         for licensing in LICENSING_IDS {
@@ -1311,12 +1318,43 @@ mod tests {
         }
 
         // 未知 id → 400（原语义不回退）。
-        let resp = validate_permissions(&["nuke.all".to_string()]).expect_err("unknown id rejected");
+        let resp =
+            validate_permissions(&["nuke.all".to_string()]).expect_err("unknown id rejected");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // 混合提交：网关侧 + 厂商侧 → 仍被拒（不接受部分合法）。
         let resp = validate_permissions(&["device.view".to_string(), "code.view".to_string()])
             .expect_err("mixed submission must be rejected");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// QA 收口（task A）：内置角色 wire 的 `permissions` 不得含任何厂商侧 id。
+    #[test]
+    fn builtin_role_wire_excludes_licensing_ids() {
+        let users: Vec<Value> = vec![];
+        let gateway: Vec<String> = crate::mgmt::rbac::permissions_of_scope(PermissionScope::Gateway)
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        let licensing_ids: Vec<String> =
+            crate::mgmt::rbac::permissions_of_scope(PermissionScope::Licensing)
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect();
+        for (id, _name) in BUILTIN_ROLES {
+            let row = builtin_role_to_wire(id, "x", &users);
+            let perms = row["permissions"].as_array().expect("perms array");
+            for p in perms {
+                let s = p.as_str().expect("perm id string");
+                assert!(
+                    !licensing_ids.contains(&s.to_string()),
+                    "builtin role {id:?} wire must not expose licensing id {s:?}"
+                );
+                assert!(
+                    gateway.iter().any(|g| g == s),
+                    "builtin role {id:?} perm {s:?} must be a known gateway id"
+                );
+            }
+        }
     }
 }

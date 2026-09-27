@@ -839,10 +839,7 @@ fn parse_leading_u64(text: &str) -> Option<u64> {
 /// 同一秒内扫描已存在的 `{base}-NNN.bak` 取 `max(N)+1`；仍冲突时继续 `+1`
 /// （有界 1000 次，绝不 panic）。
 pub fn next_backup_path(dir: &Path, config_file_name: &str) -> PathBuf {
-    let base = format!(
-        "{config_file_name}.{}",
-        format_utc8_token(unix_secs_i64())
-    );
+    let base = format!("{config_file_name}.{}", format_utc8_token(unix_secs_i64()));
     let scan_prefix = format!("{base}-");
     let mut next: u32 = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {

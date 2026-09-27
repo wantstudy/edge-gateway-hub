@@ -20,7 +20,9 @@
  *      - 已接通写端点：`POST /admin/codes/issue`（发放）、
  *        `POST /admin/codes/:id/revoke`（废弃）、`POST /admin/codes/:id/reissue`
  *        （重发）——废弃的 `confirm_tail8` 由详情端点的完整码值自动计算；
- *      - 后端确实没有的端点（租户策略写、换机工单、账号、密钥轮换、异常处置）：
+ *      - **账号 / 角色可配置**（缺口 #9 修复）：`GET/POST/PUT/DELETE /admin/accounts`
+ *        + `GET /admin/roles`（GET 仅系统角色可见，非系统 403 静默）；
+ *      - 后端确实没有的端点（租户策略写、换机工单、密钥轮换、异常处置）：
  *        读取型方法返回**诚实的空结果**（绝不回退假数据），写入型方法返回 false
  *        并把「后端缺口」写入全局提示横幅（`adminNotices`），做到清晰报错；
  *        后端未提供的数据维度以 `'—'` 展示，绝不编造。
@@ -53,6 +55,7 @@ import {
 export * from '../mock/mock-data';
 
 import { API_MODE, ApiError, adminRequest } from './client';
+import { formatTimestampText } from '../utils/time';
 
 // 再导出模式常量，页面可统一从本模块取用
 export { API_MODE } from './client';
@@ -287,7 +290,38 @@ export interface AdminRepo {
 
   // ---------- 账号 ----------
   allUsers(): AdminUser[];
-  setUserStatus(input: { account: string; enabled: boolean; actor: string }): Promise<boolean>;
+  setUserStatus(input: {
+    account: string;
+    enabled: boolean;
+    reason: string;
+    note: string;
+    confirm: string;
+    actor: string;
+  }): Promise<boolean>;
+  createUser(input: {
+    account: string;
+    name: string;
+    role: string;
+    password: string;
+    actor: string;
+  }): Promise<boolean>;
+  updateUser(input: {
+    account: string;
+    name?: string;
+    role?: string;
+    password?: string;
+    reason?: string;
+    note?: string;
+    confirm?: string;
+    actor: string;
+  }): Promise<boolean>;
+  deleteUser(input: {
+    account: string;
+    reason: string;
+    note: string;
+    confirm: string;
+    actor: string;
+  }): Promise<boolean>;
 
   // ---------- 总览 ----------
   overview(): OverviewStats;
@@ -338,6 +372,26 @@ function buildMockRepo(): AdminRepo {
     retireKey: (input) => Promise.resolve(mockRepo.retireKey(input)),
     logReveal: (input) => Promise.resolve(mockRepo.logReveal(input)),
     setUserStatus: (input) => Promise.resolve(mockRepo.setUserStatus(input)),
+    createUser: (input) =>
+      Promise.resolve(
+        mockRepo.createUser({
+          account: input.account,
+          name: input.name,
+          role: input.role,
+          actor: input.actor,
+        }),
+      ),
+    updateUser: (input) =>
+      Promise.resolve(
+        mockRepo.updateUser({
+          account: input.account,
+          name: input.name,
+          role: input.role,
+          actor: input.actor,
+        }),
+      ),
+    deleteUser: (input) =>
+      Promise.resolve(mockRepo.deleteUser({ account: input.account, actor: input.actor })),
   };
 }
 
@@ -397,6 +451,9 @@ const realKeys = reactive<SigningKey[]>([]);
 
 /** real 模式审计日志缓存（GET /admin/audit/logs）。 */
 const realAuditLogs = reactive<AuditEntry[]>([]);
+
+/** real 模式管理员账号缓存（GET /admin/accounts；缺口 #9 修复）。 */
+const realAccounts = reactive<AdminUser[]>([]);
 
 /** real 模式总览聚合（GET /admin/overview；计数契约 String，未提供维度 '—'）。 */
 const realStats = reactive<OverviewStats>({
@@ -702,6 +759,34 @@ function buildAuditRecord(raw: Record<string, unknown>, idx: number): AuditEntry
     ip: pickStr(raw, 'ip', ''),
     result: '—',
   };
+}
+
+/** 管理员账号行（AdminAccountItem）→ 页面 AdminUser（时间戳格式化，绝不裸显 epoch）。 */
+function buildAdminUserFromRaw(raw: Record<string, unknown>): AdminUser {
+  const statusRaw = pickStr(raw, 'status', 'active');
+  const lastLogin = raw.last_login_at;
+  return {
+    account: pickStr(raw, 'account', ''),
+    name: pickStr(raw, 'display_name', ''),
+    role: pickStr(raw, 'role', ''),
+    status: statusRaw === 'active' ? 'user_enabled' : 'user_disabled',
+    lastLoginAt:
+      typeof lastLogin === 'string' && lastLogin !== '' ? formatTimestampText(lastLogin) : '—',
+  };
+}
+
+/** 拉取管理员账号列表（GET /admin/accounts；仅系统角色可见，非系统 403 静默）。 */
+async function fetchAccounts(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/accounts', {}, buildAdminUserFromRaw);
+    realAccounts.splice(0, realAccounts.length, ...(rows as AdminUser[]));
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 403) {
+      // 非系统角色不可见账号列表（页面本身也仅系统可见）：静默，不刷横幅。
+      return;
+    }
+    pushNoticeOnce('load-accounts', 'warn', `账号列表加载失败：${describeCause(cause)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,15 +1365,80 @@ function buildRealRepo(): AdminRepo {
       // 说明：揭示动作本身仍受页面权限门控；服务端审计待缺口补齐后接入。
     },
 
-    // ---------- 账号（后端无管理员账号列表端点） ----------
+    // ---------- 账号（GET/POST/PUT/DELETE /admin/accounts 已接通；缺口 #9 修复） ----------
     allUsers(): AdminUser[] {
-      pushNoticeOnce('gap-users', 'warn', '后端缺口 #9：未提供管理员账号列表端点——账号页无真实数据可显示。');
-      return [];
+      return JSON.parse(JSON.stringify(realAccounts)) as AdminUser[];
     },
 
-    setUserStatus(_input: { account: string; enabled: boolean; actor: string }): Promise<boolean> {
-      pushNoticeOnce('gap-user-status', 'warn', '后端缺口 #9：未提供账号启停写端点——操作未生效。');
-      return Promise.resolve(false);
+    async setUserStatus(input): Promise<boolean> {
+      try {
+        await adminRequest<unknown>(`/admin/accounts/${encodeURIComponent(input.account)}`, {
+          method: 'PUT',
+          body: { status: input.enabled ? 'active' : 'disabled' },
+        });
+        await fetchAccounts();
+        return true;
+      } catch (cause) {
+        return reportFailure(input.enabled ? '启用账号' : '停用账号', cause);
+      }
+    },
+
+    async createUser(input): Promise<boolean> {
+      if (!input.account.trim() || !input.password) {
+        pushNotice('error', '新增账号失败：账号与初始口令均不能为空。');
+        return false;
+      }
+      try {
+        await adminRequest<unknown>('/admin/accounts', {
+          method: 'POST',
+          body: {
+            account: input.account.trim(),
+            display_name: input.name,
+            role: input.role,
+            password: input.password,
+          },
+        });
+        await fetchAccounts();
+        return true;
+      } catch (cause) {
+        return reportFailure('新增账号', cause);
+      }
+    },
+
+    async updateUser(input): Promise<boolean> {
+      const body: Record<string, unknown> = {};
+      if (input.name !== undefined) {
+        body.display_name = input.name;
+      }
+      if (input.role !== undefined) {
+        body.role = input.role;
+      }
+      if (input.password) {
+        body.password = input.password;
+      }
+      try {
+        await adminRequest<unknown>(`/admin/accounts/${encodeURIComponent(input.account)}`, {
+          method: 'PUT',
+          body,
+        });
+        await fetchAccounts();
+        return true;
+      } catch (cause) {
+        return reportFailure('修改账号', cause);
+      }
+    },
+
+    async deleteUser(input): Promise<boolean> {
+      try {
+        await adminRequest<unknown>(`/admin/accounts/${encodeURIComponent(input.account)}`, {
+          method: 'DELETE',
+          body: { reason: input.reason, note: input.note, confirm: input.confirm },
+        });
+        await fetchAccounts();
+        return true;
+      } catch (cause) {
+        return reportFailure('删除账号', cause);
+      }
     },
 
     // ---------- 总览（GET /admin/overview 已接通；计数 String 原文透传） ----------
@@ -1324,7 +1474,16 @@ export async function preloadRealData(): Promise<boolean> {
   preloadStarted = true;
   const TIMEOUT_MS = 10_000;
   await Promise.race([
-    Promise.allSettled([fetchOverview(), fetchCodes(), fetchDevices(), fetchTenants(), fetchAnomalies(), fetchKeys(), fetchAudit()]),
+    Promise.allSettled([
+      fetchOverview(),
+      fetchCodes(),
+      fetchDevices(),
+      fetchTenants(),
+      fetchAnomalies(),
+      fetchKeys(),
+      fetchAudit(),
+      fetchAccounts(),
+    ]),
     new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), TIMEOUT_MS)),
   ]);
   return true;

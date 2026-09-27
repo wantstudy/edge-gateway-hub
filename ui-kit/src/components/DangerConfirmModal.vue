@@ -177,13 +177,15 @@ interface Props {
   /**
    * 二次校验模式：
    *  · `'tail8'`（默认）—— 取 `confirmValue` 后 8 位做**本地**校验（既有行为，零改动）；
-   *  · `'full'`  —— 对象**全名原文**，**不做本地匹配拦截**（仅要求非空），
-   *    比对交由服务端（不匹配 → 400 `confirm_mismatch`）。
+   *  · `'full'`  —— 对象**全名原文**做**本地 fail-fast 精确匹配**：
+   *      比对口径 = `trim()` + 大小写不敏感**精确相等**（不做分隔符剥离 / 不做子串 / 不做归一化）。
+   *      匹配失败 → 提交按钮**立即禁用**并给出字段级错误（把错误挡在点击之前，而非提交后才报错）。
+   *      `confirmValue` 为空（调用方漏传）时退化为「仅校验非空」，交由服务端兜底。
    *
-   *  ⚠ 大小写口径：**服务端做 `trim()` + 大小写不敏感精确匹配**（`str::eq_ignore_ascii_case`）：
-   *    `rules_api` `:694 / :859`、`alerts_api` `check_trio` `:270`、`remote_ops` `:632 / :742`
-   *    均为同一口径。因此二次校验输入允许前尾空格与任意大小写，不匹配才由服务端 400
-   *    `confirm_mismatch`（注意：服务端逐一字比对前也 trim，故本组件**不做**本地归一化兜底）。
+   *  ⚠ 大小写口径：服务端 `rules_api:694/:859`、`alerts_api:270 check_trio`、
+   *    `remote_ops:632/:742` 均为 `trim()` + `eq_ignore_ascii_case` 精确匹配；
+   *    前端 fail-fast 与之一致（先 `trim` 再大小写不敏感比较），但**不**对输入做分隔符剥离 /
+   *    子串匹配，避免「看起来像就放行」。
    */
   confirmMode?: 'tail8' | 'full';
   /** 二次校验字段标签（不传则按 `confirmMode` 取默认文案） */
@@ -244,10 +246,11 @@ const reasonOptions = computed<readonly SelectOption[]>(() => [
 const expectedTail = computed(() => codeTail8(props.confirmValue));
 
 /**
- * 是否为「全名原文 + 服务端校验」模式。
+ * 是否为「全名原文 + 本地 fail-fast 精确匹配」模式。
  *
- * 该模式下**不做任何本地匹配拦截**：输入原样透传，匹配与否由服务端判定
- * （不匹配 → 400 `confirm_mismatch`），避免「前端看似匹配、后端判不匹配」的扯皮。
+ * 该模式**会**做本地匹配：输入经 `trim()` + 大小写不敏感**精确**比对 `confirmValue`，
+ * 不匹配即禁用提交并给出字段级错误。`confirmValue` 为空（漏传）时退化为仅校验非空，
+ * 交由服务端兜底。
  */
 const isFullMode = computed(() => props.confirmMode === 'full');
 
@@ -270,18 +273,31 @@ const noteError = computed(() => {
   return len < props.minNoteLength ? `还差 ${props.minNoteLength - len} 字` : '';
 });
 
-/** 二次校验错误：仅在用户已输入但填错时提示（full 模式不本地判错，交由服务端）。 */
+/**
+ * 二次校验错误（仅在用户已输入但填错时提示）：
+ *  · tail8 模式：比对归一化后 8 位（去分隔符、大写），不一致即报错；
+ *  · full 模式：比对 `confirmValue` 全名（trim + 大小写不敏感**精确**匹配），
+ *    不一致即报错；`confirmValue` 为空（漏传）时不做本地匹配，仅依赖非空校验。
+ */
 const tailError = computed(() => {
-  if (isFullMode.value) {
-    return '';
-  }
-  // fail-closed：拿不到比对目标就没有「二次校验」可言，必须显式报错而不是静默放行
-  if (props.confirmValue.trim().length === 0) {
-    return '对象标识缺失（confirmValue 未传入），无法执行对象名二次校验';
-  }
   const input = form.tail.trim();
   if (input.length === 0) {
     return '';
+  }
+  if (isFullMode.value) {
+    const expected = props.confirmValue.trim();
+    // confirmValue 缺失 → 本地无法匹配，退化为「仅非空」（交由服务端兜底）
+    if (expected.length === 0) {
+      return '';
+    }
+    // 本地 fail-fast：trim + 大小写不敏感**精确**匹配（不做分隔符剥离 / 不做子串）
+    return input.toLowerCase() === expected.toLowerCase()
+      ? ''
+      : '与对象全名不一致（不区分大小写，请完整填写全名）';
+  }
+  // tail8 模式：fail-closed —— 拿不到比对目标就没有「二次校验」可言，必须显式报错
+  if (props.confirmValue.trim().length === 0) {
+    return '对象标识缺失（confirmValue 未传入），无法执行对象名二次校验';
   }
   const normalize = input.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
   return normalize === expectedTail.value ? '' : '与对象标识后 8 位不一致';
@@ -298,7 +314,7 @@ const approverError = computed(() => {
 /** 二次校验提示：写清比对的是哪一段。 */
 const confirmHint = computed(() => {
   if (isFullMode.value) {
-    return '请完整填写对象全名（服务端 trim + 大小写不敏感精确校验）以确认';
+    return '请完整填写对象全名（本地与服务端均做 trim + 大小写不敏感精确校验）以确认';
   }
   return expectedTail.value
     ? '请完整填写对象标识后 8 位（去分隔符、不区分大小写），用于防止误操作'
@@ -310,7 +326,8 @@ const confirmHint = computed(() => {
  * 1) 原因已选（若提供枚举）
  * 2) 补充说明 ≥ minNoteLength
  * 3) 二次校验：tail8 模式本地比对后 8 位（**比对目标缺失即拒绝放行**，fail-closed）；
- *    full 模式仅要求非空（比对在服务端）
+ *    full 模式本地 fail-fast 精确匹配 `confirmValue`（trim + 大小写不敏感），
+ *    `confirmValue` 缺失时退化为仅校验非空（交由服务端兜底）
  * 4) 双人复核时第二审批人非空
  */
 const canSubmit = computed(() => {
@@ -324,8 +341,15 @@ const canSubmit = computed(() => {
     return false;
   }
   if (isFullMode.value) {
-    // 全名模式：不做本地匹配拦截，只要求输入非空（匹配交由服务端）
-    if (form.tail.trim().length === 0) {
+    // 全名模式：本地 fail-fast 精确匹配（trim + 大小写不敏感）。
+    // 匹配失败 → 禁用提交（把错误挡在点击之前）。
+    // confirmValue 缺失 → 退化为仅校验非空（交由服务端兜底）。
+    const input = form.tail.trim();
+    if (input.length === 0) {
+      return false;
+    }
+    const expected = props.confirmValue.trim();
+    if (expected.length > 0 && input.toLowerCase() !== expected.toLowerCase()) {
       return false;
     }
   } else {
@@ -386,7 +410,8 @@ function submit(): void {
   const payload = {
     reason: form.reason,
     note: form.note.trim(),
-    // full 模式：原文透传（服务端比对）；tail8 模式：保持既有去尾空格行为
+    // full 模式：原文透传（本地已 fail-fast 校验，服务端再做一次精确比对）；
+    // tail8 模式：保持既有去尾空格行为
     tail: isFullMode.value ? form.tail : form.tail.trim(),
     secondApprover: form.secondApprover.trim(),
     // 二次校验原文（不 trim / 不归一化），供服务端大小写不敏感精确匹配

@@ -1,22 +1,28 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::Manager;
-use tauri::WebviewUrl;
-use tauri::WebviewWindowBuilder;
+//! IoT-DAQ Gateway 桌面壳（Tauri 2.x）。
+//!
+//! 职责边界：
+//! 1. 承载网关侧 web-console（`frontendDist` → `../../web-console/dist`）；
+//! 2. 以**侧车**方式拉起 `iot-daq-daemon`，并为其提供真实守护能力
+//!    （崩溃自动重启 / 看门狗 / 启动失败保护），经 Tauri 命令
+//!    `supervisor_status` / `supervisor_set` 暴露给前端（见 [`supervisor`]）；
+//! 3. 首次运行就地生成**最小配置**（daemon 对「配置缺失」是 fail-fast）。
+//!
+//! ⚠️ 授权判定恒在 daemon 的 Rust 侧；本壳只承载 UI、拉起进程、转发命令。
 
-/// daemon 侧车可执行文件名（随平台变化）。
-const DAEMON_EXE: &str = if cfg!(windows) {
-    "iot-daq-daemon.exe"
-} else {
-    "iot-daq-daemon"
-};
+mod supervisor;
+
+use std::sync::Arc;
+
+use supervisor::{Supervisor, SupervisorPatch, SupervisorStatus};
 
 /// 首次运行就地生成的**最小配置**。
 ///
-/// daemon 的默认配置路径是 `./config.toml`，而 `GatewayConfig::load` 对「文件不存在」
-/// 是 fail-fast（退出码 1），因此该文件**必须存在**；但 `GatewayConfig` 全字段带
-/// `#[serde(default)]` + `Default`，最小内容即可正常启动（实测 `/api/overview` 200）。
-/// 故安装包不再随包分发 `config.example.toml`——模板只作为开发参考留在仓库根目录。
+/// daemon 的默认配置路径是 `<工作目录>/config.toml`，而 `GatewayConfig::load` 对
+/// 「文件不存在」是 fail-fast（退出码 1），因此该文件**必须存在**；但 `GatewayConfig`
+/// 全字段带 `#[serde(default)]` + `Default`，最小内容即可正常启动。故安装包不再随包
+/// 分发 `config.example.toml`——模板只作为开发参考留在仓库根目录。
 const MINIMAL_CONFIG: &str = "\
 # 本文件由 IoT-DAQ Gateway 桌面端首次运行时自动生成（已存在则绝不会被覆盖）。
 # 采集点位 / 北向出口 / 告警 / 管理面账号均可在本文件中配置，改后重启程序生效。
@@ -26,16 +32,58 @@ const MINIMAL_CONFIG: &str = "\
 gateway_id = \"gw-local\"
 ";
 
+/// `supervisor_status`：读取守护真实状态（前端 `shell.ts::supervisorStatus`）。
+#[tauri::command]
+fn supervisor_status(state: tauri::State<'_, Arc<Supervisor>>) -> SupervisorStatus {
+    state.status()
+}
+
+/// `supervisor_set`：写守护补丁，返回**写后真实状态**
+/// （前端 `shell.ts::setSupervisor`，参数名 snake_case）。
+#[tauri::command]
+fn supervisor_set(
+    state: tauri::State<'_, Arc<Supervisor>>,
+    crash_restart: Option<bool>,
+    watchdog: Option<bool>,
+    boot_failure_guard: Option<bool>,
+) -> SupervisorStatus {
+    state.set(SupervisorPatch {
+        crash_restart,
+        watchdog,
+        boot_failure_guard,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 fn main() {
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![supervisor_status, supervisor_set])
         .setup(|app| {
-            // 尝试拉起 daemon 侧车。授权判定始终在 daemon Rust 侧，本壳只承载 UI 与转发。
-            // 若 resource_dir 下不存在 daemon 二进制，壳以「纯 UI 模式」降级运行：
-            // 前端按诚实空态呈现并给出真实原因（绝无 mock 回退）。
-            spawn_daemon_sidecar(app.handle());
+            use tauri::Manager as _;
+            let handle = app.handle().clone();
+            let data_dir = supervisor::resolve_data_dir(&handle);
+            let daemon_path = supervisor::resolve_daemon_path(&handle);
 
-            // 主窗口：加载 web-console 前端（frontendDist 指向 ../../web-console/dist）。
+            // 数据目录里没有 config.toml 时就地生成最小配置（用户手写资产，存在则不覆盖）。
+            let config_path = data_dir.join("config.toml");
+            if !config_path.exists() {
+                if let Err(err) = std::fs::write(&config_path, MINIMAL_CONFIG) {
+                    eprintln!("[tauri-shell] 生成最小配置失败（{config_path:?}）：{err}");
+                }
+            }
+
+            // 真实守护：拉起侧车 + 起守护线程（未随包分发 daemon 时 supported=false，
+            // 前端按诚实空态呈现并给出真实原因，绝不回退 mock）。
+            let sup = Supervisor::new(
+                daemon_path,
+                data_dir,
+                Supervisor::mgmt_addr_from_env(),
+            );
+            sup.start();
+            app.manage(sup);
+
+            // 主窗口：加载 web-console 前端。
+            use tauri::{WebviewUrl, WebviewWindowBuilder};
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("IoT-DAQ 网关控制台")
                 .inner_size(1366.0, 768.0)
@@ -43,8 +91,7 @@ fn main() {
                 .resizable(true)
                 .fullscreen(false)
                 .center()
-                .build()
-                .expect("创建主窗口失败");
+                .build()?;
 
             Ok(())
         })
@@ -52,62 +99,20 @@ fn main() {
         .expect("启动 Tauri 运行时失败");
 }
 
-/// 从 `resource_dir()` 拉起 daemon 侧车（若存在）。失败仅记录，不阻断 UI。
-fn spawn_daemon_sidecar(app: &tauri::AppHandle) {
-    let resource_dir = match app.path().resource_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[tauri-shell] 无法定位 resource_dir，跳过 daemon 拉起：{e}");
-            return;
-        }
-    };
-    let daemon_path = resource_dir.join(DAEMON_EXE);
-    if !daemon_path.exists() {
-        eprintln!(
-            "[tauri-shell] 未找到 daemon 侧车（{:?}），以纯 UI 模式运行。",
-            daemon_path
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最小配置必须能被 daemon 的配置解析器接受（键存在且语法合法）。
+    #[test]
+    fn minimal_config_has_gateway_section() {
+        assert!(
+            MINIMAL_CONFIG.contains("[gateway]"),
+            "minimal config must declare [gateway]"
         );
-        return;
-    }
-
-    // daemon 以「自己的数据目录」为工作目录：绝不继承安装目录（安装目录可能只读，
-    // 且多用户共享），配置 / 队列 / 审计库一律落在 `%LOCALAPPDATA%` 下的应用数据目录。
-    let data_dir = match app.path().app_data_dir() {
-        Ok(dir) => {
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                eprintln!("[tauri-shell] 创建应用数据目录失败（{dir:?}）：{e}，回退到 resource_dir");
-                resource_dir.clone()
-            } else {
-                dir
-            }
-        }
-        Err(e) => {
-            eprintln!("[tauri-shell] 无法定位 app_data_dir，回退到 resource_dir：{e}");
-            resource_dir.clone()
-        }
-    };
-
-    // 首次运行：数据目录里没有 config.toml 时，就地生成一份**最小配置**（见 MINIMAL_CONFIG）。
-    // 用户手写资产，之后由用户自行维护；已存在则绝不覆盖。
-    let config_path = data_dir.join("config.toml");
-    if !config_path.exists() {
-        match std::fs::write(&config_path, MINIMAL_CONFIG) {
-            Ok(()) => eprintln!("[tauri-shell] 已生成最小配置：{config_path:?}"),
-            Err(e) => eprintln!("[tauri-shell] 生成配置失败（{config_path:?}）：{e}"),
-        }
-    }
-
-    let mut command = std::process::Command::new(&daemon_path);
-    command.current_dir(&data_dir);
-    match command.spawn() {
-        Ok(child) => eprintln!(
-            "[tauri-shell] 已拉起 daemon 侧车 pid={}（工作目录 {:?}）",
-            child.id(),
-            data_dir
-        ),
-        Err(e) => eprintln!(
-            "[tauri-shell] 拉起 daemon 侧车失败（{:?}）：{}",
-            daemon_path, e
-        ),
+        assert!(
+            MINIMAL_CONFIG.contains("gateway_id"),
+            "minimal config must set gateway_id"
+        );
     }
 }

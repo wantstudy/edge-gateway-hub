@@ -129,8 +129,8 @@ export const ROLE_META: Readonly<Record<Role, RoleMeta>> = Object.freeze({
   system: {
     id: 'system',
     label: '系统',
-    fullLabel: '系统（密钥轮换 / 租户档位配置）',
-    desc: '签名密钥轮换与租户策略配置，不参与日常发码。',
+    fullLabel: '系统（全部权限）',
+    desc: '系统管理员：具备全部权限（发码/废弃/重发/换机/密钥/租户/账号/审计）。',
   },
 });
 
@@ -165,7 +165,7 @@ export const PAGES: readonly PageMeta[] = Object.freeze([
     title: '激活码管理',
     group: '授权运营',
     crumb: '授权运营 / 激活码管理',
-    visibleTo: ['ops', 'lic_ops'],
+    visibleTo: ['ops', 'lic_ops', 'system'],
     icon: IconFile,
   },
   {
@@ -173,7 +173,7 @@ export const PAGES: readonly PageMeta[] = Object.freeze([
     title: '激活码详情',
     group: '授权运营',
     crumb: '授权运营 / 激活码管理',
-    visibleTo: ['ops', 'lic_ops'],
+    visibleTo: ['ops', 'lic_ops', 'system'],
     icon: IconFile,
     detailOnly: true,
   },
@@ -182,7 +182,7 @@ export const PAGES: readonly PageMeta[] = Object.freeze([
     title: '设备管理',
     group: '授权运营',
     crumb: '授权运营 / 设备管理',
-    visibleTo: ['ops', 'lic_ops'],
+    visibleTo: ['ops', 'lic_ops', 'system'],
     icon: IconComputer,
   },
   {
@@ -190,7 +190,7 @@ export const PAGES: readonly PageMeta[] = Object.freeze([
     title: '设备详情',
     group: '授权运营',
     crumb: '授权运营 / 设备管理',
-    visibleTo: ['ops', 'lic_ops'],
+    visibleTo: ['ops', 'lic_ops', 'system'],
     icon: IconComputer,
     detailOnly: true,
   },
@@ -215,7 +215,7 @@ export const PAGES: readonly PageMeta[] = Object.freeze([
     title: '换机工单',
     group: '风控',
     crumb: '风控 / 换机工单',
-    visibleTo: ['lic_ops'],
+    visibleTo: ['lic_ops', 'system'],
     icon: IconSwap,
   },
   {
@@ -281,17 +281,26 @@ export const ACTION_MATRIX: Readonly<Record<Role, readonly Action[]>> = Object.f
     'code.view',
   ],
   system: [
+    // 系统管理员：厂商侧全部 19 项操作权限（发码 / 废弃 / 重发 / 换机 / 密钥 / 租户 / 账号 / 审计）
+    'code.view',
+    'code.issue',
+    'code.revoke',
+    'code.reissue',
+    'code.reveal',
+    'device.view',
+    'device.mark_anomaly',
     'tenant.view',
     'tenant.policy_update',
+    'receipt.view',
+    'receipt.mark',
+    'transfer.view',
+    'transfer.process',
     'key.view',
     'key.rotate',
     'audit.view',
     'audit.export',
     'account.view',
     'account.update',
-    'code.reveal',
-    'device.view',
-    'receipt.view',
   ],
 });
 

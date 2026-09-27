@@ -485,6 +485,10 @@ pub fn router(state: MgmtState) -> Router {
             get(pages::forwarders_list).post(pages::forwarder_create),
         )
         .route(
+            "/api/forwarders/:id",
+            axum::routing::put(pages::forwarder_update).delete(pages::forwarder_delete),
+        )
+        .route(
             "/api/forwarders/:id/test",
             axum::routing::post(pages::forwarder_test),
         )
