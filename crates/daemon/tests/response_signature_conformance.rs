@@ -101,7 +101,9 @@ fn issue_and_activate(svc: &LicensingService) -> licensing_server::proto::Activa
         valid_from: (now - 1000).to_string(),
         valid_until: (now + 365 * 86_400).to_string(),
         count: 1,
-        prebind_machine_code: None,
+        // 生产契约（2026-09）：发放必须预绑定机器码（后端 MACHINE_CODE_REQUIRED fail-closed）。
+        // 预绑定值须与下方激活用的 machine 一致，否则 prebind 校验拒绝。
+        prebind_machine_code: Some("MID-CFG-RESP-0001".to_string()),
         idempotency_key: "cfg-resp-batch-1".to_string(),
     };
     let issued = svc.issue_codes(&issue).expect("issue codes");

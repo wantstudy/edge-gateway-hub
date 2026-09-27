@@ -1973,7 +1973,8 @@ pub async fn forwarder_create(
         }
     };
     // confirm 精确匹配出口名原文（创建即确认即将写入的名称）。
-    if danger.confirm.trim() != name {
+    // 契约 P0-8：trim() + 大小写不敏感精确匹配（与 accounts_api / alerts_api 同口径）。
+    if !danger.confirm.trim().eq_ignore_ascii_case(&name) {
         writeapi::audit(
             &state,
             &actor,
@@ -2129,7 +2130,8 @@ pub async fn forwarder_update(
     };
     let current = config.outlets[position].clone();
     // confirm 精确匹配现有出口名（二次确认回显对象全名）。
-    if danger.confirm.trim() != current.name {
+    // 契约 P0-8：trim() + 大小写不敏感精确匹配。
+    if !danger.confirm.trim().eq_ignore_ascii_case(&current.name) {
         writeapi::audit(
             &state,
             &actor,
@@ -2327,7 +2329,8 @@ pub async fn forwarder_delete(
     };
     let removed = config.outlets.remove(position);
     // confirm 精确匹配出口名（删除最严口径，回显对象全名）。
-    if danger.confirm.trim() != removed.name {
+    // 契约 P0-8：trim() + 大小写不敏感精确匹配。
+    if !danger.confirm.trim().eq_ignore_ascii_case(&removed.name) {
         // 失败路径绝不留下半改状态：把已摘除的行放回去。
         config.outlets.insert(position, removed.clone());
         writeapi::audit(
