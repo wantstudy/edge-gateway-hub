@@ -23,7 +23,7 @@
 //! - `IOT_DAQ_MGMT_BIND`：把管理面监听地址**固定为已知回环地址**，使看门狗探测
 //!   目标与实际监听严格一致（否则探测目标猜错会永久误判「假死」）。
 
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +40,8 @@ pub const WATCHDOG_DEAD_TIMEOUT: Duration = Duration::from_secs(90);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// 守护轮询间隔。
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// 端口探测范围：默认端口被占用时最多顺延尝试的端口数（8080 → 8081 … 8089）。
+pub const MGMT_PORT_PROBES: u16 = 10;
 /// 健康探测单次连接超时（回环连接，短超时即可）。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// `CREATE_NO_WINDOW`：父进程指定子进程**不分配控制台窗口**（Windows）。
@@ -57,6 +59,31 @@ fn lk<T>(handle: &Mutex<T>) -> MutexGuard<'_, T> {
 fn backoff_for(failures: u64) -> Duration {
     let shift = (failures.max(1) - 1).min(6) as u32;
     Duration::from_secs(1u64 << shift).min(MAX_BACKOFF)
+}
+
+/// 端口探测：管理面默认端口被占用时自动顺延到下一个可用端口。
+///
+/// 用 `TcpListener::bind` 逐个试 `preferred.port() .. +max_tries`（IP 保持
+/// `preferred` 的回环地址不变），返回第一个可绑定的地址；全部占用则返回
+/// `preferred` 本身（fail-closed：daemon 随后 bind 失败并报出真实错误，
+/// 而不是壳静默选一个永远探不到的地址）。
+///
+/// 竞态说明：bind 探测成功后立即 drop listener，到 daemon 真正 bind 之间存在
+/// 极小的「端口被第三方抢占」窗口；桌面端单用户场景下可接受，且竞态命中时
+/// 仍走 fail-closed 路径（看门狗按真实失败处置），不做持有转发。
+pub fn pick_mgmt_addr(preferred: SocketAddr, max_tries: u16) -> SocketAddr {
+    for offset in 0..max_tries {
+        let candidate = SocketAddr::new(preferred.ip(), preferred.port() + offset);
+        match TcpListener::bind(candidate) {
+            Ok(listener) => {
+                // 探测即放手：listener 无法跨进程移交，drop 后由 daemon 重新 bind。
+                drop(listener);
+                return candidate;
+            }
+            Err(_) => continue,
+        }
+    }
+    preferred
 }
 
 /// 守护开关（三者独立；`Default` 全开 → 桌面端默认具备自愈能力）。
@@ -176,6 +203,11 @@ impl Supervisor {
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080)))
     }
 
+    /// 壳实际选定的管理面回环地址（端口探测后的结果；前端经 `api_base` 命令读取）。
+    pub fn mgmt_addr(&self) -> SocketAddr {
+        self.mgmt_addr
+    }
+
     /// 拉起侧车并启动守护线程（仅当 `supported`）。
     pub fn start(self: &Arc<Self>) {
         if !self.supported {
@@ -199,7 +231,8 @@ impl Supervisor {
     }
 
     /// 追加一行到 `<data_dir>/shell.log`（GUI 子系统下 stderr 不可见，故落盘）。
-    fn log(&self, message: &str) {
+    /// `pub`：main.rs 需在 setup 阶段记录「实际选定的管理面地址」。
+    pub fn log(&self, message: &str) {
         let line = format!("[tauri-shell] {message}\n");
         let path = self.data_dir.join("shell.log");
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -605,5 +638,43 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 9137))
         );
         std::env::remove_var("IOT_DAQ_MGMT_BIND");
+    }
+
+    /// 端口探测：首选端口空闲时原样返回（不无谓顺延）。
+    #[test]
+    fn pick_mgmt_addr_returns_preferred_when_free() {
+        let preferred = SocketAddr::from(([127, 0, 0, 1], 18180));
+        assert_eq!(pick_mgmt_addr(preferred, MGMT_PORT_PROBES), preferred);
+    }
+
+    /// 端口探测：首选端口被真实占用时顺延到下一个（高位端口起点，避免开发 /
+    /// CI 环境对 8080 的偶发占用让测试抖动）。
+    #[test]
+    fn pick_mgmt_addr_skips_occupied_port() {
+        let preferred = SocketAddr::from(([127, 0, 0, 1], 18181));
+        let blocker = TcpListener::bind(preferred).expect("bind test blocker");
+        let picked = pick_mgmt_addr(preferred, MGMT_PORT_PROBES);
+        drop(blocker);
+        assert_eq!(
+            picked,
+            SocketAddr::from(([127, 0, 0, 1], 18182)),
+            "occupied port must be skipped to the next bindable one"
+        );
+    }
+
+    /// 端口探测：探测范围内全占用 → 回落 preferred（fail-closed，由 daemon
+    /// 报真实 bind 错误，而不是壳假装成功）。
+    #[test]
+    fn pick_mgmt_addr_falls_back_to_preferred_when_all_taken() {
+        let base = SocketAddr::from(([127, 0, 0, 1], 18190));
+        let blockers: Vec<TcpListener> = (0..MGMT_PORT_PROBES)
+            .map(|offset| {
+                TcpListener::bind(SocketAddr::new(base.ip(), base.port() + offset))
+                    .expect("bind test blockers")
+            })
+            .collect();
+        assert_eq!(blockers.len(), MGMT_PORT_PROBES as usize);
+        assert_eq!(pick_mgmt_addr(base, MGMT_PORT_PROBES), base);
+        // blockers 在此 drop，释放端口。
     }
 }

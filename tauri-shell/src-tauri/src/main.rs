@@ -54,15 +54,31 @@ fn supervisor_set(
     })
 }
 
+/// `api_base`：壳实际选定的管理面基址（默认端口被占时经 [`supervisor::pick_mgmt_addr`]
+/// 自动顺延后的真实结果；前端 `client.ts::resolveApiBase` 启动时调用一次）。
+#[tauri::command]
+fn api_base(state: tauri::State<'_, Arc<Supervisor>>) -> String {
+    format!("http://{}", state.mgmt_addr())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![supervisor_status, supervisor_set])
+        .invoke_handler(tauri::generate_handler![
+            supervisor_status,
+            supervisor_set,
+            api_base
+        ])
         .setup(|app| {
             use tauri::Manager as _;
             let handle = app.handle().clone();
             let data_dir = supervisor::resolve_data_dir(&handle);
             let daemon_path = supervisor::resolve_daemon_path(&handle);
+
+            // 管理面端口被占用时自动顺延（最多 MGMT_PORT_PROBES 个）；全部占用
+            // 回落 preferred（fail-closed），由 daemon 报真实 bind 错误。
+            let preferred = Supervisor::mgmt_addr_from_env();
+            let mgmt_addr = supervisor::pick_mgmt_addr(preferred, supervisor::MGMT_PORT_PROBES);
 
             // 数据目录里没有 config.toml 时就地生成最小配置（用户手写资产，存在则不覆盖）。
             let config_path = data_dir.join("config.toml");
@@ -74,12 +90,12 @@ fn main() {
 
             // 真实守护：拉起侧车 + 起守护线程（未随包分发 daemon 时 supported=false，
             // 前端按诚实空态呈现并给出真实原因，绝不回退 mock）。
-            let sup = Supervisor::new(
-                daemon_path,
-                data_dir,
-                Supervisor::mgmt_addr_from_env(),
-            );
+            let sup = Supervisor::new(daemon_path, data_dir, mgmt_addr);
             sup.start();
+            sup.log(&format!(
+                "管理面地址已选定 {mgmt_addr}（首选 {preferred}；端口被占时自动顺延，探测上限 {} 个）",
+                supervisor::MGMT_PORT_PROBES
+            ));
             app.manage(sup);
 
             // 主窗口：加载 web-console 前端。

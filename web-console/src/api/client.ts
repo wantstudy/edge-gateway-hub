@@ -51,11 +51,59 @@ export const API_MODE: ApiMode = 'real';
  * `http://localhost:5274/api/...` 后被正确转发；打包后没有这层代理，缺陷才暴露。
  *
  * 端口可配置：构建期用 `VITE_API_BASE` 覆盖（如 `VITE_API_BASE=http://127.0.0.1:9090`），
- * 未设置则用默认值。
+ * 未设置则用默认值。**运行期**可覆盖（桌面壳场景）：默认端口被占时壳会自动顺延，
+ * 前端经 Tauri 命令 `api_base` 取壳实际选定的地址（见 [`setApiBase`] / [`apiBaseReady`]）。
  */
-export const API_BASE: string =
+export let API_BASE: string =
   ((import.meta.env.VITE_API_BASE as string | undefined) ?? '').replace(/\/+$/, '') ||
   'http://127.0.0.1:8080';
+
+/** 覆盖 API 基址（去尾部斜杠归一；桌面壳启动解析出实际端口后调用）。 */
+export function setApiBase(base: string): void {
+  API_BASE = base.replace(/\/+$/, '');
+}
+
+/** 当前是否桌面壳（Tauri）环境（与 `shell.ts::shellAvailable` 同一判定依据）。 */
+export const inTauriShell: boolean =
+  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+/**
+ * 从桌面壳解析实际管理面基址（Tauri 命令 `api_base`）并写入 `API_BASE`。
+ *
+ * 非桌面端 / invoke 失败 / 返回形态不合预期时**保持默认基址不变**（不伪造），
+ * 返回 `false` 供诊断；请求错误文案携带的是真实目标地址，可直接排障。
+ */
+export async function resolveApiBase(): Promise<boolean> {
+  if (!inTauriShell) {
+    return false;
+  }
+  try {
+    const mod = await import('@tauri-apps/api/core');
+    const base = (await mod.invoke<string>('api_base')) as unknown;
+    if (typeof base === 'string' && /^http:\/\/127\.0\.0\.1:\d+$/.test(base)) {
+      setApiBase(base);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 基址就绪 promise：桌面壳下模块加载即发起 `api_base` 解析（fire-and-forget）；
+ * 浏览器环境立即 resolve。
+ *
+ * `apiRequest` / `apiRequestText` 在桌面壳下先 await 本 promise——保证首个请求
+ * （如登录页的 `/api/auth/state`）就打到壳实际选定的端口；invoke 失败则按默认
+ * 基址继续（错误文案如实报 8080，可诊断）。
+ */
+export const apiBaseReady: Promise<void> = (async () => {
+  if (!inTauriShell) {
+    return;
+  }
+  await resolveApiBase();
+})();
 
 /** 把 `/api/...` 路径拼成**绝对** URL（供 fetch / EventSource 使用）。 */
 export function apiUrl(path: string): string {
@@ -206,6 +254,9 @@ export function handleUnauthorized(): void {
  * @throws `ApiError`（401 已在函数内处理跳转；其余状态码与网络错误抛给调用方）
  */
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  if (inTauriShell) {
+    await apiBaseReady;
+  }
   const url = apiUrl(path);
   const headers = new Headers(init.headers ?? {});
   if (init.body && !headers.has('Content-Type')) {
@@ -274,6 +325,9 @@ function describeBodyHead(text: string): string {
  * @throws `ApiError`（语义与 `apiRequest` 完全一致）
  */
 export async function apiRequestText(path: string, init: RequestInit = {}): Promise<string> {
+  if (inTauriShell) {
+    await apiBaseReady;
+  }
   const url = apiUrl(path);
   const headers = new Headers(init.headers ?? {});
   const token = getStoredToken();
