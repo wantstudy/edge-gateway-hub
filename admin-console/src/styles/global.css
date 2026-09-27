@@ -144,6 +144,18 @@ body {
   flex: 1;
   min-height: 0;
 }
+/* 登录路由：顶栏 / 侧栏让位后，登录页自带 100vh 整页布局（内部不再出现滚动条） */
+.ac-app--login {
+  display: block;
+  height: auto;
+}
+.ac-body--login {
+  display: block;
+}
+.ac-body--login .ac-main {
+  overflow: visible;
+  padding-bottom: 0;
+}
 .ac-sidebar {
   width: var(--sidebar-w);
   flex: 0 0 var(--sidebar-w);
@@ -535,49 +547,8 @@ body {
   margin-top: 8px;
 }
 
-/* ---------- 登录页 ---------- */
-.ac-login {
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--bg-app);
-  padding: 24px;
-}
-.ac-login__card {
-  width: 400px;
-  max-width: 100%;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 28px 28px 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-.ac-login__brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: 600;
-  font-size: 16px;
-}
-.ac-login__desc {
-  margin: 0;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  line-height: 1.6;
-}
-.ac-login__fields {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.ac-login__err {
-  margin: 0;
-  font-size: var(--fs-caption);
-  color: var(--danger);
-}
+/* 注：登录页样式（`.ac-login*`）已随 LoginPage.vue 收归组件自身 `<style scoped>`，
+   避免全局样式与组件样式两处漂移。 */
 
 /* ---------- 权限矩阵表 ---------- */
 .ac-matrix th,

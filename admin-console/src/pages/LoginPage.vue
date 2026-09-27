@@ -1,15 +1,19 @@
 <template>
   <!--
-    LoginPage —— 管理员会话登录（页面清单第 1 项）。
-    real 模式：调 `POST /admin/auth/login`（后端已落地管理员鉴权），成功存
-    token + role（localStorage）并跳转控制台；失败显示后端错误消息。
-    mock 模式：保持原型最小可用登录（任意非空账号 + ≥6 位密码），行为零回归。
+    LoginPage —— 路由级独立登录页（`/#/login`）。
+    · 未登录访问任何受保护路由 → 守卫重定向到本页（router.ts beforeEach）；
+    · real 模式：调 `POST /admin/auth/login`（后端已落地管理员鉴权），成功存
+      token + role 并跳转该角色首个可见页面；失败展示**后端 message 原文**；
+    · mock 模式：原型最小可用登录（任意非空账号 + ≥6 位密码），行为零回归。
+    本页自带样式（冰川主题：--bg-app 底 / 白卡 16px 圆角 / --brand 主色按钮），
+    不再从 global.css 取 .ac-login*（避免两处样式漂移）。
   -->
   <div class="ac-login">
-    <form class="ac-login__card" @submit.prevent="submit">
+    <form class="ac-login__card" data-testid="login-card" @submit.prevent="submit">
+      <!-- 品牌区：纯文字品牌，沿用 AppShell 的 .ac-brand 写法，不引入任何图片 -->
       <div class="ac-login__brand">
         <span class="ac-brand__logo">LIC</span>
-        <span>IoT-DAQ 授权管理后台</span>
+        <span>IoT-DAQ 授权管理</span>
       </div>
       <p class="ac-login__desc">
         厂商侧内部系统 · 仅授权运营人员使用<br />
@@ -18,10 +22,22 @@
 
       <div class="ac-login__fields">
         <UiField label="管理员账号" required :error="error">
-          <UiInput v-model="account" placeholder="如 li.gong" :invalid="error.length > 0" />
+          <UiInput
+            v-model="account"
+            type="text"
+            autocomplete="username"
+            placeholder="如 li.gong"
+            :disabled="submitting"
+          />
         </UiField>
         <UiField :label="isReal ? '密码（后端管理员鉴权）' : '密码'" required :hint="passwordHint">
-          <UiInput v-model="password" type="password" placeholder="请输入密码" />
+          <UiInput
+            v-model="password"
+            type="password"
+            autocomplete="current-password"
+            placeholder="请输入密码"
+            :disabled="submitting"
+          />
         </UiField>
         <!-- real 模式独有：默认租户 ID（发放 / 废弃 / 重发请求的租户来源） -->
         <UiField
@@ -30,13 +46,16 @@
           required
           hint="写端点 X-Tenant-Id 头的兜底租户；请填写 licensing-server 中的租户 ID（如 t-1）"
         >
-          <UiInput v-model="tenantId" placeholder="t-1" />
+          <UiInput v-model="tenantId" placeholder="t-1" :disabled="submitting" />
         </UiField>
       </div>
 
-      <p v-if="error" class="ac-login__err" role="alert">{{ error }}</p>
-
-      <button type="submit" class="ac-btn ac-btn--primary" :disabled="submitting || !canSubmit">
+      <button
+        type="submit"
+        class="ac-btn ac-btn--primary ac-login__submit"
+        data-testid="login-submit"
+        :disabled="submitting || !canSubmit"
+      >
         {{ submitting ? '登录中…' : '登录' }}
       </button>
 
@@ -52,14 +71,15 @@
 /**
  * @file LoginPage.vue
  * @module admin-console/pages/LoginPage
- * @description 登录页。草稿（账号/密码）为页面局部状态，登录成功后交给 session 并跳转。
+ * @description 登录页。草稿（账号 / 密码 / 租户）为页面局部状态，登录成功后交给 session 并跳转。
  *
  * real 模式鉴权（契约 = crates/licensing-server/src/admin_auth.rs）：
  *  1. `POST /admin/auth/login` → `{token, role}`（HS256 JWT，1h TTL）；
  *  2. 成功：token + role 持久化（localStorage），session 记录后端签发角色并跳转；
- *  3. `401` → 凭证错误，行内报错，不放行（后端不区分原因，防账号枚举）；
- *  4. 网络不通（status 0）/ 其他错误 → 行内显示后端消息，不放行（绝不静默假登录）。
- * 登录成功后立即跳转并触发 `preloadRealData()`（mount 不等 preload——联调 P0 教训）。
+ *  3. 失败：`ApiError.message` 即后端统一信封的 `message` 原文（如 401 `invalid
+ *     credentials`）——**原样展示**，不做二次改写，避免掩盖真实原因；
+ *  4. 网络不通（status 0）/ 其他错误 → 同样展示原始 message，绝不静默假登录。
+ * 登录后立即跳转并触发 `preloadRealData()`（mount 不等 preload——联调 P0 教训）。
  */
 import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
@@ -79,7 +99,7 @@ const account = ref('li.gong');
 const password = ref('');
 /** 默认租户 ID 草稿（real 模式独有）。 */
 const tenantId = ref('t-1');
-/** 行内错误。 */
+/** 行内错误（原样透传后端 message）。 */
 const error = ref('');
 /** 提交中（防重复点击）。 */
 const submitting = ref(false);
@@ -97,6 +117,26 @@ const canSubmit = computed(
     (!isReal || tenantId.value.trim().length > 0),
 );
 
+/**
+ * 结构化错误消息：优先后端 message 原文。
+ *
+ * 后端错误一律经 `ApiError`（信封 `message`，见 api/client.ts），登录失败时
+ * 只呈现该文本 → 出现「为什么失败」的单一真源，不再前端自造文案。
+ */
+function messageOf(cause: unknown): string {
+  if (cause instanceof ApiError) {
+    const raw = cause.message.trim();
+    if (raw) {
+      return raw;
+    }
+    // 后端未回 message（非空信封 / 无网络细节）时的兜底，仍保留状态码这一结构化信息
+    return cause.status === 401 || cause.status === 403
+      ? '账号或密码错误（后端返回 HTTP 401）'
+      : `登录失败（HTTP ${cause.status || '网络异常'}）`;
+  }
+  return cause instanceof Error ? cause.message : '登录失败，请稍后重试';
+}
+
 /** real 模式登录（返回是否放行）。 */
 async function submitReal(accountName: string): Promise<boolean> {
   try {
@@ -104,12 +144,7 @@ async function submitReal(accountName: string): Promise<boolean> {
     session.login(accountName, tenantId.value.trim(), token, role);
     return true;
   } catch (cause) {
-    const status = cause instanceof ApiError ? cause.status : -1;
-    if (status === 401 || status === 403) {
-      error.value = '账号或密码错误（后端管理员鉴权已启用）';
-      return false;
-    }
-    error.value = cause instanceof Error ? cause.message : '登录失败，请稍后重试';
+    error.value = messageOf(cause);
     return false;
   }
 }
@@ -142,3 +177,55 @@ async function submit(): Promise<void> {
   }
 }
 </script>
+
+<style scoped>
+/* 冰川主题（设计权威 gateway-v2a-glacier.html · 方案 A 亮色洁净派）：
+   底色取自 --bg-app / --sidebar-bg-2，卡片白底 --bg-card + 16px 圆角，
+   主按钮 --brand(#17C3B2)，字体沿用 body 的 Sora 栈，色值一律走 token 不硬编码。 */
+.ac-login {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: linear-gradient(165deg, var(--sidebar-bg-2) 0%, var(--bg-app) 62%);
+}
+.ac-login__card {
+  width: 400px;
+  max-width: 100%;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+  padding: 28px 28px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.ac-login__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--text-1);
+}
+.ac-login__desc {
+  margin: 0;
+  margin-top: -10px;
+  font-size: var(--fs-caption);
+  color: var(--text-3);
+  line-height: 1.6;
+}
+.ac-login__fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.ac-login__submit {
+  width: 100%;
+  min-height: 38px;
+  border-radius: var(--radius-btn);
+  font-size: var(--fs-body);
+}
+</style>

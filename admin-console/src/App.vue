@@ -3,80 +3,88 @@
     AppShell —— 应用外壳：顶栏 + 侧边导航 + 内容区。
     导航项由 `canSeePage(role, page)` 过滤，与路由守卫共用同一权限矩阵（保证菜单与路由不漂移）。
   -->
-  <div class="ac-app">
-    <!-- 顶栏：应用标识 | 角色切换 | 全局状态胶囊 | 账号 -->
-    <header class="ac-topbar">
-      <div class="ac-brand">
-        <span class="ac-brand__logo">LIC</span>
-        <span>IoT-DAQ 授权管理后台</span>
-      </div>
-      <span class="ac-topbar__mini">厂商侧 · 运营与售后</span>
-      <span class="ac-spacer" />
+  <!--
+    AppShell 在 `/login` 路由下**让位**：不渲染顶栏 / 侧边导航 / 提示横幅——
+    登录必须是独立的整页体验，未登录时既无内嵌表单 / 浮层，也不露出「已登录」
+    的控制台外壳。注意：`RouterView` 必须保持挂载（登录页由它渲染），
+    因此只隐藏外壳本身（顶栏 / 侧栏 / 提示横幅），不隐藏 `.ac-body` / `.ac-main`。
+  -->
+  <div class="ac-app" :class="{ 'ac-app--login': isLoginRoute }">
+    <template v-if="!isLoginRoute">
+      <!-- 顶栏：应用标识 | 角色切换 | 全局状态胶囊 | 账号 -->
+      <header class="ac-topbar">
+        <div class="ac-brand">
+          <span class="ac-brand__logo">LIC</span>
+          <span>IoT-DAQ 授权管理后台</span>
+        </div>
+        <span class="ac-topbar__mini">厂商侧 · 运营与售后</span>
+        <span class="ac-spacer" />
 
-      <!-- 角色切换：切换后菜单与按钮可用性立即变化（验收重点） -->
-      <span class="ac-topbar__mini">角色</span>
-      <select
-        class="ac-role-select"
-        :value="session.state.role"
-        aria-label="切换当前角色"
-        @change="onRoleChange"
-      >
-        <option v-for="role in ROLES" :key="role" :value="role">
-          {{ ROLE_META[role].fullLabel }}
-        </option>
-      </select>
+        <!-- 角色切换：切换后菜单与按钮可用性立即变化（验收重点） -->
+        <span class="ac-topbar__mini">角色</span>
+        <select
+          class="ac-role-select"
+          :value="session.state.role"
+          aria-label="切换当前角色"
+          @change="onRoleChange"
+        >
+          <option v-for="role in ROLES" :key="role" :value="role">
+            {{ ROLE_META[role].fullLabel }}
+          </option>
+        </select>
 
-      <span class="ac-pill ac-pill--warn" title="点击进入待处理总览" @click="go('overview')">
-        ⚠ 待处理 {{ overview.pendingAnomalies }} 项
-      </span>
-      <span class="ac-pill ac-pill--ok" title="回执正常台数（后端未提供该维度时显示 —）">
-        ● 回执健康 {{ overview.receiptOk }}
-      </span>
+        <span class="ac-pill ac-pill--warn" title="点击进入待处理总览" @click="go('overview')">
+          ⚠ 待处理 {{ overview.pendingAnomalies }} 项
+        </span>
+        <span class="ac-pill ac-pill--ok" title="回执正常台数（后端未提供该维度时显示 —）">
+          ● 回执健康 {{ overview.receiptOk }}
+        </span>
+
+        <!--
+          双人复核开关（全局策略）
+          ─────────────────────────────────────────────────────────────────
+          【此开关位置与形态为**设计文档未明确定位**时的合理补充，非照抄】：
+          设计文档只要求「高危操作在双人复核开启时需第二审批人」，但未规定
+          该策略的开关放在哪、由谁控制。这里把它上提到**顶栏全局开关**，理由：
+            · 它是**全局策略**而非单页状态 → 放在 AppShell 顶栏，跨页一致；
+            · 运维需要「临时收紧 / 放宽」的直观入口 → 一次点击即可全局生效。
+          【实现性质：前端模拟】当前值只存在前端 session（`session.setDualApproval`），
+          并未落库。真实系统中它**必须**成为服务端租户策略
+          （licensing-api 的 `/admin/policy`，本原型未接线），因为：
+            · 复核人数是安全策略，不能由前端自证；
+            · 刷新 / 换端后必须保持一致 → 需服务端持久化。
+          开启后，各高危操作弹窗（DangerConfirmModal）会据 `requireSecondApprover`
+          追加「第二审批人」必填项。
+        -->
+        <label class="ac-dual" title="开启后，废弃 / 重发等高危操作需第二位管理员复核">
+          <input
+            type="checkbox"
+            :checked="session.state.dualApproval"
+            @change="onDualApprovalChange"
+          />
+          <span>双人复核{{ session.state.dualApproval ? '：开' : '：关' }}</span>
+        </label>
+
+        <span class="ac-avatar" :title="`当前账号：${session.state.account}`">{{ initial }}</span>
+        <button type="button" class="ac-btn ac-btn--sm" @click="onLogout">退出</button>
+      </header>
 
       <!--
-        双人复核开关（全局策略）
-        ─────────────────────────────────────────────────────────────────
-        【此开关位置与形态为**设计文档未明确定位**时的合理补充，非照抄】：
-        设计文档只要求「高危操作在双人复核开启时需第二审批人」，但未规定
-        该策略的开关放在哪、由谁控制。这里把它上提到**顶栏全局开关**，理由：
-          · 它是**全局策略**而非单页状态 → 放在 AppShell 顶栏，跨页一致；
-          · 运维需要「临时收紧 / 放宽」的直观入口 → 一次点击即可全局生效。
-        【实现性质：前端模拟】当前值只存在前端 session（`session.setDualApproval`），
-        并未落库。真实系统中它**必须**成为服务端租户策略
-        （licensing-api 的 `/admin/policy`，本原型未接线），因为：
-          · 复核人数是安全策略，不能由前端自证；
-          · 刷新 / 换端后必须保持一致 → 需服务端持久化。
-        开启后，各高危操作弹窗（DangerConfirmModal）会据 `requireSecondApprover`
-        追加「第二审批人」必填项。
+        全局提示横幅（real 模式联调专用）：
+        数据层（api/repo.ts）在后端端点缺失（诚实空态降级）或写操作失败时推入
+        `adminNotices`，此处统一展示、逐条可关闭。mock 模式下恒为空、不渲染。
       -->
-      <label class="ac-dual" title="开启后，废弃 / 重发等高危操作需第二位管理员复核">
-        <input
-          type="checkbox"
-          :checked="session.state.dualApproval"
-          @change="onDualApprovalChange"
-        />
-        <span>双人复核{{ session.state.dualApproval ? '：开' : '：关' }}</span>
-      </label>
-
-      <span class="ac-avatar" :title="`当前账号：${session.state.account}`">{{ initial }}</span>
-      <button type="button" class="ac-btn ac-btn--sm" @click="onLogout">退出</button>
-    </header>
-
-    <!--
-      全局提示横幅（real 模式联调专用）：
-      数据层（api/repo.ts）在后端端点缺失（诚实空态降级）或写操作失败时推入
-      `adminNotices`，此处统一展示、逐条可关闭。mock 模式下恒为空、不渲染。
-    -->
-    <div v-if="adminNotices.length > 0" class="ac-notices" role="status">
-      <div v-for="n in adminNotices" :key="n.id" class="ac-notice" :class="`ac-notice--${n.tone}`">
-        <span class="ac-notice__msg">{{ n.message }}</span>
-        <button type="button" class="ac-notice__close" aria-label="关闭提示" @click="dismissNotice(n.id)">×</button>
+      <div v-if="adminNotices.length > 0" class="ac-notices" role="status">
+        <div v-for="n in adminNotices" :key="n.id" class="ac-notice" :class="`ac-notice--${n.tone}`">
+          <span class="ac-notice__msg">{{ n.message }}</span>
+          <button type="button" class="ac-notice__close" aria-label="关闭提示" @click="dismissNotice(n.id)">×</button>
+        </div>
       </div>
-    </div>
+    </template>
 
-    <div class="ac-body">
-      <!-- 侧边导航：按运维动线分组 -->
-      <nav class="ac-sidebar" aria-label="主导航">
+    <div class="ac-body" :class="{ 'ac-body--login': isLoginRoute }">
+      <!-- 侧边导航：按运维动线分组（登录路由下不渲染） -->
+      <nav v-if="!isLoginRoute" class="ac-sidebar" aria-label="主导航">
         <template v-for="group in visibleGroups" :key="group">
           <div class="ac-nav-group">{{ group }}</div>
           <RouterLink
@@ -114,18 +122,38 @@
  * @module admin-console/App
  * @description 应用外壳与全局导航。
  */
-import { computed } from 'vue';
+import { computed, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { PAGES, ROLE_META, ROLES, canSeePage, firstAllowedPage, type PageId, type Role } from '@ui-kit';
 import { session } from './store/session';
 import { accountInitial } from './store/session';
-import { adminNotices, dismissNotice, repo } from './api/repo';
+import { API_MODE } from './api/client';
+import { adminNotices, dismissNotice, preloadRealData, repo } from './api/repo';
 
 const route = useRoute();
 const router = useRouter();
 
 /** 顶栏头像字符。 */
 const initial = accountInitial;
+
+/** 是否停在登录页（登录路由下不渲染控制台外壳，见模板顶部说明）。 */
+const isLoginRoute = computed(() => route.name === 'login');
+
+/**
+ * real 模式启动即拉真实数据（mock 行为零回归）。
+ *
+ * 作用不止「首屏有数据」：会话恢复（`session.restore`）只凭 localStorage 里的
+ * token 判定已登录，token 是否真的有效必须由后端裁决。启动即发请求 → 失效 /
+ * 过期 token 会立刻收到 401，由 client.ts 清会话并跳登录页，**不在已失效的
+ * 会话上静默展示一个空控制台**。
+ */
+onMounted(() => {
+  // 仅在「已恢复出会话」时预取：未登录时发请求只会换来一串 401 与「加载失败」横幅，
+  // 既噪声又白费流量；登录页那条路径由 LoginPage 登录成功后自己触发 preload。
+  if (API_MODE === 'real' && session.state.loggedIn) {
+    void preloadRealData();
+  }
+});
 
 /**
  * 总览真实聚合（顶栏计数唯一来源）。
