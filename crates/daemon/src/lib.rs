@@ -23,6 +23,9 @@ pub mod backpressure;
 pub mod bootstrap;
 pub mod codec;
 pub mod config;
+/// task #140 控制指令下发链路（管理面写指令 → 真实南向设备；Modbus
+/// write_register / write_coil；幂等 + 审计 + 诚实投递语义）。
+// TEMP-EXCL: pub mod ctrl;
 /// task 34 敏感配置加密（AES-256-GCM + HKDF(机器码)，fail-closed）。
 /// 模块本身仅提供加解密原语；接入 config 加载/落盘路径见 config.rs 后续集成任务。
 pub mod config_crypto;
@@ -35,6 +38,10 @@ pub mod hardening;
 pub mod license;
 pub mod logging;
 pub mod mgmt;
+/// 设备心跳上报端点（task 142）：模块源文件在 `mgmt/heartbeat_api.rs`，经 `#[path]`
+/// 在此注册（不改动 `mgmt/mod.rs`；路由接线由 wave2 的 `be-port` 统一做）。
+#[path = "mgmt/heartbeat_api.rs"]
+pub mod heartbeat_api;
 pub mod migrations;
 pub mod north;
 pub mod offline_queue;
@@ -47,6 +54,9 @@ pub mod scheduler;
 pub mod sim;
 /// 南向采集装配（生产 `PollHandler`，bootstrap 生产路径接线，D-12 修复）。
 pub mod southbound;
+/// 吞吐与运行指标自包含采集器（task 141 / BE-METRICS）：环形时间序列 + 快照序列化。
+/// 仅暴露录入入口与 `snapshot()`，不做埋点（埋点由 wave2 统一接线）。
+pub mod metrics;
 pub mod telemetry_store;
 
 /// 便捷再导出：`daemon::modbus` ≡ `daemon::driver::modbus`（task 9）。

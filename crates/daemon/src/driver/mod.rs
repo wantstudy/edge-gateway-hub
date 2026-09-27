@@ -324,6 +324,53 @@ impl PointAddressParser {
         })
     }
 
+    /// 线圈编址（控制面写路径专用）：`0xxxx` = 线圈（FC05），1 基线圈号。
+    ///
+    /// 与 [`Self::parse_modbus`] 刻意分离：读路径（`parse()`）仍按原契约**拒绝**
+    /// `0xxxx` 线圈区（保持「读只支持 4xxxx/3xxxx」的语义不变），写路径单独用本
+    /// 函数解析，避免改动既有读侧拒绝测试。协议地址 = 线圈号 - 1（与寄存器同口径）。
+    fn parse_coil(upper: &str) -> Result<PointAddress, String> {
+        if !upper.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "invalid modbus coil address {upper:?} (digits only expected)"
+            ));
+        }
+        let (area_raw, coil_raw) = upper.split_at(1);
+        let number: u32 = coil_raw
+            .parse()
+            .map_err(|_| format!("invalid modbus coil number {coil_raw:?}"))?;
+        if number == 0 {
+            return Err(
+                "modbus coil number must be 1-based (e.g. 00001, not 00000)".to_string(),
+            );
+        }
+        if number > u32::from(u16::MAX) + 1 {
+            return Err(format!(
+                "modbus coil number {number} out of range (1..={})",
+                u32::from(u16::MAX) + 1
+            ));
+        }
+        Ok(PointAddress {
+            db: 0,
+            area: Some(area_raw.as_bytes()[0] as char), // '0'
+            start: number,
+            bit: true,
+            bit_index: 0,
+        })
+    }
+
+    /// 线圈编址（控制面写路径专用，见 [`Self::parse_coil`]）。
+    pub fn parse_coil_address(raw: &str) -> DaemonResult<PointAddress> {
+        let normalized = raw.trim().to_ascii_uppercase();
+        let wrap = |detail: String| {
+            DaemonError::ProtocolError(format!("invalid coil address {raw:?}: {detail}"))
+        };
+        if normalized.is_empty() {
+            return Err(wrap("empty address".to_string()));
+        }
+        Self::parse_coil(&normalized).map_err(wrap)
+    }
+
     /// MC 元件编址：`M<number>`（位）/ `D<number>`（字）。
     fn parse_mc(upper: &str) -> Result<PointAddress, String> {
         let mut chars = upper.chars();
@@ -599,6 +646,35 @@ mod tests {
                 err.to_string().contains(raw),
                 "message keeps input for {raw:?}: {err}"
             );
+        }
+    }
+
+    // ---- 地址解析：线圈编址（控制面写路径，task #140） ----
+
+    /// QA Happy: 线圈 "00001" → {area:'0', start:1}，协议地址 0。
+    #[test]
+    fn parse_coil_00001_yields_area_zero() {
+        let addr = PointAddressParser::parse_coil_address("00001").expect("valid coil");
+        assert_eq!(addr.area, Some('0'), "coil area '0'");
+        assert_eq!(addr.start, 1, "1-based coil number");
+        assert!(addr.bit, "coil is bit access");
+        assert_eq!(addr.db, 0);
+        let padded = PointAddressParser::parse_coil_address(" 065536 ").expect("trimmed");
+        assert_eq!((padded.area, padded.start), (Some('0'), 65536));
+    }
+
+    /// QA Error: 线圈编址越界与非法值收敛为 ProtocolError（码 1000）。
+    #[test]
+    fn parse_coil_rejections_return_protocol_error() {
+        let cases = ["00000", "00001A", "70000", ""];
+        for raw in cases {
+            let err = PointAddressParser::parse_coil_address(raw)
+                .expect_err(&format!("must reject {raw:?}"));
+            assert!(
+                matches!(err, DaemonError::ProtocolError(_)),
+                "for {raw:?}: {err:?}"
+            );
+            assert_eq!(err.error_code(), ERR_PROTOCOL, "for {raw:?}");
         }
     }
 

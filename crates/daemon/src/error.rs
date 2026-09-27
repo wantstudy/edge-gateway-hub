@@ -33,6 +33,9 @@ pub const ERR_SECURITY: u16 = 7000;
 /// 审计链密钥绑定漂移（写入 fail-closed）。
 pub const ERR_AUDIT_KEY_DRIFT: u16 = 7001;
 
+/// 设备状态 / 探活域（心跳上报、运行状态扩展；接在 `ERR_SECURITY` 之后，新增段不插队）。
+pub const ERR_DEVICE_STATE: u16 = 8000;
+
 /// daemon 主错误枚举（计划 task 6 指定七域 + 指纹子域）。
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {

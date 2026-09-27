@@ -86,6 +86,8 @@ enum RequestOp {
     ReadInput(u16, u16),
     /// FC06 写单个保持寄存器（协议地址, 值）。
     WriteSingle(u16, u16),
+    /// FC05 写单个线圈（协议地址, 通断）。
+    WriteCoil(u16, bool),
 }
 
 /// 请求结果。
@@ -247,6 +249,16 @@ impl ModbusDriver {
                     Err(e) => Err(classify_request_error(e)),
                 }
             }
+            RequestOp::WriteCoil(reg, on) => {
+                let result = ctx.write_single_coil(reg, on).await;
+                match result {
+                    Ok(Ok(())) => Ok(RequestOutcome::Written),
+                    Ok(Err(code)) => {
+                        Err(RequestError::Terminal(format!("modbus exception {code:?}")))
+                    }
+                    Err(e) => Err(classify_request_error(e)),
+                }
+            }
         }
     }
 
@@ -316,6 +328,36 @@ impl ModbusDriver {
         let value = u16::from_be_bytes([p.value[0], p.value[1]]);
         Ok((reg as u16, value))
     }
+
+    /// 校验线圈写入点位：返回 (协议地址, 通断)。
+    ///
+    /// 仅接受 `area == '0'`（控制面专用 `parse_coil_address` 产物），值恰 1 字节
+    ///（`0x00` = 分断、`0xFF` = 导通）；其余一律 ProtocolError，绝不静默降级。
+    fn validate_write_coil(p: &WritePoint) -> DaemonResult<(u16, bool)> {
+        if p.address.area != Some('0') {
+            return Err(DaemonError::ProtocolError(format!(
+                "modbus coil write requires 0xxxx coil address, got {:?}",
+                p.address
+            )));
+        }
+        let reg = p.address.start.checked_sub(1).ok_or_else(|| {
+            DaemonError::ProtocolError("modbus coil number must be >= 1".to_string())
+        })?;
+        if reg > u32::from(u16::MAX) {
+            return Err(DaemonError::ProtocolError(format!(
+                "modbus coil {} out of range",
+                p.address.start
+            )));
+        }
+        if p.value.len() != 1 {
+            return Err(DaemonError::ProtocolError(format!(
+                "modbus coil write requires exactly 1 byte (0x00/0xFF), got {} bytes",
+                p.value.len()
+            )));
+        }
+        let on = p.value[0] != 0;
+        Ok((reg as u16, on))
+    }
 }
 
 #[async_trait]
@@ -361,8 +403,16 @@ impl Driver for ModbusDriver {
 
     async fn write(&mut self, points: &[WritePoint]) -> DaemonResult<()> {
         for p in points {
-            let (reg, value) = Self::validate_write_point(p)?;
-            match self.run_request(RequestOp::WriteSingle(reg, value)).await? {
+            let outcome = if p.address.area == Some('0') {
+                // 线圈写（FC05）：控制面专用路径。
+                let (reg, on) = Self::validate_write_coil(p)?;
+                self.run_request(RequestOp::WriteCoil(reg, on)).await?
+            } else {
+                // 保持寄存器写（FC06）。
+                let (reg, value) = Self::validate_write_point(p)?;
+                self.run_request(RequestOp::WriteSingle(reg, value)).await?
+            };
+            match outcome {
                 RequestOutcome::Written => {}
                 RequestOutcome::Words(_) => unreachable!("write op cannot read"),
             }
@@ -445,6 +495,11 @@ mod tests {
                     state.holding[addr as usize] = val;
                     state.writes.push((addr, val));
                     Response::WriteSingleRegister(addr, val)
+                }
+                Request::WriteSingleCoil(addr, on) => {
+                    // 线圈写：仅记录（断言用 writes 列表），不落 holding 寄存器。
+                    state.writes.push((addr, if on { 0xFF00 } else { 0x0000 }));
+                    Response::WriteSingleCoil(addr, on)
                 }
                 _ => return future::ready(Err(ExceptionCode::IllegalFunction)),
             };
@@ -603,6 +658,73 @@ mod tests {
                 state.requests,
                 vec![Request::WriteSingleRegister(1, 0xBEEF)],
                 "server saw FC06 addr=1"
+            );
+        }
+        driver.disconnect().await.expect("disconnect");
+    }
+
+    #[tokio::test]
+    async fn modbus_tcp_write_single_coil() {
+        let state = Arc::new(Mutex::new(MockState {
+            holding: vec![0x0000, 0x0000],
+            ..Default::default()
+        }));
+        let addr = spawn_mock_server(Arc::clone(&state)).await;
+
+        let mut driver = ModbusDriver::new(test_config(addr, ModbusFraming::Tcp));
+        driver.connect().await.expect("connect");
+
+        let point = WritePoint {
+            address: PointAddressParser::parse_coil_address("00002").expect("coil address"),
+            value: vec![0xFF],
+        };
+        driver.write(&[point]).await.expect("write coil");
+
+        {
+            let state = state.lock().expect("lock");
+            assert_eq!(
+                state.requests,
+                vec![Request::WriteSingleCoil(1, true)],
+                "server saw FC05 addr=1 on=true"
+            );
+            assert_eq!(state.writes, vec![(1, 0xFF00)], "coil write log");
+        }
+        driver.disconnect().await.expect("disconnect");
+    }
+
+    #[tokio::test]
+    async fn modbus_tcp_write_register_and_coil_routed_by_area() {
+        // 同一次 write 批量混合寄存器与线圈 → 驱动按 area 路由到 FC06 / FC05。
+        let state = Arc::new(Mutex::new(MockState {
+            holding: vec![0x0000, 0x0000],
+            ..Default::default()
+        }));
+        let addr = spawn_mock_server(Arc::clone(&state)).await;
+        let mut driver = ModbusDriver::new(test_config(addr, ModbusFraming::Tcp));
+        driver.connect().await.expect("connect");
+
+        driver
+            .write(&[
+                WritePoint {
+                    address: PointAddressParser::parse("40001").expect("register"),
+                    value: vec![0x12, 0x34],
+                },
+                WritePoint {
+                    address: PointAddressParser::parse_coil_address("00002").expect("coil"),
+                    value: vec![0x00],
+                },
+            ])
+            .await
+            .expect("mixed write");
+
+        {
+            let state = state.lock().expect("lock");
+            assert_eq!(
+                state.requests,
+                vec![
+                    Request::WriteSingleRegister(0, 0x1234),
+                    Request::WriteSingleCoil(1, false)
+                ]
             );
         }
         driver.disconnect().await.expect("disconnect");
