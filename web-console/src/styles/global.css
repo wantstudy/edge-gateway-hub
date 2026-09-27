@@ -98,6 +98,12 @@ body {
   flex: 0 0 26px;
   display: block;
   object-fit: contain;
+  /* 白底承托：顶栏毛玻璃在深色主题下为深色，logo 深色笔画需白色底才能保持对比度。
+     此处 #fff 为**不随主题翻转**的不透明白承托（同 LoginPage.vue .wc-login__logo），非主题色 token。 */
+  background: #fff;
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  box-sizing: border-box;
 }
 .wc-topbar__mini {
   font-size: var(--fs-caption);

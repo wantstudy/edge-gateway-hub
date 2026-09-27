@@ -29,8 +29,9 @@
       </button>
 
       <div class="wc-brand">
-        <!-- 品牌标识：透明底 PNG（web-console/public/logo.png，由设计原图抠白底生成） -->
-        <img class="wc-brand__logo" src="/logo.png" alt="IoT-DAQ" />
+        <!-- 品牌标识：白底 PNG（web-console/public/logo-white.png，由透明 logo 合成纯白底）。
+             顶栏为毛玻璃深色底，白底资源 + .wc-brand__logo 的白色圆角承托保证深色主题下仍可见。 -->
+        <img class="wc-brand__logo" src="/logo-white.png" alt="IoT-DAQ" />
         <span class="wc-brand__text">数据网关控制台</span>
       </div>
 

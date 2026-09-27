@@ -42,6 +42,7 @@ use crate::driver::{Driver, PointAddressParser, ReadPoint, Reconnector};
 use crate::error::{DaemonError, DaemonResult};
 use crate::pipeline::RawSample;
 use crate::scheduler::PollHandler;
+use crate::sim;
 
 /// Modbus 单次请求超时（与 `ModbusConfig::default` 一致；显式声明便于运维口径统一）。
 const SOUTHBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -52,7 +53,7 @@ const DEFAULT_SOUTHBOUND_PORT: u16 = 502;
 /// 每设备驱动连接：互斥锁内 `Box<dyn Driver>`（组任务串行使用本设备连接）。
 type DeviceConn = Arc<tokio::sync::Mutex<Box<dyn Driver>>>;
 
-/// 单设备的轮询计划：协议 + 接入地址 + 该设备全部点位标识。
+/// 单设备的轮询计划：协议 + 接入地址 + 该设备全部点位标识 + 仿真规格。
 #[derive(Debug, Clone)]
 struct DevicePlan {
     /// 南向协议字面量（点位行 `protocol`，如 `modbus-tcp`）。
@@ -61,6 +62,21 @@ struct DevicePlan {
     address: String,
     /// 该设备点位标识列表（首次出现顺序、去重）。
     point_ids: Vec<String>,
+    /// 开启仿真的点位（`point_id -> 规格`）。**只有出现在此表的点位走仿真**，
+    /// 其余点位仍走真实南向读 —— 仿真粒度是点位级，不是设备级。
+    sims: HashMap<String, SimPlan>,
+}
+
+/// 点位仿真计划：已校验规格 / **必须显式报错的非法配置**。
+///
+/// 非法配置不做静默降级：`poll` 遇到 `Invalid` 即报 `ConfigError`（该组失败并
+/// 告警），绝不偷偷退回真实读——否则「开着仿真却去连真设备」正是要消灭的假能力。
+#[derive(Debug, Clone)]
+enum SimPlan {
+    /// 已校验规格。
+    Ready(sim::SimSpec),
+    /// 非法配置的真实原因（原样上报，含字段与约束）。
+    Invalid(String),
 }
 
 /// 从配置点位表推导设备计划表（一组一设备；点位按首次出现顺序去重）。
@@ -95,9 +111,24 @@ fn derive_plans(config: &GatewayConfig) -> HashMap<String, DevicePlan> {
                 protocol: point.protocol.clone(),
                 address: ep.to_string(),
                 point_ids: Vec::new(),
+                sims: HashMap::new(),
             });
         if !plan.point_ids.contains(&point.point_id) {
             plan.point_ids.push(point.point_id.clone());
+        }
+        // 仿真点位登记（`sim_enabled = true` 才登记；未开启的点位不进此表 →
+        // 走真实南向读，语义与配置开关严格一致）。
+        if point.sim_enabled {
+            let plan_sim = match sim::SimSpec::from_fields(
+                point.sim_mode.as_deref(),
+                point.sim_min,
+                point.sim_max,
+                point.sim_dec,
+            ) {
+                Ok(spec) => SimPlan::Ready(spec),
+                Err(reason) => SimPlan::Invalid(reason),
+            };
+            plan.sims.insert(point.point_id.clone(), plan_sim);
         }
     }
     devices
@@ -116,6 +147,8 @@ pub struct DevicePollHandler {
     devices: StdRwLock<HashMap<String, DevicePlan>>,
     /// 设备驱动连接表（惰性建连；`poll` 期间按设备锁串行，组间并行）。
     conns: tokio::sync::Mutex<HashMap<String, DeviceEndpoint>>,
+    /// 仿真拍号（每次 `poll` 自增；`sim::SimSpec::value_at` 据此取确定性波形）。
+    sim_tick: std::sync::atomic::AtomicU64,
 }
 
 /// 一条设备连接的登记信息：连接本体 + 建连时的接入快照。
@@ -141,6 +174,7 @@ impl DevicePollHandler {
         Self {
             devices: StdRwLock::new(derive_plans(config)),
             conns: tokio::sync::Mutex::new(HashMap::new()),
+            sim_tick: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -257,7 +291,12 @@ impl PollHandler for DevicePollHandler {
 
     async fn poll(&self, group: &str, point_ids: &[String]) -> DaemonResult<Vec<RawSample>> {
         // 计划表短持读锁 → 拷出本拍所需字段即释放（锁绝不跨 `await`，热路径无阻塞）。
-        let (protocol, address, plan_point_ids): (String, String, Vec<String>) = {
+        let (protocol, address, plan_point_ids, sims): (
+            String,
+            String,
+            Vec<String>,
+            HashMap<String, SimPlan>,
+        ) = {
             let guard = match self.devices.read() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -267,6 +306,7 @@ impl PollHandler for DevicePollHandler {
                     plan.protocol.clone(),
                     plan.address.clone(),
                     plan.point_ids.clone(),
+                    plan.sims.clone(),
                 ),
                 None => {
                     return Err(DaemonError::ConfigError(format!(
@@ -279,10 +319,56 @@ impl PollHandler for DevicePollHandler {
             return Ok(Vec::new());
         }
 
+        // ---- 点位分区：仿真点（不碰南向） vs 真实点（走驱动批量读）----
+        // 未知点位跳过并告警（与原语义一致）；非法仿真配置**显式失败**不降级。
+        let mut sim_hits: Vec<String> = Vec::new();
+        let mut real_hits: Vec<String> = Vec::new();
+        for point_id in point_ids {
+            if !plan_point_ids.contains(point_id) {
+                warn!(
+                    group = %group,
+                    point_id = %point_id,
+                    "southbound poll: point id missing from the device plan; skipped"
+                );
+                continue;
+            }
+            match sims.get(point_id) {
+                Some(SimPlan::Ready(_)) => sim_hits.push(point_id.clone()),
+                Some(SimPlan::Invalid(reason)) => {
+                    return Err(DaemonError::ConfigError(format!(
+                        "southbound poll: point {point_id:?} has invalid simulation config: {reason}"
+                    )))
+                }
+                None => real_hits.push(point_id.clone()),
+            }
+        }
+
+        // ---- 仿真点：本拍由引擎合成（质量码 GOOD / 无设备时间戳，与真实读同口径）----
+        let tick = self
+            .sim_tick
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut out: Vec<RawSample> = Vec::with_capacity(sim_hits.len() + real_hits.len());
+        for point_id in &sim_hits {
+            if let Some(SimPlan::Ready(spec)) = sims.get(point_id) {
+                out.push(RawSample {
+                    source_id: point_id.clone(),
+                    value: spec.value_at(sim::seed_for(point_id), tick),
+                    quality: Quality::Good,
+                    device_ts_ns: None,
+                });
+            }
+        }
+
+        // 全部为仿真点 → **不建连、不发起任何南向请求**（仿真的意义即在此）。
+        if real_hits.is_empty() {
+            return Ok(out);
+        }
+
         let plan = DevicePlan {
             protocol,
             address,
             point_ids: plan_point_ids,
+            sims,
         };
 
         // 惰性建连（连接表只在取/插时短持锁；读期间按设备锁串行，组间并行）。
@@ -292,17 +378,9 @@ impl PollHandler for DevicePollHandler {
         // 组内批量读：一次驱动请求承载全部可读点位（PollHandler 契约）。
         // 未知点位 / 不可解析为南向地址的点位跳过并告警（不整体失败）。
         // 记录点位标识与请求的下标对应关系，回读后逐一解码。
-        let mut read_points: Vec<ReadPoint> = Vec::with_capacity(point_ids.len());
-        let mut read_ids: Vec<String> = Vec::with_capacity(point_ids.len());
-        for point_id in point_ids {
-            if !plan.point_ids.contains(point_id) {
-                warn!(
-                    group = %group,
-                    point_id = %point_id,
-                    "southbound poll: point id missing from the device plan; skipped"
-                );
-                continue;
-            }
+        let mut read_points: Vec<ReadPoint> = Vec::with_capacity(real_hits.len());
+        let mut read_ids: Vec<String> = Vec::with_capacity(real_hits.len());
+        for point_id in &real_hits {
             match PointAddressParser::parse(point_id) {
                 Ok(address) => {
                     read_points.push(ReadPoint { address, count: 1 });
@@ -317,7 +395,8 @@ impl PollHandler for DevicePollHandler {
             }
         }
         if read_points.is_empty() {
-            return Ok(Vec::new());
+            // 真实点全部不可解析 → 至少把已合成的仿真样本交出去（不整体失败）。
+            return Ok(out);
         }
         let samples = driver.read(&read_points).await?;
 
@@ -327,7 +406,6 @@ impl PollHandler for DevicePollHandler {
         // 设备不提供时间戳 → `device_ts_ns = None`（统一由采集时刻承载）。
         // 单个点位解码失败只跳过该点（结构性配置错误须可观测，不静默吞值）。
         let decoder = ValueDecoder::new(DecodeSpec::default())?;
-        let mut out: Vec<RawSample> = Vec::with_capacity(samples.len());
         for (sample, point_id) in samples.into_iter().zip(read_ids) {
             match decoder.decode(&sample.value) {
                 Ok(decoded) => out.push(RawSample {
@@ -739,5 +817,184 @@ mod tests {
         shared.request_shutdown();
         let result = run_handle.await.expect("run task joins").expect("run ok");
         assert_eq!(result.state(), LifecycleState::Stopped);
+    }
+
+    // ---- 仿真源（sim_* 执行体）----
+
+    /// 单设备单仿真点位的配置 TOML（地址故意指向不可达端口：仿真点**绝不应建连**）。
+    fn sim_point_toml(extra: &str) -> String {
+        format!(
+            "[[points]]\ndevice_id = \"simdev\"\npoint_id = \"40001\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"127.0.0.1:1\"\nfrequency_ms = 100\n\
+             sim_enabled = true\n{extra}"
+        )
+    }
+
+    /// 仿真点位：合成样本、**不发起任何南向连接**（地址不可达也照样出数）。
+    #[tokio::test]
+    async fn sim_point_polls_without_touching_southbound() {
+        let config = GatewayConfig::parse(&sim_point_toml(
+            "sim_mode = \"random\"\nsim_min = 0.0\nsim_max = 100.0\nsim_dec = 2\n",
+        ))
+        .expect("parse");
+        let handler = DevicePollHandler::from_config(&config);
+
+        let samples = handler
+            .poll("simdev", &["40001".to_string()])
+            .await
+            .expect("sim poll must succeed without any device");
+        assert_eq!(samples.len(), 1, "one sim point → one sample");
+        assert_eq!(samples[0].source_id, "40001");
+        assert_eq!(samples[0].quality, Quality::Good);
+        assert!(samples[0].device_ts_ns.is_none(), "sim has no device timestamp");
+        assert!(
+            (0.0..=100.0).contains(&samples[0].value),
+            "value {} outside [sim_min, sim_max]",
+            samples[0].value
+        );
+
+        // 关键断言：仿真路径**没有**留下任何南向连接（地址不可达，一旦建连必失败）。
+        assert!(
+            handler.conns.lock().await.is_empty(),
+            "simulation must not dial the southbound device"
+        );
+    }
+
+    /// `fixed` 波形恒为 `sim_min`，且小数位按 `sim_dec` 收敛。
+    #[tokio::test]
+    async fn sim_fixed_mode_is_constant_min() {
+        let config = GatewayConfig::parse(&sim_point_toml(
+            "sim_mode = \"fixed\"\nsim_min = 12.345\nsim_max = 99.0\nsim_dec = 2\n",
+        ))
+        .expect("parse");
+        let handler = DevicePollHandler::from_config(&config);
+        for _ in 0..3 {
+            let samples = handler
+                .poll("simdev", &["40001".to_string()])
+                .await
+                .expect("sim poll");
+            assert_eq!(samples[0].value, 12.35);
+        }
+    }
+
+    /// 拍号自增：`random` 波形逐拍变化（不是恒定值冒充随机）。
+    #[tokio::test]
+    async fn sim_random_advances_every_tick() {
+        let config = GatewayConfig::parse(&sim_point_toml(
+            "sim_mode = \"random\"\nsim_min = 0.0\nsim_max = 1000.0\nsim_dec = 3\n",
+        ))
+        .expect("parse");
+        let handler = DevicePollHandler::from_config(&config);
+        let mut values = Vec::new();
+        for _ in 0..6 {
+            let samples = handler
+                .poll("simdev", &["40001".to_string()])
+                .await
+                .expect("sim poll");
+            values.push(samples[0].value);
+        }
+        assert!(
+            values.windows(2).any(|w| w[0] != w[1]),
+            "random sim must advance per tick, got {values:?}"
+        );
+    }
+
+    /// 非法波形 → 该组 `ConfigError`（**绝不静默退回真实读**）。
+    #[tokio::test]
+    async fn sim_unknown_mode_fails_closed() {
+        let config = GatewayConfig::parse(&sim_point_toml("sim_mode = \"sine\"\n"))
+            .expect("parse");
+        let handler = DevicePollHandler::from_config(&config);
+        let err = handler
+            .poll("simdev", &["40001".to_string()])
+            .await
+            .expect_err("unknown sim_mode must fail");
+        assert!(matches!(err, DaemonError::ConfigError(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid simulation config"), "{msg}");
+        assert!(msg.contains("sine"), "{msg}");
+        assert!(msg.contains("random"), "{msg}");
+        // 失败即失败：不建连、不产出样本。
+        assert!(handler.conns.lock().await.is_empty());
+    }
+
+    /// 区间倒置 / 非有限值 → `ConfigError`（同样 fail-closed）。
+    #[tokio::test]
+    async fn sim_inverted_range_fails_closed() {
+        let config = GatewayConfig::parse(&sim_point_toml(
+            "sim_mode = \"random\"\nsim_min = 10.0\nsim_max = 1.0\n",
+        ))
+        .expect("parse");
+        let handler = DevicePollHandler::from_config(&config);
+        let err = handler
+            .poll("simdev", &["40001".to_string()])
+            .await
+            .expect_err("inverted range must fail");
+        assert!(matches!(err, DaemonError::ConfigError(_)), "{err:?}");
+        assert!(err.to_string().contains("sim_min"), "{err}");
+    }
+
+    /// 同一设备内「仿真点 + 真实点」共存：仿真点走合成、真实点走 mock 从站读，
+    /// 两路样本一并返回（仿真粒度是点位级，不是设备级）。
+    #[tokio::test]
+    async fn sim_and_real_points_coexist() {
+        let state = Arc::new(Mutex::new(MockInner {
+            // `40001` → 保持寄存器偏移 0；`40002` → 偏移 1（5 位 Modbus 编址）。
+            holding: vec![0x1234, 0x5678],
+            requests: Vec::new(),
+        }));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_mock_server(Arc::clone(&state), Arc::clone(&connections)).await;
+
+        let config = GatewayConfig::parse(&format!(
+            "[[points]]\ndevice_id = \"mixed\"\npoint_id = \"40001\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"{addr}\"\nfrequency_ms = 100\n\
+             sim_enabled = true\nsim_mode = \"fixed\"\nsim_min = 7.0\nsim_max = 7.0\n\n\
+             [[points]]\ndevice_id = \"mixed\"\npoint_id = \"40002\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"{addr}\"\nfrequency_ms = 100\n"
+        ))
+        .expect("parse");
+        let handler = DevicePollHandler::from_config(&config);
+
+        let samples = handler
+            .poll("mixed", &["40001".to_string(), "40002".to_string()])
+            .await
+            .expect("mixed poll");
+        assert_eq!(samples.len(), 2, "both points must yield a sample: {samples:?}");
+        let sim = samples
+            .iter()
+            .find(|s| s.source_id == "40001")
+            .expect("sim sample");
+        assert_eq!(sim.value, 7.0, "sim point uses the simulator");
+        let real = samples
+            .iter()
+            .find(|s| s.source_id == "40002")
+            .expect("real sample");
+        assert_eq!(real.value, 22136.0, "real point still reads the slave (0x5678)");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "exactly one dial (driven by the real point only)"
+        );
+    }
+
+    /// 计划表：只有 `sim_enabled = true` 的点位进仿真表（其余点位保持真实读）。
+    #[test]
+    fn plan_table_records_only_sim_enabled_points() {
+        let config = GatewayConfig::parse(
+            "[[points]]\ndevice_id = \"dev-a\"\npoint_id = \"40001\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"10.0.0.1:502\"\n\n\
+             [[points]]\ndevice_id = \"dev-a\"\npoint_id = \"40002\"\n\
+             protocol = \"modbus-tcp\"\naddress = \"10.0.0.1:502\"\n\
+             sim_enabled = true\nsim_mode = \"fixed\"\n",
+        )
+        .expect("parse");
+        let handler = DevicePollHandler::from_config(&config);
+        let plans = handler.devices.read().expect("plan lock").clone();
+        let plan = &plans["dev-a"];
+        assert_eq!(plan.point_ids.len(), 2);
+        assert_eq!(plan.sims.len(), 1, "only the sim-enabled point is registered");
+        assert!(matches!(plan.sims.get("40002"), Some(SimPlan::Ready(_))));
+        assert!(!plan.sims.contains_key("40001"));
     }
 }

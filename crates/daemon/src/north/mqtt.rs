@@ -48,6 +48,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -1231,179 +1232,61 @@ pub struct PumpReport {
     pub audit_emitted: usize,
 }
 
-// ---- 单路客户端 ----
+// ---- 发布侧句柄（驱动任务发送侧独立持有） ----
 
-/// 单路 MQTT 客户端（持有 rumqttc [`AsyncClient`] + [`EventLoop`]）。
+/// 北向发布侧句柄：把「发布 / 补发 / 审计取走」从事件循环推进中**解耦**出来。
 ///
-/// 生命周期：`new` 只构建（不发起连接）→ 首次 `poll_event()` 触发连接并产出
-/// `ConnAck` → 出错时记录退避 → 继续 `poll_event()` 即自动重连。
-pub struct MqttClient {
-    /// 该路连接的配置（含 encoding 声明）。
-    endpoint: EndpointConfig,
-    /// 发布/订阅句柄（内部走 flume 通道，不阻塞事件循环）。
+/// ## 为什么需要它（结构缺陷修复）
+/// rumqttc 的 [`EventLoop::poll`] 在**没有入站事件**时会一直挂起（只有网络事件 /
+/// keepalive 定时器能让它返回）。若把「发送轮」串在 `poll` 之后，空载时整个循环被
+/// `poll` 卡住、发送被饿死——启动后要等第一个 PINGREQ（默认 60s）唤醒 `poll` 才发出
+/// 第一条报文（启动静默死窗）。[`AsyncClient`] 是 `Clone`（内部仅持一个
+/// `mpsc::Sender`），且 `publish(&self, ..)` 只借 `&self`，因此可以把发布句柄克隆到
+/// **另一个 task** 里与事件循环并发推进：两者通过 [`AsyncClient`] 的请求通道通信，
+/// 无需共享事件循环，发布推进不再依赖任何入站事件。
+///
+/// ## 共享状态
+/// 确认记账（`submitted` / `acked` / `ack_sources`）与 [`MqttClient`] **共享同一
+/// `Arc`**：本句柄只增 `submitted` 与来源标记；[`MqttClient::poll_event`] 收到
+/// PUBACK / PUBCOMP 时增 `acked` 并从其在途窗口回收发送队列水位。
+#[derive(Clone)]
+pub struct MqttPublisher {
+    /// 发布 / 订阅句柄（与 [`MqttClient`] 共享同一请求通道）。
     client: AsyncClient,
-    /// 事件循环（手动推进；`pending` 承载会话恢复后待重发的报文）。
-    eventloop: EventLoop,
-    /// 重连退避（复用南向 `Reconnector`，纯逻辑）。
-    reconnector: Reconnector,
-    /// 最近一次 CONNACK 的 `session_present`（会话恢复观测点）。
-    session_present: bool,
-    /// 是否已建立 MQTT 会话（收到 CONNACK 且未被错误打断）。
-    connected: bool,
-    /// 累计 CONNACK 次数（首次为 1；`reconnect_count()` = 该值 - 1）。
-    connect_count: u64,
-    /// 待重连退避间隔（`Some` 表示上次 poll 失败，调用方应先 `backoff()`）。
-    retry_after: Option<Duration>,
-    /// 累计已提交的报文数（慢消费者水位记账；task 54）。
-    submitted: u64,
-    /// 累计已确认的报文数（PUBACK / PUBCOMP；task 54）。
-    acked: u64,
-    /// 已提交未确认报文的来源标记（task 54）：`true` = 出自发送队列，
-    /// PUBACK 到达时需 `confirm` 回收其水位占用；`false` = 补发 / 水位降级路径直发。
-    ///
-    /// 与 PUBACK **严格 FIFO** 对应（QoS 0 无确认语义，故不入队）。
-    ack_sources: VecDeque<bool>,
-    /// 北向背压接线束（task 54；`None` = 未接线，全部泵为空操作）。
+    /// 该路连接的默认 QoS（与 [`MqttClient`] 保持一致）。
+    qos: QoS,
+    /// 慢消费者发送水位（未确认积压阈值；`< 请求通道容量`，构建期校验）。
+    send_high_water: usize,
+    /// 北向背压接线束（`None` = 未接线，全部泵为空操作）。
     outlet: Option<Arc<NorthOutlet>>,
+    /// 累计已提交报文数（与 [`MqttClient`] 共享）。
+    submitted: Arc<AtomicU64>,
+    /// 累计已确认报文数（与 [`MqttClient`] 共享）。
+    acked: Arc<AtomicU64>,
+    /// 已提交未确认报文的来源标记（与 [`MqttClient`] 共享，PUBACK 严格 FIFO 对应）。
+    ack_sources: Arc<Mutex<VecDeque<bool>>>,
 }
 
-impl MqttClient {
-    /// 构建客户端（**不发起连接**，连接由首次 [`Self::poll_event`] 触发）。
+impl MqttPublisher {
+    /// 未确认积压（已提交未确认）：与 [`MqttClient::outstanding`] 同口径（读共享原子）。
+    fn outstanding(&self) -> usize {
+        self.submitted
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.acked.load(Ordering::Relaxed)) as usize
+    }
+
+    /// 记账一条已提交报文（语义同 [`MqttClient`] 的私有同名方法）。
     ///
-    /// # Errors
-    /// 配置非法 → [`DaemonError::ConfigError`]；证书问题 → [`DaemonError::SecurityError`]。
-    pub fn new(endpoint: EndpointConfig) -> DaemonResult<Self> {
-        let options = endpoint.build_options()?;
-        let capacity = endpoint.request_channel_capacity;
-        let reconnector = Reconnector::new(
-            endpoint.reconnect_initial,
-            endpoint.reconnect_max,
-            endpoint.reconnect_multiplier,
-        );
-        let (client, eventloop) = AsyncClient::new(options, capacity);
-        Ok(Self {
-            endpoint,
-            client,
-            eventloop,
-            reconnector,
-            session_present: false,
-            connected: false,
-            connect_count: 0,
-            retry_after: None,
-            submitted: 0,
-            acked: 0,
-            ack_sources: VecDeque::new(),
-            outlet: None,
-        })
-    }
-
-    /// 该路连接的配置（含 `encoding`）。
-    pub fn endpoint(&self) -> &EndpointConfig {
-        &self.endpoint
-    }
-
-    /// 该路连接声明的载荷编码。
-    pub fn encoding(&self) -> Encoding {
-        self.endpoint.encoding
-    }
-
-    /// 该路连接的默认 QoS。
-    pub fn qos(&self) -> QoS {
-        self.endpoint.qos
-    }
-
-    /// 最近一次 CONNACK 的 `session_present`（`true` = 会话已恢复）。
-    pub fn session_present(&self) -> bool {
-        self.session_present
-    }
-
-    /// 是否已建立会话。
-    pub fn is_connected(&self) -> bool {
-        self.connected
-    }
-
-    /// 累计重连次数（CONNACK 次数 - 1）。
-    pub fn reconnect_count(&self) -> u64 {
-        self.connect_count.saturating_sub(1)
-    }
-
-    /// 待重连退避间隔（上次 poll 失败后置位，成功后清除）。
-    pub fn retry_after(&self) -> Option<Duration> {
-        self.retry_after
-    }
-
-    /// 会话恢复后待重发的报文数（`EventLoop` 待重传队列长度）；
-    /// task 61 适配：`pending` 字段已随 rumqttc-next 变私有，改用公开访问器 `pending_len()`。
-    pub fn pending_requests(&self) -> usize {
-        self.eventloop.pending_len()
-    }
-
-    /// 未确认积压（task 54）：已提交但尚未收到 PUBACK / PUBCOMP 的报文数。
-    ///
-    /// 慢消费者水位的观测量：`submit` 时 +1，`poll_event` 收到确认时 -1。
-    /// QoS 0 报文不记账（无确认语义，broker 即时消费）。
-    pub fn outstanding(&self) -> usize {
-        self.submitted.saturating_sub(self.acked) as usize
-    }
-
-    // ---- 背压接线（task 54） ----
-
-    /// 挂载北向背压接线束（task 54）。未挂载时全部泵为无操作。
-    #[must_use]
-    pub fn with_outlet(mut self, outlet: Arc<NorthOutlet>) -> Self {
-        self.outlet = Some(outlet);
-        self
-    }
-
-    /// 已挂载的背压接线束（未挂载为 `None`）。
-    #[must_use]
-    pub fn outlet(&self) -> Option<&Arc<NorthOutlet>> {
-        self.outlet.as_ref()
-    }
-
-    /// 发送队列在途（已提交未确认）条数（task 54 水位口径）。
-    #[must_use]
-    pub fn queued_pending(&self) -> usize {
-        self.outlet
-            .as_ref()
-            .map_or(0, |outlet| outlet.send().pending())
-    }
-
-    /// 已提交、正等待 PUBACK / PUBCOMP 的报文的确认来源标记数（可观测）。
-    #[must_use]
-    pub fn ack_tracked(&self) -> usize {
-        self.ack_sources.len()
-    }
-
-    /// 记账一条已提交报文（task 54）。
-    ///
-    /// `from_send_queue` 决定 PUBACK 到达时是否回收 [`NorthSendQueue`] 的在途窗口：
-    /// 只有出自发送队列的报文才占用其水位，补发路径直发的报文不得占用。
+    /// `from_send_queue` 决定 PUBACK 到达时是否回收 [`NorthSendQueue`] 的在途窗口。
     /// QoS 0 无确认语义 → 不入确认来源队列（避免其无界增长）。
-    fn note_submitted(&mut self, from_send_queue: bool) {
-        self.submitted = self.submitted.saturating_add(1);
-        if self.endpoint.qos != QoS::AtMostOnce {
-            self.ack_sources.push_back(from_send_queue);
+    fn note_submitted(&self, from_send_queue: bool) {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        if self.qos != QoS::AtMostOnce {
+            lock_or_recover(&self.ack_sources).push_back(from_send_queue);
         }
     }
 
-    /// 提交一条负载到有界发送队列（task 54 接线点 1 入口；**同步、永不阻塞**）。
-    ///
-    /// # Errors
-    /// 未挂载 [`NorthOutlet`] → `ConfigError`（2000）。
-    ///
-    /// 硬上限且落盘也失败**不是错误**：返回 [`PushOutcome::Rejected`] 并交还数据
-    /// （已记审计），由调用方决定计数 / 告警 / 重试——**绝不静默丢**。
-    pub fn submit(&self, seq: u64, payload: Vec<u8>) -> DaemonResult<PushOutcome> {
-        let outlet = self.outlet.as_ref().ok_or_else(|| {
-            DaemonError::ConfigError(
-                "north outlet backpressure not attached (use `with_outlet`)".to_string(),
-            )
-        })?;
-        Ok(outlet.send().push(seq, payload))
-    }
-
-    /// 取走并上报全部背压审计（task 54 接线点 3：`AuditLog::drain()` 的调用点）。
+    /// 取走并上报全部背压审计（task 54 接线点 3）。未挂载 [`NorthOutlet`] → 0。
     #[must_use]
     pub fn drain_audit(&self) -> usize {
         self.outlet
@@ -1411,26 +1294,27 @@ impl MqttClient {
             .map_or(0, |outlet| outlet.audit().pump())
     }
 
-    /// 推进发送队列一轮：`take_ready` → 发布 → 失败 `requeue_failed`（task 54 接线点 1）。
+    /// 以 `&mut self` 发布一条原始报文（发布侧唯一发布入口）。
     ///
-    /// 水位口径 = 已提交未确认（PUBACK / PUBCOMP）条数；在途达水位时**不发布**，
-    /// 返回空报告（慢消费者保护，绝不阻塞）。
-    ///
-    /// 发布失败属可重试暂态，**不升级为错误**：失败条目与未处理的剩余条目一并
-    /// 回灌 `ready` 头部（水位占用不变，不丢数据），调用方据
-    /// [`SendPumpReport::requeued`] > 0 决定退避。未挂载 [`NorthOutlet`] → 空报告。
+    /// # Errors
+    /// 请求通道关闭 → [`DaemonError::MqttError`]。
+    async fn publish_mut(&mut self, topic: &str, payload: Vec<u8>, qos: QoS) -> DaemonResult<()> {
+        self.client
+            .publish(topic, qos, false, payload)
+            .await
+            .map_err(|e| DaemonError::MqttError(format!("publish `{topic}` failed: {e}")))
+    }
+
+    /// 推进发送队列一轮（语义与 [`MqttClient::pump_send`] 完全一致）。
     pub async fn pump_send(&mut self, topic_prefix: &str) -> SendPumpReport {
         let Some(outlet) = self.outlet.clone() else {
             return SendPumpReport::default();
         };
-        let headroom = self
-            .endpoint
-            .send_high_water
-            .saturating_sub(self.outstanding());
+        let headroom = self.send_high_water.saturating_sub(self.outstanding());
         if headroom == 0 {
             return SendPumpReport::default();
         }
-        let qos = self.endpoint.qos;
+        let qos = self.qos;
         let mut queue: VecDeque<PendingSend> = outlet.send().take_ready(headroom).into();
         let taken = queue.len();
         let mut published = 0usize;
@@ -1465,12 +1349,7 @@ impl MqttClient {
         }
     }
 
-    /// 推进补发一轮：`should_send` → 去重判定 → 发布 → **发布成功后 `ack`**
-    /// （task 54 接线点 2）。未挂载 [`NorthOutlet`] → 空报告。
-    ///
-    /// 顺序红线：`ack` 内部为「先落 Ack，成功后才推位点」，**不得颠倒**。
-    /// Ack 落盘失败 → 位点不动（`ack_errors` +1），该批仍可重放并由幂等键去重。
-    /// 发布失败 → 该批留在离线队列中不回灌、不落盘（避免重复行）。
+    /// 推进补发一轮（语义与 [`MqttClient::pump_replay`] 完全一致）。
     ///
     /// # Errors
     /// 离线队列写线程不可用 → `StorageError`（4000）。
@@ -1478,15 +1357,12 @@ impl MqttClient {
         let Some(outlet) = self.outlet.clone() else {
             return Ok(ReplayPumpReport::default());
         };
-        let headroom = self
-            .endpoint
-            .send_high_water
-            .saturating_sub(self.outstanding());
+        let headroom = self.send_high_water.saturating_sub(self.outstanding());
         if headroom == 0 {
             return Ok(ReplayPumpReport::default());
         }
         let batches = outlet.replay().next_replay_batch(headroom)?;
-        let qos = self.endpoint.qos;
+        let qos = self.qos;
         let mut report = ReplayPumpReport {
             candidates: batches.len(),
             ..ReplayPumpReport::default()
@@ -1541,7 +1417,7 @@ impl MqttClient {
         Ok(report)
     }
 
-    /// 一轮完整泵：发送 → 补发 → 审计上报（task 54 三个接线点各推进一次）。
+    /// 一轮完整泵：发送 → 补发 → 审计上报（语义与 [`MqttClient::pump`] 完全一致）。
     ///
     /// # Errors
     /// 离线队列不可用（[`Self::pump_replay`]）→ `StorageError`（4000）。
@@ -1554,6 +1430,250 @@ impl MqttClient {
             replay,
             audit_emitted,
         })
+    }
+}
+
+// ---- 单路客户端 ----
+
+/// 单路 MQTT 客户端（持有 rumqttc [`AsyncClient`] + [`EventLoop`]）。
+///
+/// 生命周期：`new` 只构建（不发起连接）→ 首次 `poll_event()` 触发连接并产出
+/// `ConnAck` → 出错时记录退避 → 继续 `poll_event()` 即自动重连。
+pub struct MqttClient {
+    /// 该路连接的配置（含 encoding 声明）。
+    endpoint: EndpointConfig,
+    /// 发布/订阅句柄（内部走 flume 通道，不阻塞事件循环）。
+    client: AsyncClient,
+    /// 事件循环（手动推进；`pending` 承载会话恢复后待重发的报文）。
+    eventloop: EventLoop,
+    /// 重连退避（复用南向 `Reconnector`，纯逻辑）。
+    reconnector: Reconnector,
+    /// 最近一次 CONNACK 的 `session_present`（会话恢复观测点）。
+    session_present: bool,
+    /// 是否已建立 MQTT 会话（收到 CONNACK 且未被错误打断）。
+    connected: bool,
+    /// 累计 CONNACK 次数（首次为 1；`reconnect_count()` = 该值 - 1）。
+    connect_count: u64,
+    /// 待重连退避间隔（`Some` 表示上次 poll 失败，调用方应先 `backoff()`）。
+    retry_after: Option<Duration>,
+    /// 累计已提交的报文数（慢消费者水位记账；task 54）。
+    ///
+    /// 与 [`Self::publisher`]（驱动任务发送侧）**共享同一原子**：发布侧增，本侧读。
+    submitted: Arc<AtomicU64>,
+    /// 累计已确认的报文数（PUBACK / PUBCOMP；task 54）。与发布侧共享。
+    acked: Arc<AtomicU64>,
+    /// 已提交未确认报文的来源标记（task 54）：`true` = 出自发送队列，
+    /// PUBACK 到达时需 `confirm` 回收其水位占用；`false` = 补发 / 水位降级路径直发。
+    ///
+    /// 与 PUBACK **严格 FIFO** 对应（QoS 0 无确认语义，故不入队）。
+    /// 与发布侧共享（发布侧 push_back，本侧 `poll_event` pop_front）。
+    ack_sources: Arc<Mutex<VecDeque<bool>>>,
+    /// 北向背压接线束（task 54；`None` = 未接线，全部泵为空操作）。
+    outlet: Option<Arc<NorthOutlet>>,
+}
+
+impl MqttClient {
+    /// 构建客户端（**不发起连接**，连接由首次 [`Self::poll_event`] 触发）。
+    ///
+    /// # Errors
+    /// 配置非法 → [`DaemonError::ConfigError`]；证书问题 → [`DaemonError::SecurityError`]。
+    pub fn new(endpoint: EndpointConfig) -> DaemonResult<Self> {
+        let options = endpoint.build_options()?;
+        let capacity = endpoint.request_channel_capacity;
+        let reconnector = Reconnector::new(
+            endpoint.reconnect_initial,
+            endpoint.reconnect_max,
+            endpoint.reconnect_multiplier,
+        );
+        let (client, eventloop) = AsyncClient::new(options, capacity);
+        Ok(Self {
+            endpoint,
+            client,
+            eventloop,
+            reconnector,
+            session_present: false,
+            connected: false,
+            connect_count: 0,
+            retry_after: None,
+            submitted: Arc::new(AtomicU64::new(0)),
+            acked: Arc::new(AtomicU64::new(0)),
+            ack_sources: Arc::new(Mutex::new(VecDeque::new())),
+            outlet: None,
+        })
+    }
+
+    /// 该路连接的配置（含 `encoding`）。
+    pub fn endpoint(&self) -> &EndpointConfig {
+        &self.endpoint
+    }
+
+    /// 该路连接声明的载荷编码。
+    pub fn encoding(&self) -> Encoding {
+        self.endpoint.encoding
+    }
+
+    /// 该路连接的默认 QoS。
+    pub fn qos(&self) -> QoS {
+        self.endpoint.qos
+    }
+
+    /// 最近一次 CONNACK 的 `session_present`（`true` = 会话已恢复）。
+    pub fn session_present(&self) -> bool {
+        self.session_present
+    }
+
+    /// 是否已建立会话。
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    /// 累计重连次数（CONNACK 次数 - 1）。
+    pub fn reconnect_count(&self) -> u64 {
+        self.connect_count.saturating_sub(1)
+    }
+
+    /// 待重连退避间隔（上次 poll 失败后置位，成功后清除）。
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    /// 会话恢复后待重发的报文数（`EventLoop` 待重传队列长度）；
+    /// task 61 适配：`pending` 字段已随 rumqttc-next 变私有，改用公开访问器 `pending_len()`。
+    pub fn pending_requests(&self) -> usize {
+        self.eventloop.pending_len()
+    }
+
+    /// 未确认积压（task 54）：已提交但尚未收到 PUBACK / PUBCOMP 的报文数。
+    ///
+    /// 慢消费者水位的观测量：`submit` 时 +1，`poll_event` 收到确认时 -1。
+    /// QoS 0 报文不记账（无确认语义，broker 即时消费）。
+    pub fn outstanding(&self) -> usize {
+        self.submitted
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.acked.load(Ordering::Relaxed)) as usize
+    }
+
+    // ---- 背压接线（task 54） ----
+
+    /// 挂载北向背压接线束（task 54）。未挂载时全部泵为无操作。
+    ///
+    /// 同时生效于本客户端与 [`Self::publisher`] 产出的发布句柄（后者从本字段克隆）。
+    #[must_use]
+    pub fn with_outlet(mut self, outlet: Arc<NorthOutlet>) -> Self {
+        self.outlet = Some(outlet);
+        self
+    }
+
+    /// 克隆发布侧句柄（供驱动任务的发送侧**独立任务**持有）。
+    ///
+    /// 返回的 [`MqttPublisher`] 与 `self` 共享[`AsyncClient`]请求通道与确认记账；
+    /// 本客户端仍独占 [`EventLoop`]（只能由轮询任务推进）。
+    #[must_use]
+    pub fn publisher(&self) -> MqttPublisher {
+        MqttPublisher {
+            client: self.client.clone(),
+            qos: self.endpoint.qos,
+            send_high_water: self.endpoint.send_high_water,
+            outlet: self.outlet.clone(),
+            submitted: Arc::clone(&self.submitted),
+            acked: Arc::clone(&self.acked),
+            ack_sources: Arc::clone(&self.ack_sources),
+        }
+    }
+
+    /// 已挂载的背压接线束（未挂载为 `None`）。
+    #[must_use]
+    pub fn outlet(&self) -> Option<&Arc<NorthOutlet>> {
+        self.outlet.as_ref()
+    }
+
+    /// 发送队列在途（已提交未确认）条数（task 54 水位口径）。
+    #[must_use]
+    pub fn queued_pending(&self) -> usize {
+        self.outlet
+            .as_ref()
+            .map_or(0, |outlet| outlet.send().pending())
+    }
+
+    /// 已提交、正等待 PUBACK / PUBCOMP 的报文的确认来源标记数（可观测）。
+    #[must_use]
+    pub fn ack_tracked(&self) -> usize {
+        lock_or_recover(&self.ack_sources).len()
+    }
+
+    /// 记账一条已提交报文（task 54）：委派给发布侧句柄（共享同一记账）。
+    ///
+    /// `from_send_queue` 决定 PUBACK 到达时是否回收 [`NorthSendQueue`] 的在途窗口：
+    /// 只有出自发送队列的报文才占用其水位，补发路径直发的报文不得占用。
+    /// QoS 0 无确认语义 → 不入确认来源队列（避免其无界增长）。
+    fn note_submitted(&mut self, from_send_queue: bool) {
+        self.publisher().note_submitted(from_send_queue);
+    }
+
+    /// 提交一条负载到有界发送队列（task 54 接线点 1 入口；**同步、永不阻塞**）。
+    ///
+    /// # Errors
+    /// 未挂载 [`NorthOutlet`] → `ConfigError`（2000）。
+    ///
+    /// 硬上限且落盘也失败**不是错误**：返回 [`PushOutcome::Rejected`] 并交还数据
+    /// （已记审计），由调用方决定计数 / 告警 / 重试——**绝不静默丢**。
+    pub fn submit(&self, seq: u64, payload: Vec<u8>) -> DaemonResult<PushOutcome> {
+        let outlet = self.outlet.as_ref().ok_or_else(|| {
+            DaemonError::ConfigError(
+                "north outlet backpressure not attached (use `with_outlet`)".to_string(),
+            )
+        })?;
+        Ok(outlet.send().push(seq, payload))
+    }
+
+    /// 取走并上报全部背压审计（task 54 接线点 3：`AuditLog::drain()` 的调用点）。
+    ///
+    /// 委派给发布侧句柄（同一 [`NorthOutlet`]）。
+    #[must_use]
+    pub fn drain_audit(&self) -> usize {
+        self.publisher().drain_audit()
+    }
+
+    /// 推进发送队列一轮：`take_ready` → 发布 → 失败 `requeue_failed`（task 54 接线点 1）。
+    ///
+    /// 水位口径 = 已提交未确认（PUBACK / PUBCOMP）条数；在途达水位时**不发布**，
+    /// 返回空报告（慢消费者保护，绝不阻塞）。
+    ///
+    /// 发布失败属可重试暂态，**不升级为错误**：失败条目与未处理的剩余条目一并
+    /// 回灌 `ready` 头部（水位占用不变，不丢数据），调用方据
+    /// [`SendPumpReport::requeued`] > 0 决定退避。未挂载 [`NorthOutlet`] → 空报告。
+    ///
+    /// 委派给发布侧句柄（[`Self::publisher`]）；实现见 [`MqttPublisher::pump_send`]。
+    pub async fn pump_send(&mut self, topic_prefix: &str) -> SendPumpReport {
+        let mut publisher = self.publisher();
+        publisher.pump_send(topic_prefix).await
+    }
+
+    /// 推进补发一轮：`should_send` → 去重判定 → 发布 → **发布成功后 `ack`**
+    /// （task 54 接线点 2）。未挂载 [`NorthOutlet`] → 空报告。
+    ///
+    /// 顺序红线：`ack` 内部为「先落 Ack，成功后才推位点」，**不得颠倒**。
+    /// Ack 落盘失败 → 位点不动（`ack_errors` +1），该批仍可重放并由幂等键去重。
+    /// 发布失败 → 该批留在离线队列中不回灌、不落盘（避免重复行）。
+    ///
+    /// # Errors
+    /// 离线队列写线程不可用 → `StorageError`（4000）。
+    ///
+    /// 委派给发布侧句柄（[`Self::publisher`]）；实现见 [`MqttPublisher::pump_replay`]。
+    pub async fn pump_replay(&mut self, topic_prefix: &str) -> DaemonResult<ReplayPumpReport> {
+        let mut publisher = self.publisher();
+        publisher.pump_replay(topic_prefix).await
+    }
+
+    /// 一轮完整泵：发送 → 补发 → 审计上报（task 54 三个接线点各推进一次）。
+    ///
+    /// 委派给发布侧句柄（[`Self::publisher`]）；实现见 [`MqttPublisher::pump`]。
+    ///
+    /// # Errors
+    /// 离线队列不可用（[`Self::pump_replay`]）→ `StorageError`（4000）。
+    pub async fn pump(&mut self, topic_prefix: &str) -> DaemonResult<PumpReport> {
+        let mut publisher = self.publisher();
+        publisher.pump(topic_prefix).await
     }
 
     /// 带慢消费者水位保护的发布（task 54）。
@@ -1719,9 +1839,9 @@ impl MqttClient {
                     &event,
                     Event::Incoming(Packet::PubAck(_)) | Event::Incoming(Packet::PubComp(_))
                 ) {
-                    self.acked = self.acked.saturating_add(1);
+                    self.acked.fetch_add(1, Ordering::Relaxed);
                     // 该报文的确认来源：`Some(true)` = 出自发送队列 → 回收其水位。
-                    if self.ack_sources.pop_front() == Some(true) {
+                    if lock_or_recover(&self.ack_sources).pop_front() == Some(true) {
                         if let Some(outlet) = &self.outlet {
                             outlet.send().confirm(1);
                         }
@@ -1783,7 +1903,7 @@ impl fmt::Debug for MqttClient {
             .field("connect_count", &self.connect_count)
             .field("retry_after", &self.retry_after)
             .field("outstanding", &self.outstanding())
-            .field("ack_tracked", &self.ack_sources.len())
+            .field("ack_tracked", &self.ack_tracked())
             .field("outlet_attached", &self.outlet.is_some())
             .finish_non_exhaustive()
     }
@@ -3525,6 +3645,55 @@ mod tests {
                 "payload-4".to_string(),
                 "payload-5".to_string()
             ]
+        );
+    }
+
+    /// 回归（结构缺陷修复）：**发送推进不再依赖入站事件**。
+    ///
+    /// 旧实现把 `pump_send` 串在 `poll_event().await` 之后，而 rumqttc 的
+    /// `EventLoop::poll()` 在无入站事件时会永久挂起 → 发布被饿死（启动后等第一个
+    /// PINGREQ 才发第一条，即「启动静默死窗」）。本用例用克隆出的发布句柄在
+    /// **零入站事件、连接未建立**的前提下独立推进发送，断言发布计数 > 0。
+    #[tokio::test]
+    async fn publisher_pump_send_progresses_without_inbound_events() {
+        let broker = spawn_mock_broker(BrokerOptions::default()).await;
+        let (_dir, queue) = temp_queue("gw-split");
+        let (mut client, _outlet, _sink) =
+            client_with_outlet(broker.port, "iot-daq-split1", "gw-split", &queue);
+
+        for seq in 1..=3u64 {
+            let _ = client
+                .submit(seq, format!("split-{seq}").into_bytes())
+                .expect("submit");
+        }
+        // 关键前提：从未推进事件循环 → 无任何入站事件、连接未建立。
+        assert!(
+            !client.is_connected(),
+            "precondition: no inbound event consumed yet"
+        );
+
+        let mut publisher = client.publisher();
+        let report = publisher.pump_send("telemetry").await;
+        assert_eq!(
+            report.published, 3,
+            "publish must advance without inbound events (old impl: 0): {report:?}"
+        );
+        assert!(
+            !client.is_connected(),
+            "pump_send must not require a connection / CONNACK"
+        );
+
+        // 之后才推进事件循环，证明这些发布真的到达 broker（而非只进了请求通道）。
+        for _ in 0..32 {
+            if broker.publishes().len() >= 3 {
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(3), client.poll_event()).await;
+        }
+        assert_eq!(
+            broker.publishes().len(),
+            3,
+            "published batches must reach the broker"
         );
     }
 

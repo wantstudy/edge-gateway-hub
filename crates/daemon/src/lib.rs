@@ -43,6 +43,8 @@ pub mod pipeline;
 pub mod platform;
 pub mod rules;
 pub mod scheduler;
+/// 点位模拟源（`sim_*` 配置的真实执行体；南向采集的仿真分支）。
+pub mod sim;
 /// 南向采集装配（生产 `PollHandler`，bootstrap 生产路径接线，D-12 修复）。
 pub mod southbound;
 pub mod telemetry_store;

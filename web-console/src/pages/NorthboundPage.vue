@@ -830,7 +830,8 @@ function outletWriteFailureText(cause: unknown): string {
   if (status === 501) {
     return (
       '出口未登记：后端写接口未落地（HTTP 501 not_implemented）—— 北向出口登记涉及 TLS 证书字段校验，' +
-      '该能力尚未收口。恢复路径：当前请在网关配置文件的 [[outlets]] 段登记出口并热重载；' +
+      '该能力尚未收口。恢复路径：当前请在网关配置文件的 [[outlets]] 段登记出口并重启网关' +
+      '（北向运行期只在网关启动时装配，不存在出口级热重载）；' +
       '写接口上线后本表单即可直接保存。'
     );
   }
@@ -875,7 +876,13 @@ async function saveOutlet(): Promise<void> {
   mqttPassword.value = '';
   try {
     await apiRequest<unknown>('/api/forwarders', { method: 'POST', body: JSON.stringify(payload) });
-    outletMessage.value = `出口「${outletForm.name}」已登记：范围 ${scopeText}。`;
+    // 生效时机如实呈现：北向运行期（`NorthRuntime::start`）在网关**启动时**装配，
+    // dataplane 对它的绑定是晚绑定且不可替换（重复 attach 只保留首个句柄），
+    // 因此新增出口落盘后需**重启网关**才真正参与投递 —— 绝不把它说成"已即时生效"。
+    outletMessage.value =
+      `出口「${outletForm.name}」已登记并落盘：范围 ${scopeText}。` +
+      '生效时机：北向运行期在网关启动时装配，该出口将在重启网关后参与投递' +
+      '（可在「启动与自启」页面重启网关）。';
     await loadForwarders();
   } catch (cause) {
     outletMessage.value = outletWriteFailureText(cause);
@@ -951,7 +958,7 @@ async function onDeleteSubmit(payload: { reason: string; note: string; tail: str
     const status = cause instanceof ApiError ? cause.status : 0;
     operationMessage.value =
       status === 404 || status === 405
-        ? `出口「${row.name}」未删除：后端未提供出口删除接口（HTTP ${status}）。恢复路径：暂请在网关配置文件的 [[outlets]] 段调整出口后热重载。`
+        ? `出口「${row.name}」未删除：后端未提供出口删除接口（HTTP ${status}）。恢复路径：暂请在网关配置文件的 [[outlets]] 段调整出口后重启网关。`
         : `出口「${row.name}」未删除：${forwarderFailureText(cause, 'DELETE /api/forwarders/:id')}`;
   }
 }

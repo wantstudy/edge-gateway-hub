@@ -7,13 +7,15 @@
 //! 这一跳做完，并把出口注册表挂到 `DaemonShared`（见 `crate::bootstrap`），
 //! 使采集侧能在运行期真正投递数据。
 //!
-//! ## 每个出口的驱动循环
-//! 固定两步，每轮一拍：
-//! 1. [`MqttClient::poll_event`]：推进 rumqttc 事件循环。`PUBACK` / `PUBCOMP` 到达时
-//!    该方法内部回收发送队列在途窗口（**只有确认到达才回收**）；出错则
-//!    [`MqttClient::backoff`] 后继续（rumqttc 语义：继续 poll 即自动重连，
-//!    会话恢复由 CONNACK 的 `session_present` 观测）。
-//! 2. [`MqttClient::pump`]：发送队列一轮 → 补发一轮 → 审计取走上报。
+//! ## 每个出口的驱动：两个**并发**任务
+//! rumqttc 的 `EventLoop::poll()` 在无入站事件时会一直挂起，若把发送串在它之后会被
+//! 饿死（启动/空载期的静默死窗）。故每个出口拆成两个独立任务：
+//! 1. **轮询任务**（独占 [`MqttClient`]）：循环 [`MqttClient::poll_event`] 推进事件循环。
+//!    `PUBACK` / `PUBCOMP` 到达时该方法内部回收发送队列在途窗口（**只有确认到达才回收**）；
+//!    出错则 [`MqttClient::backoff`] 后继续（rumqttc 语义：继续 poll 即自动重连，
+//!    会话恢复由 CONNACK 的 `session_present` 观测）。门控期间照常推进（维持连接）。
+//! 2. **发送任务**（持 [`MqttClient::publisher`] 的发布句柄）：按 `tick` 推进
+//!    `pump`（发送队列一轮 → 补发一轮 → 审计取走上报），**不依赖任何入站事件**。
 //!
 //! ## 红线
 //! - **采集路径永不阻塞**：采集侧只调 [`NorthRuntime::submit`]（同步、无 await、一次整数比较 + 一次有界落盘调用），驱动任务在独立 tokio task 里跑。
@@ -564,7 +566,7 @@ impl NorthRuntime {
                     continue;
                 }
             };
-            let task = spawn_driver(
+            let (poll_task, send_task) = spawn_driver(
                 outlet_cfg.name.clone(),
                 outlet_cfg.topic_prefix.clone(),
                 client,
@@ -579,7 +581,9 @@ impl NorthRuntime {
                 name: outlet_cfg.name.clone(),
                 outlet,
             });
-            tasks.push(task);
+            // 每个出口两个并发任务（轮询 + 发送）；停机时全部 abort。
+            tasks.push(poll_task);
+            tasks.push(send_task);
         }
 
         NorthRuntime {
@@ -690,7 +694,23 @@ impl std::fmt::Debug for NorthRuntime {
     }
 }
 
-/// 单个出口的驱动任务：每拍「授权门控 → 推进事件循环 → 一轮泵」。
+/// 单个出口的驱动：拆成**两个并发任务**——轮询任务（独占 [`MqttClient`] 推进事件循环）
+/// 与发送任务（持 [`MqttClient::publisher`] 的发布句柄，按 `tick` 推进发送 / 补发 / 审计）。
+///
+/// ## 为什么必须拆（结构缺陷修复）
+/// rumqttc 的 `EventLoop::poll()` 在**没有入站事件**时会一直挂起（只有网络事件 /
+/// keepalive 定时器能让它返回）。旧实现把发送轮串在 `poll` 之后，空载期整个循环被
+/// `poll` 卡住 → 发送被饿死：daemon 启动后要等第一个 PINGREQ（默认 keep_alive = 60s）
+/// 唤醒 `poll`，第一条报文才发得出去（**启动静默死窗**），任何空载时段都会重演。
+/// 发布句柄（[`MqttClient::publisher`]）可克隆到独立任务——两者通过 [`AsyncClient`]
+/// 的请求通道通信，发送推进**不再依赖任何入站事件**。
+///
+/// ## 分工
+/// - **轮询任务**：独占 `MqttClient`（`EventLoop` 只能单线程推进），循环 `poll_event()`
+///   维护连接与回收 PUBACK；出错 → `backoff()` 后继续（自动重连）。门控不影响它（保持连接）。
+/// - **发送任务**：持发布句柄，每拍「授权门控 → 一轮 `pump`」；门控拒绝时跳过发送并计数。
+///
+/// 返回 `(轮询任务, 发送任务)`；调用方把两个句柄一并纳入停机 `abort` 清单。
 #[allow(
     clippy::too_many_arguments,
     reason = "装配期一次性接线签名；参数均为独立所有权/句柄，聚合只会增加间接层"
@@ -701,15 +721,54 @@ fn spawn_driver(
     client: MqttClient,
     outlet: Arc<NorthOutlet>,
     counters: Arc<Counters>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     tick: Duration,
     gate: Option<Arc<dyn NorthForwardGate>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        // 驱动任务独占该客户端（无其它持有者），按值持有并只用 `&mut self` 方法：
-        // `MqttClient` 因 rumqttc `EventLoop` 内的 `!Sync` 传输而为 `!Sync`，
-        // 任何 `&self` 方法跨 await 都会让本 future 非 `Send`（无法 `tokio::spawn`）。
+) -> (JoinHandle<()>, JoinHandle<()>) {
+    // 发布侧句柄必须在把 `client` 移入轮询任务**之前**克隆出来。
+    let mut publisher = client.publisher();
+
+    // ---- 轮询任务：独占事件循环，只维护连接 + 回收确认 ----
+    let mut shutdown_poll = shutdown.clone();
+    let name_poll = name.clone();
+    let counters_poll = Arc::clone(&counters);
+    let poll_task = tokio::spawn(async move {
+        // 独占该客户端（无其它持有者）：`MqttClient` 因 rumqttc `EventLoop` 内的
+        // `!Sync` 传输而为 `!Sync`，只能由单个任务按值持有并 `&mut` 推进。
         let mut client = client;
+        loop {
+            if *shutdown_poll.borrow_and_update() {
+                break;
+            }
+            Counters::bump(&counters_poll.poll_cycles);
+            tokio::select! {
+                result = client.poll_event() => match result {
+                    Ok(_) => Counters::bump(&counters_poll.polls_ok),
+                    Err(err) => {
+                        Counters::bump(&counters_poll.polls_failed);
+                        warn!(
+                            outlet = %name_poll,
+                            error = %err,
+                            "north driver: poll failed; backing off before reconnect"
+                        );
+                        // 退避期间也可被停机信号打断（不让停机空等长退避）。
+                        tokio::select! {
+                            _ = client.backoff() => {}
+                            _ = shutdown_poll.changed() => break,
+                        }
+                    }
+                },
+                _ = shutdown_poll.changed() => break,
+            }
+        }
+        info!(outlet = %name_poll, "north driver: poll task stopped");
+    });
+
+    // ---- 发送任务：持发布句柄，按 tick 独立推进（不等任何入站事件） ----
+    let mut shutdown_send = shutdown;
+    let counters_send = Arc::clone(&counters);
+    let outlet_send = Arc::clone(&outlet);
+    let send_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // interval 首拍立即完成，先消费掉再进循环。
@@ -718,21 +777,20 @@ fn spawn_driver(
         let mut last_allowed = true;
         let mut denied_cycles: u64 = 0;
         loop {
-            if *shutdown.borrow_and_update() {
+            if *shutdown_send.borrow_and_update() {
                 break;
             }
             tokio::select! {
                 _ = ticker.tick() => {}
-                _ = shutdown.changed() => break,
+                _ = shutdown_send.changed() => break,
             }
-            Counters::bump(&counters.poll_cycles);
 
             // ⓪ 授权门控（fail-closed，可解释）：Degraded / Unlicensed ⇒ 跳过本轮
-            //    发送。发送队列照常受理采集侧入队（超限自然落盘降级），本地采集与
-            //    连接维护不受影响；判据经 `watch` 读授权状态，跃迁下一拍即生效。
+            //    发送。发送队列照常受理采集侧入队（超限自然落盘降级）；连接由轮询任务
+            //    继续维护（门控不影响连接）。判据经 `watch` 读授权状态，跃迁下一拍即生效。
             let allowed = gate.as_ref().is_none_or(|g| g.north_forward_allowed());
             if !allowed {
-                Counters::bump(&counters.gated_cycles);
+                Counters::bump(&counters_send.gated_cycles);
                 denied_cycles = denied_cycles.saturating_add(1);
                 // 节流：进入门控首拍必打（上一拍还是放行），之后每
                 // GATED_WARN_EVERY_CYCLES 拍提醒一次（含 Degraded 原因与恢复路径）。
@@ -749,43 +807,23 @@ fn spawn_driver(
                     );
                 }
                 last_allowed = false;
-            } else {
-                if !last_allowed {
-                    info!(
-                        outlet = %name,
-                        "north driver: license recovered; northbound forwarding resumed"
-                    );
-                }
-                last_allowed = true;
-                denied_cycles = 0;
-            }
-
-            // ① 推进事件循环：PUBACK/PUBCOMP → 回收发送队列在途窗口；
-            //    出错 → 按退避重试（继续 poll 即自动重连）。
-            //    门控期间照常推进（维持连接），只是不发送。
-            match client.poll_event().await {
-                Ok(_) => Counters::bump(&counters.polls_ok),
-                Err(err) => {
-                    Counters::bump(&counters.polls_failed);
-                    warn!(
-                        outlet = %name,
-                        error = %err,
-                        "north driver: poll failed; backing off before reconnect"
-                    );
-                    client.backoff().await;
-                    continue;
-                }
-            }
-            if !allowed {
-                // 门控生效：跳过发送轮（发送 / 补发 / 审计），下一拍重新判定。
                 continue;
             }
-            // ② 发送一轮 + 补发一轮 + 审计取走上报。
-            match client.pump(&topic_prefix).await {
+            if !last_allowed {
+                info!(
+                    outlet = %name,
+                    "north driver: license recovered; northbound forwarding resumed"
+                );
+            }
+            last_allowed = true;
+            denied_cycles = 0;
+
+            // ① 发送一轮 + 补发一轮 + 审计取走上报（不依赖任何入站事件）。
+            match publisher.pump(&topic_prefix).await {
                 Ok(report) => {
-                    Counters::bump(&counters.pumps);
+                    Counters::bump(&counters_send.pumps);
                     if report.replay.sent > 0 {
-                        Counters::add(&counters.replayed, report.replay.sent as u64);
+                        Counters::add(&counters_send.replayed, report.replay.sent as u64);
                     }
                     if report.audit_emitted > 0 {
                         info!(
@@ -796,17 +834,19 @@ fn spawn_driver(
                     }
                 }
                 Err(err) => {
-                    Counters::bump(&counters.pump_errors);
+                    Counters::bump(&counters_send.pump_errors);
                     warn!(outlet = %name, error = %err, "north driver: pump failed");
                 }
             }
         }
         // 收口：把离线队列内存中的降级数据落盘（best-effort，失败仅告警）。
-        if let Err(err) = outlet.replay().queue().flush() {
+        if let Err(err) = outlet_send.replay().queue().flush() {
             warn!(outlet = %name, error = %err, "north driver: final queue flush failed");
         }
-        info!(outlet = %name, "north driver: stopped");
-    })
+        info!(outlet = %name, "north driver: send task stopped");
+    });
+
+    (poll_task, send_task)
 }
 
 #[cfg(test)]
@@ -1184,11 +1224,13 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(runtime.stats().gated_cycles, 0, "no gate ⇒ no gating ever");
-        assert_eq!(
-            runtime.stats().pumps,
-            0,
-            "poll fails against unreachable broker so pump path never completes; \
-             the assertion here is gated_cycles == 0"
+        // 结构断言（缺陷修复的回归）：发送任务与轮询任务解耦 —— 即便 broker 不可达
+        // （轮询任务持续 `poll` 失败并退避），发送任务仍按 tick 独立推进 `pump`。
+        // 旧实现把发送串在 `poll` 之后，此处 `pumps` 会恒为 0（发送被饿死）。
+        assert!(
+            runtime.stats().pumps > 0,
+            "send task must advance independently of poll outcomes; stats={:?}",
+            runtime.stats()
         );
 
         shutdown_tx.send_replace(true);
