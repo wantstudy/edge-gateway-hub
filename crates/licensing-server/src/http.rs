@@ -1101,12 +1101,22 @@ fn paged<T>(items: Vec<T>, total: u64, page: u32, page_size: u32) -> PagedRespon
     }
 }
 
+/// 激活码前缀：新格式为 `IOT-` + 4 位年份 + `-`（如 `IOT-2026-`）。
+const CODE_PREFIX_WIDTH: usize = "IOT-2026-".len();
+
 /// 掩码激活码值（列表页显示；详情页揭示完整码值）。
 ///
-/// 形如 `IOTDAQ-****-****-****-AB12`（保留前缀 `IOTDAQ-` 与尾 4 位）；
-/// 非 `IOTDAQ-` 前缀的短码一律整串掩码（不留可猜测片段）。
+/// 新格式 `IOT-2026-XXXX-XXXX-XXXX-XX` → `IOT-2026-****-****-****-XX`
+/// （保留前缀与末段 2 位）；旧格式 `IOTDAQ-XXXX-XXXX-XXXX-XXXX` →
+/// `IOTDAQ-****-****-****-XXXX`（存量库中可能仍有未激活的旧码，仅影响**显示**，
+/// 激活判定按码值查库，不做格式重算）。非上述前缀的短码一律整串掩码（不留可猜测片段）。
 fn mask_code(code: &str) -> String {
     let chars: Vec<char> = code.chars().collect();
+    if code.starts_with("IOT-") && chars.len() >= 12 {
+        let prefix: String = chars[..CODE_PREFIX_WIDTH].iter().collect();
+        let tail: String = chars[chars.len() - 2..].iter().collect();
+        return format!("{prefix}****-****-****-{tail}");
+    }
     if code.starts_with("IOTDAQ-") && chars.len() >= 12 {
         let tail: String = chars[chars.len() - 4..].iter().collect();
         return format!("IOTDAQ-****-****-****-{tail}");
@@ -1318,6 +1328,25 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// **掩码契约**（2026-09-27）：新格式保留 `IOT-2026-` 前缀与末段 2 位；
+    /// 旧 `IOTDAQ-` 格式（库内存量码）保留 `IOTDAQ-` 与末段 4 位；短码整串掩码。
+    #[test]
+    fn mask_code_preserves_prefix_and_tail_per_format() {
+        let year = crate::keys::current_year(now_unix_secs());
+        let code = format!("IOT-{year:04}-ACDE-FGJK-LMNP-QR");
+        assert_eq!(
+            mask_code(&code),
+            format!("IOT-{year:04}-****-****-****-QR")
+        );
+        // 旧格式：仅用于显示，段结构保持 4×4。
+        assert_eq!(
+            mask_code("IOTDAQ-ACDE-FGJK-LMNP-QRST"),
+            "IOTDAQ-****-****-****-QRST"
+        );
+        // 非两种前缀的短码：整串掩码，不留可猜测片段。
+        assert_eq!(mask_code("abcd"), "****");
+    }
 
     /// **TEST_ONLY_** 密钥种子（仅测试；生产密钥绝不硬编码）。
     const TEST_ONLY_SEED: [u8; 32] = *b"iotdaq-test-seed-http-0000000001";

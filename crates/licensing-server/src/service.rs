@@ -30,7 +30,7 @@ use crate::audit::{BatchOutcome, BatchRecord, ReceiptLedger};
 use crate::admin_auth::{sha256_hex, AdminAccount, Role};
 use crate::device_auth;
 use crate::error::{LicenseError, LicenseResult, PrebindKind};
-use crate::keys::KeyRing;
+use crate::keys::{current_year, KeyRing};
 use crate::model::{
     now_ns_id, now_unix_secs, ActivationCode, ActorType, AuditLog, CodeStatus, Device,
     DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, Tenant, VerifyMode,
@@ -59,6 +59,21 @@ pub const CLOCK_SKEW_SECS: i64 = 300;
 
 /// nonce 缓存有效期（秒）：取时钟窗的两倍，保证「窗口内 nonce 不可复用」。
 pub const NONCE_TTL_SECS: i64 = CLOCK_SKEW_SECS * 2;
+
+// ---- 激活码格式（`IOT-2026-XXXX-XXXX-XXXX-XX`，与网关端 repo.ts 同一口径） ----
+
+/// 激活码字符集：大写字母 + 数字，**剔除易混字符 `0` / `O` / `1` / `I`**
+/// （手写抄录 / 电话口述场景最易混淆的三对），共 31 个字符。
+const CODE_ALPHABET: &str = "ACDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// 激活码分段数：末段为 2 位，其余 3 段各 4 位（`XXXX`）。
+const CODE_SEG_COUNT: usize = 4;
+
+/// 非末段宽度（4 位：`XXXX`）。
+const CODE_GROUP_WIDTH: usize = 4;
+
+/// 末段宽度（2 位：`XX`）。
+const CODE_TAIL_WIDTH: usize = 2;
 
 // ---- 服务端响应签名契约（daemon 侧逐字节镜像，跨端一致性由契约测试锁定） ----
 //
@@ -1333,19 +1348,30 @@ impl LicensingService {
         Ok(normalized)
     }
 
-    /// 生成随机激活码值（`IOTDAQ-XXXX-XXXX-XXXX-XXXX`，4 组 16-bit hex）。
+    /// 生成激活码值（`IOT-2026-XXXX-XXXX-XXXX-XX`）。
     ///
-    /// **绝不硬编码**：熵来自 `rand`，且码值**不进日志 / 不进错误信息**。
+    /// 结构为 `IOT-` + 签发当年（[`keys::current_year`]，非硬编码）+ 3 段各 4 位，
+    /// 再加末段 2 位，共 14 位 payload；字符集 [`CODE_ALPHABET`] 剔除易混的
+    /// `0/O/1/I`（抄写 / 口述场景），与网关端 `repo.ts` 入口校验同一口径。
+    ///
+    /// 年份取签发时刻而非硬编码常量；熵来自 `rand`，码值不进日志 / 不进错误信息；
+    /// 唯一性由存储层 `code_value` 唯一约束兜底（`Store::insert_code` 冲突即 storage
+    /// error，不做静默重试）。
     fn generate_code_value() -> String {
         use rand::Rng as _;
         let mut rng = rand::rng();
         let groups: Vec<String> = (0..4)
-            .map(|_| {
-                let n: u32 = rng.random();
-                format!("{:04X}", n & 0xFFFF)
+            .map(|seg| {
+                let width = if seg == CODE_SEG_COUNT - 1 { CODE_TAIL_WIDTH } else { CODE_GROUP_WIDTH };
+                let mut group = String::with_capacity(width);
+                for _ in 0..width {
+                    let idx = rng.random_range(0..CODE_ALPHABET.len());
+                    group.push(CODE_ALPHABET.as_bytes()[idx] as char);
+                }
+                group
             })
             .collect();
-        format!("IOTDAQ-{}", groups.join("-"))
+        format!("IOT-{:04}-{}", current_year(now_unix_secs()), groups.join("-"))
     }
 
     /// 把 [`ActivationCode`] 投影为对外响应结构 [`IssuedCode`]。
@@ -1763,7 +1789,7 @@ mod tests {
     use super::LicensingService;
     use crate::audit::ReceiptLedger;
     use crate::error::{LicenseError, PrebindKind};
-    use crate::keys::KeyRing;
+    use crate::keys::{current_year, KeyRing};
     use crate::model::{now_ns_id, now_unix_secs, CodeStatus, Device, LeaseStatus, Tenant};
     use crate::proto::{
         ActivationRequest, GapKind, HeartbeatRequest, IssueCodesRequest, Prebind, ReceiptCursor,
@@ -3430,5 +3456,79 @@ mod tests {
         let stored = svc.store().get_code_by_value(&code.code).unwrap().unwrap();
         assert_eq!(stored.status, CodeStatus::Issued);
         assert!(stored.bound_device_id.is_none());
+    }
+
+    /// 网关端 `repo.ts` 激活码正则的**逐字符镜像**（测试侧不引入 regex 依赖）。
+    ///
+    /// 对应 `^IOT-\d{4}-[A-Z2-9AC-HJ-NP-Z]{4}-[A-Z2-9AC-HJ-NP-Z]{4}-[A-Z2-9AC-HJ-NP-Z]{4}-[A-Z2-9AC-HJ-NP-Z]{2}$`。
+    fn gateway_code_shape_ok(code: &str) -> bool {
+        const ALPHABET: &str = "ACDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let mut segs = code.split('-');
+        match (
+            segs.next(),
+            segs.next(),
+            segs.next(),
+            segs.next(),
+            segs.next(),
+            segs.next(),
+        ) {
+            (Some("IOT"), Some(year), Some(a), Some(b), Some(c), Some(tail)) => {
+                year.len() == 4
+                    && year.chars().all(|ch| ch.is_ascii_digit())
+                    && [a, b, c].iter().all(|seg| seg.len() == 4)
+                    && tail.len() == 2
+                    && [a, b, c, tail]
+                        .iter()
+                        .all(|seg| !seg.is_empty() && seg.chars().all(|ch| ALPHABET.contains(ch)))
+            }
+            _ => false,
+        }
+    }
+
+    /// **激活码格式契约**（2026-09-27）：发放返回的码必须精确匹配网关端口径
+    /// `IOT-2026-XXXX-XXXX-XXXX-XX`，且字符集剔除易混的 `0` / `1` / `I` / `O`。
+    #[test]
+    fn issued_code_value_matches_gateway_format() {
+        let year = current_year(now_unix_secs());
+        for _ in 0..256 {
+            let code = LicensingService::generate_code_value();
+            assert!(gateway_code_shape_ok(&code), "码不符合网关格式: {code}");
+            // 易混字符检查只看 payload（前缀 `IOT-` 自带 `I`，年份含 `0`）。
+            let payload = &code[code.len() - 14..];
+            assert!(!payload.contains(['0', '1', 'I', 'O']), "码含易混字符: {code}");
+            assert!(code.starts_with(&format!("IOT-{year:04}-")), "年份前缀错: {code}");
+        }
+    }
+
+    /// **端到端**：`issue_codes` 真正落库并返回的码值即新格式（发放 → 激活取码同一口径）。
+    #[test]
+    fn issue_codes_returns_gateway_format_codes() {
+        let svc = build_service();
+        let resp = svc
+            .issue_codes(&IssueCodesRequest {
+                tenant_id: "t-1".to_string(),
+                count: 5,
+                tier: "pro".to_string(),
+                valid_from: (now_unix_secs() - 1000).to_string(),
+                valid_until: (now_unix_secs() + 365 * 86_400).to_string(),
+                prebind_machine_code: Some("M1".to_string()),
+                idempotency_key: "fmt-check".to_string(),
+            })
+            .unwrap();
+        assert_eq!(resp.codes.len(), 5);
+        for issued in &resp.codes {
+            assert!(
+                gateway_code_shape_ok(&issued.code),
+                "发放码不符合格式: {}",
+                issued.code
+            );
+            // 落库值必须与返回一致（激活按码值查库）。
+            let stored = svc
+                .store()
+                .get_code_by_value(&issued.code)
+                .unwrap()
+                .unwrap_or_else(|| panic!("码未落库: {}", issued.code));
+            assert_eq!(stored.code, issued.code);
+        }
     }
 }

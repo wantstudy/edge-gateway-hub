@@ -506,6 +506,16 @@ fn format_kid_date(unix_secs: i64) -> String {
     format!("{y:04}{m:02}{d:02}")
 }
 
+/// 激活码前缀年份：签发时刻的 UTC 公历年（如 `2026`）。
+///
+/// 激活码形如 `IOT-2026-XXXX-XXXX-XXXX-XX`，年份取**签发当年**（跨年时自然滚动，
+/// 不是硬编码常量）。复用 [`civil_from_days`]，与 kid 日期前缀同一口径；纯整数
+/// 运算，无 panic，亦不引入时区库依赖。
+pub fn current_year(unix_secs: i64) -> i64 {
+    let (y, _, _) = civil_from_days(unix_secs.div_euclid(86_400));
+    y
+}
+
 /// Howard Hinnant 的 `civil_from_days` 算法：days since 1970-01-01 → (y, m, d)。
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -523,6 +533,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `current_year` 取签发当年（激活码前缀年份），跨年自然滚动且非硬编码。
+    #[test]
+    fn current_year_follows_the_calendar_year() {
+        assert_eq!(current_year(0), 1970);
+        assert_eq!(current_year(1_735_689_600), 2025); // 2025-01-01T00:00:00Z
+        assert_eq!(current_year(1_767_225_600), 2026); // 2026-01-01T00:00:00Z
+        assert_eq!(current_year(1_798_761_600), 2027); // 2027-01-01T00:00:00Z
+        let now_year = current_year(crate::model::now_unix_secs());
+        assert!((1970..=9999).contains(&now_year), "year out of range: {now_year}");
+    }
 
     /// 生成密钥 → 注册 → 签发 → 验签成功；且 kid 与签名都非空。
     #[test]

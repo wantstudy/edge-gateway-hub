@@ -31,7 +31,7 @@ use crate::error::{LicenseError, LicenseResult};
 /// `req_sig` 为设备私钥对请求规范字段的签名。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationRequest {
-    /// 厂商发放的激活码（`IOTDAQ-XXXX-XXXX-XXXX-XXXX`）。
+    /// 厂商发放的激活码（`IOT-2026-XXXX-XXXX-XXXX-XX`；签发年份随当年滚动）。
     pub activation_code: String,
     /// 机器码组合指纹（HMAC 加盐截断）。
     pub machine_code: String,
@@ -395,7 +395,7 @@ pub struct IssueCodesRequest {
 pub struct IssuedCode {
     /// 激活码 ID。
     pub code_id: String,
-    /// 码值（`IOTDAQ-XXXX-XXXX-XXXX-XXXX`）。
+    /// 码值（`IOT-2026-XXXX-XXXX-XXXX-XX`）。
     pub code: String,
     /// 状态（`issued` / `bound` / `revoked` / `reissued`）。
     pub status: String,
@@ -486,7 +486,7 @@ pub struct CodeListQuery {
 pub struct CodeSummary {
     /// 激活码 ID。
     pub code_id: String,
-    /// 掩码后的码值（如 `IOTDAQ-****-****-****-AB12`）。
+    /// 掩码后的码值（如 `IOT-2026-****-****-****-AB`）。
     pub code_masked: String,
     /// 状态。
     pub status: String,
