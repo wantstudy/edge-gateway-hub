@@ -559,13 +559,13 @@ async fn main() -> ExitCode {
     //       修复前 with_poll_handler 全仓无生产调用方，采集调度器在生产形态
     //       永不启动（容器实测：点位注册成功但 mock 从站 0 连接）。
     let data_dir = config.gateway.data_dir.clone();
-    let poll_handler: Option<Arc<dyn daemon::scheduler::PollHandler>> = if config.points.is_empty()
+    // 构造 DevicePollHandler（未包装 Arc，后续按需克隆为 Arc<dyn ...>）。
+    // DevicePollHandler 实现了 Clone（仅 clone 内部 Arc 指针，零数据拷贝）。
+    let southbound: Option<daemon::southbound::DevicePollHandler> = if config.points.is_empty()
     {
         None
     } else {
-        Some(Arc::new(
-            daemon::southbound::DevicePollHandler::from_config(&config),
-        ))
+        Some(daemon::southbound::DevicePollHandler::from_config(&config))
     };
 
     // ②-c 授权生产装配（task 22/23 上岗；在 config 被 MgmtState 取走之前完成）。
@@ -628,6 +628,20 @@ async fn main() -> ExitCode {
     if let Some(registered) = shared.control_registry() {
         drop(registered); // 先验证已挂载
     }
+    // ③-b 控制面南向端口接线（BE-CTRL / task 140）：DevicePollHandler 实现 ControlWritePort，
+    //     挂载到 control_registry，使 /api/control/issue 真正下发到设备。
+    //     未配置点位时 southbound=None → 控制面保持 mounted=false（诚实 fail-closed）。
+    //     注意：southbound 是 Option<DevicePollHandler>（非 Arc），需要 clone + wrap in Arc。
+    if let Some(ref handler) = southbound {
+        // handler.clone() 只 clone 内部 Arc 指针（零数据拷贝），然后 wrap 为 trait object
+        let ctrl_port: Arc<dyn daemon::ctrl::ControlWritePort> = Arc::new(handler.clone());
+        if let Some(registry) = shared.control_registry() {
+            registry.set_port(ctrl_port);
+            info!(
+                "bootstrap: control write port mounted (DevicePollHandler → ControlWritePort)"
+            );
+        }
+    }
 
     // 写接口落盘路径绑定：与 IOT_DAQ_CONFIG / --config 指向同一文件（热重载同源）。
     let mgmt_state =
@@ -664,8 +678,8 @@ async fn main() -> ExitCode {
     let mut builder = BootstrapBuilder::new(&args.config_path)
         .with_shared(shared)
         .with_data_dir(data_dir);
-    if let Some(handler) = poll_handler {
-        builder = builder.with_poll_handler(handler);
+    if let Some(handler) = southbound {
+        builder = builder.with_poll_handler(Arc::new(handler));
     }
     // 北向运行期接线 + 停机离线队列 flush 钩子（见 ②-d）：未声明 [[outlets]] 时
     // 保持既有行为——north runtime 不注入，bootstrap 记 info 说明。

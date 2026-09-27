@@ -37,8 +37,9 @@ use tracing::{info, warn};
 
 use crate::codec::{DecodeSpec, ValueDecoder};
 use crate::config::GatewayConfig;
+use crate::ctrl::{ControlWritePort, WriteOutcome};
 use crate::driver::modbus::{ModbusConfig, ModbusDriver, ModbusFraming};
-use crate::driver::{Driver, PointAddressParser, ReadPoint, Reconnector};
+use crate::driver::{Driver, PointAddressParser, ReadPoint, Reconnector, WritePoint};
 use crate::error::{DaemonError, DaemonResult};
 use crate::pipeline::RawSample;
 use crate::scheduler::PollHandler;
@@ -151,10 +152,24 @@ pub struct DevicePollHandler {
     sim_tick: std::sync::atomic::AtomicU64,
 }
 
+impl Clone for DevicePollHandler {
+    fn clone(&self) -> Self {
+        Self {
+            // RwLock 不可 clone，重新构造新锁
+            devices: StdRwLock::new(self.devices.read().unwrap().clone()),
+            // tokio::Mutex 不可 clone，重新构造新锁；blocking_lock() 返回 Guard，直接解引用
+            conns: tokio::sync::Mutex::new(self.conns.blocking_lock().clone()),
+            // AtomicU64 不可 clone，从零开始
+            sim_tick: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
 /// 一条设备连接的登记信息：连接本体 + 建连时的接入快照。
 ///
 /// 记下快照是为了热重载时能判断**既有连接是否已失效**：接入地址 / 协议变了就
 /// 必须丢掉旧连接，否则下一拍会继续读旧端点（改造期静默读到错设备的数据）。
+#[derive(Clone)]
 struct DeviceEndpoint {
     /// 建连时的协议（与 [`DevicePlan::protocol`] 同口径）。
     protocol: String,
@@ -423,6 +438,140 @@ impl PollHandler for DevicePollHandler {
             }
         }
         Ok(out)
+    }
+}
+
+// ---- ControlWritePort 实现（控制指令下发链路，task 140） ----
+
+#[async_trait]
+impl ControlWritePort for DevicePollHandler {
+    /// 判定某设备当前是否可写（设备登记 + 协议支持）。
+    ///
+    /// 不接触设备连接；仅作配置侧白名单检查，真实连接尝试在 [`Self::dispatch`]。
+    async fn assert_writable(
+        &self,
+        device_id: &str,
+        _point_id: Option<&str>,
+        address: &str,
+    ) -> DaemonResult<()> {
+        // ① 设备登记检查。
+        let guard = match self.devices.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let plan = guard.get(device_id).ok_or_else(|| {
+            DaemonError::ConfigError(format!(
+                "device {device_id:?} is not registered (no device or point row)"
+            ))
+        })?;
+
+        // ② 协议检查：仅 modbus-tcp / modbus-rtu 支持写（V1 限制）。
+        match Self::framing_for(&plan.protocol) {
+            Some(_) => {} // 合法协议，继续
+            None => {
+                return Err(DaemonError::ConfigError(format!(
+                    "device {device_id:?} protocol {:?} does not support writes (V1: modbus-tcp/modbus-rtu only)",
+                    plan.protocol
+                )))
+            }
+        }
+
+        // ③ 地址格式检查：必须是合法 Modbus 地址（线圈或寄存器）。
+        //    - 线圈：`0xxxx` 格式（由 `parse_coil_address` 校验）
+        //    - 寄存器：`4xxxx` 格式（由 `PointAddressParser::parse` 校验）
+        //    任一种合法即可；控制面按 op 字段选择具体路径。
+        // 先按线圈尝试（area='0'），失败再按寄存器尝试（area='4'）。
+        if PointAddressParser::parse_coil_address(address).is_ok() {
+            return Ok(());
+        }
+        if PointAddressParser::parse(address).map(|a| a.area == Some('4')).unwrap_or(false) {
+            return Ok(());
+        }
+        Err(DaemonError::ProtocolError(format!(
+            "device {device_id:?} address {address:?} is not a valid modbus address (expected 0xxxx coil or 4xxxx holding register)"
+        )))
+    }
+
+    /// 设备是否在控制面登记（计划表命中即视为存在）。
+    fn device_known(&self, device_id: &str) -> bool {
+        self.devices
+            .read()
+            .map(|g| g.contains_key(device_id))
+            .unwrap_or(false)
+    }
+
+    /// 真实下发一组已解析写点。
+    ///
+    /// 逐点调用驱动 `write`（批量一次），**任一失败即整批失败**（调用方据此结构化为错误，绝不部分成功）。
+    async fn dispatch(
+        &self,
+        device_id: &str,
+        points: &[WritePoint],
+    ) -> DaemonResult<Vec<WriteOutcome>> {
+        if points.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ① 取计划表，确认设备存在 + 协议 + 地址（防御性二次检查）。
+        let (protocol, address) = {
+            let guard = match self.devices.read() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let plan = guard.get(device_id).ok_or_else(|| {
+                DaemonError::ConfigError(format!(
+                    "unknown device group {device_id:?}"
+                ))
+            })?;
+            (plan.protocol.clone(), plan.address.clone())
+        };
+
+        // ② 获取或建立驱动连接（惰性建连 + 断线自愈）。
+        //    ⚠️ 注意：`get_or_connect` 需要 `DevicePlan`，这里从计划表重新构造轻量版本。
+        let plan = {
+            let guard = match self.devices.read() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.get(device_id).cloned().ok_or_else(|| {
+                DaemonError::ConfigError(format!("device {device_id:?} not found"))
+            })?
+        };
+        let conn = self.get_or_connect(device_id, &plan).await?;
+
+        // ③ 持连接锁，调用驱动 write。
+        let mut driver_guard = conn.lock().await;
+        let driver: &mut Box<dyn Driver> = &mut *driver_guard;
+        let result = driver.write(points).await;
+
+        // ④ 按结果组装逐点 WriteOutcome：成功 → delivered=true；失败 → delivered=false + 错误原因。
+        //    ⚠️ 关键：**驱动 write 是整批原子操作**（任一失败 → 整个 Err），不存在「部分成功」语义。
+        //    因此全部 points 共享同一个 outcome。
+        match result {
+            Ok(()) => Ok(points
+                .iter()
+                .map(|_| WriteOutcome {
+                    delivered: true,
+                    reason: "ok".to_string(),
+                })
+                .collect()),
+            Err(err) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    address = %address,
+                    protocol = %protocol,
+                    error = %err,
+                    "southbound control dispatch failed"
+                );
+                Ok(points
+                    .iter()
+                    .map(|_p| WriteOutcome {
+                        delivered: false,
+                        reason: format!("dispatch failed: {err}"),
+                    })
+                    .collect())
+            }
+        }
     }
 }
 

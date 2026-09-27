@@ -733,8 +733,13 @@ impl ControlRegistry {
                 return match replay {
                     // 首发成功 → 回放成功（duplicate=true，不二次下发）。
                     Some(Replay::Success(r)) => {
-                        self.audit_security(actor, &r);
-                        Ok(r)
+                        let replay_result = ControlIssueResult {
+                            duplicate: true,
+                            idempotency_key: r.idempotency_key.clone(),
+                            commands: r.commands.clone(),
+                        };
+                        self.audit_security(actor, &replay_result);
+                        Ok(replay_result)
                     }
                     // 首发失败 → 回放同一结构化错误（绝不伪造成功 / 202）。
                     Some(Replay::Failure(e, _)) => Err(e),
