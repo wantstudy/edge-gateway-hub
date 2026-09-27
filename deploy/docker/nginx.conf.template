@@ -19,10 +19,18 @@
 
 worker_processes auto;
 
-# ★ 运行身份必须与容器运行 uid 一致（compose 的 user: 65532）。
+# ★ 运行身份：必须与容器运行 uid 一致（compose 的 user: 65532:65532）。
 #   容器 cap_drop: ALL，无 CAP_SETUID —— 若此处写 nginx(101) 或 root(0)，
 #   master 切换身份会失败，nginx 直接退出（表现为容器起来但 Web 全不可达）。
-user 65532;
+#
+# ★★ 必须写【具名】用户 nonroot，绝不能写裸 uid（user 65532;）：
+#   nginx 用 getpwnam() 按**名称**解析该指令。/etc/passwd 中没有名为 "65532" 的条目时：
+#     - 以 root 运行  → [emerg] getpwnam("65532") failed，nginx 起不来；
+#     - 以 65532 运行 → 该指令被忽略（"makes sense only if the master process runs
+#       with super-user privileges"），配置反而通过。
+#   即：同一份配置在两种运行身份下表现相反 —— 这种「只在某些身份下才炸」的差异必须消除。
+#   镜像内由 Dockerfile 创建 nonroot(65532)，故写名字在两种身份下都成立。
+user nonroot;
 
 error_log /var/log/nginx/error.log warn;
 pid /var/run/nginx.pid;

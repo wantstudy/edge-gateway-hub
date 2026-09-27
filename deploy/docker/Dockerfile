@@ -122,6 +122,16 @@ LABEL org.opencontainers.image.title="iot-daq-gateway" \
 # /var/lib/iot-daq 由 compose 挂载宿主目录
 # /var/log/nginx 由 compose 挂载或 tmpfs
 
+# ---- 运行身份：容器内固定 uid/gid 65532（与 compose 的 user: 及持久卷属主一致）----
+# ★ 必须建【具名】用户 nonroot，不能只依赖裸 uid：
+#   nginx `user` 指令用 getpwnam() 按名称解析；写 `user 65532;` 而 /etc/passwd 无同名条目时，
+#   以 root 启动会 [emerg] getpwnam("65532") failed，以 65532 启动则该指令被忽略而「看似正常」
+#   —— 同一份配置在两种运行身份下表现相反。建名后写 `user nonroot;` 两种情况都成立。
+#   另：cap_drop: ALL 下无 CAP_SETUID，身份只能靠运行期 uid 或此处具名用户切换。
+RUN set -eux; \
+    addgroup -g 65532 nonroot; \
+    adduser -D -u 65532 -G nonroot -s /sbin/nologin nonroot
+
 WORKDIR /home/nonroot
 
 # ---- 仅拷贝运行时产物 ----
@@ -157,8 +167,9 @@ COPY deploy/docker/nginx.mime.types /etc/nginx/mime.types
 # 默认端口：对外 Web 8080 / daemon 8081，均可通过 env 覆盖且两者同源联动（见 start.sh 头注释）。
 COPY deploy/docker/start.sh /usr/local/bin/start.sh
 RUN set -eux; \
-    # 日志 / 缓存目录占位（运行期由 compose tmpfs 覆盖，镜像内须先存在）
-    mkdir -p /var/log/nginx /var/lib/nginx/cache /var/cache/nginx; \
+    # 日志 / 缓存目录占位（运行期由 compose tmpfs 覆盖，镜像内须先存在且属主为 65532）
+    mkdir -p /var/log/nginx /var/lib/nginx/cache /var/cache/nginx /run; \
+    chown -R 65532:65532 /var/log/nginx /var/lib/nginx /var/cache/nginx /run; \
     chmod 0755 /usr/local/bin/start.sh
 
 
