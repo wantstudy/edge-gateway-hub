@@ -4,8 +4,10 @@
 
     真实能力边界（不许造数）：
       · 运行信息取自 `GET /api/overview`（部署形态 / 主机名 / 端口 / 版本 / 标识）；
-      · 容器 / 原生形态识别、计划重启等能力由后端按需提供，页面只展示真实可得字段；
-      · 守护进程（崩溃重启 / 看门狗 / 启动失败保护）为桌面端能力，浏览器访问时诚实降级；
+      · 容器 / 原生形态识别等能力由后端按需提供，页面只展示真实可得字段；
+      · 守护进程（崩溃重启 / 看门狗 / 启动失败保护）与异常重启累计（restarts）
+        为桌面端能力，浏览器访问时诚实降级为「需在桌面端中使用」；
+      · 计划重启（定时 / 周期）后端暂无调度能力，页面呈现诚实空态（不放假开关）；
       · 危险动作契约不变（P0-6）：重启 / 停止走 ui-kit `DangerConfirmModal`
         —— 影响清单 + 原因必填 + **服务名二次校验**；real 模式调真实
         `POST /api/ops/restart` / `POST /api/ops/stop`，body `{actor, confirm, reason}`，
@@ -17,18 +19,18 @@
       <StatCard label="服务状态" :value="serviceStatusText" :sub="serviceStatusSub" icon-tone="teal">
         <template #icon>▶</template>
       </StatCard>
-      <StatCard label="已运行" :value="gateway.uptimeText" sub="GET /api/overview" icon-tone="ink">
+      <StatCard label="已运行" :value="gateway.uptimeText" sub="自网关启动起累计" icon-tone="ink">
         <template #icon>◷</template>
       </StatCard>
       <StatCard label="上次启动" :value="startedAtText" sub="随网关进程启动" icon-tone="amber">
         <template #icon>↻</template>
       </StatCard>
-      <StatCard label="异常重启" value="—" sub="后端未提供统计字段（不伪造 0）" tone="warn" icon-tone="violet">
+      <StatCard label="异常重启" :value="crashRestartText" :sub="crashRestartSub" tone="warn" icon-tone="violet">
         <template #icon>!</template>
       </StatCard>
     </div>
 
-    <!-- 运行信息（真实字段）+ 参考命令 -->
+    <!-- 运行信息（真实字段） -->
     <section class="wc-card">
       <div class="wc-card__head">
         <h3>运行信息</h3>
@@ -47,15 +49,6 @@
           <dt>版本</dt>
           <dd class="wc-mono">{{ gateway.version || '—' }}</dd>
         </dl>
-        <div class="su-cmd">
-          <span class="su-cmd__title">参考命令（按实际部署方式选用）</span>
-          <pre class="wc-mono">docker compose -f deploy/docker/docker-compose.yml ps
-docker compose -f deploy/docker/docker-compose.yml logs -f
-docker compose -f deploy/docker/docker-compose.yml restart
-
-systemctl status iot-daq-gateway.service
-journalctl -u iot-daq-gateway.service -f</pre>
-        </div>
       </div>
     </section>
 
@@ -140,43 +133,30 @@ journalctl -u iot-daq-gateway.service -f</pre>
             <span v-if="!shellAvailable" class="wc-tag wc-tag--neutral">桌面端能力</span>
           </div>
 
-          <p v-if="shellAvailable && supervisor" class="su-sv">
-            守护状态：{{ supervisor.supported ? '支持' : '不支持' }} · 运行中 {{ supervisor.running ? '是' : '否' }} ·
-            已重启 {{ supervisor.restarts }} 次 · 连续失败 {{ supervisor.consecutive_failures }} 次 · 上次退出 {{ supervisor.last_exit || '—' }}
+          <p v-if="shellAvailable && supervisor && supervisor.supported" class="su-sv">
+            守护状态：运行中 {{ supervisor.running ? '是' : '否' }} · 已重启 {{ supervisor.restarts }} 次 ·
+            连续失败 {{ supervisor.consecutive_failures }} 次 · 上次退出 {{ supervisor.last_exit || '—' }}
+          </p>
+          <p v-else-if="shellAvailable && supervisor" class="su-hint">
+            当前安装未随包分发守护能力{{ supervisor.reason ? `：${supervisor.reason}` : '' }}
           </p>
           <p v-else-if="!shellAvailable" class="su-hint">
-            崩溃自动重启 / 看门狗 / 启动失败保护 随桌面端（IoT-DAQ Gateway）提供，当前为浏览器访问，状态不可得。
+            崩溃自动重启 / 看门狗 / 启动失败保护需在桌面端（IoT-DAQ Gateway）中使用，浏览器访问时状态不可得。
           </p>
         </div>
       </section>
 
-      <!-- 计划重启（后端暂无对应端点，本区为界面预览，不生效） -->
+      <!-- 计划重启（后端暂无定时/周期重启能力，诚实空态；立即重启见下方「危险操作」） -->
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>计划重启</h3>
-          <span class="wc-tag wc-tag--neutral">计划重启端点暂未接入，本区为界面预览，不生效</span>
+          <span class="wc-tag wc-tag--neutral">未开放</span>
         </div>
         <div class="wc-card__body">
-          <div class="su-form-grid">
-            <UiField label="启用计划重启">
-              <UiSelect v-model="plan.enabled" :options="planEnabledOptions" />
-            </UiField>
-            <UiField label="执行时间">
-              <UiInput v-model="plan.at" placeholder="03:00" />
-            </UiField>
-            <UiField label="执行周期">
-              <UiSelect v-model="plan.cycle" :options="cycleOptions" />
-            </UiField>
-            <UiField label="具体星期" hint="仅「每周」时生效">
-              <UiSelect v-model="plan.weekday" :options="weekdayOptions" :disabled="plan.cycle !== '每周'" />
-            </UiField>
-          </div>
-          <dl class="wc-kv">
-            <dt>下次执行</dt>
-            <dd class="wc-mono">—</dd>
-            <dt>上次执行</dt>
-            <dd class="wc-mono">—</dd>
-          </dl>
+          <EmptyState
+            title="计划重启暂未开放"
+            desc="网关目前支持手动立即重启（见下方「危险操作」）。定时 / 周期重启需要后端调度能力，将在后续版本提供。"
+          />
         </div>
       </section>
     </div>
@@ -249,7 +229,7 @@ journalctl -u iot-daq-gateway.service -f</pre>
 /**
  * @file StartupPage.vue
  * @module web-console/pages/StartupPage
- * @description 启动与自启：运行信息（真实）+ 启动策略 / 计划重启（本机界面状态）+ 高危运维动作。
+ * @description 启动与自启：运行信息（真实）+ 启动策略（守护开关接桌面壳）+ 高危运维动作。
  *
  * 危险动作一律经 `DangerConfirmModal`（影响清单 + 原因必填 + 服务名二次校验），
  * 确认后调真实 `repo.ops.restart` / `repo.ops.stop`（body {actor, confirm, reason}，
@@ -260,11 +240,8 @@ import {
   StatCard,
   RoleGate,
   UiSwitch,
-  UiSelect,
-  UiField,
-  UiInput,
   DangerConfirmModal,
-  type SelectOption,
+  EmptyState,
 } from '@ui-kit';
 import { dataVersion, repo, type AutostartStatus, type GatewayInfo } from '@/api/repo';
 import { shellAvailable, supervisorStatus, setSupervisor, type SupervisorStatus } from '@/api/shell';
@@ -307,7 +284,30 @@ const serviceStatusText = computed(() =>
 );
 
 /** 服务状态副文案。 */
-const serviceStatusSub = computed(() => '最近一次 /api/overview 应答正常');
+const serviceStatusSub = computed(() => '最近一次自检应答正常');
+
+/**
+ * 异常重启卡：桌面端展示守护进程真实累计重启次数（`supervisor_status` 的
+ * `restarts`），浏览器环境诚实降级为「需在桌面端中使用」，不伪造 0。
+ */
+const crashRestartText = computed<string>(() =>
+  shellAvailable && supervisor.value ? String(supervisor.value.restarts) : '—',
+);
+
+/** 异常重启卡副文案（区分浏览器 / 桌面端未随包分发两种降级）。 */
+const crashRestartSub = computed<string>(() => {
+  if (!shellAvailable) {
+    return '需在桌面端（IoT-DAQ Gateway）中使用';
+  }
+  const status = supervisor.value;
+  if (!status) {
+    return '守护状态不可得';
+  }
+  if (!status.supported) {
+    return status.reason ? `当前安装未随包分发守护能力：${status.reason}` : '当前安装未随包分发守护能力';
+  }
+  return '守护进程崩溃重启累计次数';
+});
 
 /** 是否可管理系统级自启（仅管理员）。 */
 const canManage = computed(() => session.state.role === 'admin');
@@ -525,32 +525,6 @@ function note(text: string, kind: 'ok' | 'warn' = 'ok'): void {
 
 
 // ---------------------------------------------------------------------------
-// 计划重启（后端暂无对应端点，仅作界面预览）
-// ---------------------------------------------------------------------------
-
-const plan = reactive({
-  enabled: '停用',
-  at: '03:00',
-  cycle: '每周',
-  weekday: '星期日',
-});
-
-const planEnabledOptions: readonly SelectOption[] = [
-  { value: '启用', label: '启用' },
-  { value: '停用', label: '停用' },
-];
-
-const cycleOptions: readonly SelectOption[] = [
-  { value: '每周', label: '每周' },
-  { value: '每日', label: '每日' },
-  { value: '每月', label: '每月' },
-];
-
-const weekdayOptions: readonly SelectOption[] = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'].map(
-  (d) => ({ value: d, label: d }),
-);
-
-// ---------------------------------------------------------------------------
 // 危险操作：重启 / 停止（DangerConfirmModal 契约）
 // ---------------------------------------------------------------------------
 
@@ -692,34 +666,6 @@ async function confirmStop(payload: { reason: string; note: string; confirm: str
   color: var(--text-3);
   margin-top: 4px;
   line-height: 1.6;
-}
-
-.su-form-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px 16px;
-  margin-bottom: 14px;
-}
-.su-cmd {
-  margin-top: 4px;
-}
-.su-cmd__title {
-  display: block;
-  font-size: var(--fs-caption);
-  color: var(--text-3);
-  margin-bottom: 6px;
-}
-.su-cmd pre {
-  margin: 0;
-  background: var(--bg-hover);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-2);
-  overflow-x: auto;
-  white-space: pre;
 }
 
 /* 影响块 */

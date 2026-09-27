@@ -6,7 +6,7 @@
       ① 顶部状态条（设备/质量筛选 + 仅显示异常 + 暂停 / 立即刷新 / 最后更新）
       ② KPI 卡片行（本周期采样 / 数据质量 / 最慢驱动 / 离线队列）
       ③ 实时点位值表格（1s 合并刷新，含 sparkline 波动可视化）
-      ④ 2 列栅格：设备连接状态 + 质量码汇总（SVG 柱状）
+      ④ 2 列栅格：设备连接状态 + 质量码汇总（SVG 折线，实时滚动累积）
 
     硬性约定遵守情况：
       · **1s 节流渲染**：`setInterval(tick, 1000)`，上游再怎么高频每秒只写一次响应式状态；
@@ -183,44 +183,60 @@
       <section class="wc-card">
         <div class="wc-card__head">
           <h3>质量码汇总</h3>
-          <span class="wc-card__sub">本周期 {{ filteredPoints.length }} 个点位</span>
+          <span class="wc-card__sub">各质量码点位数随时间变化（实时累积）</span>
         </div>
         <div class="wc-card__body">
-          <svg
-            class="mn-bars"
-            viewBox="0 0 100 60"
-            preserveAspectRatio="none"
-            role="img"
-            aria-label="质量码分布柱状图"
-          >
-            <g v-for="(bar, i) in qualityBars" :key="bar.key">
-              <rect
-                :x="barSlot * i + BAR_GAP / 2"
-                :y="BAR_BASE_Y - bar.height"
-                :width="barW"
-                :height="bar.height"
-                :style="{ fill: bar.color }"
-                rx="1.5"
+          <!-- 图例 + 当前计数（HTML，不随 SVG 拉伸变形） -->
+          <div class="mn-legend">
+            <span v-for="item in qualityNow" :key="item.key" class="mn-legend__item">
+              <span class="mn-legend__swatch" :style="{ background: item.color }" aria-hidden="true"></span>
+              {{ item.label }} <b class="wc-mono">{{ item.value }}</b>
+            </span>
+            <span class="mn-legend__scale">纵轴上限 {{ qualityAxisMax }}</span>
+          </div>
+
+          <!-- 折线图：纯内联 SVG，viewBox 400×160 由容器拉伸；描边 non-scaling 防变形 -->
+          <div class="mn-linechart" data-test="quality-linechart">
+            <svg
+              class="mn-linechart__svg"
+              viewBox="0 0 400 160"
+              preserveAspectRatio="none"
+              role="img"
+              aria-label="各质量码点位数随时间变化的折线图"
+            >
+              <line
+                v-for="grid in qualityGridLines"
+                :key="grid.y"
+                class="mn-linechart__grid"
+                x1="0"
+                :x2="CHART_VIEW_W"
+                :y1="grid.y"
+                :y2="grid.y"
               />
-              <text
-                class="mn-bars__label"
-                :x="barSlot * i + barSlot / 2"
-                :y="58"
-                text-anchor="middle"
-              >
-                {{ qualityLabelOf(bar.key) }}
-              </text>
-              <text
-                class="mn-bars__value"
-                :x="barSlot * i + barSlot / 2"
-                :y="BAR_BASE_Y - BAR_VALUE_LIFT - bar.height"
-                text-anchor="middle"
-                font-weight="600"
-              >
-                {{ bar.value }}
-              </text>
-            </g>
-          </svg>
+              <line
+                class="mn-linechart__axis"
+                x1="0"
+                :x2="CHART_VIEW_W"
+                :y1="CHART_BASE_Y"
+                :y2="CHART_BASE_Y"
+              />
+              <path
+                v-for="line in qualityLines"
+                :key="line.key"
+                :d="line.d"
+                fill="none"
+                stroke-width="1.6"
+                vector-effect="non-scaling-stroke"
+                :style="{ stroke: line.color }"
+              />
+            </svg>
+            <p v-if="qualitySamples.length < 2" class="mn-linechart__hint">正在累积实时数据…</p>
+          </div>
+          <p class="mn-linechart__range">
+            <span v-if="qualityRangeText">{{ qualityRangeText }}</span>
+            <span v-else>尚无数据，等待实时流…</span>
+            · 数据从进入本页起实时累积，刷新后从零累计
+          </p>
         </div>
       </section>
     </div>
@@ -293,7 +309,7 @@ const QUALITY_LABEL: Readonly<Record<string, string>> = Object.freeze({
 });
 
 /**
- * 质量码 → 柱状图颜色（全部取自 ui-kit token，非自造色值）。
+ * 质量码 → 折线图颜色（全部取自 ui-kit token，非自造色值）。
  *
  * SVG 表现属性不支持 `var()`，故这里只存放「变量名字符串」，由模板经
  * `:style` 下发（见 `qualityBars` 与模板 `:style="{ fill: bar.color }"`）。
@@ -487,6 +503,9 @@ function tickReal(): void {
   // KPI 快照（同样每秒只写一次；采样数 = 已有流数据的点位数）
   live.sampledPoints = pointSnapshots.size;
   live.goodPct = Number(((good / Math.max(allPoints.length, 1)) * 100).toFixed(1));
+
+  // 质量码折线图滚动采样（每秒一次，最近 5 分钟窗口）
+  recordQualitySample(nowMs, good);
 
   lastTickMs.value = nowMs;
   tickCount.value += 1;
@@ -829,68 +848,119 @@ function formatInt(value: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// 质量码汇总柱状
+// 质量码汇总折线图（前端从实时流滚动累积，无历史聚合端点——不伪造历史）
 // ---------------------------------------------------------------------------
 
-/** 柱状图视图模型。 */
-interface QualityBar {
-  /** 质量码（X 轴标签） */
-  key: string;
-  /** 点位数 */
-  value: number;
-  /** 柱高（viewBox 逻辑坐标，已夹紧在 BAR_MIN_H–BAR_MAX_H 之间） */
-  height: number;
-  /** 填充色 */
-  color: string;
+/** 累积窗口：300 拍 × 1s 节流 = 最近 5 分钟。 */
+const LINE_WINDOW = 300;
+const CHART_WINDOW_MINUTES = 5;
+
+/** 单个采样点：时刻 + 各质量码点位数（基于全量点位统计，与筛选无关）。 */
+interface QualitySample {
+  /** 采样时刻（毫秒） */
+  t: number;
+  /** 质量码 → 点位数 */
+  counts: Record<string, number>;
 }
 
-// ---------------------------------------------------------------------------
-// 质量码柱状图几何（viewBox 坐标系：宽 100 × 高 60，与模板 viewBox 一致）
-// ---------------------------------------------------------------------------
+/** 滚动窗口内的历史采样（每秒至多追加一次；刷新后从零累计，如实呈现）。 */
+const qualitySamples = ref<QualitySample[]>([]);
 
-/** viewBox 可用宽度，柱子等分于此宽度。 */
-const BAR_VIEW_W = 100;
-/** 基线 y：柱底贴 52，其下留 8 单位给轴标签。 */
-const BAR_BASE_Y = 52;
-/** 柱间空隙（viewBox 单位），等分时留出。 */
-const BAR_GAP = 4;
+// 折线图几何（viewBox 坐标系：宽 400 × 高 160，与模板 viewBox 一致）
+const CHART_VIEW_W = 400;
+/** 顶部留白 y。 */
+const CHART_TOP_Y = 6;
+/** 基线 y（x 轴）。 */
+const CHART_BASE_Y = 154;
+/** 绘图区高度。 */
+const CHART_H = CHART_BASE_Y - CHART_TOP_Y;
+
 /**
- * 柱最大高度 38：基线 52 − 38 = 顶边 y=14（不越过 52）；
- * 其上数值标签基线 = 52 − BAR_VALUE_LIFT − 38 = 8，减去实测字形上伸 ≈5.43 后
- * bbox 顶边 = 2.57，仍在 viewBox 内——故数据变大时柱体与数值标签都不会顶出容器。
- * （先取 41，实测标签 bbox 顶边 −0.43 被裁切，据此收紧到 38。）
+ * 在每个节拍末尾追加一次采样（只在 tickReal 内调用，保持 1 Hz 口径）。
  */
-const BAR_MAX_H = 38;
-/** 柱最小高度：计数为 0 的类别也保留一段可见柱体。 */
-const BAR_MIN_H = 2;
-/** 数值标签相对柱顶的抬升量（viewBox 单位）。 */
-const BAR_VALUE_LIFT = 6;
+function recordQualitySample(nowMs: number, good: number): void {
+  const counts: Record<string, number> = {};
+  for (const key of QUALITY_ORDER) {
+    counts[key] = 0;
+  }
+  counts['Good'] = good;
+  for (const point of allPoints) {
+    const quality = runtimeQuality[point.id] ?? point.quality;
+    if (quality !== 'Good' && counts[quality] !== undefined) {
+      counts[quality] += 1;
+    }
+  }
+  qualitySamples.value.push({ t: nowMs, counts });
+  if (qualitySamples.value.length > LINE_WINDOW) {
+    qualitySamples.value.shift();
+  }
+}
 
-/** 单条柱占的槽位宽度（含空隙）= 可用宽 / 柱条数，条数变化时自动重算。 */
-const barSlot = computed(() => BAR_VIEW_W / Math.max(qualityBars.value.length, 1));
+/** 纵轴上限（窗口内各质量码计数的最大值，至少 1 防除零）。 */
+const qualityAxisMax = computed<number>(() => {
+  let max = 1;
+  for (const sample of qualitySamples.value) {
+    for (const key of QUALITY_ORDER) {
+      max = Math.max(max, sample.counts[key] ?? 0);
+    }
+  }
+  return max;
+});
 
-/** 柱宽 = 槽位宽 − 空隙，由条数等分得出（模板 `:width`，不再写死）。 */
-const barW = computed(() => Math.max(1, barSlot.value - BAR_GAP));
+/** 各质量码折线路径（x 固定映射到 0–400，样本未满窗口时曲线从左侧逐渐生长）。 */
+const qualityLines = computed<readonly { key: string; d: string; color: string }[]>(() => {
+  const samples = qualitySamples.value;
+  if (samples.length === 0) {
+    return [];
+  }
+  const max = qualityAxisMax.value;
+  return QUALITY_ORDER.map((key) => {
+    const d = samples
+      .map((sample, i) => {
+        const x = (i / (LINE_WINDOW - 1)) * CHART_VIEW_W;
+        const y = CHART_BASE_Y - ((sample.counts[key] ?? 0) / max) * CHART_H;
+        return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(' ');
+    return { key, d, color: QUALITY_COLOR[key] ?? 'var(--unknown)' };
+  });
+});
 
-/** 质量分布柱（基于**全量**点位统计，与筛选无关）。 */
-const qualityBars = computed<readonly QualityBar[]>(() => {
-  const counts = QUALITY_ORDER.map((key) => ({
-    key,
-    value: allPoints.filter((p) => (runtimeQuality[p.id] ?? p.quality) === key).length,
-    color: QUALITY_COLOR[key] ?? 'var(--unknown)',
-  }));
-  const max = Math.max(...counts.map((c) => c.value), 1);
-  return counts.map((c) => ({
-    ...c,
-    // 归一到 BAR_MAX_H 并双向夹紧：max=0 时取下限，数据再大也不会超过上限。
-    height: Math.min(BAR_MAX_H, Math.max(BAR_MIN_H, (c.value / max) * BAR_MAX_H)),
+/** 网格线（25% / 50% / 75% 分位横线）。 */
+const qualityGridLines = computed<readonly { y: number; v: number }[]>(() => {
+  const max = qualityAxisMax.value;
+  return [0.25, 0.5, 0.75].map((f) => ({
+    y: Math.round(CHART_BASE_Y - f * CHART_H),
+    v: Math.round(max * f),
   }));
 });
 
-/** 质量码 → 图表轴中文短名（未知码原样回显）。 */
-function qualityLabelOf(key: string): string {
-  return QUALITY_LABEL[key] ?? key;
+/** 图例 + 最新计数（无采样时全 0，不伪造）。 */
+const qualityNow = computed<readonly { key: string; label: string; value: number; color: string }[]>(() => {
+  const latest = qualitySamples.value[qualitySamples.value.length - 1]?.counts;
+  return QUALITY_ORDER.map((key) => ({
+    key,
+    label: QUALITY_LABEL[key] ?? key,
+    value: latest?.[key] ?? 0,
+    color: QUALITY_COLOR[key] ?? 'var(--unknown)',
+  }));
+});
+
+/** `HH:mm:ss` 短格式。 */
+function formatClock(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
+
+/** 时间范围文本（首末采样时刻）。 */
+const qualityRangeText = computed<string>(() => {
+  const samples = qualitySamples.value;
+  if (samples.length === 0) {
+    return '';
+  }
+  return `${formatClock(samples[0].t)} → ${formatClock(samples[samples.length - 1].t)}（最近 ${CHART_WINDOW_MINUTES} 分钟）`;
+});
 
 // ---------------------------------------------------------------------------
 // 导航
@@ -982,18 +1052,69 @@ function go(name: string): void {
   height: 22px;
   display: block;
 }
-.mn-bars {
+
+/* 质量码折线图：图例（HTML，避免 SVG 拉伸变形文字） */
+.mn-legend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: var(--fs-caption);
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+.mn-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.mn-legend__swatch {
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.mn-legend__scale {
+  margin-left: auto;
+  color: var(--text-3);
+}
+
+/* 折线图容器：固定高度，viewBox 由 preserveAspectRatio="none" 拉伸 */
+.mn-linechart {
+  position: relative;
   width: 100%;
-  height: 160px;
+  height: 180px;
+}
+.mn-linechart__svg {
+  width: 100%;
+  height: 100%;
   display: block;
 }
-.mn-bars__label {
-  font-size: 4.2px;
-  fill: var(--text-3);
+.mn-linechart__grid {
+  stroke: var(--divider);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
 }
-.mn-bars__value {
-  font-size: 4.6px;
-  fill: var(--text-1);
+.mn-linechart__axis {
+  stroke: var(--border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.mn-linechart__hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  font-size: var(--fs-caption);
+  color: var(--text-3);
+  pointer-events: none;
+}
+.mn-linechart__range {
+  margin: 8px 0 0;
+  font-size: var(--fs-caption);
+  color: var(--text-3);
 }
 .mn-table tr.is-abnormal > td:first-child {
   border-left: 3px solid var(--warn);

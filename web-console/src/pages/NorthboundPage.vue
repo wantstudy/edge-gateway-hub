@@ -14,9 +14,14 @@
 
   ★ 数据链路（无 mock，成败都不编造）：
     · 读：`GET /api/forwarders`（失败保留 repo 数据源并展示原因）；
-    · 写：新增 `POST /api/forwarders`、编码修改 `repo.setForwarderEncoding`（PUT）、
-          删除 `DELETE /api/forwarders/:id`（后端未落地 → 原样报错，绝不假装成功）；
-    · 测试连接 `POST /api/forwarders/:id/test`（后端仅 TCP 建连探测，原样转述）。
+    · 写：新增 `POST /api/forwarders`（危险操作四要素：reason 必填 + note 非空则 ≥10 字 +
+          confirm=出口名全文，经 DangerConfirmModal 收集后并入 POST body；HTTP 400 时
+          后端 message 原样展示）、编码修改 `repo.setForwarderEncoding`（PUT）、
+          删除 `DELETE /api/forwarders/:id`（四要素同理，原样报错，绝不假装成功）；
+    · 测试连接 `POST /api/forwarders/:id/test`（后端仅对已登记出口做 TCP 建连探测，
+          id = 出口名；保存成功后创建弹窗内即可真实探测，原样转述）。
+  ★ client_id：后端不接受该字段，由网关自动分配 `iot-daq-<出口名>`（每出口唯一，
+    crates/daemon/src/north/mqtt.rs endpoint_from_outlet），前端无需生成。
   ★ 大数红线：qos / topic_prefix 等一律字符串直通，绝不 parseInt。
 -->
 <template>
@@ -155,8 +160,11 @@
             <UiField label="Broker 地址" required hint="mqtt://host:1883 / mqtts://host:8883">
               <UiInput v-model="outletForm.brokerUrl" placeholder="mqtt://10.0.0.5:1883" :disabled="!canEdit" data-testid="outlet-broker" />
             </UiField>
-            <UiField label="客户端 ID">
-              <UiInput v-model="outletForm.clientId" placeholder="iotdaq-line1-01" :disabled="!canEdit" />
+            <UiField
+              label="客户端 ID"
+              hint="网关自动分配：iot-daq-<出口名>（每出口唯一），无需填写；此输入项后端不接收"
+            >
+              <UiInput v-model="outletForm.clientId" placeholder="留空即可（网关自动分配）" :disabled="!canEdit" />
             </UiField>
             <!-- ── MQTT 凭据（敏感字段，红线：口令掩码，明文绝不落前端状态）── -->
             <UiField label="MQTT 用户名" hint="与口令成对；留空表示匿名连接">
@@ -218,18 +226,36 @@
           <div class="nb-section">
             <p class="nb-section__title">转发范围</p>
             <UiRadio v-model="outletScope" :options="scopeOptions" :disabled="!canEdit" />
-            <div v-if="outletScope === 'devices'" class="nb-device-chips">
-              <button
-                v-for="dev in deviceChips"
-                :key="dev.id"
-                type="button"
-                class="nb-chip"
-                :class="{ 'is-on': outletForm.deviceIds.includes(dev.id) }"
-                :disabled="!canEdit"
-                @click="toggleDevice(dev.id)"
-              >
-                {{ dev.name }}
-              </button>
+            <!-- ── 指定设备：查询框 + 设备列表（GET /api/devices，repo 真实数据源）── -->
+            <div v-if="outletScope === 'devices'" class="nb-scope-picker" data-testid="device-picker">
+              <input
+                v-model="deviceQuery"
+                class="wc-input"
+                type="search"
+                placeholder="搜索设备名称 / 设备 ID"
+                aria-label="搜索设备"
+                data-testid="device-search"
+              />
+              <div class="nb-device-chips">
+                <button
+                  v-for="dev in filteredDeviceChips"
+                  :key="dev.id"
+                  type="button"
+                  class="nb-chip"
+                  :class="{ 'is-on': outletForm.deviceIds.includes(dev.id) }"
+                  :disabled="!canEdit"
+                  :aria-pressed="outletForm.deviceIds.includes(dev.id) ? 'true' : 'false'"
+                  @click="toggleDevice(dev.id)"
+                >
+                  {{ dev.name }}
+                </button>
+                <span v-if="filteredDeviceChips.length === 0" class="nb-scope-empty">
+                  {{ deviceChips.length === 0 ? '暂无设备：请先在「设备管理」页接入设备。' : '没有匹配的设备，换个关键词试试。' }}
+                </span>
+              </div>
+              <p class="nb-scope-hint">
+                点击设备名切换勾选；未勾选任何设备时该出口不会转发任何数据。已选 {{ outletForm.deviceIds.length }} 台 / 共 {{ deviceChips.length }} 台。
+              </p>
             </div>
           </div>
 
@@ -256,6 +282,8 @@
           <p v-if="outletMessage" class="wc-modal__error" role="alert" data-testid="outlet-message">
             {{ outletMessage }}
           </p>
+          <!-- 保存成功后「测试连接」的真实探测回执（TCP 建连，原样转述） -->
+          <p v-if="createTestResult" class="wc-modal__result" data-testid="create-test-result">{{ createTestResult }}</p>
         </div>
         <div class="wc-modal__foot">
           <button type="button" class="wc-btn" data-testid="outlet-cancel" @click="closeCreate">取消</button>
@@ -369,6 +397,23 @@
     confirm-text="删除出口"
     @close="deleteOpen = false"
     @submit="onDeleteSubmit"
+  />
+
+  <!-- ══ 登记出口：危险操作四要素确认（写入配置 → 后端 reason/note/confirm 强校验）═══ -->
+  <DangerConfirmModal
+    :open="saveConfirmOpen"
+    :title="`登记出口 ${saveConfirmName}`"
+    :impacts="CREATE_IMPACTS"
+    :facts="saveConfirmFacts"
+    :reasons="CREATE_REASONS"
+    :min-note-length="10"
+    :confirm-value="saveConfirmName"
+    confirm-mode="full"
+    confirm-label="出口名二次确认（输入出口名称）"
+    confirm-placeholder="输入待登记的出口名称"
+    confirm-text="登记出口"
+    @close="saveConfirmOpen = false"
+    @submit="onSaveConfirmSubmit"
   />
 </template>
 
@@ -667,37 +712,45 @@ async function saveEncoding(): Promise<void> {
 /** 测试连接结果（真实探测回执，原样展示）。 */
 const testResult = ref('');
 
+/** 新增出口弹窗内「测试连接」的回执（保存成功后对已登记出口探测）。 */
+const createTestResult = ref('');
+
 /**
- * 测试某条出口连接：`POST /api/forwarders/{id}/test`。
+ * 对已登记出口（`id` = 出口名）做真实探测：`POST /api/forwarders/{id}/test`。
  *
  * 后端仅做 **TCP 建连**探测（`mqtts://` 不做 TLS 握手 / MQTT CONNACK），未知出口 404；
- * 结果原样展示，不把「TCP 通」说成「MQTT 可用」。
+ * 结果原样返回，不把「TCP 通」说成「MQTT 可用」。
  */
-async function testConnection(row: OutletRow): Promise<void> {
-  testResult.value = `正在探测「${row.name}」…`;
+async function probeOutlet(id: string, name: string): Promise<string> {
   try {
     const raw = await apiRequest<Record<string, unknown>>(
-      `/api/forwarders/${encodeURIComponent(row.id)}/test`,
+      `/api/forwarders/${encodeURIComponent(id)}/test`,
       { method: 'POST' },
     );
     const ok = raw['ok'] === true;
     const elapsed = pickText(raw, 'elapsed_ms', '—');
     if (ok) {
-      testResult.value =
-        `「${row.name}」：${pickText(raw, 'probe', 'tcp_connect')} 探测通过，耗时 ${elapsed} ms。` +
-        `注意：${pickText(raw, 'note', '仅 TCP 建连探测，不含 TLS 握手与 MQTT CONNACK')}。`;
-    } else {
-      testResult.value =
-        `「${row.name}」：探测失败（${pickText(raw, 'error_kind', 'failed')}），耗时 ${elapsed} ms —— ` +
-        `${pickText(raw, 'reason', '后端未给出失败原因')}。`;
+      return (
+        `「${name}」：${pickText(raw, 'probe', 'tcp_connect')} 探测通过，耗时 ${elapsed} ms。` +
+        `注意：${pickText(raw, 'note', '仅 TCP 建连探测，不含 TLS 握手与 MQTT CONNACK')}。`
+      );
     }
+    return (
+      `「${name}」：探测失败（${pickText(raw, 'error_kind', 'failed')}），耗时 ${elapsed} ms —— ` +
+      `${pickText(raw, 'reason', '后端未给出失败原因')}。`
+    );
   } catch (cause) {
     const status = cause instanceof ApiError ? cause.status : 0;
-    testResult.value =
-      status === 404
-        ? `「${row.name}」：后端未收录该出口名（HTTP 404）—— 出口以「名称」为唯一键，请先确认配置中的出口名。`
-        : `「${row.name}」：${forwarderFailureText(cause, 'POST /api/forwarders/{id}/test')}`;
+    return status === 404
+      ? `「${name}」：后端未收录该出口名（HTTP 404）—— 出口以「名称」为唯一键，请先确认配置中的出口名。`
+      : `「${name}」：${forwarderFailureText(cause, 'POST /api/forwarders/{id}/test')}`;
   }
+}
+
+/** 编辑弹窗的「测试连接」：对当前选中的已登记出口做 TCP 建连探测。 */
+async function testConnection(row: OutletRow): Promise<void> {
+  testResult.value = `正在探测「${row.name}」…`;
+  testResult.value = await probeOutlet(row.id, row.name);
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +835,20 @@ const deviceChips = computed(() => {
   return repo.allDevices().map((d) => ({ id: d.id, name: d.name }));
 });
 
+/** 指定设备模式的查询关键词（按名称 / ID 过滤）。 */
+const deviceQuery = ref('');
+
+/** 按查询关键词过滤后的设备列表（名称 / ID 不区分大小写包含匹配）。 */
+const filteredDeviceChips = computed(() => {
+  const kw = deviceQuery.value.trim().toLowerCase();
+  if (!kw) {
+    return deviceChips.value;
+  }
+  return deviceChips.value.filter(
+    (d) => d.name.toLowerCase().includes(kw) || d.id.toLowerCase().includes(kw),
+  );
+});
+
 /** 勾选 / 取消设备。 */
 function toggleDevice(id: string): void {
   const idx = outletForm.deviceIds.indexOf(id);
@@ -794,6 +861,9 @@ function toggleDevice(id: string): void {
 
 /** 新增出口结果提示（真实错误 / 回执，留在弹窗内）。 */
 const outletMessage = ref('');
+
+/** 登记出口的创建请求体（确认弹窗提交时消费；取消即弃）。 */
+let pendingCreatePayload: Record<string, unknown> | null = null;
 
 /** 打开新增出口弹窗（空表单）。 */
 function openCreate(): void {
@@ -814,6 +884,9 @@ function openCreate(): void {
   mqttPassword.value = '';
   showMqttPassword.value = false;
   outletMessage.value = '';
+  createTestResult.value = '';
+  savedOutletName.value = '';
+  deviceQuery.value = '';
   createOpen.value = true;
 }
 
@@ -822,11 +895,36 @@ function closeCreate(): void {
   createOpen.value = false;
   mqttPassword.value = '';
   outletMessage.value = '';
+  createTestResult.value = '';
+  savedOutletName.value = '';
+  pendingCreatePayload = null;
+}
+
+/** 从后端错误体提取原样错误文本（`{error, field, reason, allowed}` / `{message}`）。 */
+function backendErrorText(cause: unknown): string {
+  if (cause instanceof ApiError && cause.body !== null && typeof cause.body === 'object' && !Array.isArray(cause.body)) {
+    const body = cause.body as Record<string, unknown>;
+    const parts: string[] = [];
+    for (const key of ['field', 'reason', 'message', 'allowed'] as const) {
+      const v = body[key];
+      if (typeof v === 'string' && v.trim() !== '') {
+        parts.push(`${key}: ${v}`);
+      }
+    }
+    if (parts.length > 0) {
+      return parts.join('；');
+    }
+  }
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
 /** 出口登记写失败的「原因 + 恢复路径」。 */
 function outletWriteFailureText(cause: unknown): string {
   const status = cause instanceof ApiError ? cause.status : 0;
+  if (status === 400) {
+    // 校验失败：后端 reason/allowed 原样呈现（四要素 / broker / qos 等），绝不吞成「接口不可得」。
+    return `出口未登记：后端校验未通过（HTTP 400）—— ${backendErrorText(cause)}`;
+  }
   if (status === 501) {
     return (
       '出口未登记：后端写接口未落地（HTTP 501 not_implemented）—— 北向出口登记涉及 TLS 证书字段校验，' +
@@ -841,17 +939,44 @@ function outletWriteFailureText(cause: unknown): string {
   return `出口未登记：${forwarderFailureText(cause, 'POST /api/forwarders')}`;
 }
 
+// ---- 登记出口：危险操作四要素（reason / note / confirm=出口名全文）----
+/** 登记确认弹窗是否打开。 */
+const saveConfirmOpen = ref(false);
+
+/** 登记确认弹窗展示的出口名（= 本次将写入的出口名原文）。 */
+const saveConfirmName = ref('');
+
+/** 已成功登记的出口名（非空 = 创建弹窗内可对该出口做真实 TCP 探测）。 */
+const savedOutletName = ref('');
+
+/** 登记原因枚举（必选，记入审计）。 */
+const CREATE_REASONS: readonly string[] = ['新增客户对接出口', '更换 Broker 地址', '产线扩容新增出口', '调试联调'];
+
+/** 登记影响清单（写清后果与生效时机）。 */
+const CREATE_IMPACTS: readonly string[] = [
+  '出口将写入网关配置并落盘（凭据字段级加密），出口名与既有出口重名将登记失败。',
+  '北向运行期在网关启动时装配：该出口在重启网关后才参与投递。',
+  '登记成功后可立即对该出口做 TCP 建连探测（测试连接）。',
+];
+
+/** 登记对象摘要。 */
+const saveConfirmFacts = computed<readonly DangerFact[]>(() => [
+  { label: '出口名称', value: saveConfirmName.value || '—' },
+  { label: '地址', value: outletForm.brokerUrl.trim() || '—' },
+  { label: '类型', value: outletType.value === 'mqtt' ? 'MQTT Broker' : 'HTTP(S) 接口' },
+]);
+
 /**
- * 保存新出口：`POST /api/forwarders`。
- * 后端当前返回 501 时页面**原样呈现原因与恢复路径**，绝不把 501 吞成「已保存」。
+ * 保存新出口（第一步）：校验后打开危险操作确认弹窗。
+ * 真正的 POST 在 `onSaveConfirmSubmit`（四要素齐备后）执行。
  */
-async function saveOutlet(): Promise<void> {
+function saveOutlet(): void {
   if (!outletForm.name.trim() || !outletForm.brokerUrl.trim()) {
     outletMessage.value = '请填写出口名称与 Broker / 接口地址。';
     return;
   }
-  const scopeText = outletScope.value === 'all' ? '全部设备' : `指定 ${outletForm.deviceIds.length} 台设备`;
-  const payload =
+  // 基础业务字段（reason / note / confirm 由确认弹窗提交时并入，见 onSaveConfirmSubmit）。
+  pendingCreatePayload =
     outletType.value === 'mqtt'
       ? {
           name: outletForm.name.trim(),
@@ -872,19 +997,42 @@ async function saveOutlet(): Promise<void> {
           batch_size: outletForm.batchSize,
           encoding: 'json',
         };
-  // 红线：口令明文仅在内存中短暂存在，拼好报文后立刻清空，绝不留存在前端状态。
-  mqttPassword.value = '';
+  outletMessage.value = '';
+  createTestResult.value = '';
+  saveConfirmName.value = outletForm.name.trim();
+  saveConfirmOpen.value = true;
+}
+
+/**
+ * 确认弹窗提交（第二步）：把 reason / note / confirm 并入 POST body 真实登记。
+ *
+ * 后端四要素强校验（`forwarder_create`）：reason 必填非空、note 非空则 ≥10 字、
+ * confirm 必须逐字等于出口名；HTTP 400 时把后端 message 原样展示。
+ * 生效时机如实呈现：北向运行期在网关**启动时**装配，新增出口落盘后需**重启网关**
+ * 才真正参与投递 —— 绝不把它说成"已即时生效"。
+ */
+async function onSaveConfirmSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string; confirm: string }): Promise<void> {
+  const body = pendingCreatePayload;
+  saveConfirmOpen.value = false;
+  if (!body) {
+    return;
+  }
+  pendingCreatePayload = { ...body, reason: payload.reason, note: payload.note.trim(), confirm: payload.confirm };
+  const scopeText = outletScope.value === 'all' ? '全部设备' : `指定 ${outletForm.deviceIds.length} 台设备`;
   try {
-    await apiRequest<unknown>('/api/forwarders', { method: 'POST', body: JSON.stringify(payload) });
-    // 生效时机如实呈现：北向运行期（`NorthRuntime::start`）在网关**启动时**装配，
-    // dataplane 对它的绑定是晚绑定且不可替换（重复 attach 只保留首个句柄），
-    // 因此新增出口落盘后需**重启网关**才真正参与投递 —— 绝不把它说成"已即时生效"。
+    await apiRequest<unknown>('/api/forwarders', { method: 'POST', body: JSON.stringify(pendingCreatePayload) });
+    // 红线：口令明文仅在内存中短暂存在，登记完成后立刻清空，绝不留存在前端状态。
+    pendingCreatePayload = null;
+    mqttPassword.value = '';
+    savedOutletName.value = outletForm.name.trim();
     outletMessage.value =
       `出口「${outletForm.name}」已登记并落盘：范围 ${scopeText}。` +
       '生效时机：北向运行期在网关启动时装配，该出口将在重启网关后参与投递' +
-      '（可在「启动与自启」页面重启网关）。';
+      '（可在「启动与自启」页面重启网关）。' +
+      '已登记出口可立即测试连接（TCP 建连探测）。';
     await loadForwarders();
   } catch (cause) {
+    // 失败保留草稿与确认请求体，用户修正后可重新保存。
     outletMessage.value = outletWriteFailureText(cause);
   }
 }
@@ -892,17 +1040,23 @@ async function saveOutlet(): Promise<void> {
 /**
  * 测试新增出口表单的连通性。
  *
- * 后端只支持对**已登记**出口（`id` = 出口名）做探测，未保存的出口无从探测 ——
- * 如实说明限制与替代路径，不伪造「可达 38 ms」这类演示数值。
+ * 后端只支持对**已登记**出口（`id` = 出口名）做探测：本次表单刚登记成功时直接探测；
+ * 未保存的草稿无从探测 —— 如实说明限制与替代路径，不伪造「可达 38 ms」这类演示数值。
  */
-function testOutletForm(): void {
+async function testOutletForm(): Promise<void> {
+  const name = outletForm.name.trim();
   if (!outletForm.brokerUrl.trim()) {
     outletMessage.value = '请先填写 Broker / 接口地址再测试。';
     return;
   }
+  if (savedOutletName.value && name === savedOutletName.value) {
+    createTestResult.value = `正在探测「${name}」…`;
+    createTestResult.value = await probeOutlet(name, name);
+    return;
+  }
   outletMessage.value =
     '未保存的出口无法探测：后端仅支持对已登记出口做 TCP 建连探测（POST /api/forwarders/{id}/test，' +
-    'id = 出口名）。替代路径：先登记该出口，再在列表「编辑」弹窗里点「测试连接」。';
+    'id = 出口名）。替代路径：先点「保存出口」登记（走危险操作四要素确认），登记成功后本按钮即对该出口真实探测。';
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1229,24 @@ const messageSample = `{
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+/* 指定设备：查询框 + 设备列表 + 提示（转发范围 = 指定设备时出现） */
+.nb-scope-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.nb-scope-picker .wc-input {
+  max-width: 360px;
+}
+.nb-scope-empty {
+  font-size: var(--fs-caption);
+  color: var(--text-3);
+}
+.nb-scope-hint {
+  margin: 0;
+  font-size: var(--fs-caption);
+  color: var(--text-3);
 }
 .nb-chip {
   font-family: inherit;
