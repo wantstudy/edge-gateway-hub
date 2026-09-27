@@ -4,10 +4,10 @@
 //! `Permission::DeviceWrite` / `PointWrite`——高危配置动作，仅 `system` 可授）
 //! - `POST   /api/devices`                            设备登记（`[[devices]]` 段）
 //! - `PUT    /api/devices/:id`                        改名 / 启停 / 默认协议（upsert 登记行）
-//! - `DELETE /api/devices/:id?cascade=true|false`     删除（有点位时默认 400，`cascade=true` 连同点位级联删除）
+//! - `DELETE /api/devices/:id?cascade=true|false`     删除（P0-8 三要素；有点位时默认 400，`cascade=true` 连同点位级联删除）
 //! - `POST   /api/points`                             新增点位行
 //! - `PUT    /api/points/:device_id/:point_id`        修改协议 / 地址 / 频率
-//! - `DELETE /api/points/:device_id/:point_id`        删除点位行
+//! - `DELETE /api/points/:device_id/:point_id`        删除点位行（P0-8 三要素）
 //!
 //! ## 写路径语义（顺序即契约）
 //! 1. **鉴权**：`AuthedRole` extractor（401：身份未建立，不留审计痕）→
@@ -28,6 +28,10 @@
 //!
 //! ## 错误口径（对齐点位批量导入「行号 + 原因 + 允许值」）
 //! 400 校验失败统一 `{error: "validation_failed", field, reason, allowed}`；
+//! 危险操作三要素（`DELETE /api/devices/:id` / `/api/points/:device_id/:point_id`）：
+//! `reason` 必填非空、`note` 非空则 ≥10 字、`confirm` 须 trim + 大小写不敏感
+//! 回显对象全名（设备=设备名，点位=点位 id），不匹配 → 400
+//! `{error: "confirm_mismatch", field: "confirm", reason, allowed}`；
 //! 设备删除含点位未级联 → `{error: "device_has_points", ..., hint}`；
 //! 404 `{error: "not_found", message}`；401/403 由 rbac 层统一编码；
 //! 500 `{error: "internal", message}`（落盘失败，fail-closed 不半写）。
@@ -171,6 +175,103 @@ fn accepted(device_id: &str, point_id: Option<&str>, version: u64) -> Response {
         body["point_id"] = json!(pid);
     }
     Json(body).into_response()
+}
+
+/// 受理响应附带的 `config_version`（大数为红线，调用方一律字符串化回显）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AcceptedVersion(pub(crate) u64);
+
+// ---- 危险操作三要素（P0-8 契约：`reason` / `note` / `confirm` 独立字段）----
+
+/// `note` 最短长度（非空时）：与 pages.rs 北向出口删除同口径。
+const MIN_NOTE_CHARS: usize = 10;
+
+/// 危险操作三要素（`reason` / `note` / `confirm` 为**独立字段**，禁止拼接成一个串）。
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct DangerTrio {
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    confirm: String,
+}
+
+/// 解析请求体为三要素（`body` 为空 / 非对象 → 400，审计 `bad_request`）。
+#[allow(clippy::result_large_err)]
+pub(crate) fn parse_danger_trio(
+    state: &MgmtState,
+    actor: &str,
+    action: OpsAction,
+    body: &[u8],
+) -> Result<DangerTrio, Response> {
+    match serde_json::from_slice::<DangerTrio>(body) {
+        Ok(trio) => Ok(trio),
+        Err(err) => {
+            audit(
+                state,
+                actor,
+                action,
+                true,
+                OUTCOME_BAD_REQUEST,
+                &format!("malformed json body: {err}"),
+            );
+            Err(validation_error(
+                "body",
+                &format!("malformed JSON: {err}"),
+                "object {reason, note, confirm}",
+            ))
+        }
+    }
+}
+
+/// `reason` / `note` / `confirm` **必填性与形状**校验（`confirm` 与对象全名的
+/// 精确匹配见 `check_danger_confirm`——它需要对象全名，须在对象命中之后做）。
+#[allow(clippy::result_large_err)]
+fn check_danger_present(trio: &DangerTrio) -> Result<(), Response> {
+    if trio.reason.trim().is_empty() {
+        return Err(validation_error(
+            "reason",
+            "reason is required",
+            "non-empty change reason",
+        ));
+    }
+    let note = trio.note.trim();
+    if !note.is_empty() && note.chars().count() < MIN_NOTE_CHARS {
+        return Err(validation_error(
+            "note",
+            &format!("note must be at least {MIN_NOTE_CHARS} characters when non-empty"),
+            "≥10 characters (empty is allowed; keep `reason` and `note` independent)",
+        ));
+    }
+    if trio.confirm.trim().is_empty() {
+        return Err(validation_error(
+            "confirm",
+            "confirm is required (echo the object name)",
+            "the object name",
+        ));
+    }
+    Ok(())
+}
+
+/// `confirm` 与对象全名是否匹配（`trim()` + 大小写不敏感精确匹配）。
+fn danger_confirm_matches(confirm: &str, expected: &str) -> bool {
+    confirm.trim().eq_ignore_ascii_case(expected)
+}
+
+/// `confirm` 回显不匹配 → 400 `confirm_mismatch`（wire 形状与 accounts_api /
+/// alerts_api / pages 出口删除逐字一致）。
+fn confirm_mismatch(expected: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "confirm_mismatch",
+            "field": "confirm",
+            "reason": format!("confirm does not match {expected:?}"),
+            "allowed": expected,
+        })),
+    )
+        .into_response()
 }
 
 // ---- 校验 ----
@@ -484,6 +585,18 @@ pub(crate) fn device_exists(config: &crate::config::GatewayConfig, device_id: &s
         || config.points.iter().any(|p| p.device_id == device_id)
 }
 
+/// 设备的展示名（二次确认 `confirm` 回显的目标）：登记行 `name` 优先，
+/// 缺省回退 `device_id`（与 `device_create` 的 `name` 缺省语义一致）。
+fn device_display_name(config: &crate::config::GatewayConfig, device_id: &str) -> String {
+    config
+        .devices
+        .iter()
+        .find(|d| d.device_id == device_id)
+        .and_then(|d| d.name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| device_id.to_string())
+}
+
 /// 设备下某点位的行下标。
 fn point_index(
     config: &crate::config::GatewayConfig,
@@ -633,7 +746,9 @@ fn persist(
         OUTCOME_ACCEPTED,
         &format!("{detail}; config_version={version}"),
     );
-    accepted(device_id, point_id, version)
+    let mut resp = accepted(device_id, point_id, version);
+    resp.extensions_mut().insert(AcceptedVersion(version));
+    resp
 }
 
 // ---- 设备写处理器 ----
@@ -899,16 +1014,22 @@ pub async fn device_update(
     )
 }
 
-/// `DELETE /api/devices/:id?cascade=true|false` → 删除设备。
+/// `DELETE /api/devices/:id?cascade=true|false` → 删除设备（P0-8 危险操作三要素）。
+///
+/// body：`{reason, note, confirm}`（`confirm` 须回显**设备名**原文，大小写不敏感）。
 ///
 /// **级联语义（显式 opt-in）**：设备仍有点位时默认 400（`device_has_points`，
 /// fail-closed 防误删）；`cascade=true` 时连同该设备全部点位行一并删除（与
 /// web-console mock 语义一致）。仅登记设备（无点位）直接删除。
+///
+/// **失败路径零残留**：三要素 / 对象存在性 / `confirm` 任一不过关都在落盘前
+/// 拒绝；`confirm` 不匹配时把已摘除的行原样放回（对齐 pages.rs 出口删除口径）。
 pub async fn device_delete(
     State(state): State<MgmtState>,
     AxumPath(device_id): AxumPath<String>,
     authed: AuthedRole,
     Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
     if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
         audit(
@@ -924,6 +1045,13 @@ pub async fn device_delete(
     let actor = authed.claims.sub.clone();
     let device_id = device_id.trim().to_string();
     let cascade = params.get("cascade").map(|v| v == "true").unwrap_or(false);
+    let trio = match parse_danger_trio(&state, &actor, OpsAction::DeviceDelete, &body) {
+        Ok(trio) => trio,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = check_danger_present(&trio) {
+        return resp;
+    }
     let _guard = write_guard();
     let mut config = (*state.config()).clone();
     if !device_exists(&config, &device_id) {
@@ -965,17 +1093,50 @@ pub async fn device_delete(
         )
             .into_response();
     }
+    let confirm_target = device_display_name(&config, &device_id);
+    if !danger_confirm_matches(&trio.confirm, &confirm_target) {
+        // 落盘前拒绝；此时 config 尚未摘除任何行，无半改状态需要回滚。
+        audit(
+            &state,
+            &actor,
+            OpsAction::DeviceDelete,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("confirm mismatch for device {device_id:?} (expected {confirm_target:?})"),
+        );
+        return confirm_mismatch(&confirm_target);
+    }
     config.points.retain(|p| p.device_id != device_id);
     config.devices.retain(|d| d.device_id != device_id);
-    persist(
+    match persist(
         &state,
         config,
         &actor,
         OpsAction::DeviceDelete,
-        &format!("delete device {device_id:?} (cascade={cascade}, removed {point_rows} point(s))"),
+        &format!(
+            "delete device {device_id:?} (cascade={cascade}, reason={:?}, removed {point_rows} point(s))",
+            trio.reason
+        ),
         &device_id,
         None,
-    )
+    ) {
+        resp if resp.status() == StatusCode::OK => {
+            let version = resp
+                .extensions()
+                .get::<AcceptedVersion>()
+                .map(|v| v.0)
+                .unwrap_or(0);
+            Json(json!({
+                "accepted": true,
+                "deleted": true,
+                "device_id": device_id,
+                "deleted_points": point_rows,
+                "config_version": version.to_string(),
+            }))
+            .into_response()
+        }
+        other => other,
+    }
 }
 
 // ---- 点位写处理器 ----
@@ -1391,11 +1552,16 @@ pub async fn point_update(
     )
 }
 
-/// `DELETE /api/points/:device_id/:point_id` → 删除点位行（不存在 → 404）。
+/// `DELETE /api/points/:device_id/:point_id` → 删除点位行（P0-8 三要素）。
+///
+/// body：`{reason, note, confirm}`（`confirm` 须回显**点位 id 原文**，
+/// 大小写不敏感；与设备删除同口径）。`confirm` 不匹配 → 400 `confirm_mismatch`
+/// 且不留下半改状态；点位不存在 → 404。
 pub async fn point_delete(
     State(state): State<MgmtState>,
     AxumPath((device_id, point_id)): AxumPath<(String, String)>,
     authed: AuthedRole,
+    body: Bytes,
 ) -> Response {
     if let Err(rejection) = authed.ensure(Permission::PointWrite) {
         audit(
@@ -1411,6 +1577,13 @@ pub async fn point_delete(
     let actor = authed.claims.sub.clone();
     let device_id = device_id.trim().to_string();
     let point_id = point_id.trim().to_string();
+    let trio = match parse_danger_trio(&state, &actor, OpsAction::PointDelete, &body) {
+        Ok(trio) => trio,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = check_danger_present(&trio) {
+        return resp;
+    }
     let _guard = write_guard();
     let mut config = (*state.config()).clone();
     let Some(idx) = point_index(&config, &device_id, &point_id) else {
@@ -1426,16 +1599,48 @@ pub async fn point_delete(
             "point {point_id:?} not found on device {device_id:?}"
         ));
     };
+    // confirm 回显点位 id 原文；不匹配 → 落盘前拒绝（config 尚未摘除行）。
+    if !danger_confirm_matches(&trio.confirm, &point_id) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::PointDelete,
+            true,
+            OUTCOME_BAD_REQUEST,
+            &format!("confirm mismatch for point {device_id:?}/{point_id:?}"),
+        );
+        return confirm_mismatch(&point_id);
+    }
     config.points.remove(idx);
-    persist(
+    match persist(
         &state,
         config,
         &actor,
         OpsAction::PointDelete,
-        &format!("delete point {device_id:?}/{point_id:?}"),
+        &format!(
+            "delete point {device_id:?}/{point_id:?} (reason={:?})",
+            trio.reason
+        ),
         &device_id,
         Some(&point_id),
-    )
+    ) {
+        resp if resp.status() == StatusCode::OK => {
+            let version = resp
+                .extensions()
+                .get::<AcceptedVersion>()
+                .map(|v| v.0)
+                .unwrap_or(0);
+            Json(json!({
+                "accepted": true,
+                "deleted": true,
+                "device_id": device_id,
+                "point_id": point_id,
+                "config_version": version.to_string(),
+            }))
+            .into_response()
+        }
+        other => other,
+    }
 }
 
 // ---- 测试 ----
@@ -1591,6 +1796,24 @@ frequency_ms = 100
 
     async fn http_delete_bearer(port: u16, path: &str, token: &str) -> (u16, String, String) {
         http_request(port, "DELETE", path, None, Some(token)).await
+    }
+
+    /// `DELETE` 携带危险操作三要素请求体（P0-8 契约：删除类端点必收 body）。
+    async fn http_delete_bearer_with_body(
+        port: u16,
+        path: &str,
+        body: &str,
+        token: &str,
+    ) -> (u16, String, String) {
+        http_request(port, "DELETE", path, Some(body), Some(token)).await
+    }
+
+    /// 合法三要素（回显设备名 / 点位 id 的用例按需替换 `confirm` 字段）。
+    fn danger_body(reason: &str, confirm: &str) -> String {
+        format!(
+            r#"{{"reason":"{}","note":"冒烟清理，#41 回归","confirm":"{}"}}"#,
+            reason, confirm
+        )
     }
 
     async fn http_get(port: u16, path: &str) -> (u16, String, String) {
@@ -1765,8 +1988,14 @@ frequency_ms = 100
         let token = token_for(&state, Role::System);
         let port = spawn_server(state.clone()).await;
 
-        // dev-01 有点位：默认拒绝（fail-closed）。
-        let (status, _, body) = http_delete_bearer(port, "/api/devices/dev-01", &token).await;
+        // dev-01 有点位：cascade 未显式确认 → 默认拒绝（fail-closed）。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-01",
+            &danger_body("自动化清理", "dev-01"),
+            &token,
+        )
+        .await;
         assert_eq!(status, 400, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["error"], "device_has_points");
@@ -1774,8 +2003,13 @@ frequency_ms = 100
         assert!(load_config(&path).points.len() == 1, "points untouched");
 
         // cascade=true → 设备 + 点位一并删除。
-        let (status, _, body) =
-            http_delete_bearer(port, "/api/devices/dev-01?cascade=true", &token).await;
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-01?cascade=true",
+            &danger_body("自动化清理", "dev-01"),
+            &token,
+        )
+        .await;
         assert_eq!(status, 200, "{body}");
         let config = load_config(&path);
         assert!(
@@ -1787,13 +2021,26 @@ frequency_ms = 100
             "cascade removes registry entry if any"
         );
 
-        // 仅登记设备（无点位）直接删除。
-        let (status, _, _) = http_delete_bearer(port, "/api/devices/dev-empty", &token).await;
+        // 仅登记设备（无点位）直接删除；confirm 回显的是**设备名**（空设备），
+        // 不是 device_id（dev-empty）——大小写不敏感 + trim。
+        let (status, _, _) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-empty",
+            &danger_body("自动化清理", "  空设备 "),
+            &token,
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(load_config(&path).devices.is_empty(), "dev-empty removed");
 
         // 重复删除 → 404。
-        let (status, _, _) = http_delete_bearer(port, "/api/devices/dev-empty", &token).await;
+        let (status, _, _) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-empty",
+            &danger_body("自动化清理", "空设备"),
+            &token,
+        )
+        .await;
         assert_eq!(status, 404);
     }
 
@@ -2019,8 +2266,14 @@ frequency_ms = 100
         .await;
         assert_eq!(status, 404);
 
-        // 删除 → 文件中消失；再删 → 404。
-        let (status, _, _) = http_delete_bearer(port, "/api/points/dev-01/p_temp", &token).await;
+        // 删除（P0-8 三要素，confirm 回显 point_id）→ 文件中消失；再删 → 404。
+        let (status, _, _) = http_delete_bearer_with_body(
+            port,
+            "/api/points/dev-01/p_temp",
+            &danger_body("自动化清理", "p_temp"),
+            &token,
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(
             !load_config(&path)
@@ -2029,8 +2282,160 @@ frequency_ms = 100
                 .any(|p| p.point_id == "p_temp"),
             "point row removed from disk"
         );
-        let (status, _, _) = http_delete_bearer(port, "/api/points/dev-01/p_temp", &token).await;
+        let (status, _, _) = http_delete_bearer_with_body(
+            port,
+            "/api/points/dev-01/p_temp",
+            &danger_body("自动化清理", "p_temp"),
+            &token,
+        )
+        .await;
         assert_eq!(status, 404);
+    }
+
+    /// P0-8：设备删除三要素——成功（回显设备名，含级联点位计数）/ `reason` 缺失
+    /// 400 / `confirm` 不匹配 400 `confirm_mismatch`（且零残留）/ 对象不存在 404。
+    #[tokio::test]
+    async fn device_delete_danger_trio_gatekeeper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, path) = make_state(&dir);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // ① 缺 `reason` → 400 validation_failed（三个字段都是独立字段，不拼接）。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-01?cascade=true",
+            r#"{"note":"只留说明不留原因的非法体","confirm":"dev-01"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"],
+            "reason"
+        );
+        assert_eq!(load_config(&path).points.len(), 1, "拒绝时零残留");
+
+        // ② `confirm` 回显错误对象 → 400 confirm_mismatch，落盘零残留。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-01?cascade=true",
+            &danger_body("自动化清理", "dev-empty"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "confirm_mismatch");
+        assert_eq!(value["allowed"], "dev-01");
+        assert!(
+            load_config(&path)
+                .points
+                .iter()
+                .any(|p| p.point_id == "p_temp"),
+            "confirm 不匹配时点位未被删除"
+        );
+
+        // ③ 对象不存在 → 404（三要素齐备且正确仍不影响 404 判定）。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-nope",
+            &danger_body("自动化清理", "dev-nope"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["error"],
+            "not_found"
+        );
+
+        // ④ 合法三要素 + cascade=true → 200，回显删除点位摘要（字符串化版本）。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/devices/dev-01?cascade=true",
+            &danger_body("自动化清理", "DEV-01"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["deleted_points"], 1);
+        // 大数红线：`config_version` 必须是字符串（长度 > 0），绝不能是裸数字。
+        assert!(value["config_version"].as_str().map(str::len).unwrap() > 0);
+        let config = load_config(&path);
+        assert!(!config.points.iter().any(|p| p.device_id == "dev-01"));
+        assert!(!device_exists(&config, "dev-01"), "设备已不存在");
+    }
+
+    /// P0-8：点位删除三要素——成功 / `confirm` 张冠李戴 400 / 对象不存在 404。
+    #[tokio::test]
+    async fn point_delete_danger_trio_gatekeeper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, path) = make_state(&dir);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // ① `note` 不足 10 字 → 400 validation_failed（字段 note）。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/points/dev-01/p_temp",
+            r#"{"reason":"清理点位","note":"太短","confirm":"p_temp"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"],
+            "note"
+        );
+
+        // ② `confirm` 张冠李戴（拿设备名当点位 id）→ 400 confirm_mismatch。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/points/dev-01/p_temp",
+            &danger_body("自动化清理", "dev-01"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "confirm_mismatch");
+        assert_eq!(value["allowed"], "p_temp");
+        assert!(
+            load_config(&path)
+                .points
+                .iter()
+                .any(|p| p.point_id == "p_temp"),
+            "confirm 不匹配时点位未被删除"
+        );
+
+        // ③ 不存在 → 404。
+        let (status, _, _) = http_delete_bearer_with_body(
+            port,
+            "/api/points/dev-01/p_nope",
+            &danger_body("自动化清理", "p_nope"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        // ④ 合法三要素 → 200，点位从落盘消失。
+        let (status, _, body) = http_delete_bearer_with_body(
+            port,
+            "/api/points/dev-01/p_temp",
+            &danger_body("自动化清理", "p_temp"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !load_config(&path)
+                .points
+                .iter()
+                .any(|p| p.point_id == "p_temp"),
+            "点位已删除"
+        );
     }
 
     /// QA RBAC: ops 角色（不持 device.write / point.write）→ 403 + 审计
