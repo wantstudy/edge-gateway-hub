@@ -295,8 +295,9 @@
     :open="!!pendingDelete"
     :title="pendingDelete ? `删除点位：${pendingDelete.name}` : '删除点位'"
     :confirm-value="pendingDelete ? pendingDelete.id : ''"
-    confirm-label="风险二次确认（输入点位标识后 8 位）"
-    confirm-placeholder="输入点位标识后 8 位"
+    confirm-mode="full"
+    confirm-label="风险二次确认（输入点位标识原文）"
+    confirm-placeholder="输入点位标识原文"
     :impacts="deleteImpacts"
     :facts="deleteFacts"
     :reasons="deleteReasons"
@@ -467,6 +468,12 @@ const DEV_PAGE_SIZE = 8;
 
 /** 删除原因。 */
 const deleteReasons = ['误添加', '点位已废弃', '重复录入', '其他'];
+
+/**
+ * 补充说明最小字数：与 `DangerConfirmModal` 默认 `minNoteLength` 及后端
+ * `MIN_NOTE_CHARS` 同口径（`note` 非空即须 ≥ 10 字），不足则在提交前挡下。
+ */
+const MIN_NOTE_CHARS = 10;
 
 /** 表格列（对齐原型 :1077-1083，新增北向「推送」开关列）。 */
 const columns: readonly TableColumn[] = [
@@ -1520,18 +1527,56 @@ function askDelete(row: PointRecord): void {
 function cancelDelete(): void {
   pendingDelete.value = null;
 }
-async function confirmDelete(): Promise<void> {
+/**
+ * 危险操作四要素（`DELETE /api/points/{device_id}/{point_id}` 的硬契约）：
+ * · `reason`：必填枚举（`deleteReasons`，与设备删除同口径），随操作写入审计；
+ * · `note`：补充说明，弹窗侧 `minNoteLength` 校验（不足时提交按钮即禁用）；
+ * · `confirm`：须回显 **point_id 原文**（trim + 大小写不敏感）；
+ * · 本函数只经由弹窗的 `@submit` 触发 —— 弹窗已在本地按同口径 fail-fast 并禁用按钮，
+ *   所以这里拿到的一定是三项都填对的值（不重复做 DOM 猜测式比对）。
+ *
+ * 失败（400 结构不符 / 400 `confirm_mismatch` / 404 对象不存在）一律把后端 message
+ * 原样透出，**绝不报告成功**。
+ */
+async function confirmDelete(payload: {
+  reason: string;
+  note: string;
+  confirm: string;
+}): Promise<void> {
   const target = pendingDelete.value;
   if (!target) {
     return;
   }
-  const res = await repo.deletePoint({ id: target.id, actor: session.state.displayName });
+  const noteText = payload.note.trim();
+  // 二次校验：确认值须等于 point_id 原文（与后端 `danger_confirm_matches` 同口径）。
+  if (payload.confirm.trim().toLowerCase() !== target.id.trim().toLowerCase()) {
+    note('二次校验未通过：确认值与点位标识不一致，未发起删除。', 'warn');
+    return;
+  }
+  if (!payload.reason) {
+    note('请填写删除原因。', 'warn');
+    return;
+  }
+  if (noteText.length > 0 && noteText.length < MIN_NOTE_CHARS) {
+    note(`补充说明需 ≥ ${MIN_NOTE_CHARS} 字。`, 'warn');
+    return;
+  }
+  // 对象先落变量：三要素随本次调用一并下发，供 repo 侧按后端契约拼进 DELETE body。
+  const write = {
+    id: target.id,
+    actor: session.state.displayName,
+    reason: payload.reason,
+    note: noteText,
+    confirm: target.id,
+  };
+  const res = await repo.deletePoint(write);
   if (!res.ok) {
     pendingDelete.value = null;
     note(`删除失败：${res.message}`, 'warn');
     return;
   }
   pendingDelete.value = null;
+  note(res.message, 'ok');
   reload();
 }
 

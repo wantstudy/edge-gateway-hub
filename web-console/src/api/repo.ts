@@ -1937,20 +1937,34 @@ function extractImportErrors(cause: unknown): ImportRowError[] {
   });
 }
 
+/** 新激活码格式：`IOT-2026-` + 3 段各 4 位 + 末段 2 位。
+ *
+ * 字符集**显式枚举** `[ACD-HJ-NP-Z23456789]`，刻意不用否定区间——`[A-Z2-9AC-HJ-NP-Z]`
+ * 里外层的 `A-Z` 会把 `B` / `I` / `O` 一并收回去，否定区间形同虚设（2026-09-27 修正）。
+ * 取值集合 = 23 个字母（无 `B` / `I` / `O`）+ 8 个数字（无 `0` / `1`）= 31 个，与
+ * licensing-server `service::CODE_ALPHABET` 逐字符相等。 */
+const ACT_CODE_RE = /^IOT-\d{4}-[ACD-HJ-NP-Z23456789]{4}-[ACD-HJ-NP-Z23456789]{4}-[ACD-HJ-NP-Z23456789]{4}-[ACD-HJ-NP-Z23456789]{2}$/;
+
+/** 旧激活码格式 `IOTDAQ-XXXX-XXXX-XXXX-XXXX`：2026-09-27 之前发放的存量码仍在库中，
+ * 后端按码值查库校验（不做格式重算），因此旧码**不做作废**，仍可正常激活；此处仅
+ * 在成功路径上给出「已废弃、建议换发新码」的结构化提示。 */
+const ACT_CODE_LEGACY_RE = /^IOTDAQ-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
+
 /** 授权激活真实现（`POST /api/license/activate`，body `{code, reason}`）。
  *
  * `buildActions().activateLicense`（typed 主入口）与顶层 `repo.activate`（LicensePage
  * 兼容入口，`repo.ts` buildWrites 展开）共用。真实判定在后端：激活码格式前端只做
- * 入口校验（形如 `IOT-2026-XXXX-XXXX-XXXX-XX`）；成功即重取授权快照（页面经
- * dataVersion 感知）；失败（含端点未上线，真机实测 404）一律结构化失败，
- * **绝不让格式校验通过冒充激活成功**。
+ * 入口校验（形如 `IOT-2026-XXXX-XXXX-XXXX-XX`，另兼容旧 `IOTDAQ-` 格式）；
+ * 成功即重取授权快照（页面经 dataVersion 感知）；失败（含端点未上线，真机实测 404）
+ * 一律结构化失败，**绝不让格式校验通过冒充激活成功**。
  */
 async function doLicenseActivate(input: { code: string; reason?: string }): Promise<{ ok: boolean; message: string }> {
   const normalized = input.code.trim().toUpperCase();
   if (!normalized) {
     return { ok: false, message: '请输入激活码' };
   }
-  if (!/^IOT-\d{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{2}$/.test(normalized)) {
+  const legacyShape = ACT_CODE_LEGACY_RE.test(normalized);
+  if (!ACT_CODE_RE.test(normalized) && !legacyShape) {
     return { ok: false, message: '激活码格式不正确，应形如 IOT-2026-XXXX-XXXX-XXXX-XX' };
   }
   try {
@@ -1959,7 +1973,12 @@ async function doLicenseActivate(input: { code: string; reason?: string }): Prom
       body: JSON.stringify({ code: normalized, reason: input.reason ?? '' }),
     });
     await fetchLicense(); // 成功后重取真实授权快照
-    return { ok: true, message: '激活码已提交并生效。' };
+    return {
+      ok: true,
+      message: legacyShape
+        ? '激活码已提交并生效（旧格式 IOTDAQ- 已废弃，建议向管理员重新发放 IOT-2026- 格式新码）。'
+        : '激活码已提交并生效。',
+    };
   } catch (cause) {
     if (cause instanceof ApiError && (cause.status === 404 || cause.status === 501)) {
       return { ok: false, message: '后端激活接口尚未上线（POST /api/license/activate 未部署），本次未提交激活码。' };
@@ -2326,11 +2345,41 @@ function buildWrites() {
       }
     },
 
-    async deleteDevice(input: { id: string; actor: string }): Promise<WriteResult> {
+    /**
+     * 删除设备：`DELETE /api/devices/:id`（P0-8 危险操作三要素）。
+     *
+     * 以后端执行点 `crates/daemon/src/mgmt/writeapi.rs::device_delete` 为准：
+     * · **body 必填 JSON 对象** `{reason, note, confirm}`（空 body / 非对象 → 400
+     *   `validation_failed`），故本函数无条件下发，绝不省略 body；
+     * · `reason` 必填非空；`note` 非空则 ≥10 字（`MIN_NOTE_CHARS`）；
+     * · `confirm` 须回显**设备名原文**（`trim()` + 大小写不敏感精确匹配）；
+     * · `cascade=true`：设备仍有点位时后端默认 400 `device_has_points`（fail-closed），
+     *   页面影响清单已明示「连同点位一并删除」，故默认显式级联以与 UI 承诺一致。
+     */
+    async deleteDevice(input: {
+      id: string;
+      /** 设备名（仅用于成功回执文案；`confirm` 比对由页面与后端各自完成） */
+      name?: string;
+      cascade?: boolean;
+      actor: string;
+    } & WriteMeta): Promise<WriteResult> {
+      const id = input.id.trim();
+      if (!id) {
+        return fail('缺少设备 id，无法删除。');
+      }
       try {
-        await apiRequest<unknown>(`/api/devices/${encodeURIComponent(input.id)}`, { method: 'DELETE' });
+        const query = input.cascade === false ? '' : '?cascade=true';
+        const body = withReason({ id, actor: input.actor ?? DEFAULT_ACTOR }, input);
+        const raw = await apiRequest<Record<string, unknown>>(
+          `/api/devices/${encodeURIComponent(id)}${query}`,
+          { method: 'DELETE', body: JSON.stringify(body) },
+        );
         await refresh();
-        return { ok: true, message: `设备 ${input.id} 已删除（含其下点位）。` };
+        const removed = pickStr(raw, 'deleted_points', '');
+        return {
+          ok: true,
+          message: `设备「${input.name || id}」已删除${removed !== '' ? `（含 ${removed} 个点位）` : ''}。`,
+        };
       } catch (cause) {
         return writeFailure(cause, '删除设备');
       }
@@ -2373,15 +2422,30 @@ function buildWrites() {
       }
     },
 
-    async deletePoint(input: { id: string; actor: string }): Promise<WriteResult> {
+    /**
+     * 删除点位：`DELETE /api/points/:deviceId/:pointId`（P0-8 危险操作三要素）。
+     *
+     * 以后端执行点 `crates/daemon/src/mgmt/writeapi.rs::point_delete` 为准：
+     * · **body 必填 JSON 对象** `{reason, note, confirm}`（空 body / 非对象 → 400
+     *   `validation_failed`），故本函数无条件下发，绝不省略 body；
+     * · `reason` 必填非空；`note` 非空则 ≥10 字（`MIN_NOTE_CHARS`）；
+     * · `confirm` 须回显**点位 id 原文**（`trim()` + 大小写不敏感精确匹配），
+     *   后端比对目标是 URL 上的 `point_id`，不匹配 → 400 `confirm_mismatch`；
+     * · 后端先校验再 `config.points.remove`，**落盘前拒绝，无半改状态**；
+     * · 成功回 `{accepted, deleted, device_id, point_id, config_version}`。
+     *
+     * ⚠️ 本函数**不做任何归一 / 兜底**：`withReason` 只原样透传，比对口径一律以后端为准。
+     */
+    async deletePoint(input: { id: string; actor: string } & WriteMeta): Promise<WriteResult> {
       const target = realCache.points.find((p) => p.id === input.id);
       if (!target) {
         return fail(`点位 ${input.id} 不在当前缓存中，无法确定所属设备；请刷新后重试。`);
       }
       try {
+        const body = withReason({ actor: input.actor ?? DEFAULT_ACTOR }, input);
         await apiRequest<unknown>(
           `/api/points/${encodeURIComponent(target.deviceId)}/${encodeURIComponent(input.id)}`,
-          { method: 'DELETE' },
+          { method: 'DELETE', body: JSON.stringify(body) },
         );
         await refresh();
         return { ok: true, message: `点位 ${input.id} 已删除。` };

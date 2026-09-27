@@ -49,6 +49,12 @@
       </div>
 
       <div class="wc-card__body">
+        <!-- 删除结果反馈：成功 / 失败如实呈现，**绝不 window.alert**（弹窗被浏览器拦截时用户会看不到原因） -->
+        <div v-if="deleteNotice" class="wc-banner" :class="deleteNoticeKind === 'ok' ? 'wc-banner--ok' : 'wc-banner--danger'" data-test="device-delete-notice">
+          <span aria-hidden="true">{{ deleteNoticeKind === 'ok' ? '✓' : '!' }}</span>
+          <span>{{ deleteNotice }}</span>
+        </div>
+
         <div class="wc-filters">
           <div class="wc-filters__item">
             <label>状态</label>
@@ -126,7 +132,14 @@
               编辑
             </button>
             <RoleGate :allowed="canWrite">
-              <button type="button" class="wc-btn wc-btn--sm wc-btn--danger" @click="askDelete(row)">删除</button>
+              <button
+                type="button"
+                class="wc-btn wc-btn--sm wc-btn--danger"
+                data-test="device-delete"
+                @click="askDelete(row)"
+              >
+                删除
+              </button>
             </RoleGate>
           </template>
         </UiTable>
@@ -273,15 +286,18 @@
     </div>
   </Teleport>
 
+  <!-- 删除设备：影响清单 + 原因必填 + 设备名二次校验（P0-8，与 RulesPage / StartupPage 同构） -->
   <DangerConfirmModal
     :open="!!pendingDelete"
-    :title="pendingDelete ? `删除设备：${pendingDelete.name}` : '删除设备'"
-    :confirm-value="pendingDelete ? pendingDelete.id : ''"
-    confirm-label="风险二次确认（输入设备标识去分隔符后 6 位）"
-    confirm-placeholder="输入设备标识（如 dev001）后 6 位"
+    :title="pendingDelete ? `删除设备 ${pendingDelete.name}` : '删除设备'"
     :impacts="deleteImpacts"
     :facts="deleteFacts"
     :reasons="deleteReasons"
+    :min-note-length="10"
+    :confirm-value="pendingDelete ? pendingDelete.name : ''"
+    confirm-mode="full"
+    confirm-label="风险二次确认（输入设备名称）"
+    :confirm-placeholder="`输入设备名称 ${pendingDelete ? pendingDelete.name : ''} 以确认`"
     confirm-text="删除设备"
     @close="cancelDelete"
     @submit="confirmDelete"
@@ -803,6 +819,17 @@ async function removeGroup(g: DeviceGroup): Promise<void> {
 /** 待删除设备。 */
 const pendingDelete = ref<DeviceRecord | null>(null);
 
+/**
+ * 删除结果反馈（成功 / 失败同一条横幅，失败即后端真实原因原样透传）。
+ *
+ * ⚠️ 不用 `window.alert`：被浏览器拦截时用户根本看不到失败原因，等于把错误咽回去。
+ */
+const deleteNotice = ref('');
+const deleteNoticeKind = ref<'ok' | 'danger'>('danger');
+
+/** 说明补充最短字数（与后端 `MIN_NOTE_CHARS`、ui-kit `minNoteLength` 同口径）。 */
+const MIN_NOTE_CHARS = 10;
+
 /** 删除影响清单。 */
 const deleteImpacts = computed<string[]>(() =>
   pendingDelete.value
@@ -824,8 +851,9 @@ const deleteFacts = computed<readonly DangerFact[]>(() =>
     : [],
 );
 
-/** 打开删除确认。 */
+/** 打开删除确认（清空上一次的结果反馈）。 */
 function askDelete(row: DeviceRecord): void {
+  deleteNotice.value = '';
   pendingDelete.value = row;
 }
 
@@ -834,20 +862,68 @@ function cancelDelete(): void {
   pendingDelete.value = null;
 }
 
-/** 确认删除（真实落库，失败展示真实原因）。 */
-async function confirmDelete(): Promise<void> {
+/** 设备名二次校验的比对口径（与后端 `danger_confirm_matches` 逐字一致）。 */
+function nameMatches(input: string, expected: string): boolean {
+  return input.trim().toLowerCase() === expected.trim().toLowerCase();
+}
+
+/**
+ * 确认删除（真实落库）。
+ *
+ * 交互层 fail-fast：弹窗已按 `confirmMode="full"` 禁用提交按钮，这里再兜一次，
+ * 任一不过关即**本地拦截、直接返回、绝不发出 DELETE 请求**（省掉一轮注定失败的往返，
+ * 也避免「弹窗放行但请求被拒」的两段式报错）。
+ */
+async function confirmDelete(payload: {
+  reason: string;
+  note: string;
+  tail: string;
+  secondApprover: string;
+  confirm: string;
+}): Promise<void> {
   const target = pendingDelete.value;
   if (!target) {
     return;
   }
-  const res = await repo.deleteDevice({ id: target.id, actor: session.state.displayName });
-  if (!res.ok) {
-    const failed = target.name;
-    pendingDelete.value = null;
-    window.alert(`删除设备「${failed}」失败：${res.message}`);
+
+  // ① 原因必填非空
+  if (!payload.reason.trim()) {
+    deleteNoticeKind.value = 'danger';
+    deleteNotice.value = `删除未执行：请先选择操作原因（设备「${target.name}」仍在列表内，未做任何变更）。`;
     return;
   }
+  // ② 补充说明：非空则 ≥10 字（后端 `check_danger_present` 同口径）
+  const note = payload.note.trim();
+  if (!note || note.length < MIN_NOTE_CHARS) {
+    deleteNoticeKind.value = 'danger';
+    deleteNotice.value = `删除未执行：补充说明需至少 ${MIN_NOTE_CHARS} 字（当前 ${note.length} 字，设备「${target.name}」未做任何变更）。`;
+    return;
+  }
+  // ③ 设备名二次校验（trim + 大小写不敏感精确匹配），不匹配不下发
+  if (!nameMatches(payload.confirm, target.name)) {
+    deleteNoticeKind.value = 'danger';
+    deleteNotice.value = `删除未执行：二次确认输入的设备名与「${target.name}」不一致（不区分大小写），未向网关下发删除请求。`;
+    return;
+  }
+
+  const failedName = target.name;
   pendingDelete.value = null;
+  const res = await repo.deleteDevice({
+    id: target.id,
+    name: target.name,
+    reason: payload.reason,
+    note: payload.note,
+    confirm: payload.confirm,
+    actor: session.state.displayName,
+  });
+  if (!res.ok) {
+    deleteNoticeKind.value = 'danger';
+    deleteNotice.value = `设备「${failedName}」未删除：${res.message}`;
+    return;
+  }
+  deleteNoticeKind.value = 'ok';
+  deleteNotice.value = res.message;
+  // 仅刷新设备与分组数据：分页 / 排序 / 筛选 / 关键字状态一律原地保留，不做整页重置。
   await reload();
 }
 </script>

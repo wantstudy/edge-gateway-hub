@@ -25,10 +25,11 @@
   </PageHeader>
 
   <div class="wc-content">
-    <!-- 编辑态但设备不存在：诚实空态（不静默降级成新增） -->
+    <!-- 编辑态但设备取不到：诚实空态（不静默降级成新增）。
+         取数失败时把真实原因写进 banner，不编造「设备不存在」。 -->
     <div v-if="isEdit && !editDevice" class="wc-banner wc-banner--danger">
       <span aria-hidden="true">!</span>
-      <span>未找到设备「{{ editId }}」，可能已被删除或设备标识有误。</span>
+      <span>{{ editMissingText }}</span>
       <span class="wc-banner__ops">
         <button type="button" class="wc-btn wc-btn--sm" @click="go('devices')">返回设备列表</button>
       </span>
@@ -93,44 +94,37 @@
     <section v-show="currentStep === 2" class="wc-card">
       <div class="wc-card__head">
         <h3>② 连接参数</h3>
-        <span v-if="isEdit && !protocolChanged" class="wc-card__sub">沿用设备记录中的连接参数</span>
-        <span v-else class="wc-card__sub">{{ protocolLabel }} · 共 {{ currentProtoFields.length }} 个字段</span>
+        <span class="wc-card__sub">{{ protocolLabel }} · 共 {{ currentProtoFields.length }} 个字段</span>
       </div>
       <div class="wc-card__body">
-        <!--
-          编辑态且未改协议：`GET /api/devices` 只回传连接摘要，不包含逐字段连接参数。
-          此处如实按摘要展示已知信息，不摆一排空输入框假装「已回显」。
-        -->
-        <template v-if="isEdit && !protocolChanged">
-          <dl class="wc-kv">
-            <dt>设备名称</dt>
-            <dd>{{ editDevice?.name ?? '—' }}</dd>
-            <dt>协议</dt>
-            <dd><span class="wc-tag wc-tag--info">{{ protocolLabel }}</span></dd>
-            <dt>连接摘要</dt>
-            <dd class="wc-mono">{{ editDevice?.connectionSummary || '—' }}</dd>
-            <dt>采集频率</dt>
-            <dd class="wc-mono">{{ intervalMs }} ms</dd>
-          </dl>
-          <p class="wc-note">
-            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-            <span>连接参数以设备记录中的摘要为准；本页编辑更新设备名称与协议，连接参数保持不变。</span>
-          </p>
-        </template>
-        <template v-else>
         <div v-if="protocol === ''" class="wc-note">
           <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
           <span>请回到第 1 步选择设备类型。</span>
         </div>
 
-        <template v-for="group in fieldGroups" v-else :key="group.title">
+        <!--
+          新增 / 编辑共用同一套连接参数表单（同样的 UiField + 同样的 conn 状态）。
+          编辑态逐字段值不从任何读接口回传（`/api/devices` 只给协议与摘要），
+          也不在 `PUT /api/devices/:id` 的更新范围内，故留空由现场填写并如实说明；
+          必填校验在编辑态按「网关不持久化这些字段」放宽，避免拿填不到的数据卡住保存。
+        -->
+        <p v-if="isEdit" class="wc-note wc-note--warn">
+          <span class="wc-note__icon" aria-hidden="true">⚠</span>
+          <span>
+            该设备的逐字段连接参数不在网关读接口的返回里，也不在
+            <b>PUT /api/devices/:id</b> 的更新范围内；本步填写的值不会随本次修改下发，
+            仅用于记录本次变更的背景。设备名称、协议与分组才是会真正落库的项。
+          </span>
+        </p>
+
+        <template v-for="group in fieldGroups" :key="group.title">
           <p class="dv-grp">{{ group.title }}</p>
           <div class="dv-form">
             <UiField
               v-for="field in group.fields"
               :key="field.key"
               :label="field.label"
-              :required="!!field.required"
+              :required="!!field.required && !connOptional"
               :hint="field.hint ?? ''"
               :error="connTouched && !isFieldValid(field) ? fieldError(field) : ''"
             >
@@ -150,8 +144,6 @@
             </UiField>
           </div>
         </template>
-
-        </template>
       </div>
     </section>
 
@@ -161,7 +153,31 @@
         <h3>③ 点表准备</h3>
       </div>
       <div class="wc-card__body">
-        <p class="wc-note">
+        <template v-if="isEdit">
+          <!-- 编辑态：如实列出该设备现有点位，不让这一步空着；数量取后端详情。 -->
+          <p class="wc-card__sub" data-testid="wz-step3-count">{{ editPointRows.length }} 个点位</p>
+          <table class="wc-table" v-if="editPointRows.length">
+            <thead>
+              <tr><th>点位 id</th><th>地址</th><th>数据类型</th><th>字节序</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in editPointRows" :key="row.id">
+                <td class="wc-mono">{{ row.id }}</td>
+                <td class="wc-mono">{{ row.address || '—' }}</td>
+                <td>{{ row.dataType }}</td>
+                <td>{{ row.byteOrder || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-else class="wc-note">
+            <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
+            <span>该设备登记了 0 个点位，网关不会采集它的数据 —— 到「点位与映射」页补点表。</span>
+          </p>
+          <div class="dv-foot">
+            <button type="button" class="wc-btn wc-btn--sm" @click="goPoints(editId)">去点位与映射</button>
+          </div>
+        </template>
+        <p v-else class="wc-note">
           <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
           <span>设备保存后，到「点位与映射」页选中该设备即可添加点位或导入点表。</span>
         </p>
@@ -275,8 +291,9 @@
       </div>
     </div>
 
-    <!-- 提交成功 -->
-    <div v-if="createdName" class="wc-banner wc-banner--ok">
+    <!-- 提交结果横幅：按 `createdNote` 判定 —— 编辑态更新失败时 `createdName` 仍为空，
+         若按 `createdName` 判定会导致「点了保存修改却看不到任何反馈」。 -->
+    <div v-if="createdNote" class="wc-banner wc-banner--ok">
       <span aria-hidden="true">✓</span>
       <span>{{ createdNote }}</span>
       <span class="wc-banner__ops">
@@ -294,11 +311,9 @@
         <div class="dv-foot__ops">
           <span class="dv-foot__txt">
             第 <b>{{ currentStep }}</b> / {{ STEPS.length }} 步 · {{ STEPS[currentStep - 1] }}
-            <span v-if="isEdit && currentStep === 4 && !canSubmitEdit" class="dv-foot__warn">
-              需完成设备名称 + 变更原因{{ protocolChanged ? '，并重新填写连接参数' : '' }}才能保存修改
-            </span>
-            <span v-else-if="!isEdit && currentStep === 4 && !canSaveAndStart" class="dv-foot__warn">
-              需完成设备名称 + 变更原因才能保存
+            <!-- 禁用原因逐条给出真实校验结果，不让按钮「莫名不可点」。 -->
+            <span v-if="currentStep === 4 && saveBlockers.length" class="dv-foot__warn">
+              还不能保存：{{ saveBlockers.join('；') }}
             </span>
           </span>
           <button type="button" class="wc-btn" @click="go('devices')">取消</button>
@@ -311,7 +326,7 @@
             type="button"
             class="wc-btn wc-btn--primary"
             data-test="device-save-edit"
-            :disabled="!canSubmitEdit || !!createdName"
+            :disabled="saveBlockers.length > 0 || !!createdName"
             @click="submit('saveAndStart')"
           >
             保存修改
@@ -323,7 +338,7 @@
             <button
               type="button"
               class="wc-btn wc-btn--primary"
-              :disabled="!canSaveAndStart || !!createdName"
+              :disabled="saveBlockers.length > 0 || !!createdName"
               @click="submit('saveAndStart')"
             >
               保存并开始采集
@@ -369,6 +384,7 @@ import {
   type DeviceDraft,
   type DeviceRecord,
 } from '@/api/repo';
+import { apiRequest, ApiError } from '@/api/client';
 import { session } from '../store/session';
 
 const router = useRouter();
@@ -391,8 +407,30 @@ const editId = computed<string>(() => {
 /** 是否处于编辑态。 */
 const isEdit = computed(() => editId.value !== '');
 
-/** 编辑态设备记录（`repo.getDevice`）；查不到时为 `null`，页面给出诚实空态。 */
+/** 编辑态设备记录；取不到时为 `null`，页面给出诚实空态（不静默降级成新增）。 */
 const editDevice = ref<DeviceRecord | null>(null);
+
+/**
+ * 编辑态设备取数状态：
+ * · `missing` —— 还没取到（正在拉 `GET /api/devices/:id`），此时**不**报「未找到」；
+ * · `gone` —— 后端确认不存在（404），此时给诚实空态。
+ *
+ * 历史回归：早期只看 `repo.getDevice`（内存缓存），缓存未命中（直接打开链接、
+ * 刷新页面、未走过设备列表）时整页被「未找到设备」横幅替换，向导连第 2/3 步都
+ * 渲染不出来 —— 故这里一律先走真实详情端点兜底。
+ */
+const editMissing = ref<'missing' | 'gone' | ''>('');
+
+/** 编辑态取数的真实失败原因（供横幅透出，不编造）。 */
+const editMissingText = computed(() => {
+  if (editMissing.value === 'gone') {
+    return `网关中没有设备「${editId.value}」：它可能已被删除，或设备标识有误。`;
+  }
+  return `暂未取到设备「${editId.value}」的详情：${editFetchError.value || '正在读取…'}`;
+});
+
+/** `GET /api/devices/:id` 的真实错误文案（ApiError.message 原样透出）。 */
+const editFetchError = ref('');
 
 /** 进入编辑态时的原始协议（用于判断用户是否改了协议 —— 改协议等于点表失效）。 */
 const originalProtocol = ref<ProtocolType | ''>('');
@@ -624,13 +662,148 @@ const createdNote = ref('');
 /** 新建成功的设备 id（用于直达「点位与映射」并预选该设备）。 */
 const createdId = ref('');
 
+/** 第 3 步的点位行（详情端点 `/ 缓存同源，字段一律取真实值）。 */
+interface Step3PointRow {
+  id: string;
+  address: string;
+  dataType: string;
+  byteOrder: string;
+}
+
+/** `GET /api/devices/:id` 返回的 `points` 归属列表（详情端点的真实数据）。 */
+const detailPoints = ref<Step3PointRow[]>([]);
+
+/** 编辑态该设备的点位（第 3 步如实列出；详情优先，缺则回落到缓存）。 */
+const editPointRows = computed<Step3PointRow[]>(() => {
+  if (detailPoints.value.length) {
+    return detailPoints.value;
+  }
+  if (!editDevice.value) {
+    return [];
+  }
+  return repo.pointsOfDevice(editDevice.value.id).map((p) => ({
+    id: p.id,
+    address: p.address,
+    dataType: p.dataType,
+    byteOrder: p.byteOrder,
+  }));
+});
+
+/** 取数请求序号：只让最后一次请求的结果落地，避免并发串台。 */
+let editSeq = 0;
+
 /**
- * 编辑态回填：读取设备记录并填充**可回填字段**。
+ * 把 `GET /api/devices/:id` 的真实字段映射到 DeviceRecord。
  *
- * 诚实边界：`GET /api/devices` 只回传设备名称 / 协议 / 连接摘要 / 采集频率等，
- * 不包含逐字段连接参数，故不向 `conn` 塞空值假装；第 2 步以「连接摘要」形式
- * 展示已知信息（见模板 `isEdit && !protocolChanged` 分支）。
+ * 该端点只回传 `{id, name, protocol, enabled, poll_interval_ms, status, ...,
+ * group_id, points}`，**不回传连接摘要与逐字段连接参数**；映射时一律如实留空 /
+ * 取保守值，绝不臆造端点或连接参数。
  */
+function mapDeviceDetail(raw: Record<string, unknown>): DeviceRecord {
+  const id = typeof raw['id'] === 'string' ? raw['id'] : '';
+  const protocol = (typeof raw['protocol'] === 'string' ? raw['protocol'] : '') as ProtocolType;
+  const pollRaw = raw['poll_interval_ms'];
+  const pollNum = typeof pollRaw === 'number' ? pollRaw : Number(pollRaw);
+  const status = (['online', 'offline', 'error'].includes(String(raw['status']))
+    ? String(raw['status'])
+    : 'offline') as DeviceRecord['status'];
+  const missing: string[] = [];
+  if (raw['success_rate'] === undefined && raw['successRate'] === undefined) {
+    missing.push('success_rate / fail_streak');
+  }
+  if (raw['last_sample_at'] === undefined && raw['lastSampleAt'] === undefined) {
+    missing.push('last_sample_at');
+  }
+  return {
+    id,
+    name: typeof raw['name'] === 'string' ? raw['name'] : id,
+    protocol,
+    protocolLabel: PROTOCOL_OPTIONS.find((p) => p.value === protocol)?.label ?? protocol,
+    // 详情端点不返回连接摘要；诚实留空，不伪造 `ip:port`。
+    connectionSummary: '',
+    status,
+    unknownText: missing.length > 0 ? `详情端点未上报：${missing.join(' / ')}` : '',
+    intervalMs: Number.isFinite(pollNum) ? pollNum : 0,
+    timeoutMs: 0,
+    retryTimes: 0,
+    pointCount: Number(raw['point_count'] ?? 0) || 0,
+    groupId: typeof raw['group_id'] === 'string' ? raw['group_id'] : '',
+    lastSampleAt: '—',
+    successRate: 0,
+    failStreak: 0,
+    offlineText: status === 'offline' ? '状态未知（详情端点未上报健康度）' : '',
+    createdAt: '',
+  };
+}
+
+/**
+ * 编辑态回填：缓存命中直接用；未命中走**真实详情端点** `GET /api/devices/:id`
+ * （后端路由已存在），取不到才落到诚实空态 —— 这是「第二步/第三步无法编辑」的
+ * 根因修复：向导不再因缓存未命中而被整页横幅替换。
+ */
+async function loadEditDevice(id: string): Promise<void> {
+  const seq = ++editSeq;
+  const cached = repo.getDevice(id);
+  if (cached) {
+    editFetchError.value = '';
+    editMissing.value = '';
+    detailPoints.value = [];
+    editDevice.value = cached;
+    name.value = cached.name;
+    deviceId.value = cached.id;
+    intervalMs.value = String(cached.intervalMs);
+    originalProtocol.value = cached.protocol;
+    // 变更协议会触发 `watch(protocol)` 清空连接字段，这是预期行为（新协议要重填）。
+    protocol.value = cached.protocol;
+    // 记录已存在，四步均可直达（回退/跳转不再受 maxReached 限制）。
+    maxReached.value = STEPS.length;
+    return;
+  }
+
+  editMissing.value = 'missing';
+  editDevice.value = null;
+  editFetchError.value = '';
+  try {
+    const raw = await apiRequest<Record<string, unknown>>(
+      `/api/devices/${encodeURIComponent(id)}`,
+    );
+    if (seq !== editSeq) {
+      return;
+    }
+    const detail = mapDeviceDetail(raw);
+    if (!detail.id) {
+      // 详情端点回了没有 id 的东西：按不存在处理（不猜 id）。
+      editMissing.value = 'gone';
+      editFetchError.value = '详情端点未返回设备 id。';
+      return;
+    }
+    editDevice.value = detail;
+    name.value = detail.name;
+    deviceId.value = detail.id;
+    intervalMs.value = String(detail.intervalMs);
+    originalProtocol.value = detail.protocol;
+    protocol.value = detail.protocol;
+    maxReached.value = STEPS.length;
+    // 第 3 步的点位清单取详情端点回传的 `points`（与缓存同源，缺则为空）。
+    const owned = Array.isArray(raw['points']) ? (raw['points'] as Record<string, unknown>[]) : [];
+    detailPoints.value = owned.map((row) => ({
+      id: String(row['point_id'] ?? ''),
+      address: String(row['address'] ?? ''),
+      dataType: String(row['data_type'] ?? ''),
+      byteOrder: String(row['byte_order'] ?? ''),
+    }));
+    editMissing.value = '';
+  } catch (cause) {
+    if (seq !== editSeq) {
+      return;
+    }
+    const status = cause instanceof ApiError ? cause.status : 0;
+    editMissing.value = status === 404 ? 'gone' : 'missing';
+    editFetchError.value =
+      cause instanceof ApiError ? cause.message : String((cause as Error)?.message ?? cause);
+  }
+}
+
 watch(
   editId,
   (id) => {
@@ -638,6 +811,8 @@ watch(
       // 从编辑态切回新增态：向导进度与表单必须回到初始状态，
       // 否则 maxReached 仍是 4，未到达的步骤会被误判为「已到达」而可点。
       editDevice.value = null;
+      editMissing.value = '';
+      editFetchError.value = '';
       originalProtocol.value = '';
       currentStep.value = 1;
       maxReached.value = 1;
@@ -653,19 +828,8 @@ watch(
       createdId.value = '';
       return;
     }
-    const found = repo.getDevice(id);
-    editDevice.value = found;
-    if (!found) {
-      return;
-    }
-    name.value = found.name;
-    deviceId.value = found.id;
-    intervalMs.value = String(found.intervalMs);
-    originalProtocol.value = found.protocol;
-    // 变更协议会触发 `watch(protocol)` 清空连接字段，这是预期行为（新协议要重填）。
-    protocol.value = found.protocol;
-    // 记录已存在，四步均可直达（回退/跳转不再受 maxReached 限制）。
-    maxReached.value = STEPS.length;
+    // 缓存命中走同步回填，未命中由 loadEditDevice 走真实详情端点兜底。
+    void loadEditDevice(id);
   },
   { immediate: true },
 );
@@ -750,6 +914,10 @@ function isNumberFieldOk(raw: string): boolean {
 function isFieldValid(field: ProtoField): boolean {
   const raw = (conn[field.key] ?? '').trim();
   if (raw.length === 0) {
+    // 编辑态连接参数非必填（网关不回传也不持久化这些字段），留空即视为通过。
+    if (connOptional.value) {
+      return true;
+    }
     return !(field.required ?? false);
   }
   return field.kind === 'number' ? isNumberFieldOk(raw) : true;
@@ -763,12 +931,21 @@ function fieldError(field: ProtoField): string {
   return field.kind === 'number' ? '需为 ≥ 0 的数值' : '';
 }
 
+/**
+ * 编辑态连接参数是否**非必填**。
+ *
+ * 网关读接口（`GET /api/devices` / `/api/devices/:id`）不回传逐字段连接参数，
+ * 写接口（`PUT /api/devices/:id`）也只接受 name / protocol / endpoint / enabled /
+ * group_id —— 所以编辑态无从「沿用并回填」，也无从把它们写回。这里如实放宽必填，
+ * 避免用户为了保存一个名称修改而被迫填一批根本不会落库的字段。
+ */
+const connOptional = computed(() => isEdit.value);
+
 const step2Valid = computed(() => {
-  // 编辑态且未改协议：连接参数沿用设备记录既有值（第 2 步只读展示摘要，无需重填）。
-  if (isEdit.value && !protocolChanged.value) {
-    return true;
+  if (currentProtoFields.value.length === 0) {
+    return false;
   }
-  return currentProtoFields.value.length > 0 && currentProtoFields.value.every(isFieldValid);
+  return currentProtoFields.value.every(isFieldValid);
 });
 
 /** ③ 有默认选项，永远可继续。 */
@@ -781,21 +958,35 @@ const intervalValid = computed(() => {
 });
 const reasonValid = computed(() => changeReason.value.trim().length >= 4);
 
-/** ④ 「保存并开始采集」的全部前置条件。 */
-const canSaveAndStart = computed(
-  () => nameValid.value && intervalValid.value && reasonValid.value && step2Valid.value,
-);
-
 /**
- * 编辑态提交条件：名称 + 变更原因；若改了协议，还需重填连接参数。
- * 未改协议时连接参数与点表均未变更，无需重填。
+ * 保存阻塞项（**新增与编辑共用**）：逐条给出真实校验结果，空数组 = 可保存。
+ * 按钮 disabled 只由这里的条目驱动 —— 不再有「流程状态没初始化」之类的隐性问题。
  */
-const canSubmitEdit = computed(() => {
-  if (!nameValid.value || !reasonValid.value) {
-    return false;
+const saveBlockers = computed<string[]>(() => {
+  const out: string[] = [];
+  if (!protocol.value) {
+    out.push('尚未选择设备类型');
   }
-  return protocolChanged.value ? step2Valid.value : true;
+  if (!nameValid.value) {
+    out.push('设备名称为空');
+  }
+  if (!intervalValid.value) {
+    out.push('采集频率需为 ≥ 50 ms 的数值');
+  }
+  if (!reasonValid.value) {
+    out.push('变更原因需 ≥ 4 个字');
+  }
+  if (!step2Valid.value) {
+    out.push('连接参数有字段未通过校验');
+  }
+  return out;
 });
+
+/** ④ 「保存并开始采集」的全部前置条件。 */
+const canSaveAndStart = computed(() => saveBlockers.value.length === 0);
+
+/** 编辑态提交条件（与新增同一套校验，见 `saveBlockers`）。 */
+const canSubmitEdit = canSaveAndStart;
 
 const stepValid = computed(() => {
   if (currentStep.value === 1) {
@@ -1032,7 +1223,9 @@ async function submit(mode: 'save' | 'saveAndStart'): Promise<void> {
   };
 
   if (isEdit.value) {
-    const result = await repo.updateDevice({ ...draft, id: editId.value });
+    // `group_id` 是 `PUT /api/devices/:id` 真会落库的字段之一，编辑页既然提供了分组
+    // 选择就如实下发（漏传 = 后端不变更分组）。
+    const result = await repo.updateDevice({ ...draft, groupId: group.value, id: editId.value });
     if (!result.ok || !result.data) {
       // 写失败：如实呈现后端原因，绝不报告成功。
       createdName.value = '';

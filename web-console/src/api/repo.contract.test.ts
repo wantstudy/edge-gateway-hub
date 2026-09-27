@@ -10,6 +10,7 @@
  *  4. 后端无对应端点时写操作返回**结构化失败**（`ok:false`），绝不假装成功。
  */
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { API_MODE, repo, refresh, refreshAlerts, coerceRuleConditionValue } from './repo';
 import { DEFAULT_ACTOR, PROTOCOL_OPTIONS, licenseSnapshot } from './model';
 import { API_BASE } from './client';
@@ -624,5 +625,197 @@ describe('转发规则结构化契约（/api/rules 系列；写请求不得打�
     expect(body['reason']).toBe('调试清理');
     expect(body['note']).toBe('调试期临时规则，验证完即删');
     expect(body['confirm']).toBe('rule-9');
+  });
+});
+
+/**
+ * 激活码入口校验（2026-09-27 统一为 `IOT-2026-XXXX-XXXX-XXXX-XX`）：
+ * 新格式通过；旧 `IOTDAQ-` 格式**不做作废**（库内存量码仍可激活），但成功路径须
+ * 给出「已废弃、建议换发新码」的结构化提示。
+ */
+describe('激活码入口校验（新格式为主 + 旧格式兼容）', () => {
+  /** 新格式样例：IOT-2026- + 3 段各 4 位 + 末段 2 位。 */
+  const NEW_CODE = 'IOT-2026-ACDE-FGJK-LMNP-QR';
+  /** 旧格式样例：4 段各 4 位（2026-09-27 之前发放的存量码）。 */
+  const LEGACY_CODE = 'IOTDAQ-ACDE-FGJK-LMNP-1234';
+
+  const respond = (status: number, body: unknown): Response =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  const spyFetchWith = (calls: { url: string; init?: RequestInit }[], status: number, body: unknown) =>
+    vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: pathOf(String(input)), init });
+      return Promise.resolve(respond(status, body));
+    }) as typeof fetch);
+
+  it('既非新格式也非旧格式：入口直接拒绝，且一次请求都不发', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const spy = spyFetchWith(calls, 200, {});
+    try {
+      const result = await repo.actions.activateLicense({ code: 'IOT-2026-ACDE-FGJK-LMNP' });
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain('激活码格式不正确');
+      expect(result.message).toContain('IOT-2026-XXXX-XXXX-XXXX-XX');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('含易混字符 B 的码：入口直接拒绝，且一次请求都不发', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const spy = spyFetchWith(calls, 200, {});
+    try {
+      // `ABCD` 段含易混字符 B：必须被引擎挡在入口，而不是放行后由后端 activate 兜底
+      // （那会让用户拿到含糊失败）。故此处同时断言「零请求」，防止只改文案没拦住。
+      const result = await repo.actions.activateLicense({ code: 'IOT-2026-ABCD-EFGH-JKLM-PQ' });
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain('激活码格式不正确');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('新格式码：通过入口校验并提交 POST /api/license/activate', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const spy = spyFetchWith(calls, 404, { error: 'not_implemented' });
+    try {
+      const result = await repo.actions.activateLicense({ code: NEW_CODE });
+      // 404 = 网关端尚未部署该端点：说明入口校验已放行，且失败被诚实结构化。
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain('尚未上线');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('/api/license/activate');
+    const body = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
+    expect(body['code']).toBe(NEW_CODE);
+  });
+
+  it('旧 IOTDAQ- 格式码：不被引擎格式校验挡下，同样提交激活', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const spy = spyFetchWith(calls, 404, { error: 'not_implemented' });
+    try {
+      const result = await repo.actions.activateLicense({ code: LEGACY_CODE });
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain('尚未上线');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('/api/license/activate');
+    const body = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
+    expect(body['code']).toBe(LEGACY_CODE);
+  });
+
+  it('旧格式激活成功：仍返回成功，但提示已废弃并建议换发新码', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    // 激活成功后的重取快照（GET /api/license/status）一并 200。
+    const spy = spyFetchWith(calls, 200, { status: 'licensed' });
+    try {
+      const result = await repo.actions.activateLicense({ code: LEGACY_CODE });
+      expect(result.ok).toBe(true);
+      expect(result.message).toContain('已废弃');
+      expect(result.message).toContain('IOT-2026-');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls.some((call) => call.url === '/api/license/activate')).toBe(true);
+  });
+});
+
+/**
+ * 激活码字符集**跨端契约**（回归护栏）。
+ *
+ * 背景：2026-09-27 统一为 `IOT-2026-XXXX-XXXX-XXXX-XX` 时，前端字符类写成
+ * `[A-Z2-9AC-HJ-NP-Z]`，外层 `A-Z` 把 `B` / `I` / `O` 一并收回，否定区间形同虚设——
+ * 表现是「非法码穿过入口校验、落到后端才被拒」，属于跨模块语义漂移。人眼比对两个
+ * 源文件**会复现同一个错误**（两边写法都自认为对），故此处直接读源文件常量做断言：
+ * 任一侧改字符集都会立刻变红，而不是等线上发现。
+ */
+describe('激活码字符集跨端契约（回归护栏）', () => {
+  /** 把字符类文本展开为显式集合：`X-Y` 闭区间展开，其余按单字符收集。 */
+  const expandCharClass = (spec: string): Set<string> => {
+    const chars = new Set<string>();
+    let i = 0;
+    while (i < spec.length) {
+      const cur = spec[i];
+      const next = spec[i + 1];
+      const end = spec[i + 2];
+      if (next === '-' && end !== undefined && /[A-Za-z0-9]/.test(end)) {
+        for (let code = cur.charCodeAt(0); code <= end.charCodeAt(0); code += 1) {
+          chars.add(String.fromCharCode(code));
+        }
+        i += 3;
+      } else {
+        chars.add(cur);
+        i += 1;
+      }
+    }
+    return chars;
+  };
+
+  /** 从源码文本里抓 `const NAME = "..."` 形式的常量字符串（容忍 Rust 的类型标注）。 */
+  const constFrom = (src: string, name: string): string => {
+    const hit = src.match(new RegExp(`const ${name}[^=]*= "([^"]*)"`));
+    if (!hit) throw new Error(`源码中未找到常量 ${name}`);
+    return hit[1];
+  };
+
+  /** 读取库外源码（相对本文件定位，不依赖进程 cwd）。 */
+  const readUp = (relFromTestFile: string): string =>
+    readFileSync(new URL(relFromTestFile, import.meta.url), 'utf8');
+
+  /** 取出前端 `ACT_CODE_RE` 的字符类文本（`repo.ts` 同目录，路径相对于本测试文件）。 */
+  const frontCharClass = (): Set<string> => {
+    const repoSrc = readUp('./repo.ts');
+    const line = repoSrc.split('\n').find((l) => l.startsWith('const ACT_CODE_RE ='));
+    const hit = line?.match(/^const ACT_CODE_RE = .*?\[([^\]]+)\]/);
+    if (!hit) throw new Error('未能从 repo.ts 取出 ACT_CODE_RE 字符类');
+    return expandCharClass(hit[1]);
+  };
+
+  /** 取出服务端 `CODE_ALPHABET` 常量（跨层读 Rust 源码）。 */
+  const serverCharSet = (): Set<string> => {
+    const serviceSrc = readUp('../../../crates/licensing-server/src/service.rs');
+    return new Set([...constFrom(serviceSrc, 'CODE_ALPHABET')]);
+  };
+
+  it('服务端 CODE_ALPHABET 与前端 ACT_CODE_RE 字符类集合完全相等', () => {
+    const frontAlphabet = frontCharClass();
+    const serverSet = serverCharSet();
+    const frontOnly = [...frontAlphabet].filter((ch) => !serverSet.has(ch));
+    const serverOnly = [...serverSet].filter((ch) => !frontAlphabet.has(ch));
+    expect(
+      frontOnly,
+      `前端字符类多收了这些字符（服务端集合: ${[...serverSet].sort().join('')}）：${frontOnly.join('')}`,
+    ).toEqual([]);
+    expect(
+      serverOnly,
+      `前端字符类漏了服务端的这些字符（前端集合: ${[...frontAlphabet].sort().join('')}）：${serverOnly.join('')}`,
+    ).toEqual([]);
+    expect(
+      frontAlphabet.size,
+      `字符集大小应一致（服务端 ${serverSet.size} / 前端 ${frontAlphabet.size}）`,
+    ).toBe(serverSet.size);
+  });
+
+  it('字符集剔除易混字符 B / I / O / 0 / 1，且两侧都严格剔除', () => {
+    const confusable = ['B', 'I', 'O', '0', '1'];
+    const frontAlphabet = frontCharClass();
+    const serverSet = serverCharSet();
+    const leaked = confusable.filter((ch) => frontAlphabet.has(ch));
+    expect(
+      leaked,
+      `前端字符类仍含易混字符 ${leaked.join('')}（应为 31 字符集：${[...serverSet].sort().join('')}）`,
+    ).toEqual([]);
+    // 服务端集合本身也要守住：防止有人改服务端时悄悄把 0/O/1/I 放回去。
+    const rustLeaked = confusable.filter((ch) => serverSet.has(ch));
+    expect(rustLeaked, `服务端 CODE_ALPHABET 仍含易混字符 ${rustLeaked.join('')}`).toEqual([]);
   });
 });
