@@ -244,6 +244,17 @@ export interface AdminRepo {
   // ---------- 租户 ----------
   allTenants(): TenantRecord[];
   getTenant(id: string): TenantRecord | null;
+  /**
+   * 创建租户（real：`POST /admin/tenants`，仅 system 角色；mock：本地追加演示租户）。
+   * 成功后 real 模式会刷新租户缓存；失败返回 false 并推全局横幅（真实原因）。
+   */
+  createTenant(input: {
+    tenantId: string;
+    name: string;
+    contact: string;
+    verifyMode: Grade;
+    actor: string;
+  }): Promise<boolean>;
   updateTenant(input: {
     id: string;
     defaultGrade: Grade;
@@ -325,6 +336,25 @@ export interface AdminRepo {
 
   // ---------- 总览 ----------
   overview(): OverviewStats;
+
+  /**
+   * 激活趋势按日聚合（real：`GET /admin/stats/activations?days=N`，来自
+   * audit_log 真实计数；mock：返回空数组——诚实空态，绝不伪造趋势曲线）。
+   * `date` 为 UTC 日锚点 unix 秒（**String** 原文，大数红线）；计数为 String。
+   */
+  activationTrend(days: number): Promise<ActivationTrendPoint[]>;
+}
+
+/** 激活趋势单日聚合（`ActivationStatsDay` 前端镜像；字段一律 String 原文透传）。 */
+export interface ActivationTrendPoint {
+  /** 该日 00:00:00 UTC 的 unix 秒（String）。 */
+  date: string;
+  /** 当日发放次数（String）。 */
+  issue: string;
+  /** 当日绑定次数（String）。 */
+  bind: string;
+  /** 当日废弃次数（String）。 */
+  revoke: string;
 }
 
 // ===========================================================================
@@ -356,6 +386,10 @@ function mockOverviewToContract(): OverviewStats {
 }
 
 /** mock 仓库的 async 适配包装（读方法直通，写方法 Promise.resolve）。 */
+
+/** mock 模式下「新增租户」的本地追加列表（不改 mock-data.ts 契约本体）。 */
+const mockCreatedTenants: TenantRecord[] = [];
+
 function buildMockRepo(): AdminRepo {
   return {
     ...mockRepo,
@@ -364,6 +398,44 @@ function buildMockRepo(): AdminRepo {
     revokeCode: (input) => Promise.resolve(mockRepo.revokeCode(input)),
     reissueCode: (input) => Promise.resolve(mockRepo.reissueCode(input)),
     markDeviceAnomaly: (input) => Promise.resolve(mockRepo.markDeviceAnomaly(input)),
+    allTenants(): TenantRecord[] {
+      return [...mockRepo.allTenants(), ...mockCreatedTenants.map((t) => ({ ...t }))];
+    },
+    getTenant(id: string): TenantRecord | null {
+      const created = mockCreatedTenants.find((t) => t.id === id);
+      if (created) {
+        return { ...created };
+      }
+      return mockRepo.getTenant(id);
+    },
+    createTenant: (input) => {
+      const tenantId = input.tenantId.trim();
+      const name = input.name.trim();
+      if (!tenantId || !name) {
+        pushNotice('error', '新增租户失败：租户 ID 与名称均不能为空。');
+        return Promise.resolve(false);
+      }
+      if (mockCreatedTenants.some((t) => t.id === tenantId)) {
+        pushNotice('error', `新增租户失败：租户 ID ${tenantId} 已存在。`);
+        return Promise.resolve(false);
+      }
+      mockCreatedTenants.push({
+        id: tenantId,
+        name,
+        deviceCount: 0,
+        licensedCount: 0,
+        defaultGrade: input.verifyMode,
+        defaultTier: '—',
+        heartbeatInterval: '—',
+        offlineGrace: '—',
+        receiptRequired: false,
+        contact: input.contact.trim(),
+        enabled: true,
+      });
+      return Promise.resolve(true);
+    },
+    // mock 模式无后端聚合：诚实空态（绝不伪造趋势曲线）。
+    activationTrend: () => Promise.resolve([]),
     updateTenant: (input) => Promise.resolve(mockRepo.updateTenant(input)),
     setTenantEnabled: (input) => Promise.resolve(mockRepo.setTenantEnabled(input)),
     resolveAnomaly: (input) => Promise.resolve(mockRepo.resolveAnomaly(input)),
@@ -1082,6 +1154,21 @@ function buildRealRepo(): AdminRepo {
         void fetchOverview();
         return JSON.parse(JSON.stringify(created)) as CodeRecord[];
       } catch (cause) {
+        // 结构化业务码 → 可操作提示（不靠解析错误文案）。
+        if (cause instanceof ApiError && cause.businessCode === 'TENANT_NOT_FOUND') {
+          pushNotice(
+            'error',
+            '发放激活码失败：该租户不存在［TENANT_NOT_FOUND］。请先在「租户与策略」页新增租户，再为该租户发放激活码。',
+          );
+          return [];
+        }
+        if (cause instanceof ApiError && cause.businessCode === 'MACHINE_CODE_REQUIRED') {
+          pushNotice(
+            'error',
+            '发放激活码失败：机器码为必填项［MACHINE_CODE_REQUIRED］，请在客户设备上获取机器码后填入。',
+          );
+          return [];
+        }
         reportFailure('发放激活码', cause);
         return [];
       }
@@ -1243,13 +1330,38 @@ function buildRealRepo(): AdminRepo {
       return Promise.resolve(false);
     },
 
-    // ---------- 租户（GET /admin/tenants 已接通；策略写端点缺失） ----------
+    // ---------- 租户（GET/POST /admin/tenants 已接通；策略写端点缺失） ----------
     allTenants(): TenantRecord[] {
       return JSON.parse(JSON.stringify(realTenants)) as TenantRecord[];
     },
 
     getTenant(id: string): TenantRecord | null {
       return (JSON.parse(JSON.stringify(realTenants)) as TenantRecord[]).find((t) => t.id === id) ?? null;
+    },
+
+    async createTenant(input): Promise<boolean> {
+      const tenantId = input.tenantId.trim();
+      const name = input.name.trim();
+      if (!tenantId || !name) {
+        pushNotice('error', '新增租户失败：租户 ID 与名称均不能为空。');
+        return false;
+      }
+      try {
+        await adminRequest<unknown>('/admin/tenants', {
+          method: 'POST',
+          body: {
+            tenant_id: tenantId,
+            name,
+            contact: input.contact.trim(),
+            verify_mode_default: input.verifyMode,
+          },
+        });
+        // 创建成功后刷新租户缓存（发放弹窗的真实租户下拉随之更新）。
+        void fetchTenants();
+        return true;
+      } catch (cause) {
+        return reportFailure('新增租户', cause);
+      }
     },
 
     updateTenant(_input: {
@@ -1444,6 +1556,31 @@ function buildRealRepo(): AdminRepo {
     // ---------- 总览（GET /admin/overview 已接通；计数 String 原文透传） ----------
     overview(): OverviewStats {
       return realStats;
+    },
+
+    async activationTrend(days: number): Promise<ActivationTrendPoint[]> {
+      try {
+        const data = asRecord(
+          await adminRequest<unknown>('/admin/stats/activations', {
+            method: 'GET',
+            query: { days: String(days) },
+          }),
+        );
+        const items = Array.isArray(data.items) ? data.items : [];
+        // 日期 / 计数一律 String 原文透传（大数红线），绝不 Number 化存储。
+        return items.map((raw) => {
+          const rec = asRecord(raw);
+          return {
+            date: pickStr(rec, 'date', ''),
+            issue: pickStr(rec, 'issue', '0'),
+            bind: pickStr(rec, 'bind', '0'),
+            revoke: pickStr(rec, 'revoke', '0'),
+          };
+        });
+      } catch (cause) {
+        pushNoticeOnce('load-activation-trend', 'warn', `激活趋势加载失败：${describeCause(cause)}`);
+        return [];
+      }
     },
   };
 }

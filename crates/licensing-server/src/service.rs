@@ -158,16 +158,34 @@ impl LicensingService {
             ));
         }
         if self.store.get_tenant(tenant_id)?.is_none() {
-            return Err(LicenseError::ActivationRejected(format!(
-                "unknown tenant: {tenant_id}"
+            // fail-closed 保留；独立变体让 admin-console 能给出「请先创建租户」引导。
+            return Err(LicenseError::tenant_not_found(format!(
+                "unknown tenant: {tenant_id}; create the tenant first via POST /admin/tenants"
             )));
         }
 
+        // 机器码必填（2026-09-27 主理人决策）：发放侧一机一码闭环，
+        // `prebind_machine_code` 缺失 / 空白 → 400 `MACHINE_CODE_REQUIRED`。
+        let prebind_raw = req.prebind_machine_code.as_deref().unwrap_or("").trim();
+        if prebind_raw.is_empty() {
+            return Err(LicenseError::machine_code_required(
+                "issue requires a non-empty prebind_machine_code",
+            ));
+        }
         // G5：归一化幂等键（trim / 去尾部空白），空键直接拒绝。
         let idem = self.normalize_idempotency_key(&req.idempotency_key)?;
 
-        // G4：空白预绑定（"   " / "\t"）→ None，交给 with_prebind 统一归一。
-        let prebind = req.prebind_machine_code.clone();
+        // 预绑定取 trim 后值（发放路径不再接受空白——上方已拒绝）。
+        let prebind = Some(prebind_raw.to_string());
+
+        // G2（前置回放检查）：同幂等键已有批次 → 直接返回既有结果。
+        // 必须先于 G3 冲突检测：机器码必填后，同键重放携带同一预绑定值会命中
+        // MachineAlreadyClaimed，若不短路将掩盖「重放返回首次结果」契约。
+        let prior_batch = self.store.list_codes_by_batch_key(&idem)?;
+        if !prior_batch.is_empty() {
+            let codes: Vec<IssuedCode> = prior_batch.iter().map(Self::to_issued_code).collect();
+            return Ok(IssueCodesResponse { codes });
+        }
 
         // G3：同租户预绑定冲突检测（结构化错误，不 panic）。
         if let Some(mc) = &prebind {
@@ -441,8 +459,8 @@ impl LicensingService {
             ));
         }
         if self.store.get_tenant(tenant_id)?.is_none() {
-            return Err(LicenseError::ActivationRejected(format!(
-                "unknown tenant: {tenant_id}"
+            return Err(LicenseError::tenant_not_found(format!(
+                "unknown tenant: {tenant_id}; verify the X-Tenant-Id header"
             )));
         }
 
@@ -779,8 +797,8 @@ impl LicensingService {
             ));
         }
         if self.store.get_tenant(tenant_id)?.is_none() {
-            return Err(LicenseError::ActivationRejected(format!(
-                "unknown tenant: {tenant_id}"
+            return Err(LicenseError::tenant_not_found(format!(
+                "unknown tenant: {tenant_id}; verify the X-Tenant-Id header"
             )));
         }
 
@@ -1814,13 +1832,13 @@ mod tests {
     /// 走一遍激活，返回 `(lease_id, machine_code)`（心跳 / 校验 / 回执测试的前置）。
     fn activate_one(svc: &LicensingService) -> (String, String) {
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, &now_ns_id("idem")))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), &now_ns_id("idem")))
             .expect("issue");
         let code = &resp.codes[0];
         let act = svc
-            .activate(&activate_req(&code.code, "MID-0001"))
+            .activate(&activate_req(&code.code, "MID-A"))
             .expect("activate");
-        (act.lease_id, "MID-0001".to_string())
+        (act.lease_id, "MID-A".to_string())
     }
 
     fn issue_req(tenant: &str, prebind: Option<&str>, idem: &str) -> IssueCodesRequest {
@@ -1961,18 +1979,29 @@ mod tests {
         }
     }
 
+    /// 2026-09-27 契约变更：发放侧一机一码闭环——缺失 / 空白机器码一律拒绝
+    /// （400 `MACHINE_CODE_REQUIRED`），不再归一为「无预绑定」。
     #[test]
-    fn t46_empty_prebind_allows_any_machine() {
+    fn t46_missing_or_blank_prebind_is_rejected() {
         let svc = build_service();
-        let resp = svc
-            .issue_codes(&issue_req("t-1", None, "g1-empty"))
-            .unwrap();
-        let code = &resp.codes[0];
-        assert!(code.prebind.is_none());
-        let act = svc
-            .activate(&activate_req(&code.code, "ANY-MACHINE"))
-            .unwrap();
-        assert!(!act.lease_token.is_empty());
+        // 缺失（None）。
+        let mut missing = issue_req("t-1", Some("MID-A"), "g1-empty");
+        missing.prebind_machine_code = None;
+        let err = svc.issue_codes(&missing).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::MachineCodeRequired(_)),
+            "{err:?}"
+        );
+        assert_eq!(err.error_code(), crate::error::ERR_LICENSE_MACHINE_CODE);
+
+        // 空白（"   "）同样拒绝。
+        let err = svc
+            .issue_codes(&issue_req("t-1", Some("   "), "g1-empty-blank"))
+            .unwrap_err();
+        assert!(
+            matches!(err, LicenseError::MachineCodeRequired(_)),
+            "{err:?}"
+        );
     }
 
     // ---------------- G2：重发幂等（fail-closed） ----------------
@@ -1981,7 +2010,7 @@ mod tests {
     fn t46_reissue_idempotent_by_idempotency_key() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "g2-issue"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g2-issue"))
             .unwrap();
         let code_id = resp.codes[0].code_id.clone();
         svc.revoke(
@@ -2017,10 +2046,10 @@ mod tests {
     fn t46_issue_idempotent_by_idempotency_key() {
         let svc = build_service();
         let r1 = svc
-            .issue_codes(&issue_req("t-1", None, "g2-issue-dup"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g2-issue-dup"))
             .unwrap();
         let r2 = svc
-            .issue_codes(&issue_req("t-1", None, "g2-issue-dup"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g2-issue-dup"))
             .unwrap();
         assert_eq!(r1.codes.len(), 1);
         assert_eq!(
@@ -2070,12 +2099,32 @@ mod tests {
     #[test]
     fn t46_prebind_conflict_when_device_already_bound() {
         let svc = build_service();
-        // 发放一张无预绑定码并激活到机器 M-BOUND（设备新建 + 码绑定）。
-        let resp = svc
-            .issue_codes(&issue_req("t-1", None, "g3-issue-d"))
+        // 2026-09-27 契约变更后，构造「设备已被另一张码绑定」：
+        // A 码预绑定 MID-A 并激活（设备 MID-A 建立）→ 废弃 → 重发出**无预绑定**的 B 码
+        // （重发不强制机器码）→ B 码绑定到机器 M-BOUND。此时发放预绑定 M-BOUND 的新码：
+        // 码侧 claim 不命中（B 无预绑定），设备侧命中 → MachineAlreadyBound。
+        let resp_a = svc
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g3-issue-d"))
             .unwrap();
-        let code = &resp.codes[0];
-        svc.activate(&activate_req(&code.code, "M-BOUND")).unwrap();
+        let code_a = &resp_a.codes[0];
+        svc.activate(&activate_req(&code_a.code, "MID-A")).unwrap();
+        svc.revoke(
+            "t-1",
+            &code_a.code_id,
+            &revoke_req(&code_a.code, "replace"),
+            "admin",
+        )
+        .unwrap();
+        let reissued = svc
+            .reissue(
+                "t-1",
+                &code_a.code_id,
+                &reissue_req(None, "g3-issue-d-reissue"),
+                "admin",
+            )
+            .unwrap();
+        svc.activate(&activate_req(&reissued.new_code.code, "M-BOUND"))
+            .unwrap();
 
         // 再发一张预绑定到 M-BOUND 的码 → 该设备已被另一码绑定 → MachineAlreadyBound。
         let err = svc
@@ -2097,7 +2146,7 @@ mod tests {
             .unwrap();
         // 另一张待重发的原码。
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "g3-issue-g"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g3-issue-g"))
             .unwrap();
         let code_id = resp.codes[0].code_id.clone();
         svc.revoke(
@@ -2125,32 +2174,15 @@ mod tests {
         }
     }
 
-    // ---------------- G4：空白预绑定视为未提供 ----------------
+    // ---------------- G4：空白预绑定（发放拒绝 / 重发仍归一） ----------------
 
     #[test]
-    fn t46_prebind_whitespace_treated_as_none() {
+    fn t46_reissue_whitespace_prebind_treated_as_none() {
         let svc = build_service();
-        let resp = svc
-            .issue_codes(&issue_req("t-1", Some("   "), "g4-issue"))
-            .unwrap();
-        let stored = svc
-            .store()
-            .get_code_by_id(&resp.codes[0].code_id)
-            .unwrap()
-            .unwrap();
-        assert!(
-            stored.prebind_machine_code.is_none(),
-            "空白预绑定必须归一为 None"
-        );
-        // 任意机器均可激活（无预绑定约束）。
-        let act = svc
-            .activate(&activate_req(&resp.codes[0].code, "M-ANY"))
-            .unwrap();
-        assert!(!act.lease_token.is_empty());
-
-        // 重发空白预绑定同样 → None。
+        // 发放：机器码必填（见 t46_missing_or_blank_prebind_is_rejected）；
+        // 本用例覆盖重发路径的空白预绑定归一（重发不强制机器码，契约保留）。
         let resp2 = svc
-            .issue_codes(&issue_req("t-1", None, "g4-issue-b"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g4-issue-b"))
             .unwrap();
         let cid = resp2.codes[0].code_id.clone();
         svc.revoke("t-1", &cid, &revoke_req(&resp2.codes[0].code, "x"), "admin")
@@ -2174,17 +2206,35 @@ mod tests {
         );
     }
 
+    /// 未知租户 → 独立变体 `TenantNotFound`（400 `TENANT_NOT_FOUND`），
+    /// 消息含「先创建租户」引导，绝不静默放行（fail-closed 保留）。
+    #[test]
+    fn t_issue_unknown_tenant_maps_to_tenant_not_found() {
+        let svc = build_service();
+        let err = svc
+            .issue_codes(&issue_req("t-nope", Some("MID-A"), "g-tenant-missing"))
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::TenantNotFound(_)), "{err:?}");
+        assert_eq!(err.error_code(), crate::error::ERR_LICENSE_TENANT);
+        let msg = err.to_string();
+        assert!(msg.contains("t-nope"), "消息应含租户 ID: {msg}");
+        assert!(
+            msg.contains("create the tenant first"),
+            "消息应含创建租户引导: {msg}"
+        );
+    }
+
     // ---------------- G5：幂等键归一（trim） ----------------
 
     #[test]
     fn t46_idempotency_key_normalized_trim() {
         let svc = build_service();
         let r1 = svc
-            .issue_codes(&issue_req("t-1", None, "  key-norm  "))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "  key-norm  "))
             .unwrap();
         // 尾部 / 头部空白变体命中同一逻辑键 → 幂等。
         let r2 = svc
-            .issue_codes(&issue_req("t-1", None, "key-norm"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "key-norm"))
             .unwrap();
         assert_eq!(r1.codes[0].code_id, r2.codes[0].code_id);
         let stored = svc
@@ -2203,7 +2253,7 @@ mod tests {
     fn t46_reissue_idempotency_key_normalized() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "g5-issue"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g5-issue"))
             .unwrap();
         let cid = resp.codes[0].code_id.clone();
         svc.revoke("t-1", &cid, &revoke_req(&resp.codes[0].code, "x"), "admin")
@@ -2239,7 +2289,7 @@ mod tests {
     fn t46_same_code_same_machine_reactivation_is_idempotent() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "nofm-idem"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "nofm-idem"))
             .unwrap();
         let code = &resp.codes[0];
 
@@ -2294,7 +2344,7 @@ mod tests {
     fn t46_one_anchor_drift_rebinds_same_machine_and_reissues_lease() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "nofm-drift1"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "nofm-drift1"))
             .unwrap();
         let code = &resp.codes[0];
 
@@ -2402,7 +2452,7 @@ mod tests {
     fn t46_two_anchor_drift_is_rejected_as_other_device_without_side_effects() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "nofm-drift2"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "nofm-drift2"))
             .unwrap();
         let code = &resp.codes[0];
         svc.activate(&activate_req_with_anchors(
@@ -2469,7 +2519,7 @@ mod tests {
     fn t46_zero_hits_and_empty_anchors_are_rejected() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "nofm-zero"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "nofm-zero"))
             .unwrap();
         let code = &resp.codes[0];
         svc.activate(&activate_req_with_anchors(
@@ -2534,7 +2584,7 @@ mod tests {
     fn t46_revoked_code_is_rejected() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "nofm-revoked"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "nofm-revoked"))
             .unwrap();
         let cid = resp.codes[0].code_id.clone();
         let code = resp.codes[0].code.clone();
@@ -2560,7 +2610,7 @@ mod tests {
     fn t46_reject_path_never_leaks_machine_code_anchors_or_code_value() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "nofm-leak"))
+            .issue_codes(&issue_req("t-1", Some("MACHINE-BOUND"), "nofm-leak"))
             .unwrap();
         let code = &resp.codes[0];
 
@@ -2649,7 +2699,7 @@ mod tests {
     fn t46_reissue_requires_revoked_original() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "g-state-issue"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g-state-issue"))
             .unwrap();
         let cid = resp.codes[0].code_id.clone();
         // 未废弃直接重发 → KeyStateIllegal。
@@ -2663,7 +2713,7 @@ mod tests {
     fn t46_revoke_already_revoked_is_idempotent() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "g-state-issue-b"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "g-state-issue-b"))
             .unwrap();
         let cid = resp.codes[0].code_id.clone();
         svc.revoke(
@@ -2959,7 +3009,7 @@ mod tests {
 
         // missing：另一台设备首个回执从 5 起步 → 前缀 [1,4] 缺失。
         let other = svc
-            .issue_codes(&issue_req("t-1", None, &now_ns_id("idem-m")))
+            .issue_codes(&issue_req("t-1", Some("MID-OTHER"), &now_ns_id("idem-m")))
             .unwrap();
         let act = svc
             .activate(&activate_req(&other.codes[0].code, "MID-OTHER"))
@@ -3047,7 +3097,7 @@ mod tests {
     #[test]
     fn t_act_valid_request_activates_and_pins_pubkey_and_nonce() {
         let svc = build_service();
-        let resp = svc.issue_codes(&issue_req("t-1", None, "act-ok")).unwrap();
+        let resp = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-ok")).unwrap();
         let code = &resp.codes[0];
         let req = activate_req(&code.code, "MID-A");
         let act = svc.activate(&req).expect("activation must succeed");
@@ -3072,7 +3122,7 @@ mod tests {
     fn t_act_forged_signature_rejected_without_side_effects() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "act-forge"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "act-forge"))
             .unwrap();
         let code = &resp.codes[0];
 
@@ -3119,7 +3169,7 @@ mod tests {
     #[test]
     fn t_act_pubkey_mismatch_on_pinned_device_rejected_without_side_effects() {
         let svc = build_service();
-        let resp = svc.issue_codes(&issue_req("t-1", None, "act-pk")).unwrap();
+        let resp = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-pk")).unwrap();
         let code = &resp.codes[0];
         let first = svc
             .activate(&activate_req(&code.code, "MID-A"))
@@ -3175,7 +3225,7 @@ mod tests {
     #[test]
     fn t_act_stale_and_future_ts_rejected_without_side_effects() {
         let svc = build_service();
-        let resp = svc.issue_codes(&issue_req("t-1", None, "act-ts")).unwrap();
+        let resp = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-ts")).unwrap();
         let code = &resp.codes[0];
         let count_audit_before = count_audit(&svc);
 
@@ -3214,7 +3264,7 @@ mod tests {
     fn t_act_nonce_replay_rejected_without_side_effects() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "act-replay"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "act-replay"))
             .unwrap();
         let code = &resp.codes[0];
 
@@ -3265,20 +3315,21 @@ mod tests {
     #[test]
     fn t_act_nonce_is_global_across_codes() {
         let svc = build_service();
-        let r1 = svc.issue_codes(&issue_req("t-1", None, "act-g1")).unwrap();
-        let r2 = svc.issue_codes(&issue_req("t-1", None, "act-g2")).unwrap();
+        // 2026-09-27 契约：发放必填机器码——两张码必须预绑定不同机器。
+        let r1 = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-g1")).unwrap();
+        let r2 = svc.issue_codes(&issue_req("t-1", Some("MID-B"), "act-g2")).unwrap();
 
-        let mk = |code_value: &str, nonce: &str| {
+        let mk = |code_value: &str, machine: &str, nonce: &str| {
             let ts = now_unix_secs();
             let anchors: Vec<String> = vec!["a".to_string(); 5];
             let key = SigningKey::from_bytes(&TEST_ONLY_DEVICE_SEED);
             let pubkey = B64.encode(key.verifying_key().to_bytes());
             let hash = crate::device_auth::activation_payload_hash(
-                code_value, "MID-A", &anchors, &pubkey, nonce, ts,
+                code_value, machine, &anchors, &pubkey, nonce, ts,
             );
             ActivationRequest {
                 activation_code: code_value.to_string(),
-                machine_code: "MID-A".to_string(),
+                machine_code: machine.to_string(),
                 anchor_hashes: anchors,
                 device_pubkey: pubkey,
                 nonce: nonce.to_string(),
@@ -3287,10 +3338,10 @@ mod tests {
             }
         };
 
-        svc.activate(&mk(&r1.codes[0].code, "n-global-1"))
+        svc.activate(&mk(&r1.codes[0].code, "MID-A", "n-global-1"))
             .expect("first activation ok");
         let err = svc
-            .activate(&mk(&r2.codes[0].code, "n-global-1"))
+            .activate(&mk(&r2.codes[0].code, "MID-B", "n-global-1"))
             .unwrap_err();
         assert!(matches!(err, LicenseError::NonceReplay(_)), "{err:?}");
 
@@ -3308,7 +3359,7 @@ mod tests {
     fn t_act_malformed_fields_rejected_without_side_effects() {
         let svc = build_service();
         let resp = svc
-            .issue_codes(&issue_req("t-1", None, "act-malformed"))
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "act-malformed"))
             .unwrap();
         let code = &resp.codes[0];
 

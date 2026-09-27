@@ -10,7 +10,14 @@
     crumb="授权运营 / 租户与策略"
     title="租户与策略"
     desc="租户默认策略与校验档位配置。档位变更属高影响操作：直接影响客户数据出网范围，须二次确认并记审计。"
-  />
+  >
+    <template #actions>
+      <!-- 新增租户（发放激活码的前置：issue 对未知租户 fail-closed）。 -->
+      <RoleGate :allowed="canCreateTenant">
+        <button type="button" class="ac-btn ac-btn--primary" @click="openCreate">新增租户</button>
+      </RoleGate>
+    </template>
+  </PageHeader>
 
   <div class="ac-content">
     <!-- 全局横幅：讲清策略如何生效（可解释） -->
@@ -80,6 +87,48 @@
     </section>
   </div>
 
+  <!-- 新增租户弹窗（草稿隔离：仅在打开时初始化，关闭即清空） -->
+  <Teleport to="body">
+    <div v-if="createOpen" class="ac-modal-mask" @click.self="closeCreate">
+      <div class="ac-modal" role="dialog" aria-modal="true" aria-label="新增租户">
+        <div class="ac-modal__head"><h3>新增租户</h3></div>
+        <div class="ac-modal__body">
+          <div class="ac-grid ac-grid--2">
+            <UiField
+              label="租户 ID"
+              required
+              hint="全局唯一主键；发放激活码时按此 ID 归属租户"
+              :error="createError"
+            >
+              <UiInput v-model="createForm.tenantId" :invalid="createError.length > 0" placeholder="如 t-acme-01" />
+            </UiField>
+            <UiField label="租户名称" required hint="列表与下拉中的展示名">
+              <UiInput v-model="createForm.name" placeholder="如 安徽某某能源" />
+            </UiField>
+            <UiField label="联系方式" hint="选填">
+              <UiInput v-model="createForm.contact" placeholder="邮箱 / 电话" />
+            </UiField>
+            <UiField label="默认校验档位" required hint="A / B / C，默认 B；创建后可在策略中调整">
+              <UiSelect v-model="createForm.verifyMode" :options="gradeOptions" />
+            </UiField>
+          </div>
+          <p class="ac-note">
+            <span class="ac-note__icon">ⓘ</span>
+            <span>
+              新租户创建后即可在「激活码管理」页为其发放激活码；发放前请先在客户设备上获取机器码（发放时必填）。
+            </span>
+          </p>
+        </div>
+        <div class="ac-modal__foot">
+          <button type="button" class="ac-btn" @click="closeCreate">取消</button>
+          <button type="button" class="ac-btn ac-btn--primary" :disabled="!canSubmitCreate" @click="submitCreate">
+            创建租户
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
   <!-- 策略编辑弹窗（草稿隔离：仅在打开时初始化） -->
   <Teleport to="body">
     <div v-if="policyOpen" class="ac-modal-mask" @click.self="closePolicy">
@@ -144,19 +193,26 @@
 import { computed, reactive, ref } from 'vue';
 import {
   PageHeader,
+  RoleGate,
   UiField,
+  UiInput,
   UiSelect,
   UiSwitch,
   UiTextarea,
   UiTable,
   StatusTag,
+  can,
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
-import { repo, TIER_NAMES, DEFAULT_ACTOR, type TenantRecord } from '../api/repo';
+import { repo, TIER_NAMES, DEFAULT_ACTOR, type Grade, type TenantRecord } from '../api/repo';
+import { session } from '../store/session';
 
 /** 变更原因最小字数。 */
 const MIN_REASON = 10;
+
+/** 新增租户门控：与后端 `POST /admin/tenants`（仅 system）对齐，复用租户策略权限位。 */
+const canCreateTenant = computed(() => can(session.state.role, 'tenant.policy_update'));
 
 /** 刷新触发器。 */
 const reloadKey = ref(0);
@@ -237,6 +293,62 @@ const graceOptions: readonly SelectOption[] = [
   { value: '7 天（默认）', label: '7 天（默认）' },
   { value: '14 天', label: '14 天' },
 ];
+
+// ---------------- 新增租户 ----------------
+/** 新增弹窗开关。 */
+const createOpen = ref(false);
+/** 新增草稿（独立对象，打开时初始化、关闭时清空）。 */
+const createForm = reactive({
+  tenantId: '',
+  name: '',
+  contact: '',
+  verifyMode: 'B' as Grade,
+});
+
+/** 必填校验（ID / 名称）。 */
+const createError = computed(() =>
+  createForm.tenantId.trim() === '' || createForm.name.trim() === '' ? '租户 ID 与名称均为必填项' : '',
+);
+
+/** 可提交。 */
+const canSubmitCreate = computed(() => createError.value === '');
+
+/** 打开新增弹窗：清草稿。 */
+function openCreate(): void {
+  createForm.tenantId = '';
+  createForm.name = '';
+  createForm.contact = '';
+  createForm.verifyMode = 'B';
+  createOpen.value = true;
+}
+
+/** 关闭新增弹窗：清草稿。 */
+function closeCreate(): void {
+  createOpen.value = false;
+  createForm.tenantId = '';
+  createForm.name = '';
+  createForm.contact = '';
+  createForm.verifyMode = 'B';
+}
+
+/** 提交新增（失败时横幅已给真实原因，弹窗保持打开以便重试）。 */
+async function submitCreate(): Promise<void> {
+  if (!canSubmitCreate.value) {
+    return;
+  }
+  const ok = await repo.createTenant({
+    tenantId: createForm.tenantId,
+    name: createForm.name,
+    contact: createForm.contact,
+    verifyMode: createForm.verifyMode,
+    actor: DEFAULT_ACTOR,
+  });
+  if (!ok) {
+    return;
+  }
+  closeCreate();
+  reloadKey.value += 1;
+}
 
 // ---------------- 策略弹窗 ----------------
 /** 策略弹窗开关。 */

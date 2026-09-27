@@ -43,6 +43,11 @@ pub const ERR_LICENSE_REASON: u16 = 1170;
 pub const ERR_LICENSE_ADMIN_AUTH: u16 = 1180;
 /// 授权域错误码：管理端角色越权（RBAC 门控拒绝，HTTP 403）。
 pub const ERR_LICENSE_ADMIN_RBAC: u16 = 1190;
+/// 授权域错误码：租户不存在（发放 / 废弃 / 重发对未知租户 fail-closed，HTTP 400）。
+pub const ERR_LICENSE_TENANT: u16 = 1200;
+/// 授权域错误码：发放激活码缺少预绑定机器码（2026-09-27 主理人决策：一机一码
+/// 从发放侧闭环，`prebind_machine_code` 必填非空白，HTTP 400）。
+pub const ERR_LICENSE_MACHINE_CODE: u16 = 1210;
 
 /// licensing-server 主错误枚举。
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +193,22 @@ pub enum LicenseError {
     /// 对应业务码 `ADMIN_ONLY`（HTTP **403**，设计 §2 / §4）。
     #[error("LicenseError: admin forbidden: {0}")]
     Forbidden(String),
+
+    /// 租户不存在（发放 / 废弃 / 重发对未知租户 fail-closed）。
+    ///
+    /// 对应业务码 `TENANT_NOT_FOUND`（HTTP **400**）。此前走 `ActivationRejected`
+    /// 泛化为 `INVALID_CODE`，前端无法区分「码无效」与「租户没建」；独立变体让
+    /// admin-console 能给出「请先创建租户」的可操作引导。
+    /// 消息由调用方拼装，须包含「先创建租户」类引导（见 `service.rs`）。
+    #[error("LicenseError: tenant not found: {0}")]
+    TenantNotFound(String),
+
+    /// 发放激活码缺少预绑定机器码（`prebind_machine_code` 缺失 / 空白）。
+    ///
+    /// 对应业务码 `MACHINE_CODE_REQUIRED`（HTTP **400**）。2026-09-27 主理人决策：
+    /// 一机一码从发放侧闭环，发放时机器码必填；消息**不含**任何机器码值。
+    #[error("LicenseError: machine code required: {0}")]
+    MachineCodeRequired(String),
 }
 
 /// 预绑定冲突的细分种类。
@@ -321,6 +342,16 @@ impl LicenseError {
         LicenseError::Forbidden(message.into())
     }
 
+    /// 构造「租户不存在」错误（HTTP 400，`TENANT_NOT_FOUND`）。
+    pub fn tenant_not_found(message: impl Into<String>) -> Self {
+        LicenseError::TenantNotFound(message.into())
+    }
+
+    /// 构造「发放缺少机器码」错误（HTTP 400，`MACHINE_CODE_REQUIRED`）。
+    pub fn machine_code_required(message: impl Into<String>) -> Self {
+        LicenseError::MachineCodeRequired(message.into())
+    }
+
     /// 错误码（u16，非零）。
     pub fn error_code(&self) -> u16 {
         match self {
@@ -344,6 +375,8 @@ impl LicenseError {
             LicenseError::ReasonRequired(_) => ERR_LICENSE_REASON,
             LicenseError::Unauthorized(_) => ERR_LICENSE_ADMIN_AUTH,
             LicenseError::Forbidden(_) => ERR_LICENSE_ADMIN_RBAC,
+            LicenseError::TenantNotFound(_) => ERR_LICENSE_TENANT,
+            LicenseError::MachineCodeRequired(_) => ERR_LICENSE_MACHINE_CODE,
         }
     }
 }
@@ -438,6 +471,14 @@ mod tests {
                 ERR_LICENSE_ADMIN_AUTH,
             ),
             (LicenseError::forbidden("role gate"), ERR_LICENSE_ADMIN_RBAC),
+            (
+                LicenseError::tenant_not_found("unknown tenant: t-x"),
+                ERR_LICENSE_TENANT,
+            ),
+            (
+                LicenseError::machine_code_required("issue requires machine code"),
+                ERR_LICENSE_MACHINE_CODE,
+            ),
         ];
         let mut seen = std::collections::HashSet::new();
         for (err, code) in cases {

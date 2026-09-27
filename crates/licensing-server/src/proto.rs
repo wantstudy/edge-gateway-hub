@@ -725,6 +725,38 @@ pub struct UpdateTenantPolicyRequest {
     pub verify_mode_default: String,
 }
 
+/// `GET /admin/stats/activations` 查询参数（`days` 缺省 14，上限 90）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActivationStatsQuery {
+    /// 聚合天数（**String** 承载，与全端点 query 契约一致）。
+    #[serde(default)]
+    pub days: Option<String>,
+}
+
+/// 单日激活聚合（`GET /admin/stats/activations`）。
+///
+/// **日期与计数一律 String**（大数红线：unix 秒日期锚点与计数不进 JSON number）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationStatsDay {
+    /// 该日 00:00:00 UTC 的 unix 秒（**String**；前端自行格式化为 MM-DD）。
+    pub date: String,
+    /// 当日发放（审计 `issue`）次数（**String**）。
+    pub issue: String,
+    /// 当日绑定（审计 `activation`）次数（**String**）。
+    pub bind: String,
+    /// 当日废弃（审计 `revoke`）次数（**String**）。
+    pub revoke: String,
+}
+
+/// `GET /admin/stats/activations` 响应体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationStatsResponse {
+    /// 实际聚合天数（**String**）。
+    pub days: String,
+    /// 按日升序（含无活动日，计数为 "0"）。
+    pub items: Vec<ActivationStatsDay>,
+}
+
 /// 回执异常条目（`GET /admin/receipts/anomalies`；数据源 = 回执账本
 /// `audit_receipt_warning` 表——跳空 / 回退 / 缺失告警的权威落点）。
 ///
@@ -963,6 +995,8 @@ pub mod codes {
     pub const ACTIVATION_SIGNATURE_INVALID: &str = "ACTIVATION_SIGNATURE_INVALID";
     /// 激活请求设备公钥与库中钉定公钥不一致（403；SCREAMING_SNAKE 与既有 wire code 一致）。
     pub const ACTIVATION_PUBKEY_MISMATCH: &str = "ACTIVATION_PUBKEY_MISMATCH";
+    /// 发放激活码缺少预绑定机器码（400；2026-09-27 主理人决策：一机一码发放侧闭环）。
+    pub const MACHINE_CODE_REQUIRED: &str = "MACHINE_CODE_REQUIRED";
 }
 
 /// 业务码 → HTTP 状态码映射（设计 §0「HTTP 状态码 + 业务码双重表达」）。
@@ -975,6 +1009,7 @@ pub fn http_status(code: &str) -> u16 {
         | codes::TENANT_NOT_FOUND
         | codes::REASON_REQUIRED
         | codes::PREBIND_CONFLICT
+        | codes::MACHINE_CODE_REQUIRED
         | codes::BAD_REQUEST => 400,
         codes::TIMESTAMP_SKEW
         | codes::VERIFY_FAIL
@@ -1184,6 +1219,7 @@ mod tests {
             (codes::PREBIND_CONFLICT, 400),
             (codes::QUOTA_EXCEEDED, 403),
             (codes::TOKEN_EXPIRED, 401),
+            (codes::MACHINE_CODE_REQUIRED, 400),
         ];
         for (code, status) in table {
             assert_eq!(http_status(code), status, "code={code}");

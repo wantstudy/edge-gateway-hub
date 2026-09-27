@@ -41,13 +41,14 @@ use serde::Serialize;
 
 use crate::admin_auth::{AdminAuth, AuthedAdmin, Role};
 use crate::error::LicenseError;
-use crate::model::{now_ns_id, ActorType, CodeStatus, Device, SigningKey, Tenant};
+use crate::model::{now_ns_id, now_unix_secs, ActorType, CodeStatus, Device, SigningKey, Tenant};
 use crate::proto::{
-    self, ActivationRequest, AdminLoginRequest, AdminLoginResponse, ApiEnvelope, AuditLogItem,
-    AuditLogQuery, CodeDetail, CodeListQuery, CodeSummary, CreateTenantRequest, DeviceListItem,
-    DeviceListQuery, HeartbeatRequest, IssueCodesRequest, OverviewResponse, PagedResponse,
-    ReceiptAnomalyItem, ReissueCodeRequest, RevokeCodeRequest, SigningKeyItem, TenantItem,
-    TimelineEntry, UpdateTenantPolicyRequest,
+    self, ActivationRequest, ActivationStatsDay, ActivationStatsQuery, ActivationStatsResponse,
+    AdminLoginRequest, AdminLoginResponse, ApiEnvelope, AuditLogItem, AuditLogQuery, CodeDetail,
+    CodeListQuery, CodeSummary, CreateTenantRequest, DeviceListItem, DeviceListQuery,
+    HeartbeatRequest, IssueCodesRequest, OverviewResponse, PagedResponse, ReceiptAnomalyItem,
+    ReissueCodeRequest, RevokeCodeRequest, SigningKeyItem, TenantItem, TimelineEntry,
+    UpdateTenantPolicyRequest,
 };
 use crate::service::LicensingService;
 use crate::store::{AuditFilter, CodeFilter};
@@ -115,6 +116,7 @@ pub fn router(service: SharedService, auth: Arc<AdminAuth>) -> Router {
         .route("/admin/receipts/anomalies", get(admin_receipt_anomalies))
         .route("/admin/keys", get(admin_keys))
         .route("/admin/audit/logs", get(admin_audit_logs))
+        .route("/admin/stats/activations", get(admin_stats_activations))
         // 管理端：账号 / 角色可配置（缺口 #9；账号读写仅 system，角色清单任意角色）。
         .route(
             "/admin/accounts",
@@ -901,6 +903,78 @@ async fn admin_audit_logs(
     ok_json(paged(items, total, page, page_size))
 }
 
+/// `GET /admin/stats/activations?days=N`：按日激活聚合（任意角色；总览「激活趋势」
+/// 真实数据源，替代前端硬编码演示序列）。
+///
+/// - `days` 缺省 14，clamp 1..=90；非法整数 → 400；
+/// - 聚合来自 `audit_log` 真实计数（`issue` / `activation` / `revoke`），按 UTC 日
+///   分桶，含无活动日（计数 "0"）；日期锚点与计数一律 **String**（大数红线）。
+async fn admin_stats_activations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ActivationStatsQuery>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let days: i64 = match q.days.as_deref().map(str::trim) {
+        None | Some("") => 14,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                return error_response(&LicenseError::KeyStateIllegal(format!(
+                    "invalid days: {raw}"
+                )));
+            }
+        },
+    };
+    if !(1..=90).contains(&days) {
+        return error_response(&LicenseError::KeyStateIllegal(
+            "days must be within 1..=90".into(),
+        ));
+    }
+
+    // UTC 日锚点（unix 秒，整除 86400），与 store 层分桶口径一致。
+    let today0 = now_unix_secs().div_euclid(86_400) * 86_400;
+    let start = today0 - (days - 1) * 86_400;
+    let rows = match state
+        .service
+        .store()
+        .count_actions_by_day(&["issue", "activation", "revoke"], start)
+    {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let mut lookup: std::collections::HashMap<(i64, String), u64> = std::collections::HashMap::new();
+    for (day, action, count) in rows {
+        lookup.insert((day, action), count);
+    }
+    let items: Vec<ActivationStatsDay> = (0..days)
+        .map(|i| {
+            let day = start + i * 86_400;
+            let count = |action: &str| -> String {
+                lookup
+                    .get(&(day, action.to_string()))
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string()
+            };
+            ActivationStatsDay {
+                date: day.to_string(),
+                issue: count("issue"),
+                bind: count("activation"),
+                revoke: count("revoke"),
+            }
+        })
+        .collect();
+    ok_json(ActivationStatsResponse {
+        days: days.to_string(),
+        items,
+    })
+}
+
 // ============================================================================
 // 管理端：写操作（issue / revoke / reissue，高危仅 lic_ops / system）
 // ============================================================================
@@ -1218,6 +1292,11 @@ pub fn error_to_code(err: &LicenseError) -> &'static str {
         LicenseError::Unauthorized(_) => proto::codes::SESSION_EXPIRED,
         // 管理端角色越权 → ADMIN_ONLY（403，设计 §2 / §4）。
         LicenseError::Forbidden(_) => proto::codes::ADMIN_ONLY,
+        // 租户不存在 → TENANT_NOT_FOUND（400）：前端可区分「码无效」与「租户没建」，
+        // admin-console 据此给出「请先创建租户」引导。
+        LicenseError::TenantNotFound(_) => proto::codes::TENANT_NOT_FOUND,
+        // 发放缺少预绑定机器码 → MACHINE_CODE_REQUIRED（400，2026-09-27 主理人决策）。
+        LicenseError::MachineCodeRequired(_) => proto::codes::MACHINE_CODE_REQUIRED,
         // 存储层异常属内部错误：用未知业务码，让 `http_status` 兜底为 500，
         // 绝不伪装成客户端 400（否则故障被掩盖）。
         LicenseError::Storage(_) => "INTERNAL_SERVER_ERROR",
@@ -1331,8 +1410,9 @@ mod tests {
         B64.encode(key.sign(hash).to_bytes())
     }
 
-    /// 构造 `POST /admin/codes/issue` 请求体。
-    fn issue_body(prebind: Option<&str>, idem: &str) -> serde_json::Value {
+    /// 构造 `POST /admin/codes/issue` 请求体（2026-09-27 契约：机器码必填，
+    /// 传空串可触发 400 `MACHINE_CODE_REQUIRED` 负例）。
+    fn issue_body(prebind: &str, idem: &str) -> serde_json::Value {
         let n = now_unix_secs();
         json!({
             "tenant_id": "t-1",
@@ -1470,7 +1550,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(Some("M1"), "h-issue-1"),
+            issue_body("M1", "h-issue-1"),
             &authed,
         )
         .await;
@@ -1491,7 +1571,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(Some("M-X"), "h-issue-a"),
+            issue_body("M-X", "h-issue-a"),
             &authed,
         )
         .await;
@@ -1500,7 +1580,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(Some("M-X"), "h-issue-b"),
+            issue_body("M-X", "h-issue-b"),
             &authed,
         )
         .await;
@@ -1517,7 +1597,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-idem"),
+            issue_body("M1", "h-idem"),
             &authed,
         )
         .await;
@@ -1525,7 +1605,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-idem"),
+            issue_body("M1", "h-idem"),
             &authed,
         )
         .await;
@@ -1535,6 +1615,27 @@ mod tests {
         let id_a = a["data"]["codes"][0]["code_id"].as_str().unwrap();
         let id_b = b["data"]["codes"][0]["code_id"].as_str().unwrap();
         assert_eq!(id_a, id_b, "发放必须幂等（同键返回首次结果）");
+    }
+
+    /// 发放缺少预绑定机器码（缺失 / 空白）→ 400 `MACHINE_CODE_REQUIRED`
+    /// （2026-09-27 主理人决策：一机一码发放侧闭环）。
+    #[tokio::test]
+    async fn http_issue_missing_machine_code_returns_400_machine_code_required() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        for (label, body) in [
+            ("blank", issue_body("", "h-nomc-blank")),
+            ("blank-ws", issue_body("   ", "h-nomc-ws")),
+        ] {
+            let (status, resp) = call_with(&svc, "POST", "/admin/codes/issue", body, &authed).await;
+            assert_eq!(status, bad_request(), "{label}");
+            assert_eq!(resp["code"], "MACHINE_CODE_REQUIRED", "{label}");
+            // 拒绝路径不得落码。
+            let (_, list) =
+                call_with(&svc, "GET", "/admin/codes", json!(null), &authed).await;
+            assert_eq!(list["data"]["total"], "0", "{label}");
+        }
     }
 
     // ---------------- activate ----------------
@@ -1548,7 +1649,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(Some("M1"), "h-act-2"),
+            issue_body("M1", "h-act-2"),
             &authed,
         )
         .await;
@@ -1576,7 +1677,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(Some("M1"), "h-act-3"),
+            issue_body("M1", "h-act-3"),
             &authed,
         )
         .await;
@@ -1633,7 +1734,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-nofm-1"),
+            issue_body("M1", "h-nofm-1"),
             &authed,
         )
         .await;
@@ -1685,7 +1786,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-act-sig"),
+            issue_body("M1", "h-act-sig"),
             &authed,
         )
         .await;
@@ -1711,7 +1812,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-act-pk"),
+            issue_body("M1", "h-act-pk"),
             &authed,
         )
         .await;
@@ -1754,7 +1855,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-act-ts"),
+            issue_body("M1", "h-act-ts"),
             &authed,
         )
         .await;
@@ -1792,7 +1893,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-act-replay"),
+            issue_body("M1", "h-act-replay"),
             &authed,
         )
         .await;
@@ -1820,7 +1921,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-ri-1"),
+            issue_body("M1", "h-ri-1"),
             &authed,
         )
         .await;
@@ -1899,7 +2000,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-rr-1"),
+            issue_body("M1", "h-rr-1"),
             &authed,
         )
         .await;
@@ -1937,7 +2038,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-rh-1"),
+            issue_body("M1", "h-rh-1"),
             &authed,
         )
         .await;
@@ -1970,7 +2071,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-cm-1"),
+            issue_body("M1", "h-cm-1"),
             &authed,
         )
         .await;
@@ -2009,7 +2110,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-cm-2"),
+            issue_body("M1", "h-cm-2"),
             &authed,
         )
         .await;
@@ -2045,7 +2146,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-cm-3"),
+            issue_body("M1", "h-cm-3"),
             &authed,
         )
         .await;
@@ -2249,7 +2350,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-noauth"),
+            issue_body("M1", "h-noauth"),
             &[],
         )
         .await;
@@ -2268,7 +2369,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-rbac-1"),
+            issue_body("M1", "h-rbac-1"),
             &admin_authed,
         )
         .await;
@@ -2320,7 +2421,8 @@ mod tests {
                 &svc,
                 "POST",
                 "/admin/codes/issue",
-                issue_body(None, &format!("h-codes-{i}")),
+                // 机器码必填：三张码预绑定互异机器，避免同租户预绑定冲突。
+                issue_body(&format!("M-CODES-{i}"), &format!("h-codes-{i}")),
                 &authed,
             )
             .await;
@@ -2380,7 +2482,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-detail-1"),
+            issue_body("M1", "h-detail-1"),
             &authed,
         )
         .await;
@@ -2479,13 +2581,14 @@ mod tests {
         let token = admin_token();
         let authed = [bearer(&token)];
 
-        // 前置：对新租户 issue 直接失败（租户不存在）。
-        let mut new_issue = issue_body(None, "h-boot-0");
+        // 前置：对新租户 issue 直接失败（租户不存在 → TENANT_NOT_FOUND，fail-closed 保留；
+        // 独立业务码让 admin-console 能给出「请先创建租户」引导）。
+        let mut new_issue = issue_body("M1", "h-boot-0");
         new_issue["tenant_id"] = json!("t-new");
         let (status, body) =
             call_with(&svc, "POST", "/admin/codes/issue", new_issue, &authed).await;
         assert_eq!(status, bad_request());
-        assert_eq!(body["code"], "INVALID_CODE");
+        assert_eq!(body["code"], "TENANT_NOT_FOUND");
 
         // 创建租户 → issue 成功（自举链路）。
         let (status, created) = call_with(
@@ -2498,7 +2601,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{created}");
         assert_eq!(created["data"]["verify_mode_default"], "B");
-        let mut new_issue = issue_body(None, "h-boot-1");
+        let mut new_issue = issue_body("M1", "h-boot-1");
         new_issue["tenant_id"] = json!("t-new");
         let (status, body) =
             call_with(&svc, "POST", "/admin/codes/issue", new_issue, &authed).await;
@@ -2556,12 +2659,12 @@ mod tests {
         let svc = build_service();
         let token = admin_token();
         let authed = [bearer(&token)];
-        // 发码 + 激活 → 产生设备。
+        // 发码 + 激活 → 产生设备（预绑定与激活机器一致：契约要求发放必填机器码）。
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-dev-1"),
+            issue_body("MID-DEV-1", "h-dev-1"),
             &authed,
         )
         .await;
@@ -2626,12 +2729,12 @@ mod tests {
         let svc = build_service();
         let token = admin_token();
         let authed = [bearer(&token)];
-        // 发码 + 激活。
+        // 发码 + 激活（预绑定与激活机器一致）。
         let (_, issue) = call_with(
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-anom-1"),
+            issue_body("MID-ANOM", "h-anom-1"),
             &authed,
         )
         .await;
@@ -2752,7 +2855,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-audit-1"),
+            issue_body("M1", "h-audit-1"),
             &authed,
         )
         .await;
@@ -2795,6 +2898,63 @@ mod tests {
         assert_eq!(status, bad_request());
     }
 
+    /// `GET /admin/stats/activations`：按日真实聚合（发放 / 绑定 / 废弃；String 计数）。
+    #[tokio::test]
+    async fn http_admin_stats_activations_aggregates_audit_actions() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        // 发放 1 张码并激活 → 当日 issue=1 / activation=1。
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body("M1", "h-stats-1"),
+            &authed,
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"].as_str().unwrap();
+        let (status, _) = call_with(&svc, "POST", "/activation", activate_body(code, "M1"), &[]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // days=3：3 个日桶，计数为字符串（大数红线），末日命中。
+        let (_, stats) = call_with(
+            &svc,
+            "GET",
+            "/admin/stats/activations?days=3",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(stats["code"], "OK");
+        assert_eq!(stats["data"]["days"], "3");
+        let items = stats["data"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        let last = &items[2];
+        assert!(last["date"].is_string() && last["issue"].is_string());
+        assert_eq!(last["issue"], "1");
+        assert_eq!(last["bind"], "1");
+        assert_eq!(last["revoke"], "0");
+        // 前两日无活动 → 诚实补零。
+        assert_eq!(items[0]["issue"], "0");
+        assert_eq!(items[0]["bind"], "0");
+
+        // 缺省 days=14 → 14 个日桶。
+        let (_, stats) = call_with(&svc, "GET", "/admin/stats/activations", json!(null), &authed).await;
+        assert_eq!(stats["data"]["items"].as_array().unwrap().len(), 14);
+
+        // 非法 days → 400。
+        let (status, _) = call_with(
+            &svc,
+            "GET",
+            "/admin/stats/activations?days=abc",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+    }
+
     /// `GET /admin/overview`：聚合计数（字符串编码）+ 无活跃密钥时 active_kid 为 null。
     #[tokio::test]
     async fn http_admin_overview_aggregates_counts() {
@@ -2805,7 +2965,7 @@ mod tests {
             &svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, "h-ov-1"),
+            issue_body("M1", "h-ov-1"),
             &authed,
         )
         .await;
@@ -2819,7 +2979,8 @@ mod tests {
 
     // ---------------- 设备端：心跳 / 校验 / 回执 ----------------
 
-    /// 经 HTTP 端点走一遍「发码 → 激活」，返回 `lease_id`。
+    /// 经 HTTP 端点走一遍「发码 → 激活」，返回 `lease_id`
+    /// （2026-09-27 契约：发放预绑定机器码必填，与激活机器一致）。
     async fn activate_lease(svc: &SharedService, idem: &str, machine: &str) -> String {
         let token = admin_token();
         let authed = [bearer(&token)];
@@ -2827,7 +2988,7 @@ mod tests {
             svc,
             "POST",
             "/admin/codes/issue",
-            issue_body(None, idem),
+            issue_body(machine, idem),
             &authed,
         )
         .await;

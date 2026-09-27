@@ -167,9 +167,13 @@
         <div class="ac-modal__head"><h3>发放激活码</h3></div>
         <div class="ac-modal__body">
           <div class="ac-grid ac-grid--2">
-            <UiField label="租户" required :hint="isReal ? 'real 模式：填写 licensing-server 中的租户 ID（后端无租户列表端点，缺口 #2）' : ''">
-              <UiInput v-if="isReal" v-model="issueForm.tenant" placeholder="租户 ID，如 t-1" />
-              <UiSelect v-else v-model="issueForm.tenant" :options="issueTenantOptions" />
+            <UiField
+              label="租户"
+              required
+              :error="tenantError"
+              :hint="isReal ? '下拉为 licensing-server 中的真实租户；无目标租户请先到「租户与策略」页新增' : ''"
+            >
+              <UiSelect v-model="issueForm.tenant" :options="issueTenantOptions" />
             </UiField>
             <UiField label="授权档位" required>
               <UiSelect v-model="issueForm.tier" :options="issueTierOptions" />
@@ -188,7 +192,8 @@
             </UiField>
             <UiField
               class="ac-modal__full"
-              label="预绑定机器码（可选）"
+              label="机器码"
+              required
               :hint="prebindHint"
               :error="prebindError"
               full
@@ -429,7 +434,15 @@ const tierOptions: readonly SelectOption[] = [
   { value: '', label: '全部 tier' },
   ...TIER_NAMES.map((t) => ({ value: t, label: t })),
 ];
-const issueTenantOptions: readonly SelectOption[] = TENANT_NAMES.map((t) => ({ value: t, label: t }));
+/** 发放下拉的租户选项：real 模式来自 GET /admin/tenants（真实租户），mock 用演示租户名。 */
+const issueTenantOptions = computed<readonly SelectOption[]>(() => {
+  if (!isReal) {
+    return TENANT_NAMES.map((t) => ({ value: t, label: t }));
+  }
+  return repo
+    .allTenants()
+    .map((t) => ({ value: t.id, label: t.name && t.name !== t.id ? `${t.name}（${t.id}）` : t.id }));
+});
 const issueTierOptions: readonly SelectOption[] = TIER_NAMES.map((t) => ({ value: t, label: t }));
 
 /** 列定义。 */
@@ -514,11 +527,11 @@ const issueForm = reactive({
 /** 已生成码（结果弹窗）。 */
 const issuedCodes = ref<CodeRecord[]>([]);
 
-/** 预绑定机器码校验错误（空则无错）。 */
+/** 预绑定机器码校验错误（2026-09-27 契约：机器码必填，空即报错）。 */
 const prebindError = computed(() => {
   const value = issueForm.prebindMachineCode.trim();
   if (value.length === 0) {
-    return '';
+    return '机器码为必填项：请在客户设备上获取后填入';
   }
   return isValidMachineCode(value) ? '' : '机器码格式不正确（应为 8–64 位十六进制）';
 });
@@ -527,9 +540,19 @@ const prebindError = computed(() => {
 const prebindHint = computed(() => {
   const value = issueForm.prebindMachineCode.trim();
   if (value.length === 0) {
-    return '留空则首次激活时绑定（推荐，客户自助激活）';
+    return '一机一码：该码只能在填入的这台机器上激活';
   }
   return isValidMachineCode(value) ? '格式校验通过 · 该码将只能在此机器激活' : '格式校验未通过';
+});
+
+/** 租户校验：real 模式所选租户必须存在于真实租户列表（引导先建租户）。 */
+const tenantError = computed(() => {
+  if (!isReal || issueForm.tenant === '') {
+    return '';
+  }
+  return issueTenantOptions.value.some((o) => o.value === issueForm.tenant)
+    ? ''
+    : '租户不存在，请先在「租户与策略」页新增租户';
 });
 
 /** 发放可提交条件。 */
@@ -544,13 +567,24 @@ const canSubmitIssue = computed(() => {
     count >= 1 &&
     count <= 100 &&
     issueForm.validUntil >= issueForm.validFrom &&
-    prebindError.value === ''
+    issueForm.prebindMachineCode.trim().length > 0 &&
+    prebindError.value === '' &&
+    tenantError.value === ''
   );
 });
 
-/** 打开发放弹窗：重置草稿（草稿隔离）。real 模式租户取会话默认租户 ID。 */
+/** 打开发放弹窗：重置草稿（草稿隔离）。real 模式默认租户取会话租户（须在真实列表内），否则取首个真实租户。 */
 function openIssue(): void {
-  issueForm.tenant = isReal ? session.state.tenantId || 't-1' : TENANT_NAMES[0];
+  if (isReal) {
+    const options = issueTenantOptions.value;
+    const preferred = session.state.tenantId;
+    issueForm.tenant =
+      preferred && options.some((o) => o.value === preferred)
+        ? preferred
+        : (options[0]?.value ?? '');
+  } else {
+    issueForm.tenant = TENANT_NAMES[0];
+  }
   issueForm.tier = TIER_NAMES[0];
   issueForm.validFrom = '2026-09-23';
   issueForm.validUntil = '2027-09-23';

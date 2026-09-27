@@ -1745,6 +1745,51 @@ impl Store {
         to_u64(count, "audit count")
     }
 
+    /// 按日（UTC，`ts / 86400` 天锚点）聚合给定动作的审计计数。
+    ///
+    /// 总览「激活趋势」的真实数据源：只统计 `ts >= since_ts` 且 `action` 命中的
+    /// 审计行，返回 `(day_anchor_unix_secs, action, count)`（无行不出现，调用方补零）。
+    pub fn count_actions_by_day(
+        &self,
+        actions: &[&str],
+        since_ts: i64,
+    ) -> LicenseResult<Vec<(i64, String, u64)>> {
+        if actions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT (ts / 86400) * 86400 AS day, action, COUNT(*) \
+             FROM audit_log WHERE ts >= ?1 AND action IN (",
+        );
+        // 占位符从 ?2 起（?1 = since_ts）；action 列表来自调用方白名单，非用户输入。
+        for (idx, _) in actions.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", idx + 2));
+        }
+        sql.push_str(") GROUP BY day, action ORDER BY day ASC");
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_ts)];
+        for action in actions {
+            params_vec.push(Box::new((*action).to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            let day: i64 = row.get(0)?;
+            let action: String = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            Ok((day, action, count.max(0) as u64))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     // ================= admin_account（可配置账号 / 角色） =================
 
     /// 列出全部管理员账号（按 `created_at` 升序，再按账号名）。
@@ -3014,6 +3059,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(store.count_audit_logs(&none).expect("count"), 0);
+    }
+
+    /// 总览「激活趋势」数据源：`count_actions_by_day` 按 UTC 日锚点分桶，
+    /// 仅统计白名单动作，窗口前的行不计入。
+    #[test]
+    fn count_actions_by_day_groups_by_utc_day_anchor() {
+        let (store, _) = fixture();
+        let day0 = 1_700_000_000_i64 / 86_400 * 86_400;
+        let mk = |id: &str, action: &str, ts: i64| AuditLog {
+            id: id.into(),
+            actor_type: ActorType::Admin,
+            actor_id: "admin".into(),
+            action: action.into(),
+            entity_type: "activation_code".into(),
+            entity_id: id.into(),
+            detail: String::new(),
+            ts,
+            ip: String::new(),
+        };
+        // 当日 2 次 issue、1 次 revoke；次日 1 次 activation；窗口前 1 次 issue 与
+        // 白名单外动作（heartbeat）均不计入。
+        let logs = vec![
+            mk("d-1", "issue", day0 + 100),
+            mk("d-2", "issue", day0 + 200),
+            mk("d-3", "revoke", day0 + 300),
+            mk("d-4", "activation", day0 + 86_400 + 100),
+            mk("d-5", "issue", day0 - 100),
+            mk("d-6", "heartbeat", day0 + 400),
+        ];
+        for log in &logs {
+            store.insert_audit_log(log).expect("insert");
+        }
+        let mut rows = store
+            .count_actions_by_day(&["issue", "activation", "revoke"], day0)
+            .expect("group");
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (day0, "issue".to_string(), 2),
+                (day0, "revoke".to_string(), 1),
+                (day0 + 86_400, "activation".to_string(), 1),
+            ],
+        );
+        // 空动作白名单 → 空结果。
+        assert!(store.count_actions_by_day(&[], day0).expect("empty").is_empty());
     }
 
     #[test]

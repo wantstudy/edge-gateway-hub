@@ -43,14 +43,24 @@
     </div>
 
     <div class="ac-grid ac-grid--2-1">
-      <!-- 新增激活趋势 -->
+      <!-- 新增激活趋势（真实数据：GET /admin/stats/activations，来自审计日志按日聚合） -->
       <section class="ac-card">
         <div class="ac-card__head">
-          <h3>激活趋势（近 30 天）</h3>
+          <h3>激活趋势（近 {{ TREND_DAYS }} 天）</h3>
           <span class="ac-card__sub">发放 / 绑定 / 废弃</span>
         </div>
         <div class="ac-card__body">
-          <BarChart :labels="trendLabels" :series="trendSeries" :height="180" />
+          <!-- 加载中 -->
+          <p v-if="trendLoading" class="trend-empty">趋势数据加载中…</p>
+          <!-- 诚实空态：无数据即说无数据（绝不回退演示曲线） -->
+          <div v-else-if="trendEmpty" class="trend-empty">
+            <p>暂无激活趋势数据。</p>
+            <p class="trend-empty__reason">
+              近 {{ TREND_DAYS }} 天内服务端没有发放 / 绑定 / 废弃记录（或趋势端点不可用，原因见页面顶部提示）。
+              发放激活码并完成绑定后，这里会出现真实曲线。
+            </p>
+          </div>
+          <BarChart v-else :labels="trendLabels" :series="trendSeries" :height="180" />
         </div>
       </section>
 
@@ -127,12 +137,14 @@
 /**
  * @file OverviewPage.vue
  * @module admin-console/pages/OverviewPage
- * @description 总览页。数据来自 mock 仓库的 `overview()` 聚合（真实环境为 GET /admin/overview）。
+ * @description 总览页。KPI 来自 `repo.overview()`；激活趋势来自
+ * `GET /admin/stats/activations`（audit_log 按日真实聚合，2026-09-27 起
+ * 删除硬编码演示曲线；无数据=诚实空态）。
  */
-import { computed } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { PageHeader, StatCard, StatusTag, SEMANTIC, type PageId } from '@ui-kit';
-import { repo } from '../api/repo';
+import { repo, type ActivationTrendPoint } from '../api/repo';
 import BarChart, { type BarSeries } from '../components/BarChart.vue';
 
 const router = useRouter();
@@ -140,16 +152,45 @@ const router = useRouter();
 /** 聚合数据（只读快照）。 */
 const data = repo.overview();
 
-/** 趋势 X 轴标签。 */
-const trendLabels: readonly string[] = [
-  '08-25', '08-28', '08-31', '09-03', '09-06', '09-09', '09-12', '09-15', '09-18', '09-21', '09-23',
-];
+// ---------------------------------------------------------------------------
+// 激活趋势（真实聚合）
+// ---------------------------------------------------------------------------
+/** 聚合天数。 */
+const TREND_DAYS = 30;
 
-/** 趋势序列（发放 / 绑定 / 废弃）。 */
+/** 趋势加载态。 */
+const trendLoading = ref(false);
+/** 趋势数据（date 为 UTC 日锚点 unix 秒 String；计数 String 原文透传）。 */
+const trendPoints = ref<ActivationTrendPoint[]>([]);
+
+onMounted(async () => {
+  trendLoading.value = true;
+  trendPoints.value = await repo.activationTrend(TREND_DAYS);
+  trendLoading.value = false;
+});
+
+/** 空态：无任何日桶（后端无记录 / 端点不可用——真实原因见全局横幅）。 */
+const trendEmpty = computed(() => trendPoints.value.length === 0);
+
+/** unix 秒字符串 → `MM-DD` 标签（时间戳为秒级整数，安全转换）。 */
+function dayLabel(dateSecs: string): string {
+  const secs = Number(dateSecs);
+  if (dateSecs === '' || !Number.isFinite(secs)) {
+    return '—';
+  }
+  const d = new Date(secs * 1000);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 趋势 X 轴标签。 */
+const trendLabels = computed<readonly string[]>(() => trendPoints.value.map((p) => dayLabel(p.date)));
+
+/** 趋势序列（发放 / 绑定 / 废弃；图表渲染需数值——日计数有界，安全）。 */
 const trendSeries = computed<BarSeries[]>(() => [
-  { name: '发放', color: SEMANTIC.info, data: [12, 8, 15, 11, 9, 18, 22, 14, 17, 12, 9] },
-  { name: '绑定', color: SEMANTIC.ok, data: [10, 7, 14, 10, 8, 16, 20, 13, 15, 11, 8] },
-  { name: '废弃', color: SEMANTIC.danger, data: [1, 0, 2, 1, 1, 0, 3, 1, 2, 1, 1] },
+  { name: '发放', color: SEMANTIC.info, data: trendPoints.value.map((p) => Number(p.issue)) },
+  { name: '绑定', color: SEMANTIC.ok, data: trendPoints.value.map((p) => Number(p.bind)) },
+  { name: '废弃', color: SEMANTIC.danger, data: trendPoints.value.map((p) => Number(p.revoke)) },
 ]);
 
 /** 跳转。 */
@@ -162,3 +203,25 @@ function notify(message: string): void {
   window.alert(message);
 }
 </script>
+
+<style scoped>
+/* 趋势空态 / 加载态（本页自用） */
+.trend-empty {
+  margin: 0;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: var(--fs-table);
+}
+.trend-empty__reason {
+  margin: 0;
+  max-width: 460px;
+  text-align: center;
+  font-size: var(--fs-caption);
+  color: var(--text-2);
+}
+</style>
