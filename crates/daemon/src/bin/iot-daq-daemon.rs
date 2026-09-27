@@ -43,10 +43,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use tracing::{info, warn};
 
 use daemon::bootstrap::{BootstrapBuilder, DaemonShared};
 use daemon::config::{ConfigShared, GatewayConfig};
 use daemon::mgmt::MgmtState;
+use daemon::mgmt::ctrl_api::ControlApiState;
 use daemon::platform::{self, AnchorMountStatus, DetectionConfidence, RuntimeForm};
 
 // ---------------------------------------------------------------------------
@@ -600,9 +602,38 @@ async fn main() -> ExitCode {
     // ③ 共享状态 + 管理面：与 bootstrap 共用同一 DaemonShared（状态/热重载/事件）。
     let shared = DaemonShared::default();
     shared.set_config(Arc::new(ConfigShared::new(config.clone())));
+
+    // ③-a 控制面装配（BE-CTRL / task 140）：打开控制账本（data_dir/control.db），
+    // 构造 ControlRegistry 并挂载到 shared，再经 with_control_api 注入 MgmtState。
+    let control_db_path = data_dir.join("control.db");
+    let control_ledger = match daemon::ctrl::ControlLedger::open(&control_db_path) {
+        Ok(ledger) => {
+            info!(
+                path = %control_db_path.display(),
+                "bootstrap: control ledger opened"
+            );
+            Some(Arc::new(ledger))
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %control_db_path.display(),
+                "bootstrap: [WARN] control ledger unavailable; control endpoints will return 503"
+            );
+            None
+        }
+    };
+    let control_api = ControlApiState::new(shared.clone(), control_ledger);
+    // 将 control_api 内部的 registry 克隆一份挂到 shared，供路由 handler 访问。
+    if let Some(registered) = shared.control_registry() {
+        drop(registered); // 先验证已挂载
+    }
+
     // 写接口落盘路径绑定：与 IOT_DAQ_CONFIG / --config 指向同一文件（热重载同源）。
     let mgmt_state =
-        MgmtState::new(shared.clone(), Arc::new(config)).with_config_path(args.config_path.clone());
+        MgmtState::new(shared.clone(), Arc::new(config))
+            .with_config_path(args.config_path.clone())
+            .with_control_api(control_api);
 
     let listener = match tokio::net::TcpListener::bind(&args.bind_addr).await {
         Ok(listener) => listener,

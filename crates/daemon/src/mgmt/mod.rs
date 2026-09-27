@@ -59,6 +59,10 @@ pub mod alerts_api;
 // web-console 转发规则页契约；路由挂载由 router() 收口，见其注释）。
 pub mod rbac;
 pub mod rules_api;
+// 控制指令下发 API（POST /api/control/*；BE-CTRL / task 140）。
+pub mod ctrl_api;
+// 设备心跳上报端点（POST /api/devices/:id/heartbeat；BE-HEARTBEAT / task 142）。
+pub mod heartbeat_api;
 
 pub mod remote_ops;
 // 管理面 HTTP 测试脚手架（`#[cfg(test)]`，生产构建剔除；多个测试模块共用）。
@@ -197,6 +201,8 @@ struct MgmtStateInner {
     /// 配置写路径（`writeapi` 落盘目标；与热重载监听同一文件。`None` = 未
     /// 装配，写接口 fail-closed 拒绝）。经 `with_config_path` 装配。
     config_path: Option<PathBuf>,
+    /// 控制指令 API 状态（BE-CTRL / task 140；`None` = 未装配，控制面端点 503）。
+    control_api: Option<Arc<ctrl_api::ControlApiState>>,
 }
 
 /// 管理 API 共享状态（axum `State`；`Clone` 廉价，内部 `Arc`）。
@@ -226,6 +232,7 @@ impl MgmtState {
                 auth,
                 login: Arc::new(login),
                 config_path: None,
+                control_api: None,
             }),
         }
     }
@@ -288,6 +295,25 @@ impl MgmtState {
             ),
         }
         self
+    }
+
+    /// 绑定控制指令 API 状态（BE-CTRL / task 140）。
+    ///
+    /// 必须在 clone / 共享之前调用（与 [`Self::with_web_dist`] 同约束）；
+    /// 实例已被共享时无法写入，记 warn 后忽略。
+    pub fn with_control_api(mut self, api: ctrl_api::ControlApiState) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.control_api = Some(Arc::new(api)),
+            None => tracing::warn!(
+                "with_control_api must be called before cloning/sharing"
+            ),
+        }
+        self
+    }
+
+    /// 获取控制指令 API 状态（`None` = 未装配）。
+    pub fn control_api(&self) -> Option<Arc<ctrl_api::ControlApiState>> {
+        self.inner.control_api.clone()
     }
 
     /// 发布管理事件：分配序号 → 写历史环 → broadcast 扇出，返回事件序号。
@@ -594,6 +620,22 @@ pub fn router(state: MgmtState) -> Router {
         // ensure 门控——list=audit.view(risk/system)，export=audit.export(仅 system)）。
         .route("/api/audit", get(audit_api::list))
         .route("/api/audit/export", get(audit_api::export))
+        // BE-CTRL / task 140：控制指令下发（POST /api/control/issue + GET /api/control/status + GET /api/control/history）
+        // 控制面未装配时 handler 内部诚实返回 503。
+        .route(
+            "/api/control/issue",
+            axum::routing::post(ctrl_api::issue),
+        )
+        .route("/api/control/status", get(ctrl_api::status))
+        .route(
+            "/api/control/history",
+            axum::routing::get(ctrl_api::history),
+        )
+        // BE-HEARTBEAT / task 142：设备心跳上报（POST /api/devices/:id/heartbeat）。
+        .route(
+            "/api/devices/:id/heartbeat",
+            axum::routing::post(heartbeat_api::heartbeat),
+        )
         .merge(ops)
         .route("/", get(serve_root))
         .route("/assets/*path", get(serve_asset))

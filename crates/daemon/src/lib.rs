@@ -25,7 +25,7 @@ pub mod codec;
 pub mod config;
 /// task #140 控制指令下发链路（管理面写指令 → 真实南向设备；Modbus
 /// write_register / write_coil；幂等 + 审计 + 诚实投递语义）。
-// TEMP-EXCL: pub mod ctrl;
+pub mod ctrl;
 /// task 34 敏感配置加密（AES-256-GCM + HKDF(机器码)，fail-closed）。
 /// 模块本身仅提供加解密原语；接入 config 加载/落盘路径见 config.rs 后续集成任务。
 pub mod config_crypto;

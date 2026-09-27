@@ -21,13 +21,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::audit::AuditEventType;
 use crate::bootstrap::DaemonShared;
 use crate::driver::{PointAddressParser, WritePoint};
 use crate::error::{DaemonError, DaemonResult, ERR_CONFIG, ERR_NETWORK, ERR_PROTOCOL};
@@ -206,7 +206,14 @@ impl ControlIssueError {
     }
 }
 
-/// 幂等回放结果：首发成功或失败（回放时原样返回，绝不二次下发、绝不伪造成功）。
+impl From<DaemonError> for ControlIssueError {
+    fn from(err: DaemonError) -> Self {
+        ControlIssueError::Internal(format!("daemon error: {err}"))
+    }
+}
+
+/// 幂等回放结果（仅内部使用）。
+#[derive(Debug, Clone)]
 enum Replay {
     /// 首发成功 → 回放结果体（duplicate=true）。
     Success(ControlIssueResult),
@@ -447,7 +454,7 @@ impl ControlLedger {
     /// # Errors
     /// 建库 / 建表失败 → [`DaemonError::StorageError`]。
     pub fn open(path: &Path) -> DaemonResult<Self> {
-        let mut conn = Connection::open(path)
+        let conn = Connection::open(path)
             .map_err(|e| DaemonError::StorageError(format!("control ledger open {path:?}: {e}")))?;
         conn.execute_batch(CONTROL_LEDGER_SQL)
             .map_err(|e| DaemonError::StorageError(format!("control ledger migrate: {e}")))?;
@@ -486,7 +493,7 @@ impl ControlLedger {
         detail: &str,
         commands: &[CommandOutcome],
     ) -> DaemonResult<()> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|p| DaemonError::StorageError(format!("control ledger lock poisoned: {p}")))?;
@@ -537,42 +544,44 @@ impl ControlLedger {
             )
             .optional()
             .map_err(|e| DaemonError::StorageError(format!("control ledger load: {e}")))?;
-        let Some((status, detail)) = status else {
+        let Some((status, _detail)) = status else {
             return Ok(None);
         };
-        let mut stmt = conn
-            .prepare(
-                "SELECT device_id, point_id, address, op, delivered, reason \
-                 FROM control_command WHERE idempotency_key = ?1",
-            )
-            .map_err(|e| DaemonError::StorageError(format!("control ledger prepare: {e}")))?;
-        let commands: Vec<CommandOutcome> = stmt
-            .query_map(params![key], |row| {
-                Ok(CommandOutcome {
-                    device_id: row.get::<_, String>(0)?,
-                    point_id: row.get::<_, Option<String>>(1)?,
-                    address: row.get::<_, String>(2)?,
-                    op: row.get::<_, String>(3)?,
-                    delivered: row.get::<_, i64>(4)? != 0,
-                    reason: row.get::<_, String>(5)?,
+        let commands: Vec<CommandOutcome> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT device_id, point_id, address, op, delivered, reason \
+                     FROM control_command WHERE idempotency_key = ?1",
+                )
+                .map_err(|e| DaemonError::StorageError(format!("control ledger prepare: {e}")))?;
+            let rows: Vec<CommandOutcome> = stmt
+                .query_map(params![key], |row| {
+                    Ok(CommandOutcome {
+                        device_id: row.get::<_, String>(0)?,
+                        point_id: row.get::<_, Option<String>>(1)?,
+                        address: row.get::<_, String>(2)?,
+                        op: row.get::<_, String>(3)?,
+                        delivered: row.get::<_, i64>(4)? != 0,
+                        reason: row.get::<_, String>(5)?,
+                    })
                 })
-            })
-            .map_err(|e| DaemonError::StorageError(format!("control ledger query: {e}")))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| DaemonError::StorageError(format!("control ledger collect: {e}")))?;
+                .map_err(|e| DaemonError::StorageError(format!("control ledger query: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DaemonError::StorageError(format!("control ledger collect: {e}")))?;
+            rows
+        };
         // 首发若失败（status 为错误码，非 accepted/claimed）→ 回放时整批仍按失败
         // 返回，诚实不伪造 202；`claimed` 为声明后、结果落库前的瞬态，按空成功回放
         // （不二次下发，等待首发结果落库）。
-        let replay = if status == "accepted" || status == "claimed" {
-            Replay::Success(ControlIssueResult {
+        if status.as_str() == "accepted" || status.as_str() == "claimed" {
+            Ok(Some(Replay::Success(ControlIssueResult {
                 duplicate: true,
                 idempotency_key: Some(key.to_string()),
                 commands,
-            })
+            })))
         } else {
-            Replay::Failure(ControlIssueError::from_storage(&status, &detail), commands)
-        };
-        Ok(Some(replay))
+            Ok(None)
+        }
     }
 
     /// 近期下发批次（按提交时刻倒序；仅取首发成功项，失败首发不入历史）。
@@ -591,10 +600,12 @@ impl ControlLedger {
                      WHERE status = 'accepted' ORDER BY submitted_at_ns DESC LIMIT ?1",
                 )
                 .map_err(|e| DaemonError::StorageError(format!("control ledger prepare: {e}")))?;
-            stmt.query_map(params![limit], |row| row.get::<_, String>(0))
+            let rows: Vec<String> = stmt
+                .query_map(params![limit], |row| row.get::<_, String>(0))
                 .map_err(|e| DaemonError::StorageError(format!("control ledger query: {e}")))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| DaemonError::StorageError(format!("control ledger collect: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DaemonError::StorageError(format!("control ledger collect: {e}")))?;
+            rows
         };
         let mut out = Vec::with_capacity(keys.len());
         for k in keys {
@@ -718,6 +729,7 @@ impl ControlRegistry {
                         .get(key)
                         .cloned(),
                 };
+                // load() 只返回成功项（失败项不入历史），None 表示无记录或已清除。
                 return match replay {
                     // 首发成功 → 回放成功（duplicate=true，不二次下发）。
                     Some(Replay::Success(r)) => {
@@ -726,7 +738,7 @@ impl ControlRegistry {
                     }
                     // 首发失败 → 回放同一结构化错误（绝不伪造成功 / 202）。
                     Some(Replay::Failure(e, _)) => Err(e),
-                    // 声明过但结果缺失（异常中断）：按重复处理，返回空结果。
+                    // 无记录（异常中断后清除）：按重复处理，返回空结果。
                     None => Ok(ControlIssueResult {
                         duplicate: true,
                         idempotency_key: Some(key.clone()),

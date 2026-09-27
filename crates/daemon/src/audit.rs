@@ -94,6 +94,8 @@ pub enum AuditEventType {
     AuditRead,
     /// 审计日志导出（数据出境动作，`audit.export` 仅 system 可授）。
     AuditExport,
+    /// 控制指令下发（写入设备状态，需 device.write 权限）。
+    ControlCommand,
 }
 
 impl AuditEventType {
@@ -108,6 +110,7 @@ impl AuditEventType {
             AuditEventType::TrialExpired => "trial_expired",
             AuditEventType::AuditRead => "audit_read",
             AuditEventType::AuditExport => "audit_export",
+            AuditEventType::ControlCommand => "control_command",
         }
     }
 
@@ -122,6 +125,7 @@ impl AuditEventType {
             "trial_expired" => Some(AuditEventType::TrialExpired),
             "audit_read" => Some(AuditEventType::AuditRead),
             "audit_export" => Some(AuditEventType::AuditExport),
+            "control_command" => Some(AuditEventType::ControlCommand),
             _ => None,
         }
     }

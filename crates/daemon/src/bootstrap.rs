@@ -44,7 +44,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -155,6 +155,9 @@ struct DaemonSharedInner {
     /// `GET /api/alerts` 据此回显。**进程内 historian**——重启即清空（如实标注，
     /// 不假装持久化）。
     alarms: Arc<crate::alarm::AlarmStore>,
+    /// 控制指令下发注册表（BE-CTRL / task 140）：管理面 `POST /api/control/issue`
+    /// 入口；南向写端口与幂等账本由 bootstrap 阶段接线。
+    control: Mutex<Option<Arc<crate::ctrl::ControlRegistry>>>,
     /// 运行中的采集调度器（`None` = 未启动 / 无设备组 / 已停机）。
     ///
     /// 挂在此处（而非 `run` 的局部变量）的原因：配置热重载任务需要就地
@@ -200,6 +203,7 @@ impl DaemonShared {
                 live_tx,
                 health: Arc::new(DeviceHealthRegistry::new()),
                 alarms: crate::alarm::AlarmStore::shared(),
+                control: Mutex::new(None),
                 scheduler: RwLock::new(None),
                 poll_handler: RwLock::new(None),
             }),
@@ -500,6 +504,24 @@ impl DaemonShared {
     /// 与 [`Self::health_registry`] 同口径：构造期即创建，非 `Option`。
     pub fn alarms_store(&self) -> Arc<crate::alarm::AlarmStore> {
         Arc::clone(&self.inner.alarms)
+    }
+
+    /// 控制指令下发注册表句柄（BE-CTRL / task 140）。
+    ///
+    /// 返回 `None` 表示控制面尚未装配（路由挂入但 handler 内部诚实返回 503）。
+    /// 装配由 bootstrap 阶段调用 [`Self::attach_control_registry`] 完成。
+    pub fn control_registry(&self) -> Option<Arc<crate::ctrl::ControlRegistry>> {
+        self.inner
+            .control
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(None)
+    }
+
+    /// 挂载控制面注册表（bootstrap 阶段调用一次）。
+    pub fn attach_control_registry(&self, registry: Arc<crate::ctrl::ControlRegistry>) {
+        let mut guard = self.inner.control.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(registry);
     }
 }
 
