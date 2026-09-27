@@ -12,7 +12,7 @@
   <div class="wc-content">
     <!-- 工具条：立即备份 + 刷新清单（原页头右侧按钮迁入） -->
     <div class="pg-toolbar">
-      <span class="wc-tag wc-tag--info">数据源 GET /api/settings/backups</span>
+      <span class="wc-tag wc-tag--info">网关配置备份</span>
       <span class="wc-spacer" />
       <button type="button" class="wc-btn wc-btn--sm" data-testid="backup-refresh" @click="loadBackups">刷新清单</button>
       <RoleGate :allowed="canEdit" mode="disable" deny-text="当前角色为只读，不能立即备份">
@@ -52,7 +52,7 @@
           :columns="columns"
           :rows="pagedBackups"
           row-key-field="id"
-          footer="来源：网关 config 目录写前备份（PUT /api/settings 或回滚前自动生成）"
+          footer="来源：网关保存配置或恢复前自动生成的写前备份"
         >
           <template #cell-time="{ row }">
             <span class="wc-mono">{{ row.time }}</span>
@@ -90,8 +90,8 @@
     <div class="wc-grid wc-grid--2">
       <section class="wc-card">
         <div class="wc-card__head">
-          <h3>备份策略</h3>
-          <span class="wc-tag wc-tag--info" data-testid="backup-policy-source">数据源 GET|PUT /api/settings/backup-policy</span>
+        <h3>备份策略</h3>
+        <span class="wc-tag wc-tag--info" data-testid="backup-policy-source">保存配置 / 回滚前自动备份</span>
         </div>
         <div class="wc-card__body">
           <div class="bk-form-grid">
@@ -329,7 +329,7 @@ async function backupNow(): Promise<void> {
 
 /** 下载备份：网关无下载端点，如实告知。 */
 function download(row: BackupRecord): void {
-  actionMessage.value = `下载未执行：网关未提供备份下载接口（${row.id}）。`;
+  actionMessage.value = `下载暂不可用：网关暂不支持备份文件下载（${row.id}）。`;
 }
 
 // ---------- 备份策略（真实：GET|PUT /api/settings/backup-policy） ----------

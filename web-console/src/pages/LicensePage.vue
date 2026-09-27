@@ -188,11 +188,10 @@
 
           <!-- 能力边界说明（文字，无对应可点元素） -->
           <div class="wc-impact" data-testid="impact-note">
-            <p class="wc-impact__title">客户端不提供的能力</p>
+            <p class="wc-impact__title">说明</p>
             <ul>
               <li>没有解绑入口 —— 换机必须由厂商在管理后台处理原码后重新发放。</li>
               <li>没有重置试用入口 —— 试用期由云端首次激活时间判定，本地不可改。</li>
-              <li>授权判定全部在 Rust 侧完成，界面只做展示，改前端不影响授权结果。</li>
             </ul>
           </div>
         </div>
@@ -547,7 +546,7 @@ function onAnchorPage(next: number): void {
 
 /** 锚点表 foot（原型 :1806）。 */
 const anchorFoot =
-  'N-of-M 容错：替换任一易变锚点仍判为同机；整机更换则判为异机（判定阈值 N=4 / M=5 在 Rust 侧）';
+  'N-of-M 容错：替换任一易变锚点仍判为同机；整机更换则判为异机';
 
 /** 稳定性 tag 色调：高 ok / 中 warn / 未知 unknown。 */
 function stabilityTagClass(stability: string): string {
@@ -700,7 +699,7 @@ const TRANSFER_REASONS: readonly string[] = [
 /** 换机影响清单（把后果与恢复路径写清）。 */
 const transferImpacts: readonly string[] = [
   '本操作仅提交换机申请，不会立即改变本机授权状态。',
-  '受理后由厂商在总管理后台作废原激活码并重新发放新码（客户端不具备该能力）。',
+  '受理后由厂商作废原激活码并重新发放新码。',
   '收到新码前，本机维持当前授权状态；本地采集持续，数据不丢失。',
 ];
 
@@ -864,8 +863,8 @@ async function loadLicenseStatus(): Promise<void> {
     const code = cause instanceof ApiError ? cause.status : 0;
     licenseNotice.value =
       code === 0
-        ? '授权状态不可得：网关不可达（网络层失败）。恢复路径：确认网关进程在监听 8080 端口后点「刷新状态」重试（本页其余字段沿用现有来源）。'
-        : `授权状态不可得：HTTP ${code}。恢复路径：查看网关日志定位后点「刷新状态」重试（本页其余字段沿用现有来源）。`;
+        ? '授权状态不可得：网关连接失败。请检查网络连接后点「刷新状态」重试。'
+        : `授权状态不可得：服务返回 HTTP ${code}。请稍后点「刷新状态」重试。`;
   }
 }
 

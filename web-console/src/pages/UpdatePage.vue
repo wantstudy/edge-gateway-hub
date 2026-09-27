@@ -34,7 +34,7 @@
       <div class="wc-kpi">
         <span class="wc-kpi__label">当前版本</span>
         <span class="wc-kpi__value" data-testid="kpi-current-version">{{ currentVersion }}</span>
-        <span class="wc-kpi__sub">GET /api/overview</span>
+        <span class="wc-kpi__sub">网关上报</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">最新可用</span>
@@ -135,7 +135,7 @@
         </div>
         <EmptyState
           title="暂无更新记录"
-          desc="更新历史能力尚未接入，暂时无法列出历史版本；接入后这里会显示每一次更新的结果。"
+          desc="网关暂未返回更新历史；执行一次更新后，这里会显示每次更新的结果。"
         >
           <template #actions>
             <button type="button" class="wc-btn wc-btn--sm" data-testid="update-check-empty" @click="checkUpdate">检查更新</button>
@@ -149,9 +149,9 @@
         </div>
         <div class="wc-card__body">
           <ul class="up-impact">
-            <li>工业现场常<b>无外网</b>：必须支持导入离线更新包（.tar.zst + 签名清单），且校验逻辑与在线一致。</li>
-            <li>更新会重启服务 → 必须<b>优雅停机</b>：队列 flush 完成后再退出，否则正在补发的数据会丢。</li>
-            <li>免费基础版<b>无远程更新能力</b>，此处显示能力边界而非报错，<b>不提供任何绕过入口</b>。</li>
+            <li>工业现场常<b>无外网</b>：可导入离线更新包（.tar.zst + 签名清单），签名校验与在线一致。</li>
+            <li>更新会重启服务，采集中断约 5–15 秒；已入队数据不丢失。</li>
+            <li>当前版本<b>不支持远程更新</b>，更新请通过离线包导入。</li>
           </ul>
           <button type="button" class="wc-btn" :disabled="!canEdit" data-testid="update-offline-2" @click="openOffline">
             导入离线更新包
@@ -331,7 +331,7 @@ const toggles = reactive([
 
 /** 更新进度区副文案（能力未接入时如实说明）。 */
 const progressSub = computed<string>(() =>
-  updateSupported.value ? '等待开始' : '更新执行能力尚未接入，暂无可展示的进度',
+  updateSupported.value ? '等待开始' : '暂无进行中的更新',
 );
 
 /** 更新步骤（流程说明，不含具体包体数据）。 */
@@ -339,7 +339,7 @@ const steps = [
   { n: '1', label: '下载更新包', desc: '来自官方源或内网镜像' },
   { n: '2', label: '校验签名与完整性', desc: 'Ed25519 + SHA-256 清单' },
   { n: '3', label: '备份当前版本与配置', desc: '写入 rollback 目录' },
-  { n: '4', label: '应用并重启服务', desc: '优雅停机，队列 flush 完成后重启' },
+  { n: '4', label: '应用并重启服务', desc: '服务平滑重启，采集中断数秒后自动恢复' },
   { n: '5', label: '健康自检', desc: '采集 / 转发 / 授权 三项连通性' },
 ];
 
@@ -419,8 +419,8 @@ function openRollback(version: string): void {
 function onRollbackSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): void {
   rollbackOpen.value = false;
   actionMessage.value =
-    `回滚未执行：版本回滚能力尚未接入（原因：${payload.reason}）。` +
-    '如需回退配置，请到「备份与恢复」或「系统设置 · 配置回滚」。';
+    `回滚未执行：当前版本暂不支持版本回滚（原因：${payload.reason}）。` +
+    '如需回退配置，请到「备份与恢复」。';
 }
 
 // ---------- 离线包导入（危险） ----------
@@ -453,7 +453,7 @@ function openOffline(): void {
 /** 离线包提交：离线包导入能力尚未接入，如实告知（不伪造成功）。 */
 function onOfflineSubmit(payload: { reason: string; note: string; tail: string; secondApprover: string }): void {
   offlineOpen.value = false;
-  actionMessage.value = `导入未执行：离线包导入能力尚未接入（原因：${payload.reason}）。`;
+  actionMessage.value = `导入未执行：当前版本暂不支持离线包导入（原因：${payload.reason}）。`;
 }
 
 // ---------- 首次进入：拉取真实能力状态 ----------

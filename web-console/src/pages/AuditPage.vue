@@ -19,7 +19,7 @@
       <RoleGate
         :allowed="canExport"
         mode="disable"
-        deny-text="当前角色只有审计只读权限，导出记录（数据出境）仅限系统管理员"
+        deny-text="当前角色只读，导出审计记录仅限系统管理员"
         fallback-label="无权导出"
       >
         <button type="button" class="wc-btn wc-btn--sm" data-testid="audit-export" @click="exportCsv">导出审计记录</button>

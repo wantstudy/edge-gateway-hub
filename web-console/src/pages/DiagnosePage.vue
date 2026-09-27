@@ -57,7 +57,7 @@
       <div class="wc-card__head">
         <h3>自检结果</h3>
         <span class="wc-card__sub">
-          GET /api/diagnostics/selfcheck<span v-if="checkedAtText"> · 网关自检时刻 {{ checkedAtText }}</span>
+          网关实时自检<span v-if="checkedAtText"> · 自检时刻 {{ checkedAtText }}</span>
         </span>
       </div>
 
@@ -78,7 +78,7 @@
         :columns="columns"
         :rows="pagedChecks"
         row-key-field="key"
-        footer="结果由网关实时自检上报；`ok` 仅代表检查项可跑通，业务是否就绪以「详情」为准。"
+        footer="结果由网关实时自检上报；是否就绪以详情列为准。"
       >
         <template #cell-category="{ row }">
           <span class="wc-tag wc-tag--unknown">{{ row.category }}</span>
@@ -358,7 +358,7 @@ async function rerun(): Promise<void> {
 
 /** 导出诊断包：后端无对应端点，如实告知。 */
 function exportPack(): void {
-  lastRunText.value = `导出未执行（${nowText()}）：网关未提供诊断包导出接口。`;
+  lastRunText.value = `诊断包导出暂不可用（${nowText()}），请稍后再试。`;
 }
 
 /** 时间短文本（本地时钟，与后端 `checkedAt` 无关）。 */

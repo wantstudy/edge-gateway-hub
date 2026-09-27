@@ -22,10 +22,10 @@
   <PageHeader
     crumb="系统 / 系统设置"
     title="系统设置"
-    desc="按「基础 / 网络 / 存储 / 安全」四类组织：基础 / 存储 / 安全三组真实读写（保存即持久化并热重载），OEM 与网络为只读组（分别由厂商授权后台与北向转发页管理）。"
+    desc="管理网关标识、本地存储与安全配置；贴牌信息由厂商统一下发，北向出口在「北向转发」页管理。"
   >
     <template #actions>
-      <RoleGate :allowed="canEdit" mode="disable" deny-text="设置写入仅限管理员（system 角色）" fallback-label="无权保存">
+      <RoleGate :allowed="canEdit" mode="disable" deny-text="设置保存仅限管理员" fallback-label="无权保存">
         <button
           type="button"
           class="wc-btn wc-btn--primary wc-btn--sm"
@@ -80,7 +80,7 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>网关标识</h3>
-            <span class="wc-card__sub" data-testid="basic-mode-hint">真实读写（写前自动备份 + 热重载生效）</span>
+            <span class="wc-card__sub" data-testid="basic-mode-hint">保存后自动备份并生效</span>
           </div>
           <div class="wc-card__body">
             <div class="wc-form">
@@ -91,20 +91,13 @@
                 <UiInput :model-value="dataDir" :disabled="true" placeholder="—" />
               </UiField>
             </div>
-            <p class="wc-note" data-testid="basic-note">
-              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-              <span>
-                原型中的 所属站点 / 时区 / 界面语言 / NTP 时间源 暂无后端设置项（PUT basic 白名单仅
-                <code>gateway_id</code>），待端点扩展后接入，此处不做假表单。
-              </span>
-            </p>
           </div>
         </section>
 
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>配置回滚</h3>
-            <span class="wc-card__sub">危险操作 · 备份来自网关 config 目录</span>
+            <span class="wc-card__sub">危险操作 · 操作前自动备份</span>
           </div>
           <div class="wc-card__body">
             <dl class="wc-kv">
@@ -123,8 +116,7 @@
             <p v-else-if="!backups.length" class="wc-note" data-testid="backups-empty">
               <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
               <span>
-                网关 config 目录暂无备份：每次配置写入 / 回滚前会自动生成
-                <code>config.toml.YYYYMMDD-HHmmss-NNN.bak</code> 写前备份（内嵌 UTC+8 时刻）；执行一次「保存」后再来查看。
+                暂无备份：每次保存配置或回滚前会自动生成写前备份；执行一次「保存」后再来查看。
               </span>
             </p>
             <template v-else>
@@ -185,9 +177,7 @@
             <p class="wc-note" data-testid="rollback-note">
               <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
               <span>
-                real 模式调用真实接口 <code>POST /api/settings/rollback</code>：选择某份备份即定向回滚
-                （后端校验文件名前缀，防路径穿越）；不选则回滚到最新备份。回滚前网关对当前配置自动再备份
-                （可逆），热重载即时生效。
+                选择某份备份即回滚到该版本，不选则回滚到最新备份；回滚前网关会对当前配置自动再备份，保存后立即生效。
               </span>
             </p>
           </div>
@@ -212,7 +202,7 @@
           <p class="wc-note">
             <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
             <span>
-              OEM 组只读（PUT 会 400）：品牌名 / Logo / 主题色由厂商总后台在下发牌照时写入，网关本地只读应用。
+              品牌名 / Logo / 主题色由厂商管理后台统一写入，网关本地只读应用。
               贴牌仅替换视觉层——<b>授权判定、数据链路与审计标识不受影响</b>，审计日志始终记录设备与授权真实归属。
             </span>
           </p>
@@ -231,8 +221,7 @@
           <p class="wc-note">
             <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
             <span>
-              network 组为只读（PUT 会 400）：出口登记 / 编辑在「北向转发」页进行；出口密码已由后端脱敏为
-              <code>&lt;redacted&gt;</code>，前端不还原明文。
+              北向出口在「北向转发」页登记与编辑；出口密码不在此展示明文。
             </span>
           </p>
           <template v-if="outlets.length">
@@ -279,7 +268,7 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>本地存储</h3>
-            <span class="wc-card__sub">取自网关当前生效配置（GET storage）</span>
+            <span class="wc-card__sub">取自网关当前生效配置</span>
           </div>
           <div class="wc-card__body">
             <dl class="wc-kv">
@@ -295,7 +284,7 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>存储参数</h3>
-            <span class="wc-card__sub" data-testid="storage-mode-hint">真实读写（写前自动备份 + 热重载生效）</span>
+            <span class="wc-card__sub" data-testid="storage-mode-hint">保存后自动备份并生效</span>
           </div>
           <div class="wc-card__body">
             <div class="wc-form wc-form--single">
@@ -313,8 +302,6 @@
               <span class="wc-note__icon" aria-hidden="true">⚠</span>
               <span>
                 Docker 部署时数据目录必须挂载到<b>宿主机持久卷</b>，否则容器重建即丢失队列与遥测。
-                原型中的日志保留 / 队列保留天数细分项暂无后端设置项（PUT storage 白名单仅
-                sqlite_path / max_size_mb / retention_days），待端点扩展后接入。
               </span>
             </p>
           </div>
@@ -328,13 +315,13 @@
         <section class="wc-card">
           <div class="wc-card__head">
             <h3>安全设置</h3>
-            <span class="wc-card__sub" data-testid="security-mode-hint">真实读写（写前自动备份 + 热重载生效）</span>
+            <span class="wc-card__sub" data-testid="security-mode-hint">保存后自动备份并生效</span>
           </div>
           <div class="wc-card__body">
             <div class="st-row">
               <div class="st-row__text">
-                <div class="st-row__title">管理端登录鉴权（web_auth_enabled）</div>
-                <div class="st-row__desc">关闭后管理 API 不再校验登录，仅限隔离内网使用。</div>
+                <div class="st-row__title">管理端登录鉴权</div>
+                <div class="st-row__desc">关闭后管理端不再校验登录，仅限隔离内网使用。</div>
               </div>
               <UiSwitch v-model="securityForm.webAuthEnabled" />
               <span class="st-cur wc-mono">{{ securityForm.webAuthEnabled ? '启用' : '关闭' }}</span>
@@ -366,14 +353,6 @@
                 <span class="pt-dd-hint">只读展示（name / role），口令哈希不下发。</span>
               </dd>
             </dl>
-
-            <p class="wc-note">
-              <span class="wc-note__icon" aria-hidden="true">ⓘ</span>
-              <span>
-                原型中的 北向 TLS 强制校验 / mTLS 双向认证 暂无后端设置项（PUT security 白名单仅
-                web_auth_enabled / tls_cert_path / tls_key_path），待端点扩展后接入，此处不做假开关。
-              </span>
-            </p>
           </div>
         </section>
 
@@ -386,11 +365,6 @@
             <dl class="wc-kv">
               <dt>登录事件</dt><dd><span class="wc-tag wc-tag--ok">记录</span></dd>
               <dt>配置变更</dt><dd><span class="wc-tag wc-tag--ok">记录（含改前改后）</span></dd>
-              <dt>模拟开关变更</dt>
-              <dd>
-                <span class="wc-tag wc-tag--info">随 P0-4 模拟策略提供</span>
-                <span class="pt-dd-hint">逐点模拟尚未立项，故当前不存在该类事件。</span>
-              </dd>
               <dt>授权事件</dt><dd><span class="wc-tag wc-tag--ok">记录</span></dd>
               <dt>日志保留</dt><dd>追加写入 + 分段校验，不可篡改</dd>
             </dl>

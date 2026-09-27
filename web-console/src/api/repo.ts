@@ -250,11 +250,11 @@ function describeFailure(cause: unknown, subject: string): string {
     const detail = extractErrorMessage(cause.body);
     switch (cause.status) {
       case 501:
-        return `${subject}：后端能力未落地（501）${detail}。恢复路径：等待该能力上线，当前不可用功能请勿依赖。`;
+        return `${subject}：该功能暂未开放（501）${detail}。请升级网关后使用。`;
       case 503:
-        return `${subject}：后端依赖未装配（503）${detail}。恢复路径：检查 daemon 启动装配（如审计库挂载）后重试。`;
+        return `${subject}：网关服务暂不可用（503）${detail}。请稍后重试，若持续出现请检查网关运行状态。`;
       case 404:
-        return `${subject}：后端接口未落地（404）${detail}。恢复路径：等待对应接口上线后重试。`;
+        return `${subject}：网关暂不支持该功能（404）${detail}。请升级网关后重试。`;
       case 403:
         return `${subject}：权限不足（403）${detail}。恢复路径：使用具备相应权限的账号登录。`;
       case 400:
