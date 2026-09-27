@@ -55,8 +55,7 @@ export const API_MODE: ApiMode = 'real';
  * 前端经 Tauri 命令 `api_base` 取壳实际选定的地址（见 [`setApiBase`] / [`apiBaseReady`]）。
  */
 export let API_BASE: string =
-  ((import.meta.env.VITE_API_BASE as string | undefined) ?? '').replace(/\/+$/, '') ||
-  'http://127.0.0.1:8080';
+  ((import.meta.env.VITE_API_BASE as string | undefined) ?? '').replace(/\/+$/, '');
 
 /** 覆盖 API 基址（去尾部斜杠归一；桌面壳启动解析出实际端口后调用）。 */
 export function setApiBase(base: string): void {

@@ -103,6 +103,9 @@ services:
       IOT_DAQ_LEASE_GRACE_SECS: ${IOT_DAQ_LEASE_GRACE_SECS:-86400}
       IOT_DAQ_HTTP_BIND: ${IOT_DAQ_HTTP_BIND:-0.0.0.0}
       IOT_DAQ_HTTP_PORT: ${IOT_DAQ_HTTP_PORT:-8080}
+      # Gateway 容器内置前端：daemon 直接 serve / 和 /assets/*，
+      # 前端通过相对路径访问 API（与页面同源，无需跨域）。
+      IOT_DAQ_WEB_DIST: /srv/web-console
       IOT_DAQ_LOG_LEVEL: ${IOT_DAQ_LOG_LEVEL:-info}
       IOT_DAQ_LOG_JSON: ${IOT_DAQ_LOG_JSON:-false}
       IOT_DAQ_TAMPER_POLICY: ${IOT_DAQ_TAMPER_POLICY:-restricted}
