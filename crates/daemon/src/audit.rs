@@ -53,6 +53,15 @@ const MAX_ACTOR_CHARS: usize = 256;
 pub const MAX_QUERY_LIMIT: u32 = 1000;
 /// 查询缺省 limit。
 pub const DEFAULT_QUERY_LIMIT: u32 = 100;
+/// `audit_meta` 键：**链密钥绑定的 IKM 指纹** `hex(SHA-256(effective_ikm))`。
+///
+/// 存指纹而非密钥：密钥一旦落盘，持有 `audit.db` 的人就能重算 `entry_hash`
+/// 自由伪造整条链。指纹的作用是让「两次启动是否算出同一把密钥」可被判定，
+/// 从而把「静默换密钥」变成「显式 fail-closed」。
+const CHAIN_IKM_FP_META: &str = "chain_ikm_fp";
+/// `audit_meta` 键：绑定时的密钥来源标注（`env-secret` / `machine-code` /
+/// `salt-degraded`），供链完整性报告如实呈现（**不是**密钥材料）。
+const CHAIN_KEY_SOURCE_META: &str = "chain_key_source";
 
 // ---- 审计结果字面量（与 remote_ops 的 OUTCOME_* 同词表） ----
 
@@ -256,6 +265,14 @@ pub struct ChainVerifyReport {
     pub ok: bool,
     /// 首个断裂点的 seq（`ok == true` 时为 `None`）。
     pub first_broken_seq: Option<u64>,
+    /// 本次校验所用链密钥的来源标注（`env-secret` / `machine-code` /
+    /// `salt-degraded`）。
+    ///
+    /// 用途：**区分故障性质**。同一个 `ok=false` 可能来自「有人改了审计行」，
+    /// 也可能来自「两次启动之间链密钥换了源（旧条目因此算不上来）」——后者是
+    /// 配置漂移、不是篡改。把来源如实带出来，读取方才不会把前者误判为后者
+    /// （或反之）。
+    pub key_source: String,
 }
 
 // ---- 密码学原语（纯 Rust：hmac + sha2，零新增依赖） ----
@@ -311,12 +328,33 @@ fn ct_eq(a: &str, b: &str) -> bool {
 ///
 /// IKM 缺失时以盐自派生（降级形态，见 [`AuditLogger::open`] 注释）。
 fn derive_chain_key(salt: &[u8], ikm: Option<&[u8]>) -> [u8; 32] {
-    let ikm_bytes: &[u8] = match ikm {
+    let prk = hkdf_extract(salt, effective_ikm(salt, ikm));
+    hkdf_expand_single(&prk, CHAIN_INFO)
+}
+
+/// 派生链密钥时实际使用的 IKM 材料（IKM 缺失时**回落到盐**——盐已持久化，
+/// 故降级路径本身是跨重启稳定的，见 [`AuditLogger::open`]）。
+fn effective_ikm<'a>(salt: &'a [u8], ikm: Option<&'a [u8]>) -> &'a [u8] {
+    match ikm {
         Some(ikm) if !ikm.is_empty() => ikm,
         _ => salt,
-    };
-    let prk = hkdf_extract(salt, ikm_bytes);
-    hkdf_expand_single(&prk, CHAIN_INFO)
+    }
+}
+
+/// 链密钥来源标注（明文诊断串，**不含**任何密钥材料，绝不落盘密钥本身）。
+///
+/// 与 [`resolve_audit_ikm`] 的解析顺序一一对应：`env-secret` → `machine-code`
+/// → `salt-degraded`（盐自派生）。
+#[must_use]
+fn ikm_source_label(ikm: Option<&[u8]>) -> String {
+    if ikm.is_none_or(|ikm| ikm.is_empty()) {
+        return "salt-degraded".to_string();
+    }
+    if std::env::var(AUDIT_SECRET_ENV).is_ok_and(|secret| !secret.trim().is_empty()) {
+        "env-secret".to_string()
+    } else {
+        "machine-code".to_string()
+    }
 }
 
 /// 计算单条记录的链哈希（域内以 `\u{1f}` 分隔，固定字段顺序）。
@@ -372,8 +410,19 @@ pub fn resolve_audit_ikm(machine_code: Option<&str>) -> Option<Vec<u8>> {
 pub struct AuditLogger {
     /// 独立 SQLite 写连接（只 INSERT / SELECT；UPDATE / DELETE 由触发器拒绝）。
     conn: Mutex<Connection>,
-    /// 链密钥（HKDF 派生，见模块注释；不落盘、不打印）。
+    /// 链密钥（HKDF 派生，见模块注释；**不落盘、不打印**）。
     key: [u8; 32],
+    /// 链密钥来源标注（`env-secret` / `machine-code` / `salt-degraded`）。
+    ///
+    /// 随 [`ChainVerifyReport`] 如实带出，用于区分「有人改了审计行」与
+    /// 「两次启动之间链密钥换了源」——两者都是 `ok=false`，但性质完全不同。
+    key_source: String,
+    /// 本库链密钥是否绑定在本进程当前可复现的 IKM 上。
+    ///
+    /// `false` = 启动间发生了 IKM 源漂移，本进程推导出的密钥**不是**写入时的
+    /// 那把（历史条目因此算不上来）。此时 [`AuditLogger::record`] fail-closed
+    /// 拒绝追加：继续写等于让审计链在无人知情的情况下换密钥。
+    key_bound: bool,
     /// 时间源（UTC 纳秒；测试注入受控时钟保证确定性）。
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -382,11 +431,35 @@ impl AuditLogger {
     /// 打开（或创建）审计库。
     ///
     /// 流程：开库 → WAL + FULL 同步 → 增量迁移（v1 账本 + v2 审计表，task 55
-    /// 框架）→ 读取 / 生成链盐 → 派生链密钥。IKM 为 `None` / 空时降级为盐自
-    /// 派生密钥并 `warn`（防篡改能力弱于绑定部署密钥；绝不因缺密钥而拒绝启动）。
+    /// 框架）→ 读取 / 生成链盐 → 派生链密钥 → **钉住 / 复用链密钥**。
+    ///
+    /// IKM 为 `None` / 空时降级为盐自派生密钥并 `warn`（防篡改能力弱于绑定
+    /// 部署密钥；绝不因缺密钥而拒绝启动）。
+    ///
+    /// ## 链密钥绑定（跨重启自证的前提）
+    ///
+    /// IKM 是每次启动时**重新解析**的进程局部状态（env 部署密钥 / 授权机器
+    /// 码是否可见），盐才是持久的。若允许链密钥随 IKM 漂移，同一条已入库
+    /// 记录会在不同启动配置下算出不同的 `entry_hash` —— 整条链「换个启动
+    /// 方式就自证失败」，防篡改能力归零（现场复现：`ok=false`、
+    /// `first_broken_seq=473`，断点精确落在一次重启之后的第一个 seq）。
+    ///
+    /// 本函数在 `audit_meta` 落 **IKM 指纹**（`SHA-256(ikm_bytes)`，非密钥）：
+    ///
+    /// - 指纹缺失 → 绑定本进程的 IKM（首次开库）；
+    /// - 指纹一致 → 同一把密钥，正常跨重启自证；
+    /// - 指纹不一致 → 链密钥换了源，**`record` 立即 fail-closed 拒绝追加**
+    ///   （绝不静默地把后续记录接到一把算不上来旧条目的密钥上），同时以
+    ///   `key_source` 标注来源、`error!` 给出处置路径。运维二选一：恢复原来
+    ///   的部署 IKM（链重新可自证），或显式删除 `chain_ikm_fp` 行重新锚定链。
+    ///
+    /// **密钥本身从不落盘**：一旦落盘，持有 `audit.db` 的人就能重算出
+    /// `entry_hash` 自由伪造整条链，「防篡改」退化为「防误删」——既有
+    /// `wrong_ikm_fails_verification` 用例正是钉死这条性质的。故这里只存
+    /// 指纹，密钥永远由「持久盐 + 当前 IKM」在内存里现算。
     ///
     /// # Errors
-    /// 开库 / 迁移 / 盐读写失败 → `DaemonError::StorageError`。
+    /// 开库 / 迁移 / 盐或指纹读写失败 → `DaemonError::StorageError`。
     pub fn open(db_path: &Path, ikm: Option<&[u8]>) -> DaemonResult<Self> {
         let conn = Connection::open(db_path)
             .map_err(|e| DaemonError::StorageError(format!("audit db open: {e}")))?;
@@ -403,9 +476,48 @@ impl AuditLogger {
             );
         }
         let key = derive_chain_key(&salt, ikm);
+        let source = ikm_source_label(ikm);
+        // 指纹与 `derive_chain_key` 的入料一致：IKM 缺失时是盐本身。
+        let effective = effective_ikm(&salt, ikm);
+        let fingerprint = hex::encode(hmac_sha256(effective, b"iot-daq/audit-ikm-fp/v1"));
+
+        let (key_bound, key_source) = match read_meta(&conn, CHAIN_IKM_FP_META)? {
+            Some(bound) if bound.trim() == fingerprint => (
+                true,
+                read_meta(&conn, CHAIN_KEY_SOURCE_META)?
+                    .filter(|label| !label.trim().is_empty())
+                    .unwrap_or_else(|| source.clone()),
+            ),
+            Some(bound) => {
+                // IKM 源漂移：本进程推导出的密钥不是写入时那把。绝不静默切换，
+                // 由 `record` fail-closed 拦住后续写入，`verify_chain` 如实报告。
+                let bound_source = read_meta(&conn, CHAIN_KEY_SOURCE_META)?
+                    .unwrap_or_else(|| "unknown".to_string());
+                tracing::error!(
+                    "audit: [ERROR] chain key source drifted — bound to {bound_source}, \
+                     this process resolves {source} (fingerprint {} != {}). Historical \
+                     entries written under the bound key can no longer be self-verified; \
+                     appending now would silently fork the chain. Fail-closed: writes are \
+                     rejected. Recovery either way: restore the {AUDIT_SECRET_ENV} / machine \
+                     code that produced {bound_source}, or DELETE FROM audit_meta WHERE key \
+                     = '{CHAIN_IKM_FP_META}' to explicitly re-anchor the chain.",
+                    &bound[..bound.len().min(12)],
+                    &fingerprint[..fingerprint.len().min(12)]
+                );
+                (false, source)
+            }
+            None => {
+                write_meta(&conn, CHAIN_IKM_FP_META, &fingerprint)?;
+                write_meta(&conn, CHAIN_KEY_SOURCE_META, &source)?;
+                (true, source)
+            }
+        };
+
         Ok(Self {
             conn: Mutex::new(conn),
             key,
+            key_source,
+            key_bound,
             clock: Box::new(system_clock_ns),
         })
     }
@@ -426,7 +538,13 @@ impl AuditLogger {
 
     /// 追加一条审计记录（入哈希链；原子：读链尾 + INSERT 在同一锁与事务内）。
     ///
+    /// **fail-closed**：链密钥绑定已漂移（[`Self::key_bound`] == `false`）时
+    /// **拒绝追加**——本进程算出的密钥不是历史条目写入时那把（历史条目因此
+    /// 算不上来），继续写等于让审计链在无人知情的情况下换密钥，防篡改能力
+    /// 被悄悄抹掉。此时调用方应把该操作视为「审计不可用」并告警。
+    ///
     /// # Errors
+    /// 链密钥绑定漂移 → `DaemonError::AuditKeyDrift`；
     /// SQLite 写失败 → `DaemonError::StorageError`（调用方决定告警策略；
     /// HTTP 面约定「审计失败不阻塞主流程，只 `tracing::warn`」）。
     pub fn record(
@@ -436,6 +554,11 @@ impl AuditLogger {
         outcome: &str,
         detail: &str,
     ) -> DaemonResult<AuditRecord> {
+        if !self.key_bound {
+            return Err(DaemonError::AuditKeyDrift {
+                bound: CHAIN_IKM_FP_META.to_string(),
+            });
+        }
         // unchecked_transaction 仅需 &Connection（rusqlite 事务 API 的 &mut 形式
         // 不适用共享锁连接场景）。
         let conn = self.lock_conn();
@@ -644,6 +767,7 @@ impl AuditLogger {
             verified,
             ok: first_broken_seq.is_none(),
             first_broken_seq,
+            key_source: self.key_source.clone(),
         })
     }
 }
@@ -704,6 +828,30 @@ fn ensure_chain_salt(conn: &Connection) -> DaemonResult<Vec<u8>> {
     Ok(salt)
 }
 
+/// 读 `audit_meta` 单键（`QueryReturnedNoRows` → `None`）。
+fn read_meta(conn: &Connection, key: &str) -> DaemonResult<Option<String>> {
+    conn.query_row("SELECT value FROM audit_meta WHERE key = ?1", params![key], |row| {
+        row.get(0)
+    })
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other),
+    })
+    .map_err(|e| DaemonError::StorageError(format!("audit meta read: {e}")))
+}
+
+/// 写 `audit_meta` 单键（`key` 为 PRIMARY KEY，冲突即覆盖）。
+fn write_meta(conn: &Connection, key: &str, value: &str) -> DaemonResult<()> {
+    conn.execute(
+        "INSERT INTO audit_meta(key, value) VALUES(?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![key, value],
+    )
+    .map_err(|e| DaemonError::StorageError(format!("audit meta write: {e}")))?;
+    Ok(())
+}
+
 /// 查询行 → 记录（u64 语义列以 i64 存储，读回钳制非负）。
 #[allow(clippy::needless_pass_by_value)]
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
@@ -728,6 +876,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ERR_AUDIT_KEY_DRIFT;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -932,6 +1081,152 @@ mod tests {
         assert_eq!(report.total, 16);
         assert_eq!(report.verified, 16);
         assert_eq!(report.first_broken_seq, None);
+    }
+
+    /// QA 安全（防篡改红线）: **跨重启换密钥不得让历史条目自证失败**。
+    ///
+    /// 回归背景：链密钥原本是 `HKDF(salt, resolve_audit_ikm(..))`，而 IKM 是每次
+    /// 启动重新解析的进程局部状态（env 部署密钥 / 授权机器码是否可见）。某次启动
+    /// 少了那份 IKM → 派生出不同的密钥 → 此后每条历史 `entry_hash` 都算不上来，
+    /// 整条链「换个启动方式就自证失败」＝防篡改能力归零（现场复现：`ok=false`、
+    /// `first_broken_seq=473`，断点精确落在一次重启之后的第一个 seq）。
+    ///
+    /// 本用例模拟**未配置部署 IKM（盐自派生）→ 重启 → 继续追加**：绑定必须仍然
+    /// 一致、链整体可自证。这才是「盐已持久化」应当保证的性质，也是本次事故
+    /// 现场那条「seq 1..472 一直能算上来」的常态。
+    #[test]
+    fn chain_key_survives_restart_without_ikm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(10);
+
+        // 第 1 次启动：无部署 IKM → 盐自派生。
+        let first = AuditLogger::open(&dir.path().join("audit.db"), None)
+            .expect("open 1")
+            .with_clock(clock.clock());
+        for i in 0..3 {
+            first
+                .record(
+                    "admin",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("e{i}"),
+                )
+                .expect("record 1");
+            clock.advance(10);
+        }
+        let first_report = first.verify_chain().expect("verify 1");
+        assert!(first_report.ok);
+        assert_eq!(first_report.key_source, "salt-degraded");
+        drop(first); // 进程"重启"。
+
+        // 第 2 次启动：依旧无部署 IKM → 盐复用 → 同一把密钥。
+        let second = AuditLogger::open(&dir.path().join("audit.db"), None)
+            .expect("open 2")
+            .with_clock(clock.clock());
+        assert!(
+            second.key_bound,
+            "盐自派生路径跨重启必须仍然绑定，否则审计写入会被 fail-closed 拦死"
+        );
+        for i in 3..6 {
+            second
+                .record(
+                    "admin",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("e{i}"),
+                )
+                .expect("record 2");
+            clock.advance(10);
+        }
+
+        let report = second.verify_chain().expect("verify 2");
+        assert!(
+            report.ok,
+            "重启后整链必须仍可自证: {report:?}（链密钥不该漂移）"
+        );
+        assert_eq!(report.total, 6);
+        assert_eq!(report.verified, 6);
+        assert_eq!(report.key_source, "salt-degraded", "来源标注不得随重启漂移");
+    }
+
+    /// QA 安全: IKM 源**真的换了**时写入 fail-closed，绝不静默把后续记录接到
+    /// 一把算不上来旧条目的密钥上。
+    ///
+    /// 这一条与 [`wrong_ikm_fails_verification`] 互补：那里要求「错误密钥不能
+    /// 验证既有链」，这里要求「错误密钥不能续写新链」。两者合起来堵死「换个
+    /// 启动配置就把审计链洗白」这条攻击路径。
+    #[test]
+    fn ikm_drift_fails_closed_on_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(10);
+
+        let first = AuditLogger::open(
+            &dir.path().join("audit.db"),
+            Some(b"audit-test-ikm-before".as_slice()),
+        )
+        .expect("open 1")
+        .with_clock(clock.clock());
+        first
+            .record(
+                "admin",
+                AuditEventType::ConfigChange,
+                OUTCOME_ACCEPTED,
+                "before-drift",
+            )
+            .expect("record 1");
+        drop(first);
+
+        // 换了 IKM 后重启：绑定漂移 → 拒绝追加 + 如实报告。
+        let second = AuditLogger::open(
+            &dir.path().join("audit.db"),
+            Some(b"audit-test-ikm-after".as_slice()),
+        )
+        .expect("open 2")
+        .with_clock(clock.clock());
+        assert!(!second.key_bound, "绑定必须判为漂移");
+        let err = second
+            .record(
+                "admin",
+                AuditEventType::ConfigChange,
+                OUTCOME_ACCEPTED,
+                "after-drift",
+            )
+            .expect_err("漂移后必须拒绝写入");
+        assert!(
+            matches!(err, DaemonError::AuditKeyDrift { .. }),
+            "错误类型应为 AuditKeyDrift: {err:?}"
+        );
+        assert_eq!(
+            err.error_code(),
+            ERR_AUDIT_KEY_DRIFT,
+            "错误码必须是 7001（北向 / 日志可检索）"
+        );
+
+        let report = second.verify_chain().expect("verify");
+        assert!(!report.ok, "漂移后既有链不可自证，必须如实报告: {report:?}");
+        assert_eq!(report.first_broken_seq, Some(1));
+        assert_eq!(report.total, 1);
+    }
+
+    /// QA 安全: 链完整性报告必须带出密钥来源，让 `ok=false` 的成因可判别。
+    #[test]
+    fn chain_report_carries_key_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(10));
+        logger
+            .record(
+                "admin",
+                AuditEventType::ConfigChange,
+                OUTCOME_ACCEPTED,
+                "e0",
+            )
+            .expect("record");
+
+        let report = logger.verify_chain().expect("verify");
+        assert!(matches!(
+            report.key_source.as_str(),
+            "env-secret" | "machine-code" | "salt-degraded"
+        ));
     }
 
     /// QA（计划验收核心：改一行 → 校验失败）: 绕过触发器（测试内先 DROP）

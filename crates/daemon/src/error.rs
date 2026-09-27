@@ -30,6 +30,9 @@ pub const ERR_NETWORK: u16 = 6000;
 /// 安全域（TLS / 鉴权 / 防篡改）。
 pub const ERR_SECURITY: u16 = 7000;
 
+/// 审计链密钥绑定漂移（写入 fail-closed）。
+pub const ERR_AUDIT_KEY_DRIFT: u16 = 7001;
+
 /// daemon 主错误枚举（计划 task 6 指定七域 + 指纹子域）。
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -64,6 +67,16 @@ pub enum DaemonError {
     /// 机器码指纹失败（[`FingerprintError`] 经 `From` 并入，保留原始结构）。
     #[error("AuthError: machine fingerprint failed: {0}")]
     MachineFingerprint(#[from] FingerprintError),
+
+    /// 审计链密钥绑定漂移（跨启动换了 IKM 源）→ 写入 **fail-closed**。
+    ///
+    /// 继续追加会让审计链在无人知情的情况下换密钥、历史条目全部失去自证
+    /// 能力，因此拒绝写并显式暴露。处置见日志中的恢复路径。
+    #[error(
+        "AuditKeyDrift: audit chain key was bound to a different IKM ({bound}); \
+         refusing to append until the binding is restored or explicitly re-anchored"
+    )]
+    AuditKeyDrift { bound: String },
 }
 
 impl DaemonError {
@@ -78,6 +91,7 @@ impl DaemonError {
             DaemonError::NetworkError(_) => ERR_NETWORK,
             DaemonError::SecurityError(_) => ERR_SECURITY,
             DaemonError::MachineFingerprint(_) => ERR_MACHINE_FINGERPRINT,
+            DaemonError::AuditKeyDrift { .. } => ERR_AUDIT_KEY_DRIFT,
         }
     }
 }
