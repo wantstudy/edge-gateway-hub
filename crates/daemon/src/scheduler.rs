@@ -1687,22 +1687,28 @@ pub mod scheduled_restart {
 /// `GET /updates/manifest` 对接）。
 ///
 /// ## 语义
-/// - `[gateway.ota].enabled = false`（缺省）/ 三要素（enabled + manifest_url +
-///   signing_key_b64）未齐 → **no-op**：不发任何网络请求、不报错；启动时记一条
-///   `info!`（关闭）或 `warn!`（已启用但未配置，附配置键名与怎么配）。
+/// - `[gateway.ota].enabled = false`（缺省）/ **未就绪**（[`OtaSection::is_ready`]：
+///   无生效端点——`manifest_url` 省略且 `cloud_url` 也空——或缺 `signing_key_b64`）
+///   → **no-op**：不发任何网络请求、不报错；启动时记一条 `info!`（关闭）或
+///   `warn!`（已启用但未就绪，附配置键名与 env 通道）。
+/// - 生效端点由 [`OtaSection::effective_manifest_url`] 解析：显式 `manifest_url` 优先，
+///   否则按 `{cloud_url}/updates/manifest` 推导（容器形态无需写 `manifest_url`）。
 /// - 启用 → **首个周期到来时才执行**：先 `sleep(poll_interval_secs)` 再检查
 ///   （避免启动瞬间打请求 / 启动风暴）；周期每轮从配置快照重读，热重载即生效。
-/// - 每轮：GET `manifest_url` → 读 `available` → 复用 [`crate::ota::OtaManager`]
-///   的解析 + 版本单调性 + Ed25519 验签管线 → 写入 pending 槽；
+/// - 每轮：GET `manifest_url` → 读 `available` → 复用**全进程唯一**
+///   [`crate::ota::OtaManager`]（由 bootstrap 用落盘 `FileOtaStore` 装配）的
+///   解析 + 版本单调性 + Ed25519 验签管线 → 写入落盘 pending 槽；
 ///   `available = false`（授权端诚实空态）**不计失败**，不重试风暴；
 ///   网络失败 / 验签失败 / 报文非法 / 版本不新 → `warn!` 带**真实原因**，旧版本不受影响。
+/// - 公钥热重载：每轮比对 `signing_key_b64`，变化时就地替换管理器的验签公钥
+///   （版本真相始终来自落盘 `meta.json`，无需重建管理器）。
 ///
 /// ## V1 限制（诚实声明）
 /// - 下载通道仅支持 `http://` 明文（无 TLS；完整性由 Ed25519 验签兜底，
 ///   机密性无保障，详见 [`crate::ota`] 模块文档）；
-/// - pending 槽用进程内 [`crate::ota::InMemoryOtaStore`]：**进程重启即丢失**——
-///   本任务只完成「下载 + 轮询 + 暂存」接线；把 pending 落持久卷并与
-///   `boot_commit_or_rollback` 启动确认路径贯通，属后续任务（不在本 V1 范围）。
+/// - pending / current 槽已**落盘持久**（`<data_dir>/ota/`），进程重启不丢；
+///   启动确认（commit / 回滚）由 `bootstrap.rs` 按「上次运行是否健康」的落盘标记
+///   驱动（见该模块 OTA 启动健康标记）。
 pub mod ota_poll {
     use std::sync::Arc;
     use std::time::Duration;
@@ -1712,10 +1718,7 @@ pub mod ota_poll {
 
     use crate::bootstrap::DaemonShared;
     use crate::config::OtaSection;
-    use crate::error::DaemonResult;
-    use crate::ota::{
-        verifying_key_from_b64, InMemoryOtaStore, OtaManager, OtaPollOutcome, OtaStore,
-    };
+    use crate::ota::{verifying_key_from_b64, OtaManager, OtaPollOutcome};
 
     /// 启动 OTA 轮询后台任务（返回 `JoinHandle`，循环不退出直到进程停机）。
     pub fn spawn(daemon: DaemonShared) -> JoinHandle<()> {
@@ -1723,12 +1726,18 @@ pub mod ota_poll {
     }
 
     async fn run(daemon: Arc<DaemonShared>) {
-        // 启动提示（一次）：关闭 / 已启用但未配置都明确说明，绝不静默。
-        log_config_state(&daemon.config_snapshot().gateway.ota);
+        // 启动提示（一次）：关闭 / 已启用但未就绪都明确说明，绝不静默。
+        {
+            let snapshot = daemon.config_snapshot();
+            log_config_state(
+                &snapshot.gateway.ota,
+                snapshot.gateway.licensing.cloud_url.as_deref(),
+            );
+        }
 
-        let mut manager: Option<OtaManager> = None;
-        // 已绑定的（url, key_b64, current_version）——配置变更时重建管理器。
-        let mut bound: Option<(String, String, u64)> = None;
+        // 已绑定的签名公钥：配置热重载更换公钥时就地替换（版本真相始终来自落盘 meta，
+        // 无需重建管理器）。
+        let mut bound_key: Option<String> = None;
         loop {
             // 首个周期到来才执行（先 sleep 再检查，避免启动风暴）。
             let interval = daemon
@@ -1740,29 +1749,37 @@ pub mod ota_poll {
             tokio::time::sleep(Duration::from_secs(interval)).await;
 
             // 睡醒后重读配置（热重载即时生效）。
-            let section = daemon.config_snapshot().gateway.ota.clone();
-            if !section.is_configured() {
+            let snapshot = daemon.config_snapshot();
+            let section = snapshot.gateway.ota.clone();
+            let cloud_url = snapshot.gateway.licensing.cloud_url.clone();
+            let cloud = cloud_url.as_deref();
+            if !section.is_ready(cloud) {
+                bound_key = None;
                 continue;
             }
-            let url = section
-                .manifest_url
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            // 生效端点：显式 manifest_url 优先，否则按 cloud_url 推导（不写回配置）。
+            let Some(url) = section.effective_manifest_url(cloud) else {
+                bound_key = None;
+                continue;
+            };
             let key_b64 = section
                 .signing_key_b64
                 .as_deref()
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let signature = (url.clone(), key_b64.clone(), section.current_version);
 
-            if bound.as_ref() != Some(&signature) {
-                match build_manager(&section, &key_b64) {
-                    Ok(mgr) => {
-                        manager = Some(mgr);
-                        bound = Some(signature);
+            // 全进程唯一实例（由 bootstrap 用落盘 FileOtaStore 装配）；未接线 → 跳过。
+            let Some(manager) = daemon.ota_manager() else {
+                warn!("ota: shared OtaManager not wired; upgrade check skipped");
+                continue;
+            };
+
+            if bound_key.as_deref() != Some(key_b64.as_str()) {
+                match verifying_key_from_b64(&key_b64) {
+                    Ok(key) => {
+                        manager.lock().await.set_verifying_key(key);
+                        bound_key = Some(key_b64.clone());
                         info!(url = %url, "ota: poller bound to manifest endpoint");
                     }
                     Err(err) => {
@@ -1771,18 +1788,15 @@ pub mod ota_poll {
                             "ota: signing_key_b64 is not a usable Ed25519 public key; \
                              upgrade check skipped"
                         );
-                        manager = None;
-                        bound = None;
+                        bound_key = None;
                         continue;
                     }
                 }
             }
 
-            let Some(mgr) = manager.as_mut() else {
-                continue;
-            };
-            // 单轮检查（未配置 → `None`；此处已 `is_configured`，故必为 `Some`）。
-            let Some(outcome) = check_once(&section, mgr).await else {
+            // 单轮检查（未就绪 → `None`；此处已 `is_ready`，故必为 `Some`）。
+            let mut guard = manager.lock().await;
+            let Some(outcome) = check_once(&section, cloud, &mut guard).await else {
                 continue;
             };
             match outcome {
@@ -1807,37 +1821,30 @@ pub mod ota_poll {
         }
     }
 
-    /// 单轮检查（未配置 → `None`，**不产生任何网络动作**）。
-    async fn check_once(section: &OtaSection, manager: &mut OtaManager) -> Option<OtaPollOutcome> {
-        if !section.is_configured() {
+    /// 单轮检查（未就绪 → `None`，**不产生任何网络动作**）。
+    async fn check_once(
+        section: &OtaSection,
+        cloud_url: Option<&str>,
+        manager: &mut OtaManager,
+    ) -> Option<OtaPollOutcome> {
+        if !section.is_ready(cloud_url) {
             return None;
         }
-        let url = section.manifest_url.as_deref().unwrap_or("").trim();
-        Some(manager.poll_and_stage(url).await)
+        let url = section.effective_manifest_url(cloud_url)?;
+        Some(manager.poll_and_stage(&url).await)
     }
 
-    /// 按配置构造 [`OtaManager`]（公钥 + 进程内 pending 槽；见模块 V1 限制）。
-    fn build_manager(section: &OtaSection, key_b64: &str) -> DaemonResult<OtaManager> {
-        let key = verifying_key_from_b64(key_b64)?;
-        let store = Arc::new(InMemoryOtaStore::default());
-        Ok(OtaManager::new(
-            store as Arc<dyn OtaStore>,
-            key,
-            section.current_version,
-        ))
-    }
-
-    /// 启动时的一次性配置状态提示（关闭 / 未配置 / 已启用）。
-    fn log_config_state(section: &OtaSection) {
-        if section.is_configured() {
+    /// 启动时的一次性配置状态提示（关闭 / 未就绪 / 已就绪）。
+    fn log_config_state(section: &OtaSection, cloud_url: Option<&str>) {
+        if section.is_ready(cloud_url) {
             info!(
-                url = %section.manifest_url.as_deref().unwrap_or("").trim(),
+                url = %section.effective_manifest_url(cloud_url).unwrap_or_default(),
                 interval_secs = section.poll_interval_secs.max(1),
                 current_version = section.current_version,
                 "ota: upgrade checks enabled"
             );
         } else if section.enabled {
-            // 已启用但缺 URL / 公钥 → 明确 warn（含配置键名），绝不静默。
+            // 已启用但缺端点 / 公钥 → 明确 warn（含配置键名与 env 通道），绝不静默。
             warn!("ota: {}", section.config_hint());
         } else {
             info!("ota: disabled ([gateway.ota].enabled = false); no upgrade checks");
@@ -1853,6 +1860,8 @@ pub mod ota_poll {
         use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::ota::{InMemoryOtaStore, OtaStore};
 
         /// 计数型 mock HTTP 服务器：每收到一次请求即 +1，并回放固定响应。
         async fn counting_mock(counter: Arc<AtomicUsize>) -> SocketAddr {
@@ -1915,7 +1924,7 @@ pub mod ota_poll {
                 current_version: 1,
             };
             let mut mgr = manager();
-            let outcome = check_once(&section, &mut mgr).await;
+            let outcome = check_once(&section, None, &mut mgr).await;
             assert!(outcome.is_none(), "未启用 = no-op");
             assert_eq!(
                 counter.load(Ordering::SeqCst),
@@ -1924,7 +1933,8 @@ pub mod ota_poll {
             );
         }
 
-        /// `enabled = true` 但缺 URL / 缺公钥 → 判定「未配置」→ no-op（诚实降级，不 panic）。
+        /// `enabled = true` 但缺端点（无 manifest_url 且无 cloud_url）/ 缺公钥
+        /// → 判定「未就绪」→ no-op（诚实降级，不 panic）。
         #[tokio::test]
         async fn enabled_but_unconfigured_is_noop() {
             let counter = Arc::new(AtomicUsize::new(0));
@@ -1937,7 +1947,7 @@ pub mod ota_poll {
                 signing_key_b64: Some("AAAA".to_string()),
                 ..OtaSection::default()
             };
-            assert!(check_once(&no_url, &mut mgr).await.is_none());
+            assert!(check_once(&no_url, None, &mut mgr).await.is_none());
 
             let no_key = OtaSection {
                 enabled: true,
@@ -1945,28 +1955,49 @@ pub mod ota_poll {
                 signing_key_b64: None,
                 ..OtaSection::default()
             };
-            assert!(check_once(&no_key, &mut mgr).await.is_none());
+            assert!(check_once(&no_key, Some("http://license.test/x"), &mut mgr)
+                .await
+                .is_none());
             assert_eq!(
                 counter.load(Ordering::SeqCst),
                 0,
-                "未配置时不得发出任何网络请求"
+                "未就绪时不得发出任何网络请求"
             );
         }
 
-        /// `build_manager`：坏公钥 → ConfigError（不 panic）；合法公钥 → 可构造。
-        #[test]
-        fn build_manager_rejects_bad_key() {
+        /// `manifest_url` 省略 + `cloud_url` 有值 → poller 按推导端点发起检查
+        /// （不再误判「未配置」）；推导成功即真实发出一次请求。
+        #[tokio::test]
+        async fn poller_derives_manifest_url_from_cloud_url() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let addr = counting_mock(Arc::clone(&counter)).await;
             let section = OtaSection {
                 enabled: true,
-                manifest_url: Some("http://127.0.0.1:1/updates/manifest".to_string()),
+                manifest_url: None,
                 signing_key_b64: Some("AAAA".to_string()),
                 ..OtaSection::default()
             };
-            assert!(build_manager(&section, "AAAA").is_err(), "坏公钥必须被拒");
+            let mut mgr = manager();
+            let cloud = format!("http://{addr}/licensing/");
+            let outcome = check_once(&section, Some(&cloud), &mut mgr).await;
+            assert!(
+                matches!(outcome, Some(OtaPollOutcome::NoUpdate { .. })),
+                "cloud_url 推导成功后应发起检查并得到诚实空态: {outcome:?}"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "应恰好发出一次请求（推导端点被真实使用）"
+            );
+        }
 
+        /// 轮询绑定公钥：坏公钥 → ConfigError（不 panic）；合法公钥 → 可解析。
+        #[test]
+        fn poller_rejects_bad_signing_key() {
+            assert!(verifying_key_from_b64("AAAA").is_err(), "坏公钥必须被拒");
             let key = SigningKey::from_bytes(&[0x11u8; 32]).verifying_key();
             let b64 = base64::engine::general_purpose::STANDARD.encode(key.to_bytes());
-            assert!(build_manager(&section, &b64).is_ok(), "合法公钥可构造");
+            assert!(verifying_key_from_b64(&b64).is_ok(), "合法公钥可解析");
         }
     }
 }

@@ -703,7 +703,10 @@ async fn post_once(url: &str, body: &str) -> DaemonResult<String> {
 /// 上报客户端配置（URL 由装配注入，**禁止硬编码**）。
 #[derive(Debug, Clone)]
 pub struct ReceiptReporterConfig {
-    /// 完整端点 URL（如 `http://licensing.vendor.com/v1/audit/receipt`；仅 `http://`）。
+    /// 完整端点 URL（canonical：
+    /// `http://license.webscad.cn/licensing/audit/receipt`；仅 `http://`）。
+    /// 由 `{base_url}/audit/receipt` 拼成——服务端路由在**根路径**，宿主 nginx 把
+    /// `/licensing/*` 剥前缀后转发（见 [`crate::auth::client::LicensingClientConfig`]）。
     pub endpoint_url: String,
     /// 单次请求超时（默认 2 秒）。
     pub timeout: Duration,

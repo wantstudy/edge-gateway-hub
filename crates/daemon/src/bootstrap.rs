@@ -48,6 +48,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
@@ -61,7 +62,7 @@ use crate::license::{LicenseRuntime, LicenseRuntimeConfig, LICENSE_RECOVERY_HINT
 use crate::mgmt::health::DeviceHealthRegistry;
 use crate::north::runtime::{NorthForwardGate, NorthRuntime, NorthRuntimeConfig};
 use crate::offline_queue::{OfflineQueue, QueueConfig, SystemClock, QUEUE_DB_FILE_NAME};
-use crate::ota::OtaBootDecision;
+use crate::ota::{verifying_key_from_b64, FileOtaStore, OtaBootDecision, OtaManager, OtaStore};
 use crate::pipeline::RawSample;
 use crate::scheduler::{
     groups_changed, GroupConfig, GroupScheduler, PollHandler, RunningScheduler,
@@ -169,6 +170,12 @@ struct DaemonSharedInner {
     /// 与 `scheduler` 同挂共享态的原因：启动时配置里没有设备 ⇒ 调度器未启动，而
     /// 用户随后经 API 建出第一个设备时，热重载任务得能用手头这份 handler 补启动。
     poll_handler: RwLock<Option<Arc<dyn PollHandler>>>,
+    /// 全进程唯一的 OTA 管理器（`None` = 未配置 `[gateway.ota]` / 未接线）。
+    ///
+    /// 轮询任务（`scheduler::ota_poll`）、启动判定（`run` 内）与管理面
+    /// （`ops_api::updates_check` / `updates_apply`）共用同一实例——保证「pending 槽
+    /// 落盘真相」只有一个读侧，不出现各持一份内存副本的状态分裂。
+    ota: RwLock<Option<SharedOtaManager>>,
 }
 
 /// daemon 全局共享状态：生命周期 / 心跳 / 配置快照（task 51）。
@@ -206,6 +213,7 @@ impl DaemonShared {
                 control: Mutex::new(None),
                 scheduler: RwLock::new(None),
                 poll_handler: RwLock::new(None),
+                ota: RwLock::new(None),
             }),
         }
     }
@@ -519,6 +527,27 @@ impl DaemonShared {
         let mut guard = self.inner.control.lock().unwrap_or_else(|p| p.into_inner());
         *guard = Some(registry);
     }
+
+    /// 挂载全进程唯一的 OTA 管理器（bootstrap 在配置加载后调用一次；重复调用覆盖）。
+    pub fn set_ota_manager(&self, manager: SharedOtaManager) {
+        let mut guard = self
+            .inner
+            .ota
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(manager);
+    }
+
+    /// 全进程唯一的 OTA 管理器（`None` = 未配置 `[gateway.ota]` / 未接线）。
+    ///
+    /// 轮询任务 / 管理面据此拿到与启动判定**同一份**实例。
+    pub fn ota_manager(&self) -> Option<SharedOtaManager> {
+        self.inner
+            .ota
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl Default for DaemonShared {
@@ -565,6 +594,12 @@ pub type OtaBootFuture = Pin<Box<dyn Future<Output = DaemonResult<OtaBootDecisio
 /// 在闭包内构造真实 `OtaManager`（store + 公钥注入）并调用
 /// `boot_commit_or_rollback(healthy)`；bootstrap 只负责结果审计/日志与回滚告警。
 pub type OtaBootCheckHook = Arc<dyn Fn() -> OtaBootFuture + Send + Sync>;
+
+/// 全进程唯一的 OTA 管理器句柄。
+///
+/// `tokio::sync::Mutex` 守护：轮询任务的「下载 → 验签 → 写 pending」与启动判定、
+/// 管理面查询共用同一实例，临界区内含网络 `await`，故必须用异步互斥锁。
+pub type SharedOtaManager = Arc<tokio::sync::Mutex<OtaManager>>;
 
 // ---- 装配器 ----
 
@@ -804,9 +839,8 @@ impl BootstrapBuilder {
             );
         }
 
-        // ①-b OTA 启动判定（task 35 接线）：commit / 回滚结果写审计日志；
-        //      回滚发生时显式 [WARN] 并记录原因（宽限期内未确认启动健康）。
-        run_ota_boot_check(&self.ota_boot_check).await;
+        // ①-b OTA 运行期接线已下移到配置加载之后（见 ②-b：构造 OtaManager 需要
+        //      `[gateway.ota]` 的验签公钥与当前版本号，配置未加载前无从装配）。
 
         // ①-c 授权运行期（**提前到配置 / 北向之前**）：北向转发门控与免费版配额
         //     闸门都需要授权状态真相源（[`LicenseRuntime`]），故先构造并步进一次
@@ -877,12 +911,69 @@ impl BootstrapBuilder {
         shared.set_config_path(self.config_path.clone());
         shared.notify_config_reload(config_shared.version());
 
+        // ②-ota OTA 运行期接线（全进程唯一 OtaManager + 启动健康标记 + 启动判定）。
+        //   - 落盘：`<data_dir>/ota/{current.bin,pending.bin,meta.json}`（FileOtaStore，原子写）；
+        //   - 健康标记：`<data_dir>/ota/boot.json`（上次运行是否已确认健康）；
+        //   - 未配置 `[gateway.ota]` → 不构造管理器（no-op：不发请求 / 不报错）；但
+        //     boot.json 照写——它描述的是「上次运行是否健康」，与 OTA 是否启用无关。
+        let ota_root = ota_storage_root(self.data_dir.as_deref(), &self.config_path);
+        let ota_healthy = read_boot_marker(&ota_root);
+        // 判定/就绪前先落「本次启动尝试中（未确认）」：若进程在 Running 前退出，
+        // 下次启动将据此判定为不健康（fail-safe 回滚 pending）。
+        if let Err(err) = write_boot_marker(&ota_root, false) {
+            warn!(
+                error = %err,
+                root = %ota_root.display(),
+                "bootstrap: [WARN] ota boot marker (attempt) not written; \
+                 crash detection degrades until the next successful write"
+            );
+        }
+        let snapshot = config_shared.snapshot();
+        let ota_section = snapshot.gateway.ota.clone();
+        let cloud_url = snapshot.gateway.licensing.cloud_url.clone();
+        let shared_ota: Option<SharedOtaManager> = if ota_section.is_ready(cloud_url.as_deref()) {
+            match build_ota_manager(&ota_section, &ota_root) {
+                Ok(manager) => {
+                    shared.set_ota_manager(Arc::clone(&manager));
+                    info!(
+                        root = %ota_root.display(),
+                        current_ota_version = ota_section.current_version,
+                        manifest_url = %ota_section
+                            .effective_manifest_url(cloud_url.as_deref())
+                            .unwrap_or_default(),
+                        "bootstrap: ota manager wired (persistent file store)"
+                    );
+                    Some(manager)
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "bootstrap: [WARN] ota signing_key_b64 is not a usable Ed25519 \
+                         public key; OTA runtime not wired (upgrade checks skipped)"
+                    );
+                    None
+                }
+            }
+        } else {
+            info!("bootstrap: [gateway.ota] not ready; OTA runtime not wired");
+            None
+        };
+        // 启动判定：commit / 回滚结果写审计日志（回滚显式 [WARN]）。优先使用装配方
+        // 注入的钩子（测试 / 嵌入式），否则用刚装配的共享实例。
+        let boot_hook: Option<OtaBootCheckHook> = match &self.ota_boot_check {
+            Some(hook) => Some(Arc::clone(hook)),
+            None => shared_ota
+                .as_ref()
+                .map(|manager| ota_boot_hook(Arc::clone(manager), ota_healthy)),
+        };
+        run_ota_boot_check(&boot_hook).await;
+
         // 计划重启调度（每日 `[ops] scheduled_restart_at`；未配置 = 空转不触发）。
         let restart_task = crate::scheduler::scheduled_restart::spawn(shared.clone());
 
         // OTA 系统更新轮询（`[gateway.ota]`；未启用 / 未配置 = no-op 空转）。
         // 轮询任务按 `poll_interval_secs` 周期拉授权端 `GET /updates/manifest`，
-        // 复用 `ota::OtaManager` 的解析 + 验签管线并写入 pending 槽；
+        // 复用共享 `OtaManager` 的解析 + 验签管线并写入**落盘** pending 槽；
         // `available = false`（授权端诚实空态）不计失败，网络/验签失败记真实原因 warn。
         let ota_task = crate::scheduler::ota_poll::spawn(shared.clone());
 
@@ -1040,6 +1131,18 @@ impl BootstrapBuilder {
 
         shared.set_state(LifecycleState::Running);
         info!("bootstrap: daemon running");
+
+        // ③-ota 「真实就绪点」：配置 / 调度器 / 北向 / 授权全部装配完成、生命周期
+        //   已置 Running，此刻才写「已确认健康」。若进程在此前退出（含 ②-b 配额
+        //   闸门 return Err），boot.json 保持「未确认」→ 下次启动判定不健康并回滚 pending。
+        if let Err(err) = write_boot_marker(&ota_root, true) {
+            warn!(
+                error = %err,
+                root = %ota_root.display(),
+                "bootstrap: [WARN] ota boot marker (healthy) not written; \
+                 the next start may treat this run as unconfirmed"
+            );
+        }
 
         // ⑤ 看门狗。
         let watchdog_task = tokio::spawn(run_watchdog(
@@ -1301,6 +1404,106 @@ async fn run_ota_boot_check(hook: &Option<OtaBootCheckHook>) {
         },
         None => warn!("bootstrap: ota boot check not configured (no-op hook)"),
     }
+}
+
+// ---- OTA 运行期接线：持久化存储根 / 启动健康标记 / 共享管理器 ----
+
+/// OTA 数据子目录名（`<data_dir>/ota`）。
+const OTA_STORAGE_DIR: &str = "ota";
+/// 启动健康标记文件名（`<data_dir>/ota/boot.json`）。
+const OTA_BOOT_MARKER_FILE: &str = "boot.json";
+
+/// 解析 OTA 持久化根目录：优先装配方注入的 `data_dir`，否则回退**配置文件同目录**。
+///
+/// 生产 bin 经 [`BootstrapBuilder::with_data_dir`] 注入宿主持久卷 → 落 `<data_dir>/ota`；
+/// 未注入（测试 / 嵌入式）时回退配置文件目录，避免把相对缺省 data_dir（如 `./data`）
+/// 写到进程 cwd。
+fn ota_storage_root(data_dir: Option<&Path>, config_path: &Path) -> PathBuf {
+    match data_dir {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(OTA_STORAGE_DIR),
+        _ => config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+            .join(OTA_STORAGE_DIR),
+    }
+}
+
+/// 当前 Unix 纳秒（时钟异常退化为 0，零 panic）。
+fn now_unix_ns_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// 读取「上次运行是否已确认健康」标记 → 本次启动是否可判定为**健康**。
+///
+/// 标记文件 `<root>/boot.json`，内容 `{"confirmed_healthy":"true|false","attempt_ts_ns":"<str>"}`
+/// （字段值一律字符串，大数红线）。
+///
+/// 语义与**安全默认**：
+/// - 文件**不存在** → `true`（首次运行，或本进程从未写失败标记）——这是唯一能让
+///   首次 pending 得以 commit 的路径，故必须视为健康；
+/// - `confirmed_healthy = "true"` → `true`（上次启动最终确认健康）；
+/// - `confirmed_healthy = "false"` → `false`（上次启动未确认就退出，疑崩溃）；
+/// - 文件**损坏 / 字段缺失 / 非 JSON / 不可读** → **`false`（安全默认）**。
+///   理由：标记的用途是「证明上次运行健康」；无法证明时，宁可对 pending 走回滚
+///   （轻微代价：一次可重试的\"不升级\"），也不要把可能损坏的新版本 commit 成
+///   当前版本（不可逆代价）。删除读不到的文件即可恢复到「首次运行」语义。
+fn read_boot_marker(root: &Path) -> bool {
+    let path = root.join(OTA_BOOT_MARKER_FILE);
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => matches!(
+                value.get("confirmed_healthy").and_then(Value::as_str),
+                Some("true")
+            ),
+            Err(_) => false,
+        },
+    }
+}
+
+/// 原子写入启动健康标记（`confirmed_healthy` 为字符串 `"true"` / `"false"`）。
+///
+/// # Errors
+/// 目录创建 / 临时文件 / `fsync` / `rename` 失败 → [`DaemonError::StorageError`]。
+fn write_boot_marker(root: &Path, confirmed_healthy: bool) -> DaemonResult<()> {
+    let payload = json!({
+        "confirmed_healthy": if confirmed_healthy { "true" } else { "false" },
+        "attempt_ts_ns": now_unix_ns_string(),
+    });
+    let text = serde_json::to_string(&payload)
+        .map_err(|e| crate::error::DaemonError::StorageError(format!("ota boot marker: {e}")))?;
+    crate::ota::atomic_write_file(&root.join(OTA_BOOT_MARKER_FILE), text.as_bytes())
+}
+
+/// 按 `[gateway.ota]` 配置构造共享 OTA 管理器（`FileOtaStore` 落盘 + 验签公钥注入）。
+///
+/// # Errors
+/// `signing_key_b64` 非可用 Ed25519 公钥 → [`DaemonError::ConfigError`]（调用方降级）。
+fn build_ota_manager(
+    ota: &crate::config::OtaSection,
+    root: &Path,
+) -> DaemonResult<SharedOtaManager> {
+    let key_b64 = ota.signing_key_b64.as_deref().unwrap_or("").trim();
+    let key = verifying_key_from_b64(key_b64)?;
+    let store = Arc::new(FileOtaStore::new(root.to_path_buf()));
+    let manager = OtaManager::new(store as Arc<dyn OtaStore>, key, ota.current_version);
+    Ok(Arc::new(tokio::sync::Mutex::new(manager)))
+}
+
+/// 构造启动判定钩子：对给定共享实例调用 `boot_commit_or_rollback(healthy)`。
+fn ota_boot_hook(manager: SharedOtaManager, healthy: bool) -> OtaBootCheckHook {
+    Arc::new(move || {
+        let manager = Arc::clone(&manager);
+        Box::pin(async move {
+            let mut guard = manager.lock().await;
+            guard.boot_commit_or_rollback(healthy).await
+        }) as OtaBootFuture
+    })
 }
 
 /// 完整性 manifest 文件名约定：`<exe 全名>.integrity-manifest`，内容为
@@ -2324,6 +2527,113 @@ frequency_ms = 2000
         .await;
         shared.request_shutdown();
         handle.await.expect("run task joins").expect("run ok");
+    }
+
+    // ---- OTA 落盘 + 启动健康标记（be-ota-full） ----
+
+    /// QA：`ota_storage_root` 优先注入的 data_dir，否则回退配置文件目录。
+    #[test]
+    fn ota_storage_root_prefers_data_dir() {
+        let cfg = PathBuf::from("/etc/iot-daq/config.toml");
+        assert_eq!(
+            ota_storage_root(Some(Path::new("/var/lib/iot-daq")), &cfg),
+            PathBuf::from("/var/lib/iot-daq/ota")
+        );
+        assert_eq!(
+            ota_storage_root(None, &cfg),
+            PathBuf::from("/etc/iot-daq/ota")
+        );
+    }
+
+    /// QA：启动健康标记语义（缺失 = 健康；`true` = 健康；`false` = 不健康；
+    /// 损坏 / 非法值 → **安全默认不健康**）。
+    #[test]
+    fn ota_boot_marker_semantics_and_safe_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("ota");
+
+        assert!(read_boot_marker(&root), "缺失 → 健康（首次运行）");
+        write_boot_marker(&root, true).expect("write true");
+        assert!(read_boot_marker(&root), "true → 健康");
+        write_boot_marker(&root, false).expect("write false");
+        assert!(!read_boot_marker(&root), "false → 不健康");
+
+        // 损坏 → 安全默认不健康（宁可回滚，不冒进 commit）。
+        std::fs::write(root.join(OTA_BOOT_MARKER_FILE), b"{ not json").expect("corrupt");
+        assert!(!read_boot_marker(&root), "损坏 → 安全默认不健康");
+
+        // 字段值非 "true"/"false" → 同样安全默认不健康。
+        std::fs::write(
+            root.join(OTA_BOOT_MARKER_FILE),
+            br#"{"confirmed_healthy":"maybe"}"#,
+        )
+        .expect("bad value");
+        assert!(!read_boot_marker(&root));
+    }
+
+    /// QA：`build_ota_manager` 坏公钥 → Err（不 panic）；合法公钥 → Ok（落盘根生效）。
+    #[test]
+    fn build_ota_manager_validates_signing_key() {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("ota");
+        let mut ota = crate::config::OtaSection {
+            enabled: true,
+            manifest_url: Some("http://127.0.0.1:1/updates/manifest".to_string()),
+            signing_key_b64: Some("AAAA".to_string()),
+            current_version: 1,
+            ..crate::config::OtaSection::default()
+        };
+        assert!(
+            build_ota_manager(&ota, &root).is_err(),
+            "坏公钥必须被拒（不 panic）"
+        );
+
+        let key = SigningKey::from_bytes(&[0x11u8; 32]).verifying_key();
+        ota.signing_key_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(key.to_bytes()));
+        assert!(build_ota_manager(&ota, &root).is_ok(), "合法公钥可装配");
+    }
+
+    /// QA：`ota_boot_hook(healthy=true)` 对共享实例调用 `boot_commit_or_rollback`
+    /// → pending 槽晋升 current（落盘生效）。
+    #[tokio::test]
+    async fn ota_boot_hook_commits_pending_into_file_store() {
+        use crate::ota::{OtaMeta, OtaStore, SLOT_CURRENT, SLOT_PENDING};
+        use ed25519_dalek::SigningKey;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("ota");
+        let store = Arc::new(FileOtaStore::new(root.clone()));
+        store
+            .save_bytes(SLOT_PENDING, b"new-bytes")
+            .await
+            .expect("save pending");
+        store
+            .persist_meta(&OtaMeta {
+                current_version: "1".to_string(),
+                pending_version: Some("2".to_string()),
+                updated_ts_ns: "1".to_string(),
+            })
+            .await
+            .expect("persist meta");
+
+        let manager: SharedOtaManager = Arc::new(tokio::sync::Mutex::new(OtaManager::new(
+            Arc::clone(&store) as Arc<dyn OtaStore>,
+            SigningKey::from_bytes(&[0x1au8; 32]).verifying_key(),
+            1,
+        )));
+        let hook = ota_boot_hook(Arc::clone(&manager), true);
+        let decision = hook().await.expect("boot decision");
+        assert_eq!(decision, OtaBootDecision::Committed { version: 2 });
+        assert_eq!(
+            store.load_bytes(SLOT_CURRENT).await.expect("current"),
+            Some(b"new-bytes".to_vec()),
+            "commit 后 current 槽持有新字节"
+        );
+        assert_eq!(store.load_bytes(SLOT_PENDING).await.expect("pending"), None);
     }
 
     // ---- 集成波次接线：北向运行期（task 19 + task 54 最后一跳） ----

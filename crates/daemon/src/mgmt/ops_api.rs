@@ -5,11 +5,14 @@
 //!
 //! ## 诚实性红线
 //! 每个能力：实现了就真实现；没实现就**结构化返回「未实现 + 原因」**，严禁假成功。
-//! 更新检查未接升级源 / 能力未接线 → `check_supported:false` + **面向用户**的原因
-//! （现状 + 怎么办）；`POST /api/updates/apply` 在执行能力接线前先校验**危险操作
-//! 四要素**（`reason` / `note` / `confirm` 三独立字段），随后诚实返回
-//! `supported:false`（HTTP 200）——绝不伪造「升级成功」；自启注册读写在 Windows 下
-//! 真实现（`reg query` / `reg add|delete` HKCU Run 键），非 Windows 如实 501。
+//! 更新检查的真相源是 `[gateway.ota]`（[`crate::config::OtaSection::is_ready`]）：
+//! 就绪 → `check_supported:true` 并如实回显落盘 pending 版本；未就绪 →
+//! `check_supported:false` + **面向用户**的原因（现状 + 怎么办）。
+//! `POST /api/updates/apply` 先校验**危险操作四要素**（`reason` / `note` / `confirm`
+//! 三独立字段），随后按真实状态分流：有 pending → `accepted:true`（待重启生效）；
+//! 否则诚实返回 `supported:false`。**`applied` 恒 false**——本进程不做二进制替换，
+//! 绝不伪造「升级成功」；自启注册读写在 Windows 下真实现（`reg query` /
+//! `reg add|delete` HKCU Run 键），非 Windows 如实 501。
 //!
 //! ## 备份策略语义（B-2）
 //! - `auto_before_write`：写路径落盘前自动备份（既有行为显式化，闸门在
@@ -54,95 +57,159 @@ fn now_ms() -> u64 {
 
 // ---- 更新检查 / 执行 ----
 
-/// 升级源地址（`[settings.updates].source_url`，trim 后非空才算已配置）。
-fn update_source_url(state: &MgmtState) -> Option<String> {
-    state
-        .config()
-        .settings
-        .updates
-        .source_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-/// **面向用户**的「未配置升级源」说明：现状 + 怎么办，不出现内部术语。
-const UPDATE_NO_SOURCE_REASON: &str = "尚未配置升级源，暂时无法检查或安装更新。\
-请在网关配置文件 config.toml 的 [settings.updates] 段填写 source_url（升级源地址）后保存，\
-配置会自动生效；随后回到本页点击「检查更新」即可。";
-
-/// **面向用户**的「已配置升级源、但能力尚未接线」说明。
-fn update_not_wired_reason(url: &str) -> String {
-    format!(
-        "已配置升级源 {url}，但本版本尚未提供从升级源下载并安装更新的能力（该功能仍在开发中），\
-因此不会下载或应用任何更新包。期间可继续使用手工离线升级流程。"
-    )
-}
-
-/// `GET /api/updates/check` → 更新检查（**诚实降级**）。
+/// **面向用户**的「OTA 未就绪」说明：现状 + 怎么办，不出现内部术语。
 ///
-/// 未配置升级源 / 能力尚未接线时：`check_supported:false` + **面向用户**的原因
-/// （现状 + 怎么办）；绝不伪造「已是最新版本」之类的假成功，也不出现「写端点 /
-/// 接口未提供」这类内部术语。
+/// 指向**真实开关 `[gateway.ota]`**（不再是已废弃的 `[settings.updates]`），并给出
+/// 容器形态的 env 通道（只读根文件系统下唯一可注入路径）。
+const UPDATE_NO_SOURCE_REASON: &str = "系统更新尚未就绪，暂时无法检查或安装更新。\
+请在网关配置文件 config.toml 的 [gateway.ota] 段设置 enabled = true 并填写 signing_key_b64\
+（授权端 Ed25519 公钥 base64）；manifest_url 可省略，会按授权服务的 cloud_url 自动推导\
+（canonical：http://license.webscad.cn/licensing/updates/manifest）。\
+容器形态请在部署 env 中设置 IOT_DAQ_OTA_ENABLED=true 与 IOT_DAQ_OTA_SIGNING_KEY_B64\
+（IOT_DAQ_OTA_MANIFEST_URL 可留空自动推导、IOT_DAQ_OTA_CURRENT_VERSION 可选）。\
+保存配置或重启后自动生效，随后回到本页点击「检查更新」即可。";
+
+/// `GET /api/updates/check` → 更新检查（**诚实反映真实状态**）。
+///
+/// 就绪判定 = [`crate::config::OtaSection::is_ready`]（`enabled` + 有生效 manifest 端点
+/// （显式或由 `cloud_url` 推导）+ `signing_key_b64` 非空白）。
+/// - 就绪 → 读**全进程唯一** OTA 管理器的落盘状态：`check_supported:true`、
+///   `update_available` = 是否存在待重启生效的 pending 版本、`available_version` = pending
+///   版本号、`source` = 生效 manifest 端点。配置就绪但**运行期管理器未装配**（如公钥
+///   无法解析）→ 同样 `check_supported:false`，reason 单独点名运行期缺口（配置确实就绪，
+///   故 `source_configured` 仍为 true）。
+/// - 未就绪 → **诚实降级**：`check_supported:false` + [`UPDATE_NO_SOURCE_REASON`]。
+///   绝不伪造「已是最新」。
 ///
 /// wire 契约（响应字段）：
-/// - `check_supported`   bool         —— 后端是否真能完成一次升级检查（当前恒 false）；
-/// - `current_version`   string       —— 当前网关版本（`CARGO_PKG_VERSION`）；
-/// - `update_available`  bool         —— 是否有可升级版本（能力未就绪时恒 false）；
-/// - `available_version` string|null  —— 可升级版本（未知 = null，不臆造）；
-/// - `source`            string       —— 升级源：已配置的地址 / `"unconfigured"`；
-/// - `source_configured` bool         —— 是否已在配置中声明升级源；
+/// - `check_supported`   bool         —— 后端是否能完成一次升级检查；
+/// - `current_version`   string       —— 网关版本（`CARGO_PKG_VERSION`，构建期包版本串）；
+/// - `ota_current_version` string|null —— **另一口径**：OTA 自身 u64 单调序当前版本号
+///   （来自落盘 `meta.json`；未就绪 / 无存储 = null）。二者不可混用；
+/// - `update_available`  bool         —— 是否存在待重启生效的新版本（= 有 pending）；
+/// - `available_version` string|null  —— 待安装版本号（无 = null，不臆造）；
+/// - `source`            string       —— 生效 manifest 端点 / `"unconfigured"`；
+/// - `source_configured` bool         —— 是否已声明升级源（显式或可推导）；
 /// - `reason`            string       —— 面向用户的说明（现状 + 怎么办）。
 pub async fn updates_check(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
     if let Err(resp) = authed.ensure(Permission::OpsLogsRead) {
         return resp.into_response();
     }
     let current = env!("CARGO_PKG_VERSION");
-    let configured = update_source_url(&state);
-    let (source, reason) = match &configured {
-        Some(url) => (url.clone(), update_not_wired_reason(url)),
-        None => (
-            "unconfigured".to_string(),
-            UPDATE_NO_SOURCE_REASON.to_string(),
-        ),
-    };
+    let config = state.config();
+    let ota = config.gateway.ota.clone();
+    let cloud_url = config.gateway.licensing.cloud_url.clone();
+    let cloud = cloud_url.as_deref();
+    let endpoint = ota.effective_manifest_url(cloud);
+
+    // ① OTA 就绪：如实反映真实轮询 / 落盘状态（不再恒 false）。
+    if ota.is_ready(cloud) {
+        let manifest_url = endpoint.clone().unwrap_or_default();
+        let mut update_available = false;
+        let mut available_version = Value::Null;
+        let mut ota_current_version = ota.current_version.to_string();
+        let mut reason = format!(
+            "已配置升级源 {manifest_url}，但更新运行期尚未就绪（签名公钥不可用或未装配），暂时无法检查待安装版本。"
+        );
+        if let Some(manager) = state.daemon().ota_manager() {
+            let guard = manager.lock().await;
+            if let Ok(Some(stored)) = guard.stored_current_version().await {
+                ota_current_version = stored;
+            }
+            match guard.pending_version().await {
+                Ok(Some(pending)) if !pending.trim().is_empty() => {
+                    update_available = true;
+                    available_version = Value::String(pending.clone());
+                    reason = format!(
+                        "已配置升级源 {manifest_url}；新版本 {pending} 已下载并通过验签，重启网关后由宿主安装器完成替换。"
+                    );
+                }
+                Ok(_) => {
+                    reason = format!("已配置升级源 {manifest_url}；当前没有待安装的新版本。");
+                }
+                Err(err) => {
+                    reason = format!(
+                        "已配置升级源 {manifest_url}，但读取本机更新状态失败（{err}），暂时无法判定待安装版本。"
+                    );
+                }
+            }
+        } else {
+            // 配置层就绪但运行期管理器未装配（典型：`signing_key_b64` 无法解析导致
+            // bootstrap 装配失败）。此时**不能承诺能完成一次检查**：`check_supported`
+            // 如实为 false（缺口在运行期，配置确实已就绪），reason 指向真实修复路径。
+            // `ota_current_version` 恒 null——统一规则：只有读到落盘 meta 才给值。
+            return Json(json!({
+                "check_supported": false,
+                "current_version": current,
+                "ota_current_version": Value::Null,
+                "update_available": false,
+                "available_version": Value::Null,
+                "source": manifest_url,
+                "source_configured": true,
+                "reason": format!(
+                    "已配置升级源 {manifest_url}，但更新运行期尚未就绪（通常是签名公钥无法解析或装配失败）。\
+                     请核对 [gateway.ota].signing_key_b64（容器形态为 IOT_DAQ_OTA_SIGNING_KEY_B64）后重启网关，\
+                     再回到本页检查更新。"
+                ),
+            }))
+            .into_response();
+        }
+        return Json(json!({
+            "check_supported": true,
+            "current_version": current,
+            "ota_current_version": ota_current_version,
+            "update_available": update_available,
+            "available_version": available_version,
+            "source": manifest_url,
+            "source_configured": true,
+            "reason": reason,
+        }))
+        .into_response();
+    }
+
+    // ② OTA 未就绪：诚实降级（reason 指向真实开关 [gateway.ota] 与 env 通道）。
     Json(json!({
         "check_supported": false,
         "current_version": current,
+        "ota_current_version": Value::Null,
         "update_available": false,
         "available_version": Value::Null,
-        "source": source,
-        "source_configured": configured.is_some(),
-        "reason": reason,
+        "source": endpoint.unwrap_or_else(|| "unconfigured".to_string()),
+        "source_configured": ota.effective_manifest_url(cloud).is_some(),
+        "reason": UPDATE_NO_SOURCE_REASON,
     }))
     .into_response()
 }
 
-/// `POST /api/updates/apply` → 执行更新（**危险操作**；当前能力未接线，诚实返回）。
+/// `POST /api/updates/apply` → 执行更新（**危险操作**；诚实反映可执行状态）。
 ///
 /// ## ⚠️ 危险操作四要素硬契约
 /// body 必须是 JSON 对象，且**同时**含 `reason` / `note` / `confirm` 三个**彼此
 /// 独立**的字段（`note` **绝不允许**拼进 `reason`）；三者 trim 后均须非空。
 /// 任一缺失 / 非字符串 / trim 后空白 / 出现未知字段 → **400 `validation_failed`**
-/// （不进入执行路径，fail-closed）。
+/// （不进入执行路径，fail-closed）。此契约**四个要素校验逻辑一字未改**。
 ///
 /// ## wire 契约
 /// - 方法 / 路径：`POST /api/updates/apply`；
 /// - 请求体：`{"reason": string, "note": string, "confirm": string}`（三字段必填且独立）；
 /// - 鉴权：`Authorization: Bearer <JWT>`；权限 `ops.collectors`（服务运行期控制，仅 system）；
-/// - 成功（HTTP 200，**不是**「升级成功」）：
-///   `{"supported": false, "accepted": false, "applied": false, "current_version": string,
-///     "target_version": null, "source": string, "source_configured": bool, "reason": string}`
-///   —— `supported:false` 表示后端**尚未具备**执行更新的能力，`reason` 面向用户说明
-///   现状与怎么办；`applied` **恒 false**，绝不伪造升级成功；
+/// - 四要素校验**通过后**按真实状态分流：
+///   - `[gateway.ota]` 已配置且存在待安装 pending 版本 → 接受（HTTP 200）：
+///     `{"supported": true, "accepted": true, "applied": false, "current_version": string,
+///       "target_version": "<pending 版本>", "source": "<manifest_url>",
+///       "source_configured": true, "reason": string}`
+///     —— 新版本已下载并通过验签、待重启由宿主安装器替换；**本进程不做二进制替换**，
+///     故 `applied` **恒 false**；
+///   - 未配置 OTA / 无 pending → 诚实降级：`supported:false` + `accepted:false` +
+///     `applied:false` + `reason`（现状与怎么办）。
 /// - 失败：缺字段 / 非字符串 / 空白 / 未知字段 → **400**；未带 token → 401；
 ///   权限不足 → 403。
 ///
 /// ## 审计
 /// 本端点已接入 `remote_ops` 审计环，动作字面量 = `update_apply`（**独立**动作，
 /// 不复用其它字面量）：鉴权被拒 → `denied`；body 校验失败 → `bad_request`；
-/// 三要素齐全但执行能力未接线（诚实降级 200）→ `not_implemented`（请求已放行）。
+/// 三要素齐全但无待安装版本（诚实降级 200）→ `not_implemented`；
+/// 三要素齐全且已接受待安装版本 → `accepted`。
 /// 审计经 `writeapi::audit` 同步落持久安全审计；持久写失败仅记 warn，**不**改变
 /// 业务响应（响应语义只由上方 wire 契约决定，不产生伪造的成功痕迹）。
 pub async fn updates_apply(
@@ -205,17 +272,57 @@ pub async fn updates_apply(
             }
         }
     }
-    // 组装诚实降级响应（执行能力未接线）。
+    // 四要素校验通过后的**执行语义**（契约与校验逻辑一字未改，仅在其后分流）：
+    // OTA 已配置且存在待安装版本 → 接受（待重启生效）；本进程**不做二进制替换**，
+    // 故 `applied` 恒 false，绝不伪造升级成功。
+    let config = state.config();
+    let ota = config.gateway.ota.clone();
+    let cloud_url = config.gateway.licensing.cloud_url.clone();
+    let cloud = cloud_url.as_deref();
+    let endpoint = ota.effective_manifest_url(cloud);
+    if ota.is_ready(cloud) {
+        if let Some(manager) = state.daemon().ota_manager() {
+            let pending = {
+                let guard = manager.lock().await;
+                guard.pending_version().await
+            };
+            if let Ok(Some(pending)) = pending {
+                if !pending.trim().is_empty() {
+                    let manifest_url = endpoint.clone().unwrap_or_default();
+                    audit(
+                        &state,
+                        &actor,
+                        OpsAction::UpdateApply,
+                        true,
+                        OUTCOME_ACCEPTED,
+                        &format!(
+                            "update {pending} accepted; staged in the pending slot, will be \
+                             installed by the host installer after restart (no in-process \
+                             binary replacement)"
+                        ),
+                    );
+                    return Json(json!({
+                        "supported": true,
+                        "accepted": true,
+                        "applied": false,
+                        "current_version": env!("CARGO_PKG_VERSION"),
+                        "target_version": pending,
+                        "source": manifest_url,
+                        "source_configured": true,
+                        "reason": format!(
+                            "新版本 {pending} 已下载并通过验签，重启网关后由宿主安装器完成替换；\
+                             本进程不做二进制替换，因此 applied 恒为 false。"
+                        ),
+                    }))
+                    .into_response();
+                }
+            }
+        }
+    }
+    // 组装诚实降级响应（OTA 未就绪 / 无待安装版本）。
     let current = env!("CARGO_PKG_VERSION");
-    let configured = update_source_url(&state);
-    let (source, reason) = match &configured {
-        Some(url) => (url.clone(), update_not_wired_reason(url)),
-        None => (
-            "unconfigured".to_string(),
-            UPDATE_NO_SOURCE_REASON.to_string(),
-        ),
-    };
-    // 能力未接线：入审计（not_implemented，请求已放行但未执行任何更新），
+    let source = endpoint.unwrap_or_else(|| "unconfigured".to_string());
+    // 未就绪：入审计（not_implemented，请求已放行但未执行任何更新），
     // 再诚实返回 supported:false + 面向用户原因，绝不伪造成功。
     audit(
         &state,
@@ -224,7 +331,7 @@ pub async fn updates_apply(
         true,
         OUTCOME_NOT_IMPLEMENTED,
         &format!(
-            "update apply requested but capability not wired (source: {source}); \
+            "update apply requested but no staged update is available (source: {source}); \
              no update downloaded or applied"
         ),
     );
@@ -235,8 +342,8 @@ pub async fn updates_apply(
         "current_version": current,
         "target_version": Value::Null,
         "source": source,
-        "source_configured": configured.is_some(),
-        "reason": reason,
+        "source_configured": ota.effective_manifest_url(cloud).is_some(),
+        "reason": UPDATE_NO_SOURCE_REASON,
     }))
     .into_response()
 }
@@ -1466,6 +1573,8 @@ mod tests {
     use crate::mgmt::auth_jwt::{now_unix_secs, sign, Claims};
     use crate::mgmt::rbac::Role;
     use crate::mgmt::remote_ops;
+    use crate::ota::{InMemoryOtaStore, OtaManager, OtaMeta, OtaStore};
+    use ed25519_dalek::SigningKey;
     use std::sync::Arc;
 
     /// 测试种子配置（[gateway] 最小段）。
@@ -1872,12 +1981,12 @@ data_dir = "./data"
 
     // ---- 更新检查 / 执行 ----
 
-    /// QA（updates check）: 未配置升级源 → `check_supported:false` + **面向用户**原因
-    /// （指导如何配置）；已配置升级源 → `source` 反映地址、原因说明能力尚未接线；
-    /// 两种状态的 reason 都**不含**「写端点 / 未提供…接口」等内部术语。
-    #[tokio::test]
+    /// QA（updates check）: OTA 未就绪 → `check_supported:false` + **面向用户**原因
+    /// （指向真实开关 `[gateway.ota]` 与容器 env 通道）；已声明端点但缺签名公钥 →
+    /// `source` 如实回显、`source_configured:true`、仍 `check_supported:false`；
+    /// 两种状态的 reason 都**不含**「写端点 / 接口 / 端点」等内部术语。    #[tokio::test]
     async fn updates_check_is_honest_and_user_facing() {
-        // ① 未配置升级源。
+        // ① 完全未配置 [gateway.ota]。
         let dir = tempfile::tempdir().expect("tempdir");
         let (state, _path) = make_state(&dir);
         let token = token_for(&state, Role::System);
@@ -1892,8 +2001,8 @@ data_dir = "./data"
         assert_eq!(value["source_configured"], false);
         let reason = value["reason"].as_str().expect("reason");
         assert!(
-            reason.contains("[settings.updates]") && reason.contains("source_url"),
-            "reason must tell the user how to configure a source: {reason}"
+            reason.contains("[gateway.ota]") && reason.contains("IOT_DAQ_OTA_ENABLED"),
+            "reason must point at the real switch + container env: {reason}"
         );
         for term in ["写端点", "未提供更新执行接口", "接口", "端点"] {
             assert!(
@@ -1902,10 +2011,11 @@ data_dir = "./data"
             );
         }
 
-        // ② 已配置升级源（能力仍未接线，如实说明）。
+        // ② 已声明 manifest_url 但缺签名公钥 → 未就绪；source 如实回显。
         let dir2 = tempfile::tempdir().expect("tempdir");
         let toml = format!(
-            "{SEED_TOML}\n[settings.updates]\nsource_url = \"https://ota.example.com/gw\"\n"
+            "{SEED_TOML}\n[gateway.ota]\nenabled = true\n\
+             manifest_url = \"http://license.webscad.cn/licensing/updates/manifest\"\n"
         );
         let (state2, _p2) = make_state_with(&dir2, &toml);
         let token2 = token_for(&state2, Role::System);
@@ -1913,13 +2023,19 @@ data_dir = "./data"
         let (status, body) = http(port2, "GET", "/api/updates/check", None, Some(&token2)).await;
         assert_eq!(status, 200, "{body}");
         let value: Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(value["check_supported"], false, "capability not wired yet");
-        assert_eq!(value["source"], "https://ota.example.com/gw");
+        assert_eq!(
+            value["check_supported"], false,
+            "缺签名公钥 → 未就绪（仍诚实降级）"
+        );
+        assert_eq!(
+            value["source"],
+            "http://license.webscad.cn/licensing/updates/manifest"
+        );
         assert_eq!(value["source_configured"], true);
         let reason = value["reason"].as_str().expect("reason");
         assert!(
-            reason.contains("尚未提供"),
-            "reason must state the capability is not wired yet: {reason}"
+            reason.contains("IOT_DAQ_OTA_SIGNING_KEY_B64"),
+            "reason must name the missing env knob: {reason}"
         );
     }
 
@@ -1955,7 +2071,7 @@ data_dir = "./data"
             assert_eq!(status, 400, "{body_raw} → {body}");
         }
 
-        // 三要素齐全 → 200 诚实降级（绝不伪造成功）。
+        // OTA 未就绪 → 200 诚实降级（绝不伪造成功）。
         let (status, body) = http(
             port,
             "POST",
@@ -1978,7 +2094,7 @@ data_dir = "./data"
         assert!(value["reason"]
             .as_str()
             .expect("reason")
-            .contains("[settings.updates]"));
+            .contains("[gateway.ota]"));
 
         // 无 token → 401（未进入校验）。
         let (status, _) = http(
@@ -1990,6 +2106,174 @@ data_dir = "./data"
         )
         .await;
         assert_eq!(status, 401);
+    }
+
+    // ---- 更新检查 / 执行：OTA（[gateway.ota]）已配置后的真实状态 ----
+
+    /// 带 `[gateway.ota]` 三要素的配置模板（显式 manifest_url + 公钥 + enabled，
+    /// [`crate::config::OtaSection::is_ready`] 为真）。
+    const OTA_TOML: &str = r#"
+[gateway]
+gateway_id = "gw-ops-ota-test"
+data_dir = "./data"
+
+[gateway.ota]
+enabled = true
+manifest_url = "http://ota.example.com/updates/manifest"
+signing_key_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+current_version = 1
+"#;
+
+    /// 把一个「全进程唯一」OTA 管理器挂到 state 的共享态上，落盘 meta 标注 pending。
+    async fn wire_ota_manager(state: &MgmtState, pending: Option<&str>) {
+        let store = Arc::new(InMemoryOtaStore::default());
+        store
+            .persist_meta(&OtaMeta {
+                current_version: "1".to_string(),
+                pending_version: pending.map(str::to_string),
+                updated_ts_ns: "1".to_string(),
+            })
+            .await
+            .expect("persist meta");
+        let manager = OtaManager::new(
+            store as Arc<dyn OtaStore>,
+            SigningKey::from_bytes(&[0x5au8; 32]).verifying_key(),
+            1,
+        );
+        state
+            .daemon()
+            .set_ota_manager(Arc::new(tokio::sync::Mutex::new(manager)));
+    }
+
+    /// QA：`[gateway.ota]` 已配置且存在 pending → check 如实报 `check_supported:true` /
+    /// `update_available:true` / `available_version` = pending；`ota_current_version`
+    /// 与 `current_version`（Cargo 包版本串）是两个不同口径。
+    #[tokio::test]
+    async fn updates_check_reports_ota_pending_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, Some("2")).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], true);
+        assert_eq!(value["update_available"], true);
+        assert_eq!(value["available_version"], "2");
+        assert_eq!(value["source"], "http://ota.example.com/updates/manifest");
+        assert_eq!(value["source_configured"], true);
+        assert_eq!(
+            value["ota_current_version"], "1",
+            "OTA 单调序当前版本来自落盘 meta"
+        );
+        assert!(
+            value["current_version"].is_string(),
+            "Cargo 包版本串必须保留"
+        );
+        assert_ne!(
+            value["current_version"], value["ota_current_version"],
+            "两个版本口径不得混用"
+        );
+    }
+
+    /// QA：`[gateway.ota]` 已配置但无 pending → `check_supported:true` 且
+    /// `update_available:false` / `available_version:null`（不臆造）。
+    #[tokio::test]
+    async fn updates_check_ota_without_pending_is_honest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, None).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], true);
+        assert_eq!(value["update_available"], false);
+        assert_eq!(value["available_version"], Value::Null);
+    }
+
+    /// QA：`[gateway.ota]` 已配置且存在 pending → apply 接受（`accepted:true`），但
+    /// `applied` **恒 false**（本进程不做二进制替换）；`target_version` = pending。
+    #[tokio::test]
+    async fn updates_apply_accepts_staged_pending_without_claiming_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, Some("2")).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(r#"{"reason":"维护窗口","note":"升级到 2","confirm":"确认执行"}"#),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["accepted"], true);
+        assert_eq!(
+            value["applied"], false,
+            "绝不伪造升级成功（本进程不做二进制替换）"
+        );
+        assert_eq!(value["target_version"], "2");
+        assert_eq!(value["source"], "http://ota.example.com/updates/manifest");
+        assert_eq!(value["source_configured"], true);
+    }
+
+    /// QA：`[gateway.ota]` 已配置但**无 pending** → apply 回到诚实降级
+    /// （`accepted:false` / `applied:false`）。
+    #[tokio::test]
+    async fn updates_apply_ota_without_pending_stays_honest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, None).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(r#"{"reason":"r","note":"n","confirm":"c"}"#),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["accepted"], false);
+        assert_eq!(value["applied"], false);
+    }
+
+    /// QA：`[gateway.ota]` 已配置但运行期管理器未装配 → `check_supported:false`
+    /// （不能承诺能完成一次检查），但 `source` 如实回显、`source_configured:true`
+    /// （配置层确实就绪，缺口在运行期），reason 非空且点名「尚未就绪」；
+    /// `ota_current_version` 恒 null（统一规则：只有读到落盘 meta 才给值）。
+    #[tokio::test]
+    async fn updates_check_ota_configured_but_manager_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], false);
+        assert_eq!(value["update_available"], false);
+        assert_eq!(value["available_version"], Value::Null);
+        assert_eq!(value["source_configured"], true);
+        assert_eq!(value["ota_current_version"], Value::Null);
+        let reason = value["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("尚未就绪"),
+            "reason 应点名运行期未就绪，实际：{reason}"
+        );
     }
 
     /// 计划重启：`GET` 回显当前配置；`PUT` 校验非法时刻 / 三要素缺失，合法则落盘。

@@ -53,6 +53,144 @@ fn default_data_dir() -> PathBuf {
     data_dir_from_env(std::env::var(DATA_DIR_ENV).ok())
 }
 
+/// 授权云服务基址环境变量：**容器形态下 `cloud_url` 的唯一运行期注入入口**。
+///
+/// 容器镜像内的配置文件位于只读路径 `/etc/iot-daq/gateway.toml`
+/// （compose `read_only: true` 且 `volumes:` 未挂载该目录），现场无法在运行期改文件；
+/// 修复前该文件 `cloud_url = ""` 恒为空串，没有任何赋值入口 → 装配判定
+/// `(cloud_url=None, code=Some(_)) → Failed("cloud_url is missing")` fail-closed，
+/// 容器内即便配了激活码也**必然激活失败**。存在且非空白时覆盖
+/// `[gateway.licensing].cloud_url`（`trim().is_empty()` 判空，勿裸 `is_empty()`）。
+pub const LICENSE_SERVER_URL_ENV: &str = "IOT_DAQ_LICENSE_SERVER_URL";
+
+/// 租约心跳间隔环境变量（单位：秒；覆盖 `[gateway.licensing].heartbeat_interval_secs`）。
+///
+/// 非法值（非数字 / 零）**绝不**静默降级为 0 秒心跳：记 `warn!` 后回退配置文件值。
+pub const LEASE_HEARTBEAT_SECS_ENV: &str = "IOT_DAQ_LEASE_HEARTBEAT_SECS";
+
+/// OTA 启用开关环境变量（覆盖 `[gateway.ota].enabled`）。
+///
+/// **容器形态启用 OTA 的唯一通道之一**（`/etc/iot-daq/gateway.toml` 只读不可写）。
+/// 取值 `1/true/yes/on` → true；`0/false/no/off`（或空白）→ false；
+/// 其它值 → 记 `warn!` 点名变量与非法值后回退配置文件值。
+pub const OTA_ENABLED_ENV: &str = "IOT_DAQ_OTA_ENABLED";
+/// OTA manifest 端点环境变量（覆盖 `[gateway.ota].manifest_url`；非空白才覆盖）。
+pub const OTA_MANIFEST_URL_ENV: &str = "IOT_DAQ_OTA_MANIFEST_URL";
+/// OTA 验签公钥环境变量（覆盖 `[gateway.ota].signing_key_b64`；非空白才覆盖）。
+pub const OTA_SIGNING_KEY_B64_ENV: &str = "IOT_DAQ_OTA_SIGNING_KEY_B64";
+/// OTA 当前版本号环境变量（覆盖 `[gateway.ota].current_version`；合法 `u64` 才覆盖）。
+pub const OTA_CURRENT_VERSION_ENV: &str = "IOT_DAQ_OTA_CURRENT_VERSION";
+
+/// `cloud_url` 解析（纯函数，单测注入）：env 存在且非空白 → 用 env 值
+/// （显式覆盖配置文件）；否则回退文件值（同样 trim 后非空才返回，
+/// 空白一律归一为 `None`）。判空必须 `trim().is_empty()`。
+fn cloud_url_from_env(file_value: Option<String>, env_value: Option<String>) -> Option<String> {
+    fn normalize(v: String) -> Option<String> {
+        let v = v.trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+    env_value
+        .and_then(normalize)
+        .or_else(|| file_value.and_then(normalize))
+}
+
+/// 心跳间隔解析（纯函数，单测注入）：env trim 后为空 → 视同未设置，静默回退文件值；
+/// env 可解析为 `u64` 且 `> 0` → 用 env；其余（非数字 / 零）记 `warn!` 点名变量与
+/// 非法内容后回退文件值，**绝不让非法配置变成 0 秒心跳**。
+fn heartbeat_secs_from_env(file_value: u64, env_value: Option<String>) -> u64 {
+    let Some(raw) = env_value else {
+        return file_value;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return file_value;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(v) if v > 0 => v,
+        _ => {
+            tracing::warn!(
+                target: "daemon::config",
+                env = LEASE_HEARTBEAT_SECS_ENV,
+                value = %raw,
+                fallback = file_value,
+                "config: invalid lease heartbeat env value; falling back to config file value"
+            );
+            file_value
+        }
+    }
+}
+
+/// OTA 启用开关解析（纯函数，单测注入）：env trim 后为空 → 视同未设置，回退文件值；
+/// `1/true/yes/on`（大小写不敏感）→ true；`0/false/no/off` → false；
+/// 其它值 → 记 `warn!` 点名变量与非法内容后回退文件值（绝不猜）。
+fn ota_enabled_from_env(file_value: bool, env_value: Option<String>) -> bool {
+    let Some(raw) = env_value else {
+        return file_value;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return file_value;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => {
+            tracing::warn!(
+                target: "daemon::config",
+                env = OTA_ENABLED_ENV,
+                value = %raw,
+                "config: invalid ota enabled env value; falling back to config file value"
+            );
+            file_value
+        }
+    }
+}
+
+/// `Option<String>` 字段的 env 覆盖（纯函数，单测注入）：env trim 非空 → 覆盖文件值；
+/// env 缺失 / 空白 → 保留文件值；文件空白 → `None`（空白一律归一为未配置）。
+fn ota_option_override(file_value: Option<String>, env_value: Option<String>) -> Option<String> {
+    fn normalize(v: String) -> Option<String> {
+        let v = v.trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+    env_value
+        .and_then(normalize)
+        .or_else(|| file_value.and_then(normalize))
+}
+
+/// OTA 当前版本号解析（纯函数，单测注入）：env trim 后为空 → 回退文件值；
+/// 可解析为 `u64`（含 `0`）→ 覆盖；非法 → 记 `warn!` 点名变量与非法内容后回退文件值。
+fn ota_current_version_from_env(file_value: u64, env_value: Option<String>) -> u64 {
+    let Some(raw) = env_value else {
+        return file_value;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return file_value;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!(
+                target: "daemon::config",
+                env = OTA_CURRENT_VERSION_ENV,
+                value = %raw,
+                fallback = file_value,
+                "config: invalid ota current_version env value; falling back to config file value"
+            );
+            file_value
+        }
+    }
+}
+
 fn default_topic_prefix() -> String {
     "telemetry".to_string()
 }
@@ -527,11 +665,16 @@ fn default_ota_poll_interval_secs() -> u64 {
 ///
 /// 语义（诚实降级）：
 /// - `enabled = false`（默认）→ 调度任务 no-op，**不发任何网络请求**、不报错；
-/// - `enabled = true` 但 `manifest_url` / `signing_key_b64` 缺失 → 视为**未配置**：
+/// - `enabled = true` 但**既无 `manifest_url`、又无可用 `cloud_url`**，或缺
+///   `signing_key_b64` → 视为**未就绪**（[`OtaSection::is_ready`] = false）：
 ///   调度任务记一次 `warn!` 说明「OTA 未配置，跳过升级检查」并附配置键名，
 ///   绝不 panic、绝不静默；
 /// - `manifest_url` 指向授权端 `GET /updates/manifest`（V1 仅支持 `http://` 明文，
 ///   完整性由 Ed25519 验签兜底，理由见 [`crate::ota`] 模块文档）；
+/// - **`manifest_url` 可省略**：省略时按 `{cloud_url}/updates/manifest` 推导
+///   （见 [`OtaSection::effective_manifest_url`]；canonical 形态
+///   `cloud_url = http://license.webscad.cn/licensing` →
+///   `manifest_url = http://license.webscad.cn/licensing/updates/manifest`）；
 /// - `signing_key_b64` 是 Ed25519 **公钥**（32 字节，标准 base64）——用于校验
 ///   下发的 manifest 签名，签名者是持有对应私钥的授权端；
 /// - `current_version` 是网关当前 OTA 版本号（u64 单调序）；新包版本必须**严格大于**
@@ -541,7 +684,9 @@ fn default_ota_poll_interval_secs() -> u64 {
 pub struct OtaSection {
     /// 是否启用 OTA 检查（缺省 **false** = 不动作）。
     pub enabled: bool,
-    /// 授权端 manifest 端点（如 `http://licensing.internal:7080/updates/manifest`）。
+    /// 授权端 manifest 端点（canonical：
+    /// `http://license.webscad.cn/licensing/updates/manifest`）。**可省略**——
+    /// 省略时按 `{cloud_url}/updates/manifest` 推导（不写回配置文件）。
     pub manifest_url: Option<String>,
     /// 轮询周期（秒；缺省 3600）。`0` 在运行时按 1 秒兜底。
     pub poll_interval_secs: u64,
@@ -564,9 +709,11 @@ impl Default for OtaSection {
 }
 
 impl OtaSection {
-    /// 是否**已配置**（enabled + manifest_url + signing_key_b64 三者齐备）。
+    /// 是否**显式配置**（enabled + manifest_url + signing_key_b64 三者齐备）。
     ///
-    /// `enabled = false`、URL 为空串 / 全空白、公钥缺失 → 均视为未配置。
+    /// `enabled = false`、URL 为空串 / 全空白、公钥缺失 → 均视为未显式配置。
+    /// **注意**：生产就绪判定请用 [`Self::is_ready`]（它允许 `manifest_url` 省略、
+    /// 由 `cloud_url` 推导）。
     pub fn is_configured(&self) -> bool {
         self.enabled
             && !self.manifest_url.as_deref().unwrap_or("").trim().is_empty()
@@ -578,11 +725,54 @@ impl OtaSection {
                 .is_empty()
     }
 
-    /// 未配置时的**面向运维**提示（含配置键名与怎么配）。
+    /// **生效的** manifest 端点（显式值优先，否则按 `cloud_url` 推导）。
+    ///
+    /// - 显式 `manifest_url` trim 后非空 → 返回它（去掉尾斜杠规范化）；
+    /// - 否则 `cloud_url` trim 后非空 → 返回 `{cloud_url 去尾斜杠}/updates/manifest`；
+    /// - 两者皆空 → `None`（未就绪）。
+    ///
+    /// **不写回配置文件**：推导结果只存在于内存，避免操作者日后改 `cloud_url` 时
+    /// 配置里残留一条陈旧 URL（`save()` 只持久化显式字段）。
+    pub fn effective_manifest_url(&self, cloud_url: Option<&str>) -> Option<String> {
+        fn normalize(raw: &str) -> Option<String> {
+            let trimmed = raw.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        if let Some(url) = self.manifest_url.as_deref().and_then(normalize) {
+            return Some(url);
+        }
+        cloud_url
+            .and_then(normalize)
+            .map(|base| format!("{base}/updates/manifest"))
+    }
+
+    /// 生产**就绪**判定：`enabled` + 有生效的 manifest 端点（显式或由 `cloud_url`
+    /// 推导）+ `signing_key_b64` 非空白。三者齐备才允许发起升级检查。
+    pub fn is_ready(&self, cloud_url: Option<&str>) -> bool {
+        self.enabled
+            && self.effective_manifest_url(cloud_url).is_some()
+            && !self
+                .signing_key_b64
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+    }
+
+    /// 未就绪时的**面向运维**提示（含配置键名、canonical 值与 env 通道）。
     pub fn config_hint(&self) -> &'static str {
-        "OTA 未配置，跳过升级检查；如需启用请在 [gateway.ota] 段配置 \
-         enabled = true、manifest_url = \"http://<授权端主机>:<端口>/updates/manifest\"、\
-         signing_key_b64 = \"<授权端 Ed25519 公钥 base64>\"（poll_interval_secs 可选，缺省 3600）"
+        "OTA 未就绪，跳过升级检查；如需启用请在 [gateway.ota] 段配置 \
+         enabled = true、signing_key_b64 = \"<授权端 Ed25519 公钥 base64>\"，\
+         并二选一提供 manifest_url（canonical：\
+         http://license.webscad.cn/licensing/updates/manifest）或 cloud_url \
+         （manifest_url 可省略，将按 {cloud_url}/updates/manifest 推导）；\
+         容器形态经 env 注入：IOT_DAQ_OTA_ENABLED / IOT_DAQ_OTA_SIGNING_KEY_B64 / \
+         IOT_DAQ_OTA_MANIFEST_URL（可省略）/ IOT_DAQ_LICENSE_SERVER_URL \
+         （poll_interval_secs 可选，缺省 3600）"
     }
 }
 
@@ -892,6 +1082,8 @@ pub struct GatewayConfig {
 impl GatewayConfig {
     /// 从 TOML 文件加载。
     ///
+    /// 走 [`Self::parse`]（唯一入口）→ 自带环境变量覆盖，保证启动期与热重载都生效。
+    ///
     /// # Errors
     /// 读取失败映射 [`DaemonError::StorageError`]，解析失败映射
     /// [`DaemonError::ConfigError`]（错误路径不 panic）。
@@ -899,17 +1091,56 @@ impl GatewayConfig {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .map_err(|e| DaemonError::StorageError(format!("read {}: {e}", path.display())))?;
-        let config: GatewayConfig = toml::from_str(&raw)?;
+        let config = Self::parse(&raw)?;
         warn_inverted_points(&config);
         Ok(config)
     }
 
-    /// 从 TOML 字符串解析（测试与嵌入场景用）。
+    /// 从 TOML 字符串解析（测试与嵌入场景用）：解析成功后应用环境变量覆盖。
+    ///
+    /// **这是配置装载的唯一入口**（[`Self::load`] 内部委托本方法；管理面热重载
+    /// 亦经 [`Self::load`]）——`IOT_DAQ_LICENSE_SERVER_URL` /
+    /// `IOT_DAQ_LEASE_HEARTBEAT_SECS` 的覆盖在此处统一生效，避免出现「某条装载
+    /// 路径漏接 env」的容器激活黑洞。
     ///
     /// # Errors
     /// 解析失败映射 [`DaemonError::ConfigError`]。
     pub fn parse(raw: &str) -> DaemonResult<Self> {
-        Ok(toml::from_str(raw)?)
+        let config: Self = toml::from_str(raw)?;
+        Ok(config.apply_env_overrides())
+    }
+
+    /// 应用环境变量覆盖（授权 + 心跳 + OTA 四项）。
+    ///
+    /// env 显式优先于配置文件：容器只读根文件系统下，这是 `cloud_url` / 心跳 /
+    /// `[gateway.ota]` 的**唯一**可注入通道（`/etc/iot-daq/gateway.toml` 不可写）。
+    fn apply_env_overrides(mut self) -> Self {
+        self.gateway.licensing.cloud_url = cloud_url_from_env(
+            self.gateway.licensing.cloud_url,
+            std::env::var(LICENSE_SERVER_URL_ENV).ok(),
+        );
+        self.gateway.licensing.heartbeat_interval_secs = heartbeat_secs_from_env(
+            self.gateway.licensing.heartbeat_interval_secs,
+            std::env::var(LEASE_HEARTBEAT_SECS_ENV).ok(),
+        );
+        // OTA（容器形态逐项可注入；每个覆盖函数对非法值 warn 后回退文件值）。
+        self.gateway.ota.enabled = ota_enabled_from_env(
+            self.gateway.ota.enabled,
+            std::env::var(OTA_ENABLED_ENV).ok(),
+        );
+        self.gateway.ota.manifest_url = ota_option_override(
+            self.gateway.ota.manifest_url,
+            std::env::var(OTA_MANIFEST_URL_ENV).ok(),
+        );
+        self.gateway.ota.signing_key_b64 = ota_option_override(
+            self.gateway.ota.signing_key_b64,
+            std::env::var(OTA_SIGNING_KEY_B64_ENV).ok(),
+        );
+        self.gateway.ota.current_version = ota_current_version_from_env(
+            self.gateway.ota.current_version,
+            std::env::var(OTA_CURRENT_VERSION_ENV).ok(),
+        );
+        self
     }
 
     /// 保存配置到 TOML 文件（管理面写路径）：
@@ -1260,6 +1491,17 @@ mod tests {
     use super::*;
     use crate::rules::{Action, CmpOp, Condition, ConditionValue};
 
+    /// 串行化「读 / 改进程环境变量」的测试：env 是进程级全局状态，而 `parse`
+    /// 现会读取 [`LICENSE_SERVER_URL_ENV`] / [`LEASE_HEARTBEAT_SECS_ENV`]
+    /// （以及 data_dir 默认读 [`DATA_DIR_ENV`]）。并行测试下必须互斥，否则断言
+    /// 文件派生值的用例会被并发的 env 注入污染。
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 获取 env 测试互斥锁（中毒时取回内层 guard，测试间不互相连坐）。
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     const EXAMPLE_TOML: &str = r#"
 [gateway]
 gateway_id = "gw-alpha"
@@ -1305,6 +1547,7 @@ frequency_ms = 100
     /// QA: 示例 TOML（1 个 Modbus 设备 + MQTT 配置）解析成功，协议 Modbus、频率 100ms。
     #[test]
     fn parse_example_config() {
+        let _guard = env_guard();
         let config = GatewayConfig::parse(EXAMPLE_TOML).expect("parse ok");
         assert_eq!(config.gateway.gateway_id, "gw-alpha");
         assert_eq!(
@@ -1384,12 +1627,12 @@ frequency_ms = 100
         assert_eq!(ota.current_version, 0);
         assert!(!ota.is_configured(), "空配置 = 未配置");
 
-        // 2) 显式段解析。
+        // 2) 显式段解析（canonical 域名形态）。
         let parsed = GatewayConfig::parse(
             r#"
 [gateway.ota]
 enabled = true
-manifest_url = "http://licensing.internal:7080/updates/manifest"
+manifest_url = "http://license.webscad.cn/licensing/updates/manifest"
 poll_interval_secs = 60
 signing_key_b64 = "AAAA"
 current_version = 7
@@ -1400,12 +1643,16 @@ current_version = 7
         assert!(ota.enabled);
         assert_eq!(
             ota.manifest_url.as_deref(),
-            Some("http://licensing.internal:7080/updates/manifest")
+            Some("http://license.webscad.cn/licensing/updates/manifest")
         );
         assert_eq!(ota.poll_interval_secs, 60);
         assert_eq!(ota.signing_key_b64.as_deref(), Some("AAAA"));
         assert_eq!(ota.current_version, 7);
         assert!(ota.is_configured(), "三要素齐备 = 已配置");
+        assert!(
+            ota.is_ready(None),
+            "显式 manifest_url + 公钥 + enabled = 就绪"
+        );
 
         // 3) enabled=true 但 URL 为空 / 全空白 → 未配置；缺公钥同样未配置。
         let no_url = OtaSection {
@@ -1424,6 +1671,262 @@ current_version = 7
             ..OtaSection::default()
         };
         assert!(!no_key.is_configured(), "缺公钥 = 未配置");
+    }
+
+    /// `effective_manifest_url` 推导语义：
+    /// ① 显式 manifest_url 优先（并去尾斜杠规范化）；
+    /// ② 省略 + cloud_url 有值 → `{cloud_url}/updates/manifest`（cloud_url 带尾斜杠同样正确）；
+    /// ③ 两者皆空 → `None`。
+    #[test]
+    fn effective_manifest_url_prefers_explicit_then_derives_from_cloud_url() {
+        let explicit = OtaSection {
+            enabled: true,
+            manifest_url: Some("  http://license.webscad.cn/licensing/updates/manifest/  ".into()),
+            signing_key_b64: Some("AAAA".into()),
+            ..OtaSection::default()
+        };
+        assert_eq!(
+            explicit
+                .effective_manifest_url(Some("http://other.example/base"))
+                .as_deref(),
+            Some("http://license.webscad.cn/licensing/updates/manifest"),
+            "显式 manifest_url 优先且去尾斜杠 + trim"
+        );
+
+        let derived = OtaSection {
+            enabled: true,
+            manifest_url: None,
+            signing_key_b64: Some("AAAA".into()),
+            ..OtaSection::default()
+        };
+        assert_eq!(
+            derived
+                .effective_manifest_url(Some("http://license.webscad.cn/licensing"))
+                .as_deref(),
+            Some("http://license.webscad.cn/licensing/updates/manifest"),
+            "省略 → 按 cloud_url 推导"
+        );
+        assert_eq!(
+            derived
+                .effective_manifest_url(Some("http://license.webscad.cn/licensing///"))
+                .as_deref(),
+            Some("http://license.webscad.cn/licensing/updates/manifest"),
+            "cloud_url 带尾斜杠 → 仅拼接一个 /updates/manifest"
+        );
+        assert_eq!(
+            derived.effective_manifest_url(Some("   ")),
+            None,
+            "cloud_url 全空白视同未配置"
+        );
+        assert_eq!(derived.effective_manifest_url(None), None, "双缺 → None");
+
+        // 显式 manifest_url 为空白 → 回退 cloud_url 推导（不被空白遮蔽）。
+        let blank_explicit = OtaSection {
+            enabled: true,
+            manifest_url: Some("   ".into()),
+            signing_key_b64: Some("AAAA".into()),
+            ..OtaSection::default()
+        };
+        assert_eq!(
+            blank_explicit
+                .effective_manifest_url(Some("http://license.webscad.cn/licensing"))
+                .as_deref(),
+            Some("http://license.webscad.cn/licensing/updates/manifest")
+        );
+    }
+
+    /// `is_ready` 就绪判定：enabled + 有生效端点（显式 / cloud_url 推导）+ 公钥非空白。
+    #[test]
+    fn is_ready_requires_enabled_endpoint_and_key() {
+        let base = OtaSection {
+            enabled: true,
+            manifest_url: None,
+            signing_key_b64: Some("AAAA".into()),
+            ..OtaSection::default()
+        };
+        assert!(
+            base.is_ready(Some("http://license.webscad.cn/licensing")),
+            "enabled + cloud_url + 公钥 → 就绪"
+        );
+        assert!(!base.is_ready(None), "无端点来源 → 未就绪");
+
+        let disabled = OtaSection {
+            enabled: false,
+            ..base.clone()
+        };
+        assert!(
+            !disabled.is_ready(Some("http://license.webscad.cn/licensing")),
+            "enabled=false → 未就绪"
+        );
+
+        let no_key = OtaSection {
+            signing_key_b64: Some("   ".into()),
+            ..base.clone()
+        };
+        assert!(
+            !no_key.is_ready(Some("http://license.webscad.cn/licensing")),
+            "空白公钥 → 未就绪"
+        );
+
+        let explicit_only = OtaSection {
+            enabled: true,
+            manifest_url: Some("http://license.webscad.cn/licensing/updates/manifest".into()),
+            signing_key_b64: Some("AAAA".into()),
+            ..OtaSection::default()
+        };
+        assert!(
+            explicit_only.is_ready(None),
+            "显式 manifest_url 不依赖 cloud_url"
+        );
+        assert!(
+            explicit_only
+                .config_hint()
+                .contains("IOT_DAQ_OTA_SIGNING_KEY_B64"),
+            "config_hint 必须点名 env 通道"
+        );
+    }
+
+    /// 纯函数语义：OTA 启用开关（模糊真值表 + 非法值 warn 回退文件值）。
+    #[test]
+    fn ota_enabled_from_env_semantics() {
+        for truthy in ["1", "true", "TRUE", "Yes", " on "] {
+            assert!(
+                ota_enabled_from_env(false, Some(truthy.into())),
+                "{truthy:?} → true"
+            );
+        }
+        for falsy in ["0", "false", "No", "OFF"] {
+            assert!(
+                !ota_enabled_from_env(true, Some(falsy.into())),
+                "{falsy:?} → false"
+            );
+        }
+        assert!(ota_enabled_from_env(true, None), "env 缺失 → 文件值 true");
+        assert!(
+            !ota_enabled_from_env(false, None),
+            "env 缺失 → 文件值 false"
+        );
+        assert!(
+            ota_enabled_from_env(true, Some("   ".into())),
+            "空白 → 回退文件值 true"
+        );
+        assert!(
+            ota_enabled_from_env(true, Some("maybe".into())),
+            "非法值 → warn 后回退文件值 true"
+        );
+        assert!(
+            !ota_enabled_from_env(false, Some("maybe".into())),
+            "非法值 → warn 后回退文件值 false"
+        );
+    }
+
+    /// 纯函数语义：`Option<String>` 覆盖（非空覆盖、空白回退、缺失回退）。
+    #[test]
+    fn ota_option_override_semantics() {
+        assert_eq!(
+            ota_option_override(Some("file".into()), Some("  env  ".into())).as_deref(),
+            Some("env"),
+            "env 非空白 → 覆盖并 trim"
+        );
+        assert_eq!(
+            ota_option_override(Some("file".into()), Some("   ".into())).as_deref(),
+            Some("file"),
+            "env 全空白 → 回退文件值"
+        );
+        assert_eq!(
+            ota_option_override(Some("file".into()), None).as_deref(),
+            Some("file"),
+            "env 缺失 → 文件值"
+        );
+        assert_eq!(
+            ota_option_override(Some("  ".into()), None),
+            None,
+            "文件空白 → None"
+        );
+        assert_eq!(
+            ota_option_override(None, Some("env".into())).as_deref(),
+            Some("env"),
+            "文件缺失 + env → env"
+        );
+    }
+
+    /// 纯函数语义：OTA current_version（合法 u64 含 0 覆盖；非法 warn 回退）。
+    #[test]
+    fn ota_current_version_from_env_semantics() {
+        assert_eq!(ota_current_version_from_env(7, Some("42".into())), 42);
+        assert_eq!(
+            ota_current_version_from_env(7, Some(" 0 ".into())),
+            0,
+            "0 是合法 u64"
+        );
+        assert_eq!(ota_current_version_from_env(7, None), 7, "缺失 → 文件值");
+        assert_eq!(
+            ota_current_version_from_env(7, Some("  ".into())),
+            7,
+            "空白 → 文件值"
+        );
+        assert_eq!(
+            ota_current_version_from_env(7, Some("abc".into())),
+            7,
+            "非数字 → 回退文件值"
+        );
+        assert_eq!(
+            ota_current_version_from_env(7, Some("-1".into())),
+            7,
+            "负数 → 回退文件值"
+        );
+    }
+
+    /// 集成回归：`GatewayConfig::parse` 走完 OTA 四个 env 覆盖（容器只读根下的唯一通道）。
+    #[test]
+    fn parse_applies_ota_env_overrides() {
+        let _guard = env_guard();
+        let keys = [
+            OTA_ENABLED_ENV,
+            OTA_MANIFEST_URL_ENV,
+            OTA_SIGNING_KEY_B64_ENV,
+            OTA_CURRENT_VERSION_ENV,
+        ];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        let prev_cloud = std::env::var(LICENSE_SERVER_URL_ENV).ok();
+
+        std::env::set_var(OTA_ENABLED_ENV, "true");
+        std::env::remove_var(OTA_MANIFEST_URL_ENV); // 留空 → 走 cloud_url 推导
+        std::env::set_var(OTA_SIGNING_KEY_B64_ENV, "  PUBKEY  ");
+        std::env::set_var(OTA_CURRENT_VERSION_ENV, "9");
+        std::env::set_var(
+            LICENSE_SERVER_URL_ENV,
+            " http://license.webscad.cn/licensing/ ",
+        );
+
+        let config = GatewayConfig::parse("").expect("parse with ota env overrides");
+
+        // 还原 env（先于断言，避免断言失败污染后续用例）。
+        for (k, v) in keys.iter().zip(prev.iter()) {
+            restore_env(k, v.clone());
+        }
+        restore_env(LICENSE_SERVER_URL_ENV, prev_cloud);
+
+        let ota = &config.gateway.ota;
+        assert!(ota.enabled, "IOT_DAQ_OTA_ENABLED 覆盖");
+        assert_eq!(ota.manifest_url, None, "manifest 留空 → 不写字段");
+        assert_eq!(ota.signing_key_b64.as_deref(), Some("PUBKEY"));
+        assert_eq!(ota.current_version, 9);
+        assert_eq!(
+            ota.effective_manifest_url(config.gateway.licensing.cloud_url.as_deref())
+                .as_deref(),
+            Some("http://license.webscad.cn/licensing/updates/manifest"),
+            "cloud_url 去尾斜杠后推导 manifest 端点"
+        );
+        assert!(
+            ota.is_ready(config.gateway.licensing.cloud_url.as_deref()),
+            "env 四要素齐备 → 就绪"
+        );
+        assert_eq!(
+            config.gateway.licensing.cloud_url.as_deref(),
+            Some("http://license.webscad.cn/licensing/"),
+            "cloud_url env 值仅 trim（尾斜杠保留，由推导侧去除）"
+        );
     }
 
     /// 激活码脱敏纪律（task 19 尾巴）：
@@ -1528,6 +2031,7 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
     /// CI 不应设置该变量；被占用时跳过（避免污染并行测试）。
     #[test]
     fn data_dir_env_wins_over_local_default_in_parsed_config() {
+        let _guard = env_guard();
         if std::env::var(DATA_DIR_ENV).is_ok() {
             return;
         }
@@ -1541,6 +2045,141 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
         );
     }
 
+    // ---- 容器激活修复：IOT_DAQ_LICENSE_SERVER_URL / IOT_DAQ_LEASE_HEARTBEAT_SECS ----
+
+    /// 严格恢复进程环境变量（测试用；避免污染其它用例）。
+    fn restore_env(key: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// 纯函数语义：env 非空 → 覆盖文件值（并 trim）；env 缺失 / 空白 → 保留文件值；
+    /// 文件空白 / 缺失 → `None`（空白一律归一为未配置）。
+    #[test]
+    fn cloud_url_from_env_semantics() {
+        assert_eq!(
+            cloud_url_from_env(Some("https://file.example".into()), None),
+            Some("https://file.example".to_string()),
+            "env 缺失 → 保留文件值"
+        );
+        assert_eq!(
+            cloud_url_from_env(Some("https://file.example".into()), Some(String::new())),
+            Some("https://file.example".to_string()),
+            "env 空串 → 视同未设置，保留文件值"
+        );
+        assert_eq!(
+            cloud_url_from_env(Some("https://file.example".into()), Some("   ".into())),
+            Some("https://file.example".to_string()),
+            "env 全空白 → 保留文件值"
+        );
+        assert_eq!(
+            cloud_url_from_env(
+                Some("https://file.example".into()),
+                Some("https://env.example".into())
+            ),
+            Some("https://env.example".to_string()),
+            "env 非空 → 覆盖文件值"
+        );
+        assert_eq!(
+            cloud_url_from_env(
+                Some("https://file.example".into()),
+                Some("  https://env.example \n".into())
+            ),
+            Some("https://env.example".to_string()),
+            "env 值必须 trim"
+        );
+        assert_eq!(
+            cloud_url_from_env(Some(String::new()), None),
+            None,
+            "文件空串 + 无 env → None"
+        );
+        assert_eq!(
+            cloud_url_from_env(Some("   ".into()), None),
+            None,
+            "文件全空白 + 无 env → None"
+        );
+        assert_eq!(cloud_url_from_env(None, None), None, "双缺 → None");
+        assert_eq!(
+            cloud_url_from_env(None, Some(" https://env.example ".into())),
+            Some("https://env.example".to_string()),
+            "文件缺失 + env 非空 → env 值"
+        );
+    }
+
+    /// 纯函数语义：env 合法正整数 → 覆盖；非法（0 / 负数 / 非数字 / 空 / 空白）→
+    /// 回退文件值（绝不退化为 0 秒心跳）。
+    #[test]
+    fn heartbeat_secs_from_env_semantics() {
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, None),
+            86_400,
+            "env 缺失 → 文件值"
+        );
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, Some("300".into())),
+            300,
+            "env 合法正整数 → 覆盖"
+        );
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, Some(" 300 \n".into())),
+            300,
+            "env 值必须 trim 后解析"
+        );
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, Some("0".into())),
+            86_400,
+            "0 → 文件值"
+        );
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, Some("-1".into())),
+            86_400,
+            "负数 → 文件值"
+        );
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, Some("abc".into())),
+            86_400,
+            "非数字 → 文件值"
+        );
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, Some(String::new())),
+            86_400,
+            "空串 → 文件值"
+        );
+        assert_eq!(
+            heartbeat_secs_from_env(86_400, Some("   ".into())),
+            86_400,
+            "全空白 → 文件值"
+        );
+    }
+
+    /// 集成回归：`GatewayConfig::parse` 走完 env 覆盖——容器只读根文件系统下，
+    /// env 是 `cloud_url` / 心跳的唯一注入通道。严格恢复环境（含外部已占用情形）。
+    #[test]
+    fn parse_applies_cloud_url_and_heartbeat_env_overrides() {
+        let _guard = env_guard();
+        let prev_url = std::env::var(LICENSE_SERVER_URL_ENV).ok();
+        let prev_hb = std::env::var(LEASE_HEARTBEAT_SECS_ENV).ok();
+
+        std::env::set_var(LICENSE_SERVER_URL_ENV, "  https://env-license.example  ");
+        std::env::set_var(LEASE_HEARTBEAT_SECS_ENV, "300");
+        let config = GatewayConfig::parse(EXAMPLE_TOML).expect("parse with env overrides");
+
+        restore_env(LICENSE_SERVER_URL_ENV, prev_url);
+        restore_env(LEASE_HEARTBEAT_SECS_ENV, prev_hb);
+
+        assert_eq!(
+            config.gateway.licensing.cloud_url.as_deref(),
+            Some("https://env-license.example"),
+            "env 必须覆盖文件 cloud_url（且已 trim）"
+        );
+        assert_eq!(
+            config.gateway.licensing.heartbeat_interval_secs, 300,
+            "env 必须覆盖文件 heartbeat_interval_secs"
+        );
+    }
+
     // ---- D-07：随镜像分发的默认配置模板逐行 schema 对齐 ----
 
     /// 默认配置模板（deploy/docker/config/gateway.default.toml）必须整体落在
@@ -1549,6 +2188,7 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
     /// [serial] 段全部被 serde 静默忽略。）
     #[test]
     fn default_template_parses_within_schema() {
+        let _guard = env_guard();
         const TEMPLATE: &str = include_str!("../../../deploy/docker/config/gateway.default.toml");
         let config =
             GatewayConfig::parse(TEMPLATE).expect("deploy template must parse into GatewayConfig");
@@ -1562,8 +2202,13 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
 
         // 授权段：字段名与 schema 一致；模板不内置激活码（真实值经 env 注入，
         // 占位符也绝不默认启用——未配置 = NotConfigured，保持既有行为）。
+        // 模板 `cloud_url = ""` 经 `parse` 归一为 `None`（空白 = 未配置；运行时
+        // 可经 IOT_DAQ_LICENSE_SERVER_URL 注入，见 apply_env_overrides）。
         let licensing = &config.gateway.licensing;
-        assert_eq!(licensing.cloud_url.as_deref(), Some(""));
+        assert_eq!(
+            licensing.cloud_url, None,
+            "blank cloud_url normalizes to None"
+        );
         assert_eq!(licensing.heartbeat_interval_secs, 86_400);
         assert_eq!(
             licensing.activation_code, None,

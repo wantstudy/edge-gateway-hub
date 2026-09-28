@@ -259,7 +259,12 @@ pub const RECEIPT_FIELD_WHITELIST: [&str; 8] = [
 /// 授权服务端点配置（从 `config` 注入，**禁止硬编码 URL / 激活码**）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LicensingClientConfig {
-    /// 授权服务基址，如 `https://licensing.vendor.com/v1`。
+    /// 授权服务基址（canonical：`http://license.webscad.cn/licensing`）。
+    ///
+    /// **服务端路由不带额外前缀**：请求路径为 `{base_url}/{path}`，其中
+    /// `path ∈ activate | heartbeat | verify | audit/receipt`；宿主 nginx 收到
+    /// `/licensing/*` 后**剥掉前缀**转发到 licensing-server 根路径（如
+    /// `http://license.webscad.cn/licensing/activate` → `http://127.0.0.1:9010/activate`）。
     pub base_url: String,
     /// 心跳周期（小时，默认 24）。
     pub heartbeat_hours: u64,

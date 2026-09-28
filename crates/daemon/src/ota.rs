@@ -20,9 +20,12 @@
 //!   `committed == true` → pending 槽晋升为 current 槽（commit）；
 //!   `committed == false`（宽限期内未确认，如反复崩溃/看门狗复位）→ 清除 pending
 //!   槽、current 槽保留旧版本字节（即「恢复旧版本」——两槽位协议下旧字节从未被
-//!   覆盖，保留即恢复）。本任务只实现判定函数与测试，**不接线 bootstrap**
-//!   （未来接线点：`bootstrap.rs` 启动序列中构造 `OtaManager` 后，
-//!   按上次运行是否健康调用 `boot_commit_or_rollback(healthy)`）。
+//!   覆盖，保留即恢复）。
+//!
+//! 生产实现（[`FileOtaStore`]，落 `<data_dir>/ota/{current.bin,pending.bin,meta.json}`）
+//! 由 `bootstrap.rs` 装配为**全进程唯一**的 [`OtaManager`]：轮询任务
+//! （`scheduler::ota_poll`）写入 pending、启动早期按「上次运行是否健康」调用
+//! `boot_commit_or_rollback`，管理面读同一实例如实回显 pending / 版本。
 //!
 //! ## 版本单调性（选型说明）
 //! 选 **u64 单调递增版本号**（弃用 SemVer）：守护进程固件发布序号天然单调，
@@ -61,6 +64,9 @@
 //! [`DaemonError`]；版本号 / 时间戳 / 字节数在 JSON 侧一律字符串。
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -375,6 +381,164 @@ impl OtaStore for InMemoryOtaStore {
 
     async fn load_meta(&self) -> DaemonResult<Option<OtaMeta>> {
         Ok(self.lock_meta()?.clone())
+    }
+}
+
+// ---- 文件系统存储（生产实现：pending / current 落盘，进程重启不丢） ----
+
+/// 把字节**原子**写入 `path`：同目录临时文件 → `write_all` → `sync_all` → `rename`。
+///
+/// `rename` 在同一文件系统内是原子的，故目标文件要么是旧内容、要么是完整新内容，
+/// 绝不会出现写了一半的文件。任何一步失败都清理临时文件并返回 [`DaemonError::StorageError`]，
+/// **零 panic**。
+///
+/// 命名风格与 [`crate::migrations::backup_before_rewrite`] 的「临时文件 + fsync +
+/// 原子 rename」一致（临时文件带进程号后缀，避免同进程并发写碰撞）。
+///
+/// # Errors
+/// 目录创建 / 打开临时文件 / 写入 / `fsync` / `rename` 失败（权限、磁盘满等）→
+/// `StorageError`（可读原因，不静默吞）。
+pub(crate) fn atomic_write_file(path: &Path, data: &[u8]) -> DaemonResult<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        DaemonError::StorageError(format!(
+            "ota atomic write: create dir {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("ota");
+    let tmp = dir.join(format!("{file_name}.tmp-{}", std::process::id()));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DaemonError::StorageError(format!(
+            "ota atomic write: write temp {}: {e}",
+            tmp.display()
+        )));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DaemonError::StorageError(format!(
+            "ota atomic write: rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// 文件系统 OTA 存储（**生产实现**）：把两槽位 + 元数据落在
+/// `<root>/current.bin` / `<root>/pending.bin` / `<root>/meta.json`。
+///
+/// 与 [`InMemoryOtaStore`] 的关键差异：进程重启后 pending 槽与 meta **仍然存在**
+/// （这正是「下载 → 重启后由宿主安装器替换」流程成立的前提）。
+///
+/// ## 原子性与大数红线
+/// - 所有写路径走 [`atomic_write_file`]（临时文件 + `fsync` + 原子 rename）；
+/// - `meta.json` 复用 [`OtaMeta::to_json`] / [`OtaMeta::from_json`]——版本 / 时间戳
+///   字段一律 JSON 字符串，数值型一律拒绝（双向守护）。
+///
+/// ## 槽位名映射（防路径穿越）
+/// 只接受 [`SLOT_CURRENT`] / [`SLOT_PENDING`] 两个已知槽位名；未知槽位名直接返回
+/// `StorageError`（**绝不**把外部字符串拼进文件路径）。
+///
+/// ## 目录不存在
+/// 首次写入时按需 `create_dir_all`；读取时目录 / 文件不存在按「无该槽位 / 无元数据」
+/// 处理（非错误），与 trait 语义一致。
+pub struct FileOtaStore {
+    /// 存储根目录（如 `<data_dir>/ota`）。
+    root: PathBuf,
+}
+
+impl FileOtaStore {
+    /// 以根目录构造（目录可不存在，首次写入时创建）。
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// 存储根目录（诊断 / 日志用）。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// 槽位名 → 文件路径（未知槽位名 → `StorageError`，防路径穿越）。
+    fn slot_path(&self, slot: &str) -> DaemonResult<PathBuf> {
+        let name = match slot {
+            SLOT_CURRENT => "current.bin",
+            SLOT_PENDING => "pending.bin",
+            other => {
+                return Err(DaemonError::StorageError(format!(
+                    "ota file store: unknown slot {other:?} (expected {SLOT_CURRENT:?} or \
+                     {SLOT_PENDING:?})"
+                )))
+            }
+        };
+        Ok(self.root.join(name))
+    }
+
+    /// `meta.json` 文件路径。
+    fn meta_path(&self) -> PathBuf {
+        self.root.join("meta.json")
+    }
+}
+
+#[async_trait]
+impl OtaStore for FileOtaStore {
+    async fn save_bytes(&self, slot: &str, data: &[u8]) -> DaemonResult<()> {
+        let path = self.slot_path(slot)?;
+        atomic_write_file(&path, data)
+    }
+
+    async fn load_bytes(&self, slot: &str) -> DaemonResult<Option<Vec<u8>>> {
+        let path = self.slot_path(slot)?;
+        match std::fs::read(&path) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DaemonError::StorageError(format!(
+                "ota file store: read slot {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    async fn delete(&self, slot: &str) -> DaemonResult<()> {
+        let path = self.slot_path(slot)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            // 幂等：不存在即视为已删除（trait 契约）。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(DaemonError::StorageError(format!(
+                "ota file store: delete slot {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    async fn persist_meta(&self, meta: &OtaMeta) -> DaemonResult<()> {
+        let json = meta.to_json()?;
+        atomic_write_file(&self.meta_path(), json.as_bytes())
+    }
+
+    async fn load_meta(&self) -> DaemonResult<Option<OtaMeta>> {
+        let path = self.meta_path();
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => Ok(Some(OtaMeta::from_json(&raw)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            // 非 UTF-8 / 权限等读取失败 → 可读错误（不静默吞）。
+            Err(e) => Err(DaemonError::StorageError(format!(
+                "ota file store: read meta {}: {e}",
+                path.display()
+            ))),
+        }
     }
 }
 
@@ -809,6 +973,44 @@ impl OtaManager {
         self
     }
 
+    /// 就地替换固件包验签公钥（配置热重载 / 授权端密钥轮换用）。
+    ///
+    /// 只改验签公钥，**不动**两槽位状态与当前版本（版本真相来自落盘 meta）。
+    pub fn set_verifying_key(&mut self, public_key: VerifyingKey) {
+        self.public_key = public_key;
+    }
+
+    /// 读取落盘元数据中的待确认版本（`None` = 无 pending / 元数据缺失）。
+    ///
+    /// 管理面 `GET /api/updates/check` 据此如实回显「是否有待重启生效的新版本」，
+    /// 不做任何推测。
+    ///
+    /// # Errors
+    /// 存储读取 / `meta.json` 解析失败 → `StorageError`。
+    pub async fn pending_version(&self) -> DaemonResult<Option<String>> {
+        Ok(self
+            .store
+            .load_meta()
+            .await?
+            .and_then(|meta| meta.pending_version)
+            .filter(|v| !v.trim().is_empty()))
+    }
+
+    /// 读取落盘元数据中的 OTA 当前版本（u64 单调序的十进制字符串）。
+    ///
+    /// `None` = 元数据缺失（从未写入）；与编辑期 `CARGO_PKG_VERSION` **不是**同一
+    /// 口径（后者是 Cargo 包版本串，前者是 OTA 单调序），管理面必须分别下发。
+    ///
+    /// # Errors
+    /// 存储读取 / 解析失败 → `StorageError`。
+    pub async fn stored_current_version(&self) -> DaemonResult<Option<String>> {
+        Ok(self
+            .store
+            .load_meta()
+            .await?
+            .map(|meta| meta.current_version))
+    }
+
     /// 当前状态机状态。
     pub fn state(&self) -> OtaState {
         self.state
@@ -1101,6 +1303,13 @@ impl OtaManager {
         let Some(meta) = self.store.load_meta().await? else {
             return Ok(OtaBootDecision::NoPending);
         };
+        // 版本真相来自落盘 meta：上次 commit 已推进的版本必须被采纳，否则以配置里
+        // 过期的 current_version 重建管理器会重放「已应用过的版本」（回退到旧基线）。
+        if let Ok(persisted) = meta.current_version.parse::<u64>() {
+            if persisted > self.current_version {
+                self.current_version = persisted;
+            }
+        }
         let Some(pending_str) = meta.pending_version.clone() else {
             return Ok(OtaBootDecision::NoPending);
         };
@@ -2297,5 +2506,260 @@ mod tests {
             ota_signing_message(3, &sha256_hex(b"other")),
             "sha 变化必须改变消息"
         );
+    }
+
+    // ---- 文件系统存储（FileOtaStore：生产落盘实现） ----
+
+    /// QA Happy：写入后**重建** `FileOtaStore`（模拟进程重启）读回一致；
+    /// 原子写不残留临时文件。
+    #[tokio::test]
+    async fn file_store_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("ota");
+
+        {
+            let store = FileOtaStore::new(root.clone());
+            store
+                .save_bytes(SLOT_PENDING, b"pending-bytes")
+                .await
+                .expect("save pending");
+            store
+                .save_bytes(SLOT_CURRENT, b"current-bytes")
+                .await
+                .expect("save current");
+            store
+                .persist_meta(&OtaMeta {
+                    current_version: "1".to_string(),
+                    pending_version: Some("2".to_string()),
+                    updated_ts_ns: "1763000000000000000".to_string(),
+                })
+                .await
+                .expect("persist meta");
+        }
+
+        // 重建 = 进程重启：pending / current / meta 全部读回一致。
+        let store = FileOtaStore::new(root.clone());
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("load pending"),
+            Some(b"pending-bytes".to_vec())
+        );
+        assert_eq!(
+            store.load_bytes(SLOT_CURRENT).await.expect("load current"),
+            Some(b"current-bytes".to_vec())
+        );
+        let meta = store
+            .load_meta()
+            .await
+            .expect("load meta")
+            .expect("meta present");
+        assert_eq!(meta.current_version, "1");
+        assert_eq!(meta.pending_version, Some("2".to_string()));
+
+        // 原子写：无 `.tmp-` 残留。
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write must not leave temp files: {leftovers:?}"
+        );
+    }
+
+    /// QA：pending 写入 → delete → 「no pending」语义正确（None）且幂等；
+    /// 从未写过的槽位 / 元数据也是 None（非错误）。
+    #[tokio::test]
+    async fn file_store_pending_delete_yields_no_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileOtaStore::new(dir.path().join("ota"));
+
+        store
+            .save_bytes(SLOT_PENDING, b"x")
+            .await
+            .expect("save pending");
+        assert!(store
+            .load_bytes(SLOT_PENDING)
+            .await
+            .expect("load pending")
+            .is_some());
+
+        store.delete(SLOT_PENDING).await.expect("delete pending");
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("load pending"),
+            None,
+            "删除后即无 pending"
+        );
+        // 幂等：再次删除不报错。
+        store.delete(SLOT_PENDING).await.expect("idempotent delete");
+
+        assert_eq!(
+            store.load_bytes(SLOT_CURRENT).await.expect("load current"),
+            None,
+            "从未写过的槽位 = None（非错误）"
+        );
+        assert_eq!(store.load_meta().await.expect("load meta"), None);
+    }
+
+    /// QA Error：`meta.json` 被手工写坏 / 数值型字段 → 返回 Err（`StorageError`），
+    /// **不 panic**。
+    #[tokio::test]
+    async fn file_store_corrupt_meta_returns_error_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("ota");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let store = FileOtaStore::new(root.clone());
+
+        // 非 JSON。
+        std::fs::write(root.join("meta.json"), b"{ not json").expect("write corrupt");
+        let err = store
+            .load_meta()
+            .await
+            .expect_err("corrupt meta must be Err");
+        assert!(matches!(err, DaemonError::StorageError(_)), "{err:?}");
+
+        // 数值型字段（大数红线违规）同样 Err。
+        std::fs::write(
+            root.join("meta.json"),
+            br#"{"current_version":1,"pending_version":null,"updated_ts_ns":"0"}"#,
+        )
+        .expect("write numeric");
+        let err = store
+            .load_meta()
+            .await
+            .expect_err("numeric field must be Err");
+        assert!(matches!(err, DaemonError::StorageError(_)), "{err:?}");
+    }
+
+    /// QA Error：未知槽位名 → `StorageError`（防路径穿越），不落到任意路径。
+    #[tokio::test]
+    async fn file_store_rejects_unknown_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileOtaStore::new(dir.path().join("ota"));
+        assert!(matches!(
+            store.save_bytes("../evil", b"x").await,
+            Err(DaemonError::StorageError(_))
+        ));
+        assert!(matches!(
+            store.load_bytes("../evil").await,
+            Err(DaemonError::StorageError(_))
+        ));
+        assert!(matches!(
+            store.delete("bogus").await,
+            Err(DaemonError::StorageError(_))
+        ));
+        assert!(!dir.path().join("evil").exists(), "绝不写出根目录");
+    }
+
+    /// QA 全流程：`FileOtaStore` 上 apply → **重启** → healthy commit（pending 落盘 +
+    /// 版本推进 + 管理面查询口径）。
+    #[tokio::test]
+    async fn file_store_end_to_end_restart_then_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("ota");
+        let payload = firmware_payload(0xF1);
+        let manifest_bytes = build_manifest_json(&key_a(), 2, &payload);
+        let addr = spawn_http_mock(move |_| ok_response(&manifest_bytes)).await;
+
+        {
+            let store = Arc::new(FileOtaStore::new(root.clone()));
+            let mut ota = OtaManager::new(store as Arc<dyn OtaStore>, key_a().verifying_key(), 1);
+            ota.fetch_update(&format!("http://{addr}/ota/x"))
+                .await
+                .expect("fetch");
+            ota.apply().await.expect("apply");
+            assert_eq!(ota.state(), OtaState::Applied);
+        }
+
+        // 重启后的新管理器读回 pending，healthy 判定 → pending 晋升 current。
+        let store = Arc::new(FileOtaStore::new(root.clone()));
+        let mut ota = OtaManager::new(
+            Arc::clone(&store) as Arc<dyn OtaStore>,
+            key_a().verifying_key(),
+            1,
+        );
+        let decision = ota.boot_commit_or_rollback(true).await.expect("commit");
+        assert_eq!(decision, OtaBootDecision::Committed { version: 2 });
+        assert_eq!(
+            store.load_bytes(SLOT_CURRENT).await.expect("current"),
+            Some(payload)
+        );
+        assert_eq!(store.load_bytes(SLOT_PENDING).await.expect("pending"), None);
+        assert_eq!(ota.pending_version().await.expect("pending query"), None);
+        assert_eq!(
+            ota.stored_current_version().await.expect("current query"),
+            Some("2".to_string())
+        );
+    }
+
+    /// QA 全流程：重启后不健康判定 → 回滚（pending 清空、current 旧字节保留）。
+    #[tokio::test]
+    async fn file_store_end_to_end_restart_then_rollback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("ota");
+        let old = firmware_payload(0x01);
+        let new = firmware_payload(0x02);
+        let manifest_bytes = build_manifest_json(&key_a(), 2, &new);
+        let addr = spawn_http_mock(move |_| ok_response(&manifest_bytes)).await;
+
+        {
+            let store = Arc::new(FileOtaStore::new(root.clone()));
+            store
+                .save_bytes(SLOT_CURRENT, &old)
+                .await
+                .expect("seed current");
+            let mut ota = OtaManager::new(store as Arc<dyn OtaStore>, key_a().verifying_key(), 1);
+            ota.fetch_update(&format!("http://{addr}/ota/x"))
+                .await
+                .expect("fetch");
+            ota.apply().await.expect("apply");
+        }
+
+        let store = Arc::new(FileOtaStore::new(root.clone()));
+        let mut ota = OtaManager::new(
+            Arc::clone(&store) as Arc<dyn OtaStore>,
+            key_a().verifying_key(),
+            1,
+        );
+        let decision = ota.boot_commit_or_rollback(false).await.expect("rollback");
+        assert_eq!(decision, OtaBootDecision::RolledBackTo { version: 1 });
+        assert_eq!(store.load_bytes(SLOT_PENDING).await.expect("pending"), None);
+        assert_eq!(
+            store.load_bytes(SLOT_CURRENT).await.expect("current"),
+            Some(old),
+            "旧版本字节完整保留"
+        );
+        assert_eq!(
+            ota.pending_version().await.expect("pending query"),
+            None,
+            "回滚后无 pending"
+        );
+    }
+
+    /// QA：boot 判定采纳落盘 meta 中更高的已提交版本（防止以过期配置基线重放）。
+    #[tokio::test]
+    async fn boot_reconciles_persisted_current_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(FileOtaStore::new(dir.path().join("ota")));
+        store
+            .persist_meta(&OtaMeta {
+                current_version: "5".to_string(),
+                pending_version: None,
+                updated_ts_ns: "1".to_string(),
+            })
+            .await
+            .expect("persist meta");
+
+        let mut ota = OtaManager::new(
+            Arc::clone(&store) as Arc<dyn OtaStore>,
+            key_a().verifying_key(),
+            1,
+        );
+        assert_eq!(
+            ota.boot_commit_or_rollback(true).await.expect("decide"),
+            OtaBootDecision::NoPending
+        );
+        assert_eq!(ota.current_version(), 5, "采纳落盘 meta 的 current_version");
     }
 }
