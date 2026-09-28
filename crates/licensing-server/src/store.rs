@@ -1841,6 +1841,41 @@ impl Store {
         Ok(())
     }
 
+    /// **幂等** upsert 签名密钥（**仅公钥 + hsm_ref**，私钥绝不落库）。
+    ///
+    /// `kid` 已存在 → 覆盖 `status` / `public_key` / `hsm_ref` / `enabled_at` /
+    /// `retired_at`（即整行对齐传入值）；不存在 → 与 [`Store::insert_signing_key`]
+    /// 相同的 INSERT。语义上等价于「以传入值为准的对账」，**绝不产生重复行**
+    /// （`kid` 是主键，冲突由 `ON CONFLICT(kid) DO UPDATE` 就地改写）。
+    ///
+    /// # 用途
+    /// 供**启动期 env 注入对账**使用：签名私钥经环境变量注入、只在
+    /// [`crate::keys::KeyRing`] 内存中，`signing_key` 表只承载公钥。每次启动把注入的
+    /// kid + 公钥 upsert 一次，`GET /admin/keys`（读表）才能反映实际生效的密钥；
+    /// 与 [`Store::insert_signing_key`] 的区别是**可重复执行**，重启不会因主键冲突报错。
+    pub fn upsert_signing_key(&self, key: &SigningKey) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO signing_key (kid, status, public_key, hsm_ref, enabled_at, retired_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(kid) DO UPDATE SET
+                 status     = excluded.status,
+                 public_key = excluded.public_key,
+                 hsm_ref    = excluded.hsm_ref,
+                 enabled_at = excluded.enabled_at,
+                 retired_at = excluded.retired_at",
+            params![
+                key.kid,
+                key.status.as_str(),
+                key.public_key,
+                key.hsm_ref,
+                key.enabled_at,
+                key.retired_at,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 按 kid 查询。
     pub fn get_signing_key(&self, kid: &str) -> LicenseResult<Option<SigningKey>> {
         let conn = self.conn.lock();
@@ -2308,7 +2343,10 @@ impl Store {
     ) -> LicenseResult<Vec<TransferTicket>> {
         let page = page.max(1);
         let page_size = page_size.max(1);
-        let offset = to_i64(((page - 1) as usize) * page_size as usize, "transfer offset")?;
+        let offset = to_i64(
+            ((page - 1) as usize) * page_size as usize,
+            "transfer offset",
+        )?;
 
         let mut sql = format!("SELECT {TRANSFER_COLUMNS} FROM transfer_ticket WHERE 1 = 1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -2390,7 +2428,10 @@ impl Store {
     /// 三者要么全部生效、要么全部回滚：绝不出现「码已废弃但工单仍待处理」的中间态。
     /// `TicketStatus::Processed` 的终态字段（`resolution` / `processed_at` / `processed_by` /
     /// `note`）一并落库。
-    pub fn complete_transfer_ticket(&self, completion: &TransferCompletion<'_>) -> LicenseResult<()> {
+    pub fn complete_transfer_ticket(
+        &self,
+        completion: &TransferCompletion<'_>,
+    ) -> LicenseResult<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         // 1) 原子占位（重复处理 / 并发 → TicketNotPending，事务自动回滚）。
@@ -2475,7 +2516,14 @@ fn update_transfer_ticket_status_tx(
         "UPDATE transfer_ticket
             SET status = ?2, resolution = ?3, processed_at = ?4, processed_by = ?5, note = ?6
           WHERE ticket_id = ?1 AND status = 'pending'",
-        params![ticket_id, status.as_str(), resolution, processed_at, processed_by, note],
+        params![
+            ticket_id,
+            status.as_str(),
+            resolution,
+            processed_at,
+            processed_by,
+            note
+        ],
     )?;
     if affected != 1 {
         // 不存在 / 已终结 / 并发抢先：均按「非待处理」拒绝（终态不可复写）。
@@ -2487,9 +2535,9 @@ fn update_transfer_ticket_status_tx(
             )
             .optional()?;
         return Err(match current {
-            None => LicenseError::KeyStateIllegal(format!(
-                "transfer ticket not found: {ticket_id}"
-            )),
+            None => {
+                LicenseError::KeyStateIllegal(format!("transfer ticket not found: {ticket_id}"))
+            }
             Some(raw) => LicenseError::ticket_not_pending(format!(
                 "transfer ticket {ticket_id} is {raw}, not pending"
             )),
@@ -3636,6 +3684,83 @@ mod tests {
         assert_eq!(k2.retired_at, None);
     }
 
+    /// upsert：空表首插 → 出现一条。
+    #[test]
+    fn upsert_signing_key_inserts_when_absent() {
+        let (store, _) = fixture();
+        let key = SigningKey {
+            kid: "k-up".into(),
+            status: SigningKeyStatus::Active,
+            public_key: "cHViLXVw".into(),
+            hsm_ref: None,
+            enabled_at: 1_700_010_000,
+            retired_at: None,
+        };
+        store.upsert_signing_key(&key).expect("upsert insert");
+        let all = store.list_signing_keys().expect("list");
+        assert_eq!(all.len(), 1, "空表 upsert 后应恰有一条");
+        assert_eq!(all[0], key);
+    }
+
+    /// upsert：同 kid 二次调用覆盖 public_key，且**不产生重复行**（幂等对账）。
+    #[test]
+    fn upsert_signing_key_is_idempotent_and_overwrites() {
+        let (store, _) = fixture();
+        let first = SigningKey {
+            kid: "k-up".into(),
+            status: SigningKeyStatus::Active,
+            public_key: "b2xk".into(),
+            hsm_ref: None,
+            enabled_at: 1_700_010_000,
+            retired_at: None,
+        };
+        let second = SigningKey {
+            kid: "k-up".into(),
+            status: SigningKeyStatus::Retiring,
+            public_key: "bmV3".into(),
+            hsm_ref: Some("kms://rotated".into()),
+            enabled_at: 1_700_020_000,
+            retired_at: Some(1_700_030_000),
+        };
+        store.upsert_signing_key(&first).expect("first upsert");
+        store.upsert_signing_key(&second).expect("second upsert");
+        assert_eq!(
+            store.list_signing_keys().expect("list").len(),
+            1,
+            "同 kid 二次 upsert 不得产生重复行"
+        );
+    }
+
+    /// upsert 已存在 kid 后，`get_signing_key` 返回新值（整行对齐传入值）。
+    #[test]
+    fn upsert_signing_key_get_returns_latest() {
+        let (store, _) = fixture();
+        store
+            .upsert_signing_key(&SigningKey {
+                kid: "k-up".into(),
+                status: SigningKeyStatus::Active,
+                public_key: "b2xk".into(),
+                hsm_ref: None,
+                enabled_at: 1_700_010_000,
+                retired_at: None,
+            })
+            .expect("first upsert");
+        let latest = SigningKey {
+            kid: "k-up".into(),
+            status: SigningKeyStatus::Retiring,
+            public_key: "bmV3".into(),
+            hsm_ref: Some("kms://rotated".into()),
+            enabled_at: 1_700_020_000,
+            retired_at: Some(1_700_030_000),
+        };
+        store.upsert_signing_key(&latest).expect("second upsert");
+        assert_eq!(
+            store.get_signing_key("k-up").expect("get"),
+            Some(latest),
+            "upsert 覆盖后应读到新值"
+        );
+    }
+
     #[test]
     fn audit_log_round_trip_and_filters() {
         let (store, _) = fixture();
@@ -3881,7 +4006,9 @@ mod tests {
             .expect("code2");
         let mut second = sample_ticket("tr-2", "c-t2");
         second.submitted_at = 1_700_000_100;
-        store.insert_transfer_ticket(&sample_ticket("tr-1", "c-t1")).expect("t1");
+        store
+            .insert_transfer_ticket(&sample_ticket("tr-1", "c-t1"))
+            .expect("t1");
         store.insert_transfer_ticket(&second).expect("t2");
 
         // 直查 round-trip（终态字段留空）。
@@ -3987,9 +4114,14 @@ mod tests {
             )
             .expect("seed dirty row");
         }
-        let err = store.get_transfer_ticket("tr-bad").expect_err("dirty status");
+        let err = store
+            .get_transfer_ticket("tr-bad")
+            .expect_err("dirty status");
         assert!(matches!(err, LicenseError::Storage(_)), "{err:?}");
-        assert!(err.to_string().contains("unknown transfer_ticket.status"), "{err}");
+        assert!(
+            err.to_string().contains("unknown transfer_ticket.status"),
+            "{err}"
+        );
     }
 
     /// 换机处理单事务：工单终结 + 废弃 + 重发一并生效；重复处理 → `TicketNotPending`（回滚）。
@@ -4015,7 +4147,9 @@ mod tests {
             revoke: Some(("c-src", "客户更换硬件")),
             reissue: Some((&new_code, "c-src")),
         };
-        store.complete_transfer_ticket(&completion).expect("complete");
+        store
+            .complete_transfer_ticket(&completion)
+            .expect("complete");
 
         let ticket = store
             .get_transfer_ticket("tr-tx")
@@ -4103,7 +4237,13 @@ mod tests {
             .expect("ticket");
 
         store
-            .reject_transfer_ticket("tr-rj", "客户材料不全，驳回", 1_700_001_100, "admin", "补充说明不少于十个字符")
+            .reject_transfer_ticket(
+                "tr-rj",
+                "客户材料不全，驳回",
+                1_700_001_100,
+                "admin",
+                "补充说明不少于十个字符",
+            )
             .expect("reject");
         let ticket = store
             .get_transfer_ticket("tr-rj")
@@ -4122,7 +4262,13 @@ mod tests {
         );
         // 终态不可二次驳回。
         assert!(store
-            .reject_transfer_ticket("tr-rj", "再次驳回", 1_700_001_200, "admin", "补充说明不少于十个字符")
+            .reject_transfer_ticket(
+                "tr-rj",
+                "再次驳回",
+                1_700_001_200,
+                "admin",
+                "补充说明不少于十个字符"
+            )
             .is_err());
     }
 }

@@ -1150,10 +1150,7 @@ async fn admin_transfers(
         Ok(rows) => rows,
         Err(e) => return error_response(&e),
     };
-    let total = service
-        .store()
-        .count_transfer_tickets(&filter)
-        .unwrap_or(0);
+    let total = service.store().count_transfer_tickets(&filter).unwrap_or(0);
     ok_json(paged(items, total, page, page_size))
 }
 
@@ -1174,7 +1171,10 @@ async fn admin_create_transfer(
     if let Err(resp) = require_role(&authed, &ROLES_DANGEROUS, "create transfer ticket") {
         return resp;
     }
-    match state.service.admin_create_transfer_ticket(&req, &authed.sub) {
+    match state
+        .service
+        .admin_create_transfer_ticket(&req, &authed.sub)
+    {
         Ok(item) => ok_json(item),
         Err(e) => error_response(&e),
     }
@@ -3645,14 +3645,8 @@ mod tests {
         )
         .await;
         let code = issue["data"]["codes"][0]["code"].as_str().unwrap();
-        let (status, _) = call_with(
-            &svc,
-            "POST",
-            "/activation",
-            activate_body(code, "M1"),
-            &[],
-        )
-        .await;
+        let (status, _) =
+            call_with(&svc, "POST", "/activation", activate_body(code, "M1"), &[]).await;
         assert_eq!(status, StatusCode::OK);
 
         // 展示态（大写 + 分隔符）检索串：必须归一后命中。
@@ -3664,7 +3658,10 @@ mod tests {
             &authed,
         )
         .await;
-        assert_eq!(hit["data"]["total"], "1", "带分隔符检索串必须命中（归一后）");
+        assert_eq!(
+            hit["data"]["total"], "1",
+            "带分隔符检索串必须命中（归一后）"
+        );
         // 实质不同（多一位）的串仍不命中（归一 ≠ 模糊匹配）。
         let (_, miss) = call_with(
             &svc,
@@ -3700,7 +3697,10 @@ mod tests {
     async fn http_transfer_ticket_full_lifecycle() {
         let svc = build_service();
         let token = admin_token();
-        let authed = [bearer(&token), ("x-tenant-id".to_string(), "t-1".to_string())];
+        let authed = [
+            bearer(&token),
+            ("x-tenant-id".to_string(), "t-1".to_string()),
+        ];
 
         // 发码（预绑定 M1）。
         let (_, issue) = call_with(
@@ -3711,7 +3711,10 @@ mod tests {
             &authed,
         )
         .await;
-        let code_id = issue["data"]["codes"][0]["code_id"].as_str().unwrap().to_string();
+        let code_id = issue["data"]["codes"][0]["code_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // 创建工单（机器码用带 `-` 的展示态 → 必须归一）。
         let (status, created) = call_with(
@@ -3770,8 +3773,7 @@ mod tests {
             "重发必须返回新码"
         );
         assert_eq!(
-            processed["data"]["new_code"]["reissued_from"],
-            code_id,
+            processed["data"]["new_code"]["reissued_from"], code_id,
             "新码必须溯源到原码"
         );
         // 处理后：待处理计数归零，平均处理时长出现（真实 AVG(processed_at - submitted_at)）。
@@ -3809,7 +3811,10 @@ mod tests {
             &authed,
         )
         .await;
-        let code_id2 = issue2["data"]["codes"][0]["code_id"].as_str().unwrap().to_string();
+        let code_id2 = issue2["data"]["codes"][0]["code_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let (_, created2) = call_with(
             &svc,
             "POST",

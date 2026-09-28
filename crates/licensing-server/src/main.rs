@@ -5,7 +5,8 @@
 //! 1. 从环境变量解析监听地址 / SQLite 数据库路径 / 日志级别；
 //! 2. 初始化全局 tracing subscriber（与 daemon 同款 env 约定）；
 //! 3. 打开 [`licensing_server::store::Store`]、装配 [`licensing_server::keys::KeyRing`]
-//!    （部署契约：签名私钥**只经环境变量注入**，绝不落盘 / 进日志）并构造
+//!    （部署契约：签名私钥**只经环境变量注入**，绝不落盘 / 进日志；注入成功后把
+//!    **公钥**幂等 upsert 进 `signing_key` 表，供 `GET /admin/keys` 观测）并构造
 //!    [`licensing_server::service::LicensingService`]；
 //! 4. 用 lib 的现成路由 [`licensing_server::http::router`] 起 axum 服务。
 //!
@@ -32,6 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use licensing_server::admin_auth::{AdminAccount, AdminAuth};
 use licensing_server::http;
 use licensing_server::keys::KeyRing;
+use licensing_server::model::{SigningKey as StoredSigningKey, SigningKeyStatus};
 use licensing_server::service::LicensingService;
 use licensing_server::store::Store;
 
@@ -76,11 +78,17 @@ fn now_unix_secs() -> i64 {
 
 /// 签名私钥注入（部署契约：只经环境变量；kid 与 key **成对出现**才注册）。
 ///
-/// - 注册失败只记 `warn` 不阻断启动（fail-safe：`/verify` 等验签路径不受影响，
+/// 两段式语义：
+/// 1. **内存注册**——私钥经 [`KeyRing::register_from_b64`] 进入进程内存，仅用于签发；
+/// 2. **公钥落库对账**——注册成功后取回条目的公开视图，`upsert` 进 `signing_key`
+///    表，使 `GET /admin/keys`（只读该表）能反映实际生效的公钥。表内**只有公钥 +
+///    hsm_ref**，私钥**绝不落库**。
+///
+/// - 任一步失败只记 `warn` 不阻断启动（fail-safe：`/verify` 等验签路径不受影响，
 ///   签发端点按业务规则 fail-closed）；
 /// - 绝不生成临时密钥（跨重启不可复现的 kid 会让已签发 Lease 全部失验）；
-/// - key 值**绝不进日志**。
-fn register_signing_key_from_env(keyring: &KeyRing) {
+/// - key 值**绝不进日志**（日志只出现 kid）。
+fn register_signing_key_from_env(keyring: &KeyRing, store: &Store) {
     let kid = std::env::var(SIGNING_KID_ENV)
         .ok()
         .map(|v| v.trim().to_string())
@@ -91,12 +99,14 @@ fn register_signing_key_from_env(keyring: &KeyRing) {
         .filter(|v| !v.is_empty());
     match (kid, key) {
         (Some(kid), Some(key)) => {
-            if let Err(err) = keyring.register_from_b64(&kid, &key, None, now_unix_secs()) {
-                tracing::warn!(
+            let now = now_unix_secs();
+            match keyring.register_from_b64(&kid, &key, None, now) {
+                Ok(()) => persist_signing_key_public(keyring, store, &kid, now),
+                Err(err) => tracing::warn!(
                     error = %err,
                     "licensing-server: signing key registration failed; issuance endpoints \
                      will fail closed until a valid key is provided"
-                );
+                ),
             }
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -111,6 +121,39 @@ fn register_signing_key_from_env(keyring: &KeyRing) {
                  {SIGNING_KEY_ENV}); issuance endpoints will fail closed"
             );
         }
+    }
+}
+
+/// 把内存中已注册的签名密钥**公钥**幂等落库（`signing_key` 表；**仅公钥，私钥不落库**）。
+///
+/// 失败只记 `warn`：这是可观测性缺口（`/admin/keys` 看不到注入密钥），
+/// **不是致命错误**，绝不能让启动被它阻断、也绝不静默吞掉。
+fn persist_signing_key_public(keyring: &KeyRing, store: &Store, kid: &str, enabled_at: i64) {
+    let Some(entry) = keyring.get(kid) else {
+        // 刚 `register_from_b64` 成功却查不到条目 = 内存态异常；记 warn 不 panic。
+        tracing::warn!(
+            kid = %kid,
+            "licensing-server: injected signing key not found in keyring after registration; \
+             public key not persisted"
+        );
+        return;
+    };
+    let public = entry.public_view();
+    let stored = StoredSigningKey {
+        kid: public.kid,
+        status: SigningKeyStatus::Active,
+        public_key: public.public_key_b64,
+        hsm_ref: None,
+        enabled_at,
+        retired_at: None,
+    };
+    if let Err(err) = store.upsert_signing_key(&stored) {
+        tracing::warn!(
+            error = %err,
+            kid = %kid,
+            "licensing-server: failed to persist injected signing key public part; \
+             /admin/keys may not reflect it (issuance is unaffected)"
+        );
     }
 }
 
@@ -175,7 +218,7 @@ async fn run(listen: String, db_path: PathBuf) -> Result<(), String> {
     seed_admin_account(&store);
 
     let keyring = KeyRing::empty();
-    register_signing_key_from_env(&keyring);
+    register_signing_key_from_env(&keyring, &store);
     let service = Arc::new(LicensingService::new(store, keyring));
 
     // 管理端鉴权器（env 注入；测试可替换为显式构造）。
@@ -263,5 +306,35 @@ mod tests {
         let path = PathBuf::from(raw);
         let as_ref: &Path = path.as_path();
         assert_eq!(as_ref, Path::new("./licensing.db"));
+    }
+
+    /// 内存注册 → 公钥落库对账：`/admin/keys` 的数据源（`list_signing_keys`）必须能看到
+    /// 注入密钥的公钥；重复调用（模拟重启）不产生重复行。
+    ///
+    /// 不走 env（避免全局环境变量并发干扰），直接驱动 [`persist_signing_key_public`]。
+    #[test]
+    fn persist_signing_key_public_makes_key_visible_and_is_idempotent() {
+        let store = Store::open_in_memory().expect("open in-memory store");
+        let keyring = KeyRing::empty();
+        let now = 1_700_000_000;
+        let kid = keyring.register_generated(None, now).expect("register");
+        let expected_public = keyring
+            .get(&kid)
+            .expect("entry")
+            .public_key_b64()
+            .to_string();
+
+        persist_signing_key_public(&keyring, &store, &kid, now);
+        let stored = store
+            .get_signing_key(&kid)
+            .expect("get")
+            .expect("persisted");
+        assert_eq!(stored.public_key, expected_public, "落库公钥须与内存一致");
+        assert_eq!(stored.status, SigningKeyStatus::Active);
+        assert_eq!(stored.enabled_at, now);
+
+        // 二次调用（重启）幂等：仍只有一行。
+        persist_signing_key_public(&keyring, &store, &kid, now + 10);
+        assert_eq!(store.list_signing_keys().expect("list").len(), 1);
     }
 }

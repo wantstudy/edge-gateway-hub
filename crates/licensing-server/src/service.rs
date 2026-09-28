@@ -1245,7 +1245,11 @@ impl LicensingService {
     }
 
     /// 载入工单并断言「属于该租户 + 处于 `pending`」（终态不可复写）。
-    fn load_pending_ticket(&self, tenant_id: &str, ticket_id: &str) -> LicenseResult<TransferTicket> {
+    fn load_pending_ticket(
+        &self,
+        tenant_id: &str,
+        ticket_id: &str,
+    ) -> LicenseResult<TransferTicket> {
         let ticket = self.store.get_transfer_ticket(ticket_id)?.ok_or_else(|| {
             LicenseError::KeyStateIllegal(format!("transfer ticket not found: {ticket_id}"))
         })?;
@@ -4482,13 +4486,7 @@ mod tests {
 
         let item = svc
             .admin_create_transfer_ticket(
-                &create_transfer_req(
-                    "t-1",
-                    "8F3A-91C2-7D04-5BE6",
-                    "",
-                    &code_id,
-                    "主板损坏返修",
-                ),
+                &create_transfer_req("t-1", "8F3A-91C2-7D04-5BE6", "", &code_id, "主板损坏返修"),
                 "客服甲",
             )
             .unwrap();
@@ -4499,7 +4497,10 @@ mod tests {
         );
         assert_eq!(item.new_machine_code, "");
         assert!(
-            item.submitted_at.parse::<i64>().expect("submitted_at 必须是 epoch 秒串") > 0,
+            item.submitted_at
+                .parse::<i64>()
+                .expect("submitted_at 必须是 epoch 秒串")
+                > 0,
             "提交时间必须为大数十进制串"
         );
         assert!(item.processed_at.is_none());
