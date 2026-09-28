@@ -331,6 +331,31 @@ function fail<T = void>(message: string): WriteResult<T> {
   return { ok: false, message };
 }
 
+/**
+ * 更新执行结果 → 面向用户的人读消息。
+ *
+ * 诚实红线：`accepted:true` 只代表后端**已受理**（下载 + 验签通过），
+ * `applied` 当前恒为 false —— 版本替换由宿主安装器在**重启时**完成。
+ * 因此本函数**绝不**出现「成功」字样；`supported:false` / `accepted:false` 时
+ * 把后端 `reason` 原文并入消息（那是面向用户的真实原因，不自行编造覆盖）。
+ */
+function describeApplyResult(result: UpdateApplyResult): string {
+  if (!result.supported) {
+    return `更新未执行：${result.reason || '后端尚未具备执行更新的能力。'}`;
+  }
+  if (!result.accepted) {
+    return `更新未受理：${result.reason || '后端拒绝了本次更新请求。'}`;
+  }
+  const target = result.targetVersion || '新版本';
+  if (result.applied) {
+    return `更新已应用：${result.currentVersion || '当前版本'} → ${target}。`;
+  }
+  return (
+    `更新包已受理：后端已完成下载并通过签名校验（目标 ${target}）；` +
+    '重启网关后由宿主安装器完成替换，替换结果须以重启后的实际版本号为准（本次尚未应用）。'
+  );
+}
+
 /** 后端角色（`dev`/`system` 等）→ 设备 id 生成用的 ASCII slug。 */
 function slug(value: string, fallback: string): string {
   const ascii = value
@@ -1223,6 +1248,15 @@ export interface OpsApi {
   selfCheck(): Promise<SelfCheckReport>;
   /** 更新检查（`GET /api/updates/check`；**实测仅 GET**，POST → 405）。 */
   checkUpdates(): Promise<UpdateCheckInfo>;
+  /**
+   * 执行系统更新（`POST /api/updates/apply`；**危险操作**，三字段硬契约）。
+   *
+   * body **必须**是彼此独立的 `{reason, note, confirm}` 三字段（`note` **绝不**
+   * 并入 `reason`）；后端出现未知字段 / 任一字段 trim 后为空 → 400
+   * `validation_failed`（fail-closed，不进入执行路径）。
+   * 请求失败（400/401/403/404/501/503）**绝不**假装成功：返回结构化结果 + 人读消息。
+   */
+  applyUpdate(input: { reason: string; note: string; confirm: string }): Promise<UpdateApplyOutcome>;
   /** 开机自启状态（`GET /api/service/autostart`；写入未实现时 `writeSupported:false` 原样保留）。 */
   autostartStatus(): Promise<AutostartStatus>;
   /** 设置开机自启（`PUT /api/service/autostart`；后端未上线 → 诚实 405/404 失败）。 */
@@ -1263,6 +1297,41 @@ export interface UpdateCheckInfo {
   availableVersion: string;
   source: string;
   reason: string;
+}
+
+/** `POST /api/updates/apply` 响应的前端镜像（camelCase 透传）。 */
+export interface UpdateApplyResult {
+  /** 后端是否**具备执行更新**的能力（未配置升级源 / 能力未接线 → false）。 */
+  supported: boolean;
+  /** 本次请求是否被后端**受理**（HTTP 200 且通过三要素校验）；≠ 已升级完成。 */
+  accepted: boolean;
+  /** 是否已真正完成版本替换；**当前后端恒 false** —— 绝不据此声称「已升级」。 */
+  applied: boolean;
+  currentVersion: string;
+  /** 目标版本；后端未给出时为 JSON null → 诚实映射为空串。 */
+  targetVersion: string;
+  source: string;
+  sourceConfigured: boolean;
+  /** 面向用户的原因 / 说明（`supported:false` / `accepted:false` 时照原文展示）。 */
+  reason: string;
+}
+
+/**
+ * 更新执行结果（结构化 + 人读消息）。
+ *
+ * ⚠️ 诚实边界：`accepted:true` 只代表**请求被受理**（后端完成下载 + 验签），
+ * `applied` 当前恒为 false —— 版本替换由宿主安装器在**重启时**完成，
+ * 因此 `message` **绝不**出现「成功」字样，结果一律以重启后的实际版本号为准。
+ */
+export interface UpdateApplyOutcome {
+  /** 后端是否受理本次更新请求（HTTP 200 且 `accepted=true`）。 */
+  accepted: boolean;
+  /** 后端是否已真正完成版本替换（当前恒 false）。 */
+  applied: boolean;
+  /** 后端原始结构化结果；请求失败（非 200 / 网络失败）时为 `null`。 */
+  result: UpdateApplyResult | null;
+  /** 面向用户的人读消息（含后端 `reason` 原文；禁用「成功」措辞）。 */
+  message: string;
 }
 
 /** `GET /api/service/autostart` 响应的前端镜像。 */
@@ -1447,6 +1516,67 @@ function buildOps(): OpsApi {
           source: '',
           reason: describeFailure(cause, '更新检查'),
         };
+      }
+    },
+
+    async applyUpdate(input): Promise<UpdateApplyOutcome> {
+      // wire（ops_api.rs:148 硬契约）：POST /api/updates/apply，body **恰好**
+      // `{reason, note, confirm}` 三个彼此独立的字段（`note` 绝不并入 `reason`）；
+      // 出现未知字段 / 任一字段 trim 后为空 → 400 `validation_failed`。
+      // 失败一律返回结构化结果 + 人读消息，**绝不**假装成功。
+      try {
+        const raw = await apiRequest<Record<string, unknown>>('/api/updates/apply', {
+          method: 'POST',
+          body: JSON.stringify({ reason: input.reason, note: input.note, confirm: input.confirm }),
+        });
+        const result: UpdateApplyResult = {
+          supported: pickBool(raw, 'supported', false),
+          accepted: pickBool(raw, 'accepted', false),
+          applied: pickBool(raw, 'applied', false),
+          currentVersion: pickStr(raw, 'currentVersion', pickStr(raw, 'current_version', '')),
+          // 后端 `target_version: null` → 空串（诚实「目标未知」，不臆造版本号）。
+          targetVersion: pickStr(raw, 'targetVersion', pickStr(raw, 'target_version', '')),
+          source: pickStr(raw, 'source', ''),
+          sourceConfigured: pickBool(raw, 'sourceConfigured', pickBool(raw, 'source_configured', false)),
+          reason: pickStr(raw, 'reason', ''),
+        };
+        return {
+          accepted: result.accepted,
+          applied: result.applied,
+          result,
+          message: describeApplyResult(result),
+        };
+      } catch (cause) {
+        if (cause instanceof ApiError && (cause.status === 404 || cause.status === 501)) {
+          return {
+            accepted: false,
+            applied: false,
+            result: null,
+            message: '后端更新执行接口尚未上线（POST /api/updates/apply 未部署），本次未做任何变更。',
+          };
+        }
+        if (cause instanceof ApiError && cause.status === 403) {
+          return {
+            accepted: false,
+            applied: false,
+            result: null,
+            message: '权限不足（403）：当前角色不可执行系统更新。',
+          };
+        }
+        if (cause instanceof ApiError && cause.status === 400) {
+          // 后端 400 体形如 `{error:"validation_failed", message:<detail>}`：
+          // 先取字段级原因，再取人读消息（去掉 `——` 前缀），最后兜底诚实说明。
+          const detail = validationReason(cause) || extractErrorMessage(cause.body).replace(/^——/, '');
+          return {
+            accepted: false,
+            applied: false,
+            result: null,
+            message:
+              `网关拒绝（400）：${detail || '更新请求三要素（reason / note / confirm）校验未通过'}。` +
+              '本次未做任何变更。',
+          };
+        }
+        return { accepted: false, applied: false, result: null, message: describeFailure(cause, '系统更新') };
       }
     },
 

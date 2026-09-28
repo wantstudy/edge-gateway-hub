@@ -3,12 +3,14 @@
   UpdatePage —— 系统更新（设计 §3.7 / 原型 gateway-v2a-glacier「update」）
   =============================================================================
   真实能力边界（不许造数）：
-    · 后端提供「当前版本」（`GET /api/overview`）与「更新检查」（`GET /api/updates/check`）；
-      从升级源下载 / 安装 / 版本回滚 / 离线包导入的能力尚未接入，相关指标诚实留空（`—`），
-      并在页面上用**面向用户**的话说明「现在能做什么、为什么不能、怎么办」；
+    · 后端提供「当前版本」（`GET /api/overview`）、「更新检查」（`GET /api/updates/check`）
+      与「执行更新」（`POST /api/updates/apply`）；
+    · 「开始更新」经 DangerConfirmModal 四要素确认（影响清单 + 原因必填 + 网关标识二次校验）
+      后真实下发 `{reason, note, confirm}` 三要素；后端返回 `accepted:true, applied:false`
+      时**如实**说明「新包已下载并通过验签，重启后由宿主安装器完成替换」——绝不写「更新成功」；
+      后端 `supported:false` / `accepted:false` 时原文展示其 `reason`，不自行编造文案；
+    · 版本回滚 / 离线包导入的能力尚未接入，相关动作诚实留空（`—`）并按真实结果反馈；
     · 通道与策略开关为**本机界面状态**（暂不保存到网关），显式标注，不伪装成已落库；
-    · 回滚 / 离线包为高危动作，仍走 DangerConfirmModal 四要素确认（影响清单 + 原因必填 +
-      对象二次校验），确认后按真实结果反馈（当前为「能力尚未接入」的诚实说明）；
     · 「执行更新」按钮按后端声明的真实能力禁用——**不允许点了才报错，也不允许假装可点**。
 -->
 <template>
@@ -151,7 +153,8 @@
           <ul class="up-impact">
             <li>工业现场常<b>无外网</b>：可导入离线更新包（.tar.zst + 签名清单），签名校验与在线一致。</li>
             <li>更新会重启服务，采集中断约 5–15 秒；已入队数据不丢失。</li>
-            <li>当前版本<b>不支持远程更新</b>，更新请通过离线包导入。</li>
+            <li v-if="updateSupported">已配置更新源：可在线更新；现场无外网时也可改用离线包，签名校验一致。</li>
+            <li v-else>在线更新当前不可用：{{ lastCheck?.reason || '请先点击「检查更新」获取后端声明的真实原因。' }}</li>
           </ul>
           <button type="button" class="wc-btn" :disabled="!canEdit" data-testid="update-offline-2" @click="openOffline">
             导入离线更新包
@@ -160,6 +163,23 @@
       </section>
     </div>
   </div>
+
+  <!-- 执行更新（危险：下载 + 验签，重启后由宿主安装器替换运行版本） -->
+  <DangerConfirmModal
+    :open="applyOpen"
+    :title="`执行系统更新到 ${applyTargetVersion || '最新版本'}`"
+    :impacts="applyImpacts"
+    :facts="applyFacts"
+    :reasons="APPLY_REASONS"
+    :min-note-length="10"
+    confirm-mode="full"
+    :confirm-value="gatewayId"
+    confirm-label="风险二次确认（输入网关标识全名）"
+    :confirm-placeholder="`输入网关标识 ${gatewayId || '（当前不可得）'} 以确认`"
+    confirm-text="确认执行更新"
+    @close="applyOpen = false"
+    @submit="onApplySubmit"
+  />
 
   <!-- 回滚危险二次确认 -->
   <DangerConfirmModal
@@ -220,6 +240,21 @@ watch(dataVersion, () => {
   currentVersion.value = repo.getGateway().version || '—';
 });
 
+/**
+ * 网关标识（`GET /api/overview` 的 name 即当前 gateway_id）：执行更新的
+ * 二次校验锚点，只透传真实值供用户对照输入，**禁止硬编码**。
+ */
+const gatewayName = ref(repo.getGateway().name || '');
+watch(dataVersion, () => {
+  gatewayName.value = repo.getGateway().name || '';
+});
+
+/** 规范化后的网关标识（空 / 占位符 → 空串，不可用于二次校验）。 */
+const gatewayId = computed<string>(() => {
+  const id = gatewayName.value.trim();
+  return id && id !== '—' ? id : '';
+});
+
 /** 操作提示（结果区，真实结果原文）。 */
 const actionMessage = ref('');
 
@@ -236,10 +271,14 @@ const NOT_CHECKED_HINT = '尚未检查更新，暂不能执行更新；请先点
 /** 后端是否声明支持更新检查（未配置升级源 / 能力未接线 → false）。 */
 const updateSupported = computed<boolean>(() => lastCheck.value?.checkSupported === true);
 
-/** 「执行更新」是否可点：后端声明支持 + 存在可升级版本 + 当前角色有权限。 */
-const applyEnabled = computed<boolean>(
-  () => canEdit.value && updateSupported.value && lastCheck.value?.updateAvailable === true,
-);
+/**
+ * 「执行更新」是否可点：后端声明具备能力（`checkSupported`）+ 当前角色有权限。
+ *
+ * 语义边界：只要后端声明可检查（即已接线 / 已配置升级源）就允许发起；
+ * 「是否有可升级版本」「是否真正能替换」由**后端在执行端点里判定**并给出
+ * 真实原因，本页不自造判定、也不把按钮做成永远点不动。
+ */
+const applyEnabled = computed<boolean>(() => canEdit.value && updateSupported.value);
 
 /** 无法执行更新时的**真实原因**（优先取后端 `reason`；绝不假装可点）。 */
 const applyDisabledReason = computed<string>(() => {
@@ -251,9 +290,6 @@ const applyDisabledReason = computed<string>(() => {
   }
   if (!lastCheck.value.checkSupported) {
     return lastCheck.value.reason || '暂时无法执行更新。';
-  }
-  if (!lastCheck.value.updateAvailable) {
-    return '当前已是可用版本，没有需要安装的更新。';
   }
   return '';
 });
@@ -343,15 +379,84 @@ const steps = [
   { n: '5', label: '健康自检', desc: '采集 / 转发 / 授权 三项连通性' },
 ];
 
+// ---------- 执行更新（危险：POST /api/updates/apply） ----------
+/** 危险二次确认弹窗开关。 */
+const applyOpen = ref(false);
+/** 是否正在下发（防重复提交）。 */
+const applying = ref(false);
+
+/** 本次更新目标版本（来自最近一次检查；无可升级版本时为空）。 */
+const applyTargetVersion = computed<string>(() =>
+  lastCheck.value?.updateAvailable ? lastCheck.value.availableVersion || '' : '',
+);
+
+/** 执行更新影响清单（如实写清后果与恢复路径）。 */
+const applyImpacts: readonly string[] = [
+  '更新会替换当前运行版本并重启服务，采集中断约 5–15 秒；已入队数据不丢失。',
+  '更新包必须通过签名与完整性校验（Ed25519 + SHA-256），校验失败即拒绝安装。',
+  '后端当前只负责下载与验签：替换由宿主安装器在重启时完成，本页不承诺「已升级」，结果以重启后的实际版本号为准。',
+  '操作不可撤销；原因与补充说明将写入审计日志。',
+];
+
+/** 执行更新对象摘要（真实字段）。 */
+const applyFacts = computed<readonly DangerFact[]>(() => [
+  { label: '当前版本', value: currentVersion.value },
+  { label: '目标版本', value: applyTargetVersion.value || '—' },
+  { label: '升级源', value: lastCheck.value?.source || '—' },
+  { label: '网关标识', value: gatewayId.value || '—' },
+]);
+
+/** 执行更新原因枚举（必选，将随操作写入审计）。 */
+const APPLY_REASONS: readonly string[] = [
+  '安全漏洞修复',
+  '功能升级',
+  '缺陷修复',
+  '现场验收要求升级',
+  '其它（请在补充说明中描述）',
+];
+
 /**
- * 「开始更新」：按钮已按后端声明的真实能力禁用（本版本 `checkSupported` 恒为 false），
- * 正常路径不可点击；此处兜底**如实**说明原因，绝不伪造成功、绝不下发假指令。
+ * 「开始更新」：能力就绪时打开**危险二次确认**弹窗（不直接下发指令）。
  *
- * 接线提示：后端开放更新执行能力后，应在此走危险确认弹窗并提交
- * `reason` / `note` / `confirm` 三要素（需先在 `repo.ops` 增加对应方法）。
+ * 兜底说明：按钮不可点时给出后端声明的真实原因；取不到网关标识时拒绝打开
+ * 弹窗（二次校验锚点缺失 → fail-closed），绝不伪造成功、绝不下发假指令。
  */
 function startUpdate(): void {
-  actionMessage.value = `更新未开始：${applyDisabledReason.value}`;
+  if (!applyEnabled.value) {
+    actionMessage.value = applyDisabledReason.value;
+    return;
+  }
+  if (!gatewayId.value) {
+    actionMessage.value = '无法二次确认：未取到网关标识，请刷新页面后重试。';
+    return;
+  }
+  applyOpen.value = true;
+}
+
+/**
+ * 确认执行更新：真实 `POST /api/updates/apply`。
+ *
+ * body 恰好是 `{reason, note, confirm}` 三个**彼此独立**的字段
+ * （`note` 绝不并入 `reason`）；后端 `accepted:true, applied:false` 时由 repo
+ * 给出「已下载并验签、重启后由宿主安装器替换」的**如实**文案，绝不写「更新成功」；
+ * `supported:false` / `accepted:false` 时把后端 `reason` 原文呈现给用户。
+ */
+async function onApplySubmit(payload: { reason: string; note: string; confirm: string }): Promise<void> {
+  if (applying.value) {
+    return;
+  }
+  applying.value = true;
+  try {
+    const outcome = await repo.ops.applyUpdate({
+      reason: payload.reason,
+      note: payload.note,
+      confirm: payload.confirm,
+    });
+    applyOpen.value = false;
+    actionMessage.value = outcome.message;
+  } finally {
+    applying.value = false;
+  }
 }
 
 /**
