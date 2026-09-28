@@ -24,12 +24,11 @@ gateway_id = "gw-unset"
 data_dir = "/var/lib/iot-daq"
 
 [gateway.licensing]
-# 云授权服务地址（离线现场留空 = 纯本地模式；未配置授权时北向闸门恒放行）。
-# 容器形态的两种赋值方式（镜像内本文件位于只读 /etc/iot-daq/gateway.toml，
-# 运行期无法改文件）：
-#   ① 设 env IOT_DAQ_LICENSE_SERVER_URL（**推荐**，已接线：优先于本行，见 config.rs）；
-#   ② 构建前改本文件（随镜像固化，改动需重建镜像）。
-cloud_url = ""
+# 云授权服务地址（开源版硬编码；生产环境可通过环境变量 IOT_DAQ_LICENSE_SERVER_URL 覆盖）
+# 容器形态的两种赋值方式：
+#   ① 镜像内硬编码（当前，适合开源版 / 统一云服务）
+#   ② 设 env IOT_DAQ_LICENSE_SERVER_URL（**可覆盖本值**，适用于自建授权服务场景）
+cloud_url = "http://license.webscad.cn/licensing"
 # 心跳间隔（秒；默认 24h，与 auth::client 口径一致）
 heartbeat_interval_secs = 86400
 # 激活码是**敏感凭据**：默认注释掉（未配置 = 不启用云端激活）。

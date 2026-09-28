@@ -18,6 +18,29 @@ set -eu
 #   （陷阱 2 红线）不可写，故渲染产物落到 tmpfs 的 /tmp/nginx.conf。
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# 自动初始化：首次运行时生成指纹密钥（无需用户手动执行第二步）
+# -----------------------------------------------------------------------------
+# 解析顺序：
+#   1. IOT_DAQ_FINGERPRINT_KEY（环境变量，已有则直接使用，跳过初始化）
+#   2. IOT_DAQ_FINGERPRINT_KEY_FILE（文件路径，文件存在则直接使用）
+#   3. 自动生成到持久卷（首次运行）
+# -----------------------------------------------------------------------------
+DATA_DIR="${IOT_DAQ_DATA_DIR:-/var/lib/iot-daq}"
+FINGERPRINT_KEY_FILE="${IOT_DAQ_FINGERPRINT_KEY_FILE:-${DATA_DIR}/secrets/fingerprint-key}"
+
+if [ -n "${IOT_DAQ_FINGERPRINT_KEY:-}" ]; then
+    echo "[init] 指纹密钥已从环境变量注入，跳过初始化"
+elif [ -f "${FINGERPRINT_KEY_FILE}" ]; then
+    echo "[init] 指纹密钥文件已存在: ${FINGERPRINT_KEY_FILE}"
+else
+    echo "[init] 自动生成指纹密钥到: ${FINGERPRINT_KEY_FILE}"
+    mkdir -p "$(dirname "${FINGERPRINT_KEY_FILE}")"
+    head -c 32 /dev/urandom > "${FINGERPRINT_KEY_FILE}"
+    chmod 600 "${FINGERPRINT_KEY_FILE}"
+    export IOT_DAQ_FINGERPRINT_KEY_FILE="${FINGERPRINT_KEY_FILE}"
+fi
+
 DAEMON_BIN="/usr/local/bin/iot-daq-daemon"
 DAEMON_CONFIG="${IOT_DAQ_CONFIG:-/etc/iot-daq/gateway.toml}"
 NGINX_TEMPLATE="/etc/nginx/nginx.conf.template"
