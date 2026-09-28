@@ -283,20 +283,31 @@ function describeFailure(cause: unknown, subject: string): string {
   return `${subject}：${cause instanceof Error ? cause.message : String(cause)}`;
 }
 
-/** 从后端错误体取人读消息（`{message}` / `{error}` / `{reason}` 优先，其次原文）。 */
-function extractErrorMessage(body: unknown): string {
+/**
+ * 从后端错误体取人读消息（`{message}` / `{reason}` / `{error}` 优先，其次原文）。
+ *
+ * 同时透传后端 `hint` 恢复路径：存在非空 `hint` 时追加 ` 恢复路径：<hint>`，
+ * 把后端已算好的「怎么修」一并给到用户（如预绑定冲突的换机工单 / 解绑旧机）。
+ * `hint` 为空串时视为不存在；无任何主消息时仅回 `——恢复路径：<hint>`。
+ */
+export function extractErrorMessage(body: unknown): string {
   const rec = asRecord(body);
+  const hint = pickStr(rec, 'hint', '');
+  const suffix = hint ? ` 恢复路径：${hint}` : '';
   const message = pickStr(rec, 'message', '');
   if (message) {
-    return `——${message}`;
+    return `——${message}${suffix}`;
   }
   const reason = pickStr(rec, 'reason', '');
   if (reason) {
-    return `——${reason}`;
+    return `——${reason}${suffix}`;
   }
   const error = pickStr(rec, 'error', '');
   if (error) {
-    return `——${error}`;
+    return `——${error}${suffix}`;
+  }
+  if (hint) {
+    return `——恢复路径：${hint}`;
   }
   return typeof body === 'string' && body ? `——${body}` : '';
 }
