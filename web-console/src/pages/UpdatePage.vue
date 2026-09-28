@@ -45,8 +45,8 @@
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">更新包签名</span>
-        <span class="wc-kpi__value">—</span>
-        <span class="wc-kpi__sub">无更新包可校验</span>
+        <span class="wc-kpi__value">{{ updateAvailable ? '已通过验签' : '—' }}</span>
+        <span class="wc-kpi__sub">{{ updateAvailable ? 'Ed25519 + SHA-256' : '无待安装更新包' }}</span>
       </div>
       <div class="wc-kpi">
         <span class="wc-kpi__label">更新通道</span>
@@ -268,17 +268,22 @@ const lastCheck = ref<UpdateCheckInfo | null>(null);
 /** 尚未检查时展示的中性说明（不假设能力可用）。 */
 const NOT_CHECKED_HINT = '尚未检查更新，暂不能执行更新；请先点击「检查更新」。';
 
-/** 后端是否声明支持更新检查（未配置升级源 / 能力未接线 → false）。 */
+/** 后端是否声明支持更新检查（未配置 OTA / 能力未接线 → false）。 */
 const updateSupported = computed<boolean>(() => lastCheck.value?.checkSupported === true);
 
+/** 后端是否存在**待安装**的新版本（= 已有落盘 pending；该包已下载并通过验签）。 */
+const updateAvailable = computed<boolean>(() => lastCheck.value?.updateAvailable === true);
+
 /**
- * 「执行更新」是否可点：后端声明具备能力（`checkSupported`）+ 当前角色有权限。
+ * 「执行更新」是否可点：后端声明具备能力（`checkSupported`）+ 已有待安装的新版本
+ * （`updateAvailable` = 存在落盘 pending）+ 当前角色有权限。
  *
- * 语义边界：只要后端声明可检查（即已接线 / 已配置升级源）就允许发起；
- * 「是否有可升级版本」「是否真正能替换」由**后端在执行端点里判定**并给出
- * 真实原因，本页不自造判定、也不把按钮做成永远点不动。
+ * 语义边界：`updateAvailable` 只表示「存在待重启生效的新版本」，是否最终被受理由
+ * **后端在执行端点里判定**并给出真实原因，本页不自造判定。
  */
-const applyEnabled = computed<boolean>(() => canEdit.value && updateSupported.value);
+const applyEnabled = computed<boolean>(
+  () => canEdit.value && updateSupported.value && updateAvailable.value,
+);
 
 /** 无法执行更新时的**真实原因**（优先取后端 `reason`；绝不假装可点）。 */
 const applyDisabledReason = computed<string>(() => {
@@ -291,19 +296,27 @@ const applyDisabledReason = computed<string>(() => {
   if (!lastCheck.value.checkSupported) {
     return lastCheck.value.reason || '暂时无法执行更新。';
   }
+  if (!lastCheck.value.updateAvailable) {
+    return lastCheck.value.reason || '当前没有待安装的新版本。';
+  }
   return '';
 });
 
-/** 最新可用版本（未检查 / 无更新 → 空串，页面显示 —）。 */
+/**
+ * 最新可用版本（未检查 / 无待安装版本 → 空串，页面显示 —）。
+ *
+ * ⚠️ 口径红线：`availableVersion` 是 OTA 的待安装版本号，与 `currentVersion`
+ * （Cargo 包版本串）**不是同一口径**，因此无待安装版本时**不**回落展示包版本。
+ */
 const latestVersion = computed<string>(() => {
   const info = lastCheck.value;
-  if (!info || !info.checkSupported) {
+  if (!info || !info.checkSupported || !info.updateAvailable) {
     return '';
   }
-  return info.updateAvailable ? info.availableVersion || '' : info.currentVersion || '';
+  return info.availableVersion || '';
 });
 
-/** 最新可用副文案（诚实：未检查 / 无更新 / 有更新各一句）。 */
+/** 最新可用副文案（诚实：未检查 / 无待安装 / 有待安装各一句，不可判定时用后端原文）。 */
 const latestVersionSub = computed<string>(() => {
   const info = lastCheck.value;
   if (!info) {
@@ -312,7 +325,9 @@ const latestVersionSub = computed<string>(() => {
   if (!info.checkSupported) {
     return info.reason || '暂时无法检查更新。';
   }
-  return info.updateAvailable ? `来自 ${info.source || '配置的更新源'}` : '当前已是最新版本';
+  return info.updateAvailable
+    ? `来自 ${info.source || '配置的更新源'}`
+    : info.reason || '当前没有待安装的新版本。';
 });
 
 /** 顶部条：真实状态（能力未接入时直接展示后端给出的原因）。 */
@@ -327,7 +342,9 @@ const updateBanner = computed<string>(() => {
   if (!info.checkSupported) {
     return info.reason || '暂时无法检查更新。';
   }
-  return info.updateAvailable ? `发现新版本 ${info.availableVersion || ''}` : '当前无可用更新';
+  return info.updateAvailable
+    ? `待安装新版本 ${info.availableVersion || ''}（重启后生效）`
+    : '没有待安装的新版本';
 });
 
 /** 顶部条色调（有更新 = 提示色，无更新 = 正常色，未检查 = 中性）。 */
@@ -365,10 +382,13 @@ const toggles = reactive([
 
 // ---------- 进度（能力未接入 → 不做假进度） ----------
 
-/** 更新进度区副文案（能力未接入时如实说明）。 */
-const progressSub = computed<string>(() =>
-  updateSupported.value ? '等待开始' : '暂无进行中的更新',
-);
+/** 更新进度区副文案（如实反映是否有待安装版本，不做假进度）。 */
+const progressSub = computed<string>(() => {
+  if (updateAvailable.value) {
+    return '新版本已就绪 · 待重启生效';
+  }
+  return updateSupported.value ? '没有待安装的新版本' : '暂无进行中的更新';
+});
 
 /** 更新步骤（流程说明，不含具体包体数据）。 */
 const steps = [
@@ -385,7 +405,7 @@ const applyOpen = ref(false);
 /** 是否正在下发（防重复提交）。 */
 const applying = ref(false);
 
-/** 本次更新目标版本（来自最近一次检查；无可升级版本时为空）。 */
+/** 本次更新目标版本（来自最近一次检查的待安装版本；无待安装版本时为空）。 */
 const applyTargetVersion = computed<string>(() =>
   lastCheck.value?.updateAvailable ? lastCheck.value.availableVersion || '' : '',
 );
@@ -477,9 +497,14 @@ async function checkUpdate(): Promise<void> {
     if (!info.checkSupported) {
       actionMessage.value = `未执行检查：${info.reason || '暂时无法检查更新。'}`;
     } else if (info.updateAvailable) {
-      actionMessage.value = `发现新版本 ${info.availableVersion || ''}（当前 ${info.currentVersion}，来源 ${info.source || '—'}）。`;
+      // 口径红线：`availableVersion`（OTA 待安装版本号）与 `currentVersion`（Cargo
+      // 包版本串）不是一个口径，**不**并排展示；重启替换的口径以后端为准。
+      actionMessage.value =
+        `发现待安装的新版本 ${info.availableVersion || '（版本号未上报）'}（升级源 ${info.source || '—'}）；` +
+        '重启网关后由宿主安装器完成替换。';
     } else {
-      actionMessage.value = `当前 ${info.currentVersion} 已是最新版本（来源 ${info.source || '—'}）。`;
+      // 无待安装版本 ≠ 「已是最新」——直接展示后端原文，避免过度承诺。
+      actionMessage.value = info.reason || '当前没有待安装的新版本。';
     }
   } catch (cause) {
     lastCheck.value = null;

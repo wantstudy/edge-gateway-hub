@@ -199,3 +199,60 @@ describe('repo.ops.applyUpdate（POST /api/updates/apply 三字段硬契约）',
     expect(notDeployed.message).not.toContain('成功');
   });
 });
+
+describe('repo.ops.checkUpdates（OTA 已配置的新契约透传）', () => {
+  it('check_supported:true + pending → 三个布尔/版本字段正确；ota u64 序不冒充 Cargo 包版本', async () => {
+    const { calls, restore } = stubFetch(200, {
+      check_supported: true,
+      current_version: '0.1.0',
+      ota_current_version: '7',
+      update_available: true,
+      available_version: '8',
+      source: 'https://updates.example.com/manifest.json',
+      source_configured: true,
+      reason: '已配置升级源 https://updates.example.com/manifest.json；新版本 8 已下载并通过验签，重启网关后由宿主安装器完成替换。',
+    });
+
+    let info: Awaited<ReturnType<typeof repo.ops.checkUpdates>>;
+    try {
+      info = await repo.ops.checkUpdates();
+    } finally {
+      restore();
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('/api/updates/check');
+    expect(info.checkSupported).toBe(true);
+    expect(info.updateAvailable).toBe(true);
+    expect(info.availableVersion).toBe('8');
+    expect(info.source).toBe('https://updates.example.com/manifest.json');
+    // 口径红线：current_version 是 Cargo 包版本（0.1.0），OTA u64 序（7）不得冒充它。
+    expect(info.currentVersion).toBe('0.1.0');
+    expect(info.currentVersion).not.toBe('7');
+  });
+
+  it('无 pending → update_available:false 且 available_version:null → 空串；reason 原文保留', async () => {
+    const { restore } = stubFetch(200, {
+      check_supported: true,
+      current_version: '0.1.0',
+      ota_current_version: '7',
+      update_available: false,
+      available_version: null,
+      source: 'https://updates.example.com/manifest.json',
+      source_configured: true,
+      reason: '已配置升级源 https://updates.example.com/manifest.json；当前没有待安装的新版本。',
+    });
+
+    let info: Awaited<ReturnType<typeof repo.ops.checkUpdates>>;
+    try {
+      info = await repo.ops.checkUpdates();
+    } finally {
+      restore();
+    }
+
+    expect(info.checkSupported).toBe(true);
+    expect(info.updateAvailable).toBe(false);
+    expect(info.availableVersion).toBe('');
+    expect(info.reason).toContain('当前没有待安装的新版本');
+  });
+});
