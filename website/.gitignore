@@ -1,0 +1,4 @@
+# 构建依赖与产物不入库：本站为单文件静态站（index.html 已内联全部资源），
+# 无需 node_modules 与 dist 构建产物。
+node_modules/
+dist/

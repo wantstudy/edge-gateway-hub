@@ -1,0 +1,1561 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IoT-DAQ Gateway — 工业边缘数据采集网关</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='5' fill='%230a0d11'/><rect x='4' y='4' width='24' height='24' rx='3' fill='none' stroke='%23ffb224' stroke-width='2'/><text x='16' y='21' font-family='monospace' font-size='12' font-weight='700' fill='%23ffb224' text-anchor='middle'>GW</text></svg>">
+<script>document.documentElement.classList.add('js');</script>
+<style>
+/* ============ Design Tokens ============ */
+:root {
+  --bg: #0a0d11;
+  --bg-2: #0e1217;
+  --surface: #11161d;
+  --surface-2: #161c25;
+  --surface-3: #1b2330;
+  --line: #212a36;
+  --line-2: #2c3746;
+  --ink: #eef2f7;
+  --ink-2: #b4becb;
+  --ink-3: #7c8898;
+  --amber: #ffb224;
+  --amber-2: #ffca63;
+  --amber-ink: #211603;
+  --cyan: #3fd8bf;
+  --blue: #7fa8ff;
+  --ok: #4ede80;
+  --warn: #ffb224;
+  --danger: #ff6b5e;
+  --radius: 3px;
+  --radius-2: 5px;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --pad: clamp(1.1rem, 4vw, 2.4rem);
+  --focus: #7fa8ff;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* 工程网格背景 */
+.grid-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(127, 168, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(127, 168, 255, 0.045) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.35) 60%, rgba(0,0,0,0.5));
+  -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.35) 60%, rgba(0,0,0,0.5));
+}
+.grid-bg::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 90% 55% at 50% -8%, rgba(127,168,255,0.08), transparent 60%);
+}
+
+main, header, footer { position: relative; z-index: 1; }
+
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+::selection { background: rgba(255, 178, 36, 0.32); color: #fff; }
+
+/* ============ 通用组件 ============ */
+.container {
+  width: 100%;
+  padding-left: var(--pad);
+  padding-right: var(--pad);
+  margin: 0 auto;
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6em;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--amber);
+}
+.eyebrow::before {
+  content: "";
+  width: 22px;
+  height: 1px;
+  background: var(--amber);
+  opacity: 0.7;
+}
+
+.sec-title {
+  margin: 0;
+  font-size: clamp(1.6rem, 3.2vw, 2.4rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.sec-sub {
+  margin: 0.6rem 0 0;
+  color: var(--ink-3);
+  font-size: 1rem;
+}
+
+/* 按钮 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55em;
+  padding: 0.72em 1.35em;
+  border-radius: var(--radius-2);
+  font-size: 0.95rem;
+  font-weight: 650;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+  white-space: nowrap;
+}
+.btn:hover { text-decoration: none; transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+.btn-primary {
+  background: var(--amber);
+  color: var(--amber-ink);
+}
+.btn-primary:hover {
+  background: var(--amber-2);
+  box-shadow: 0 4px 22px rgba(255, 178, 36, 0.28);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+.btn-ghost:hover {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.btn .arrow { font-family: var(--font-mono); font-size: 0.85em; }
+
+/* 滚动渐显（仅在 JS 可用时生效） */
+.js .reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.7s ease, transform 0.75s cubic-bezier(0.16, 1, 0.3, 1);
+  transition-delay: var(--d, 0s);
+}
+.js .reveal.in { opacity: 1; transform: none; }
+
+/* ============ 顶栏 ============ */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  border-bottom: 1px solid var(--line);
+  background: rgba(10, 13, 17, 0.82);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.2rem;
+  padding-top: 0.8rem;
+  padding-bottom: 0.8rem;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  color: var(--ink);
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+.brand:hover { text-decoration: none; }
+.brand-mark {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--amber);
+  border-radius: var(--radius);
+  display: grid;
+  place-items: center;
+  color: var(--amber);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+.brand-name { font-size: 0.98rem; }
+.brand-name small { color: var(--ink-3); font-weight: 500; }
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: 1.4rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.topnav a {
+  color: var(--ink-2);
+  font-size: 0.9rem;
+}
+.topnav a:hover { color: var(--amber); text-decoration: none; }
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+}
+.ver-tag {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  padding: 0.2em 0.8em;
+  white-space: nowrap;
+}
+.btn-nav {
+  padding: 0.5em 1.1em;
+  font-size: 0.85rem;
+}
+
+/* ============ 首屏 ============ */
+.hero {
+  padding: clamp(3.2rem, 7vw, 6rem) 0 clamp(2.5rem, 5vw, 4.5rem);
+}
+.hero-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: clamp(1.8rem, 4vw, 4rem);
+  align-items: center;
+}
+.hero-copy .eyebrow { margin-bottom: 1.1rem; }
+.hero-title {
+  margin: 0;
+  font-size: clamp(2.1rem, 5.4vw, 3.9rem);
+  font-weight: 850;
+  line-height: 1.04;
+  letter-spacing: -0.03em;
+}
+.hero-title .mono {
+  font-family: var(--font-mono);
+  font-size: 0.42em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--cyan);
+  display: block;
+  margin-top: 0.35em;
+}
+.hero-sub {
+  margin: 1rem 0 0;
+  font-size: clamp(1.05rem, 2vw, 1.3rem);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.hero-desc {
+  margin: 1rem 0 0;
+  color: var(--ink-2);
+  max-width: 34em;
+}
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  margin-top: 1.6rem;
+}
+.hero-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  margin-top: 2rem;
+  max-width: 32em;
+}
+.stat {
+  background: var(--bg-2);
+  padding: 0.8rem 1rem;
+}
+.stat b {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.stat span {
+  font-size: 0.78rem;
+  color: var(--ink-3);
+}
+
+/* 拓扑面板 */
+.hero-visual { position: relative; }
+.panel-frame {
+  position: relative;
+  background:
+    radial-gradient(ellipse 120% 100% at 50% 0%, rgba(63, 216, 191, 0.05), transparent 55%),
+    linear-gradient(180deg, var(--surface), var(--bg-2));
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-2);
+  padding: 1rem 1.1rem 1.2rem;
+}
+.panel-frame::before,
+.panel-frame::after {
+  content: "";
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  border-color: var(--amber);
+  opacity: 0.75;
+}
+.panel-frame::before { top: -1px; left: -1px; border-top: 2px solid; border-left: 2px solid; }
+.panel-frame::after { bottom: -1px; right: -1px; border-bottom: 2px solid; border-right: 2px solid; }
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding-bottom: 0.7rem;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 0.7rem;
+}
+.panel-title {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  color: var(--ink-3);
+  text-transform: uppercase;
+}
+.panel-title b { color: var(--ink-2); font-weight: 600; }
+.panel-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--ok);
+}
+.panel-status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+  animation: led 2.4s ease-in-out infinite;
+}
+.topo-svg { display: block; width: 100%; height: auto; }
+.topo-svg text {
+  font-family: var(--font-mono);
+  fill: var(--ink-3);
+  font-size: 11px;
+}
+.topo-svg .t-strong { fill: var(--ink); font-weight: 700; }
+.topo-svg .t-amber { fill: var(--amber); }
+.topo-svg .t-cyan { fill: var(--cyan); }
+.topo-svg .t-blue { fill: var(--blue); }
+.node-body {
+  fill: var(--surface-3);
+  stroke: var(--line-2);
+  stroke-width: 1.2;
+}
+.node-core {
+  fill: var(--surface-2);
+  stroke: var(--line-2);
+  stroke-width: 1;
+}
+.gw-body {
+  fill: #151b25;
+  stroke: #34404f;
+  stroke-width: 1.4;
+}
+.gw-accent {
+  fill: none;
+  stroke: var(--amber);
+  stroke-width: 1.4;
+}
+.link-line {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.link-cyan { stroke: var(--cyan); }
+.link-amber { stroke: var(--amber); }
+.link-dim { stroke: var(--line-2); }
+.flow-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 5 9;
+  animation: dashflow 1.1s linear infinite;
+}
+.flow-line.f1 { stroke: rgba(63, 216, 191, 0.85); }
+.flow-line.f2 { stroke: rgba(255, 178, 36, 0.85); animation-delay: 0.35s; }
+@keyframes dashflow { to { stroke-dashoffset: -14; } }
+.led {
+  animation: led 2.4s ease-in-out infinite;
+}
+.led.l2 { animation-delay: 0.6s; }
+.led.l3 { animation-delay: 1.1s; }
+@keyframes led {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.topo-note {
+  margin-top: 0.8rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.1rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--ink-3);
+  letter-spacing: 0.04em;
+}
+.topo-note span::before {
+  content: "▪";
+  color: var(--amber);
+  margin-right: 0.45em;
+  font-size: 0.7em;
+}
+
+/* ============ 协议规格条 ============ */
+.protocols {
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.protocols-inner {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--line);
+}
+.proto {
+  background: var(--bg-2);
+  padding: 1rem 1.2rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  transition: background 0.2s ease;
+}
+.proto:hover { background: var(--surface); }
+.proto-led {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--cyan);
+  box-shadow: 0 0 9px rgba(63, 216, 191, 0.55);
+}
+.proto:nth-child(2) .proto-led { background: var(--blue); box-shadow: 0 0 9px rgba(127, 168, 255, 0.55); }
+.proto:nth-child(3) .proto-led { background: var(--amber); box-shadow: 0 0 9px rgba(255, 178, 36, 0.55); }
+.proto:nth-child(4) .proto-led { background: var(--ok); box-shadow: 0 0 9px rgba(78, 222, 128, 0.55); }
+.proto-name {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.proto-desc {
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  margin-top: 0.1rem;
+}
+
+/* ============ 配置示例 ============ */
+.config { padding: clamp(3rem, 6vw, 5rem) 0; }
+.config-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: clamp(1.8rem, 4vw, 3.6rem);
+  align-items: center;
+}
+.config-copy .sec-title { margin-top: 1rem; }
+.config-points {
+  list-style: none;
+  margin: 1.4rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.85rem;
+}
+.config-points li {
+  display: flex;
+  gap: 0.8rem;
+  color: var(--ink-2);
+  font-size: 0.95rem;
+}
+.config-points .pc {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--amber);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  padding: 0.12em 0.5em;
+  height: fit-content;
+  margin-top: 0.22em;
+}
+
+/* 终端窗口 */
+.terminal {
+  background: #0b0f15;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-2);
+  overflow: hidden;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.4);
+}
+.term-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.62rem 0.95rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.term-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line-2); }
+.term-dot.d1 { background: var(--danger); opacity: 0.85; }
+.term-dot.d2 { background: var(--warn); opacity: 0.85; }
+.term-dot.d3 { background: var(--ok); opacity: 0.85; }
+.term-file {
+  margin-left: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-3);
+}
+.term-file b { color: var(--ink-2); font-weight: 600; }
+.term-live {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--ok);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+}
+.term-live::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  animation: led 2s ease-in-out infinite;
+}
+.term-body {
+  padding: 1.05rem 1.15rem;
+  overflow-x: auto;
+}
+.term-body pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.75;
+  color: var(--ink-2);
+  white-space: pre;
+}
+.tok-c { color: #5b6775; font-style: italic; }
+.tok-s { color: var(--amber); }
+.tok-k { color: var(--blue); }
+.tok-v { color: var(--cyan); }
+.tok-n { color: var(--amber); }
+
+/* ============ 核心特性 ============ */
+.features {
+  padding: clamp(3rem, 6vw, 5rem) 0;
+  border-top: 1px solid var(--line);
+  background:
+    linear-gradient(180deg, var(--bg-2), var(--bg));
+}
+.features-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 2.2rem;
+}
+.features-head .sec-sub { max-width: 30em; }
+.spec-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+.spec {
+  background: var(--bg-2);
+  padding: 1.35rem 1.4rem 1.45rem;
+  position: relative;
+  transition: background 0.25s ease;
+}
+.spec:hover { background: var(--surface); }
+.spec::after {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--amber);
+  transform: scaleY(0);
+  transform-origin: top;
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.spec:hover::after { transform: scaleY(1); }
+.spec-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.spec-no {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink-3);
+  letter-spacing: 0.1em;
+}
+.spec-tag {
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.18em 0.7em;
+  transition: color 0.2s ease, border-color 0.2s ease;
+}
+.spec:hover .spec-tag { color: var(--amber); border-color: rgba(255, 178, 36, 0.45); }
+.spec h3 {
+  margin: 0.75rem 0 0;
+  font-size: 1.08rem;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+}
+.spec p {
+  margin: 0.4rem 0 0;
+  color: var(--ink-3);
+  font-size: 0.9rem;
+}
+.spec code {
+  font-family: var(--font-mono);
+  font-size: 0.82em;
+  color: var(--cyan);
+}
+
+/* ============ 快速下载 ============ */
+.download {
+  padding: clamp(3rem, 6vw, 5rem) 0;
+  border-top: 1px solid var(--line);
+}
+.download-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 2.2rem;
+}
+.download-head .sec-sub { max-width: 30em; }
+.media-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.2rem;
+}
+.media-card {
+  position: relative;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-2);
+  background: var(--surface);
+  padding: 1.5rem 1.5rem 1.6rem;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.22s ease, transform 0.22s ease;
+}
+.media-card:hover {
+  border-color: rgba(255, 178, 36, 0.55);
+  transform: translateY(-2px);
+}
+.media-card.featured {
+  border-color: rgba(255, 178, 36, 0.6);
+  background:
+    radial-gradient(ellipse 110% 90% at 50% -20%, rgba(255, 178, 36, 0.09), transparent 60%),
+    var(--surface);
+}
+.badge-rec {
+  position: absolute;
+  top: -0.7rem;
+  right: 1.2rem;
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  color: var(--amber-ink);
+  background: var(--amber);
+  border-radius: 999px;
+  padding: 0.2em 0.85em;
+  font-weight: 700;
+}
+.media-icon {
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  display: grid;
+  place-items: center;
+  color: var(--amber);
+  background: var(--surface-2);
+  margin-bottom: 1.1rem;
+}
+.media-card.featured .media-icon { color: var(--amber); }
+.media-os {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  color: var(--ink-3);
+  text-transform: uppercase;
+}
+.media-title {
+  margin: 0.3rem 0 0;
+  font-size: 1.3rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.media-meta {
+  list-style: none;
+  margin: 1rem 0 1.3rem;
+  padding: 0;
+  display: grid;
+  gap: 0.45rem;
+}
+.media-meta li {
+  display: flex;
+  gap: 0.7rem;
+  font-size: 0.88rem;
+  color: var(--ink-2);
+}
+.media-meta .mk {
+  flex: none;
+  width: 1.2em;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  margin-top: 0.12em;
+}
+.pull-cmd {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: #0b0f15;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.8rem;
+  margin: 0 0 1.2rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--cyan);
+  overflow: hidden;
+}
+.pull-cmd code { white-space: nowrap; overflow-x: auto; }
+.copy-btn {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  padding: 0.35em 0.75em;
+  cursor: pointer;
+  transition: color 0.18s ease, border-color 0.18s ease;
+}
+.copy-btn:hover { color: var(--amber); border-color: var(--amber); }
+.media-foot {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+}
+.media-size {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  margin-left: auto;
+}
+
+/* ============ Docker 部署 ============ */
+.deploy {
+  padding: clamp(3rem, 6vw, 5rem) 0;
+  border-top: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--bg-2), var(--bg));
+}
+.deploy-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.4rem;
+}
+.deploy-head .sec-sub { max-width: 34em; }
+.deploy-quick {
+  margin: 0 0 1.6rem;
+}
+.deploy-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.2rem;
+}
+.deploy-note {
+  margin: 1.4rem 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-3);
+}
+.deploy-note b { color: var(--ink-2); font-weight: 700; }
+.deploy-note span::before {
+  content: "▪";
+  color: var(--amber);
+  margin-right: 0.5em;
+  font-size: 0.7em;
+}
+
+/* ============ 快速开始 ============ */
+.start {
+  padding: clamp(3rem, 6vw, 5rem) 0;
+  border-top: 1px solid var(--line);
+  background:
+    linear-gradient(180deg, var(--bg-2), var(--bg));
+}
+.start-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 2.4rem;
+}
+.start-head .sec-sub { max-width: 30em; }
+.steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.2rem;
+  counter-reset: step;
+}
+.step {
+  position: relative;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  border-radius: var(--radius-2);
+  padding: 1.4rem 1.4rem 1.5rem;
+  transition: border-color 0.22s ease, transform 0.22s ease;
+}
+.step:hover {
+  border-color: rgba(255, 178, 36, 0.5);
+  transform: translateY(-2px);
+}
+.step-no {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--amber);
+  letter-spacing: 0.14em;
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+}
+.step-no::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.step h3 {
+  margin: 0.9rem 0 0;
+  font-size: 1.05rem;
+  font-weight: 750;
+}
+.step p {
+  margin: 0.4rem 0 0;
+  color: var(--ink-3);
+  font-size: 0.9rem;
+}
+.step-arrow {
+  display: none;
+}
+@media (min-width: 900px) {
+  .step:not(:last-child)::after {
+    content: "→";
+    position: absolute;
+    right: -0.95rem;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--line-2);
+    font-family: var(--font-mono);
+    font-size: 1rem;
+    z-index: 2;
+    background: var(--bg-2);
+    padding: 0 0.15rem;
+  }
+}
+
+/* ============ 页脚 ============ */
+.footer {
+  border-top: 1px solid var(--line);
+  padding: 0 0 2.2rem;
+  background: var(--bg-2);
+}
+.footer-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.1fr) minmax(0, 0.9fr) auto;
+  gap: clamp(1.6rem, 3vw, 3rem);
+  padding: 2.4rem 0 1.8rem;
+}
+.footer-col-title {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 0.75rem;
+}
+.footer-brand { display: flex; align-items: flex-start; gap: 0.7rem; }
+.footer-brand .brand-mark { width: 26px; height: 26px; font-size: 0.64rem; margin-top: 0.15rem; }
+.footer-brand-name { font-weight: 800; color: var(--ink); font-size: 0.95rem; }
+.footer-brand-sub { font-size: 0.82rem; color: var(--ink-3); margin-top: 0.15rem; }
+.footer-contact-list, .footer-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.55rem;
+}
+.footer-contact-list li { display: flex; align-items: center; gap: 0.6rem; font-size: 0.88rem; min-width: 0; }
+.fc-key {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  color: var(--amber);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.1em 0.45em;
+}
+.footer-contact-list a { color: var(--ink-2); overflow-wrap: anywhere; }
+.footer-contact-list a:hover { color: var(--amber); text-decoration: none; }
+.footer-contact-list .fc-value { color: var(--ink-2); overflow-wrap: anywhere; }
+.copy-mini {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--ink-3);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.14em 0.5em;
+  cursor: pointer;
+  transition: color 0.18s ease, border-color 0.18s ease;
+}
+.copy-mini:hover { color: var(--amber); border-color: var(--amber); }
+.footer-links { gap: 0.55rem; }
+.footer-links a { color: var(--ink-3); font-size: 0.88rem; }
+.footer-links a:hover { color: var(--amber); text-decoration: none; }
+.footer-wx { text-align: center; }
+.footer-wx img {
+  display: block;
+  width: 110px;
+  height: 110px;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-2);
+  padding: 5px;
+}
+.footer-wx span {
+  display: block;
+  margin-top: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  color: var(--ink-3);
+}
+.footer-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--line);
+  padding: 1.1rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--ink-3);
+}
+.footer-beian a { color: var(--ink-3); }
+.footer-beian a:hover { color: var(--amber); text-decoration: none; }
+.footer-copy { margin: 0; font-size: 0.78rem; color: var(--ink-3); font-family: var(--font-mono); }
+
+/* ============ 响应式 ============ */
+@media (max-width: 980px) {
+  .hero-inner { grid-template-columns: 1fr; }
+  .hero-visual { max-width: 640px; }
+  .protocols-inner { grid-template-columns: repeat(2, 1fr); }
+  .config-inner { grid-template-columns: 1fr; }
+  .spec-grid { grid-template-columns: 1fr; }
+  .media-grid { grid-template-columns: 1fr; }
+  .deploy-grid { grid-template-columns: 1fr; }
+  .steps { grid-template-columns: 1fr; }
+  .step:not(:last-child)::after { display: none; }
+  .topnav { display: none; }
+  .footer-main { grid-template-columns: repeat(2, 1fr); }
+  .footer-wx { justify-self: start; }
+}
+
+@media (max-width: 600px) {
+  .footer-main { grid-template-columns: 1fr; }
+  .footer-wx { justify-self: center; }
+  .footer-bottom { justify-content: center; text-align: center; }
+}
+
+/* ============ 打印 ============ */
+@media print {
+  body { background: #fff; color: #111; }
+  .grid-bg, .topbar, .hero-visual, .copy-btn, .copy-mini, .topnav, .step:not(:last-child)::after { display: none !important; }
+  .container { max-width: none; }
+  .hero-stats, .spec-grid, .media-grid, .steps, .deploy-grid { border-color: #999; }
+  .spec, .stat, .media-card, .step { background: #fff !important; border-color: #bbb; }
+  .sec-title, .hero-title, .hero-sub, .spec h3, .media-title, .step h3 { color: #111; }
+  .hero-desc, .sec-sub, .spec p, .media-meta li, .step p { color: #333; }
+  .terminal, .pull-cmd { background: #f4f4f4; border-color: #bbb; }
+  .footer, .footer-main, .footer-bottom { background: #fff !important; border-color: #bbb; }
+  .footer-copy, .footer-col-title, .footer-brand-sub, .footer-wx span { color: #333; }
+  .footer-contact-list a, .footer-links a, .footer-beian a, .footer-contact-list .fc-value { color: #333; }
+  .fc-key { color: #a86600; border-color: #bbb; }
+  a { color: #111; }
+}
+
+/* 动效降级 */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.001s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001s !important;
+  }
+  .js .reveal { opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body>
+<div class="grid-bg" aria-hidden="true"></div>
+
+<!-- ===== 顶栏 ===== -->
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a class="brand" href="#top" aria-label="IoT-DAQ Gateway 首页">
+      <span class="brand-mark" aria-hidden="true">GW</span>
+      <span class="brand-name">IoT-DAQ Gateway</span>
+    </a>
+    <nav aria-label="主导航">
+      <ul class="topnav">
+        <li><a href="#features">核心特性</a></li>
+        <li><a href="#download">快速下载</a></li>
+        <li><a href="#docker">Docker 部署</a></li>
+        <li><a href="#start">快速开始</a></li>
+      </ul>
+    </nav>
+    <div class="topbar-right">
+      <span class="ver-tag">v0.1.0</span>
+      <a class="btn btn-primary btn-nav" href="https://github.com/wantstudy/edge-gateway-hub" target="_blank" rel="noopener noreferrer">GitHub <span class="arrow">↗</span></a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- ===== 首屏：数据流拓扑 ===== -->
+  <section class="hero" id="top">
+    <div class="container hero-inner">
+      <div class="hero-copy">
+        <p class="eyebrow">开源 · 工业级 · 边缘计算</p>
+        <h1 class="hero-title">IoT-DAQ Gateway<span class="mono">/INDUSTRIAL EDGE GATEWAY</span></h1>
+        <p class="hero-sub">工业边缘数据采集网关</p>
+        <p class="hero-desc">从 PLC / 仪表采集数据，本地缓存与规则计算，并转发到 MQTT 北向平台。支持 Windows 安装包与 Docker 镜像，开箱即用。</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="#download">立即下载 <span class="arrow">↓</span></a>
+          <a class="btn btn-ghost" href="https://edge.webscad.cn/docs" target="_blank" rel="noopener noreferrer">查看文档 <span class="arrow">↗</span></a>
+        </div>
+        <div class="hero-stats" role="list" aria-label="产品信息">
+          <div class="stat" role="listitem"><b>v0.1.0</b><span>当前版本</span></div>
+          <div class="stat" role="listitem"><b>93.8 MB</b><span>Docker 镜像</span></div>
+          <div class="stat" role="listitem"><b>5.3 MB</b><span>Windows 安装包</span></div>
+        </div>
+      </div>
+
+      <div class="hero-visual reveal">
+        <div class="panel-frame">
+          <div class="panel-head">
+            <span class="panel-title">SYS.MON // <b>EDGE-01</b> DATA PATH</span>
+            <span class="panel-status">RUNNING</span>
+          </div>
+          <svg class="topo-svg" viewBox="0 0 660 400" role="img" aria-labelledby="topo-title topo-desc">
+            <title id="topo-title">IoT-DAQ Gateway 数据流拓扑</title>
+            <desc id="topo-desc">从 PLC 与仪表通过 Modbus TCP 采集数据，经网关本地队列缓存与规则计算，转发至 MQTT 北向平台。</desc>
+
+            <!-- 网格刻度 -->
+            <g stroke="#1c2530" stroke-width="0.6" opacity="0.6">
+              <line x1="0" y1="80" x2="660" y2="80"/>
+              <line x1="0" y1="320" x2="660" y2="320"/>
+              <line x1="220" y1="0" x2="220" y2="400"/>
+              <line x1="440" y1="0" x2="440" y2="400"/>
+            </g>
+
+            <!-- 设备：PLC 与仪表 -->
+            <rect class="node-body" x="26" y="96" width="122" height="58" rx="3"/>
+            <rect class="node-core" x="34" y="108" width="52" height="20" rx="2"/>
+            <rect class="node-core" x="34" y="134" width="26" height="12" rx="2"/>
+            <rect x="66" y="134" width="12" height="12" rx="2" fill="#3fd8bf" opacity="0.85"/>
+            <text x="92" y="118" class="t-strong">PLC-01</text>
+            <text x="92" y="132" class="t-cyan">MODBUS TCP</text>
+            <text x="92" y="146">192.168.1.100</text>
+
+            <rect class="node-body" x="26" y="178" width="122" height="58" rx="3"/>
+            <rect class="node-core" x="34" y="190" width="52" height="20" rx="2"/>
+            <rect class="node-core" x="34" y="216" width="26" height="12" rx="2"/>
+            <rect x="66" y="216" width="12" height="12" rx="2" fill="#4ede80" opacity="0.85"/>
+            <text x="92" y="200" class="t-strong">METER-02</text>
+            <text x="92" y="214" class="t-cyan">MODBUS RTU</text>
+            <text x="92" y="228">RS-485 · SERIAL</text>
+
+            <!-- 设备汇聚总线 -->
+            <path class="link-line link-dim" d="M 148 125 L 168 125 L 168 220 L 204 220"/>
+            <path class="link-line link-dim" d="M 148 207 L 168 207"/>
+
+            <!-- 网关 -->
+            <rect class="gw-body" x="244" y="86" width="182" height="150" rx="4"/>
+            <rect class="gw-accent" x="244" y="86" width="182" height="24" rx="4"/>
+            <text x="252" y="101" class="t-strong" font-size="10.5">IoT-DAQ GATEWAY</text>
+            <text x="410" y="101" text-anchor="end" font-size="9.5">v0.1.0</text>
+            <circle cx="268" cy="128" r="4" fill="#4ede80" class="led"/>
+            <circle cx="284" cy="128" r="4" fill="#3fd8bf" class="led l2"/>
+            <circle cx="300" cy="128" r="4" fill="#ffb224" class="led l3"/>
+            <text x="314" y="132" class="t-strong" font-size="10.5">ACQ · RULE · Q</text>
+            <rect class="node-core" x="258" y="146" width="48" height="34" rx="2"/>
+            <rect class="node-core" x="312" y="146" width="48" height="34" rx="2"/>
+            <rect class="node-core" x="366" y="146" width="48" height="34" rx="2"/>
+            <text x="282" y="167" text-anchor="middle" font-size="9">采集</text>
+            <text x="336" y="167" text-anchor="middle" font-size="9">规则</text>
+            <text x="390" y="167" text-anchor="middle" font-size="9">队列</text>
+            <text x="258" y="198" class="t-cyan" font-size="9.5">SQLITE QUEUE</text>
+            <text x="258" y="212" class="t-amber" font-size="9.5">EDGE RULES</text>
+            <text x="258" y="226" font-size="9">EDGE QUEUE · BACKPRESSURE ON</text>
+
+            <!-- MQTT Broker -->
+            <rect class="node-body" x="508" y="104" width="128" height="76" rx="3"/>
+            <rect class="node-core" x="520" y="116" width="104" height="14" rx="2"/>
+            <line x1="520" y1="142" x2="624" y2="142" stroke="#2c3746" stroke-width="1.4"/>
+            <line x1="520" y1="152" x2="624" y2="152" stroke="#2c3746" stroke-width="1.4"/>
+            <line x1="520" y1="162" x2="624" y2="162" stroke="#2c3746" stroke-width="1.4"/>
+            <circle cx="532" cy="164" r="3.5" fill="#7fa8ff" class="led l2"/>
+            <text x="572" y="126" text-anchor="middle" class="t-strong">MQTT BROKER</text>
+            <text x="572" y="174" text-anchor="middle" class="t-blue">tcp://mqtt-server:1883</text>
+
+            <!-- 采集链路：设备 → 网关 -->
+            <path class="link-line link-cyan" d="M 204 220 L 244 220"/>
+            <path class="flow-line f1" d="M 204 220 L 244 220"/>
+            <g fill="#3fd8bf">
+              <circle r="3.4"><animateMotion dur="2.1s" repeatCount="indefinite" path="M 204 220 L 244 220"/></circle>
+              <circle r="3.4" opacity="0.5"><animateMotion dur="2.1s" repeatCount="indefinite" begin="0.9s" path="M 204 220 L 244 220"/></circle>
+            </g>
+
+            <!-- 转发链路：网关 → MQTT -->
+            <path class="link-line link-amber" d="M 426 220 L 508 220"/>
+            <path class="flow-line f2" d="M 426 220 L 508 220"/>
+            <g fill="#ffb224">
+              <circle r="3.4"><animateMotion dur="2.6s" repeatCount="indefinite" path="M 426 220 L 508 220"/></circle>
+              <circle r="3.4" opacity="0.5"><animateMotion dur="2.6s" repeatCount="indefinite" begin="1.1s" path="M 426 220 L 508 220"/></circle>
+            </g>
+
+            <!-- 采集侧注解 -->
+            <text x="36" y="60" class="t-amber" font-size="9.5">/// 采集侧 · SOURCES</text>
+            <text x="36" y="74" font-size="9">PLC / 仪表 / 传感器</text>
+            <!-- 转发侧注解 -->
+            <text x="508" y="60" class="t-blue" font-size="9.5">/// 北向 · NORTHBOUND</text>
+            <text x="508" y="74" font-size="9">MQTT v3.1.1 / v5</text>
+          </svg>
+          <div class="topo-note">
+            <span>MODBUS TCP / RTU</span>
+            <span>OPC UA</span>
+            <span>SQLITE 本地队列</span>
+            <span>MQTT v5 转发</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 协议规格条 ===== -->
+  <section class="protocols" aria-label="支持协议">
+    <div class="protocols-inner">
+      <div class="proto">
+        <span class="proto-led" aria-hidden="true"></span>
+        <div><div class="proto-name">MODBUS TCP/RTU</div><div class="proto-desc">PLC · 仪表 · 传感器</div></div>
+      </div>
+      <div class="proto">
+        <span class="proto-led" aria-hidden="true"></span>
+        <div><div class="proto-name">OPC UA</div><div class="proto-desc">工业互联标准</div></div>
+      </div>
+      <div class="proto">
+        <span class="proto-led" aria-hidden="true"></span>
+        <div><div class="proto-name">MQTT v3.1.1 / v5</div><div class="proto-desc">北向平台转发</div></div>
+      </div>
+      <div class="proto">
+        <span class="proto-led" aria-hidden="true"></span>
+        <div><div class="proto-name">SQLITE QUEUE</div><div class="proto-desc">断网续传保障</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 配置示例 ===== -->
+  <section class="config" id="config">
+    <div class="container config-inner">
+      <div class="config-copy reveal">
+        <p class="eyebrow">CONFIG // GETTING STARTED</p>
+        <h2 class="sec-title">极简配置，快速接入</h2>
+        <p class="sec-sub" style="max-width:26em;">一段 <code>gateway.toml</code> 定义采集设备与北向转发；更复杂的点位、规则与告警，全部在 Web 控制台完成。</p>
+        <ul class="config-points">
+          <li><span class="pc">01</span><span>声明设备：<b>Modbus TCP</b> 指向 PLC 地址与端口，一条即可接入。</span></li>
+          <li><span class="pc">02</span><span>声明北向：<b>MQTT v5</b> 指定 broker，数据自动转发上云。</span></li>
+          <li><span class="pc">03</span><span>本地韧性：<b>SQLite 队列</b> 断网缓存、恢复后自动补传。</span></li>
+        </ul>
+      </div>
+      <div class="terminal reveal" style="--d:.12s">
+        <div class="term-bar">
+          <span class="term-dot d1" aria-hidden="true"></span>
+          <span class="term-dot d2" aria-hidden="true"></span>
+          <span class="term-dot d3" aria-hidden="true"></span>
+          <span class="term-file">gateway.toml — <b>最小可运行配置</b></span>
+          <span class="term-live">READY</span>
+        </div>
+        <div class="term-body">
+<pre><code><span class="tok-c"># 一份最小可运行配置</span>
+<span class="tok-s">[gateway]</span>
+name = <span class="tok-v">"plant-01-gw"</span>
+
+<span class="tok-c"># 设备采集：Modbus TCP</span>
+<span class="tok-s">[[devices]]</span>
+driver = <span class="tok-v">"modbus-tcp"</span>
+host = <span class="tok-v">"192.168.1.100"</span>
+port = <span class="tok-n">502</span>
+
+<span class="tok-c"># 北向转发：MQTT v5</span>
+<span class="tok-s">[northbound]</span>
+protocol = <span class="tok-v">"mqtt"</span>
+broker = <span class="tok-v">"tcp://mqtt-server:1883"</span></code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 核心特性 ===== -->
+  <section class="features" id="features">
+    <div class="container">
+      <div class="features-head reveal">
+        <div>
+          <p class="eyebrow">SPEC // CORE FEATURES</p>
+          <h2 class="sec-title">核心特性</h2>
+          <p class="sec-sub">面向工业现场的全栈数据采集解决方案</p>
+        </div>
+      </div>
+      <div class="spec-grid reveal" style="--d:.08s">
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-01</span><span class="spec-tag">采集层</span></div>
+          <h3>多协议采集</h3>
+          <p>支持 Modbus TCP / RTU、OPC UA 等主流工业协议，覆盖 PLC、仪表、传感器等设备。</p>
+        </article>
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-02</span><span class="spec-tag">转发层</span></div>
+          <h3>北向转发</h3>
+          <p>MQTT（v3.1.1 / v5）发布，每路独立 protobuf / JSON 编码，适配各类云平台。</p>
+        </article>
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-03</span><span class="spec-tag">韧性</span></div>
+          <h3>本地韧性</h3>
+          <p>断网续传（SQLite 队列）、背压控制，确保数据不丢失、网络恢复后自动补传。</p>
+        </article>
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-04</span><span class="spec-tag">边缘计算</span></div>
+          <h3>规则与公式</h3>
+          <p>点位级计算、告警规则灵活配置，边缘侧完成数据预处理与阈值判断。</p>
+        </article>
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-05</span><span class="spec-tag">管理面</span></div>
+          <h3>Web 控制台</h3>
+          <p>设备 / 点位 / 转发 / 告警 / 审计全功能管理，本地访问 <code>http://127.0.0.1:9012</code>。</p>
+        </article>
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-06</span><span class="spec-tag">安全面</span></div>
+          <h3>安全设计</h3>
+          <p>最小权限容器（非 root、只读根文件系统、cap_drop ALL），降低攻击面。</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 快速下载 ===== -->
+  <section class="download" id="download">
+    <div class="container">
+      <div class="download-head reveal">
+        <div>
+          <p class="eyebrow">RELEASE // DOWNLOAD</p>
+          <h2 class="sec-title">快速下载</h2>
+          <p class="sec-sub">选择适合您环境的交付形态</p>
+        </div>
+      </div>
+      <div class="media-grid reveal" style="--d:.08s">
+        <article class="media-card featured">
+          <span class="badge-rec">推荐</span>
+          <div class="media-icon" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/><path d="M9 20v-3"/><path d="M12 20v-4"/><path d="M15 20v-3"/></svg>
+          </div>
+          <p class="media-os">Windows · Setup</p>
+          <h3 class="media-title">Windows 安装包</h3>
+          <ul class="media-meta">
+            <li><span class="mk">OS</span><span>Windows 10 / 11 x64</span></li>
+            <li><span class="mk">SIZE</span><span>约 5.3 MB · 安装即用</span></li>
+            <li><span class="mk">PKG</span><span>IoT-DAQ-Gateway_0.1.0_x64-setup.exe</span></li>
+          </ul>
+          <div class="media-foot">
+            <a class="btn btn-primary" href="https://github.com/wantstudy/edge-gateway-hub/releases/download/v0.1.0/IoT-DAQ-Gateway_0.1.0_x64-setup.exe" target="_blank" rel="noopener noreferrer">下载 <span class="arrow">↓</span></a>
+            <span class="media-size">v0.1.0</span>
+          </div>
+        </article>
+
+        <article class="media-card">
+          <div class="media-icon" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/><path d="M8 6.5h.01M8 17.5h.01"/></svg>
+          </div>
+          <p class="media-os">Docker · OCI</p>
+          <h3 class="media-title">Docker 镜像</h3>
+          <ul class="media-meta">
+            <li><span class="mk">OS</span><span>Linux AMD64 · 93.8 MB</span></li>
+            <li><span class="mk">IMG</span><span>wantstudy/iot-daq-gateway:0.1.0</span></li>
+            <li><span class="mk">RUN</span><span>最小权限容器 · 端口 9011/9012</span></li>
+          </ul>
+          <div class="pull-cmd">
+            <code>docker pull wantstudy/iot-daq-gateway:0.1.0</code>
+            <button class="copy-btn" type="button" data-copy="docker pull wantstudy/iot-daq-gateway:0.1.0">复制</button>
+          </div>
+          <div class="media-foot">
+            <a class="btn btn-ghost" href="#docker">部署方式 <span class="arrow">↓</span></a>
+            <span class="media-size">v0.1.0</span>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Docker 部署（简化版） ===== -->
+  <section class="deploy" id="docker">
+    <div class="container">
+      <div class="deploy-head reveal">
+        <div>
+          <p class="eyebrow">DEPLOY // DOCKER</p>
+          <h2 class="sec-title">Docker 部署</h2>
+          <p class="sec-sub">镜像以最小权限容器运行（非 root / 只读根文件系统 / cap_drop ALL）。端口 <b>9011</b> 为 API，<b>9012</b> 为 Web 控制台。</p>
+        </div>
+      </div>
+
+      <!-- 快速部署：单行命令 -->
+      <div class="pull-cmd deploy-quick reveal" style="--d:.04s">
+        <code>docker run -d -p 9011:9011 -p 9012:9012 -e IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing wantstudy/iot-daq-gateway:0.1.0</code>
+        <button class="copy-btn" type="button" data-copy="docker run -d -p 9011:9011 -p 9012:9012 -e IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing wantstudy/iot-daq-gateway:0.1.0">复制</button>
+      </div>
+
+      <div class="deploy-grid reveal" style="--d:.08s">
+        <div class="terminal">
+          <div class="term-bar">
+            <span class="term-dot d1" aria-hidden="true"></span>
+            <span class="term-dot d2" aria-hidden="true"></span>
+            <span class="term-dot d3" aria-hidden="true"></span>
+            <span class="term-file">docker run — <b>单容器</b></span>
+          </div>
+          <div class="term-body">
+<pre><code>docker run -d --name iot-daq-gateway \
+  -p 9011:9011 \
+  -p 9012:9012 \
+  -e IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing \
+  wantstudy/iot-daq-gateway:0.1.0</code></pre>
+          </div>
+        </div>
+        <div class="terminal">
+          <div class="term-bar">
+            <span class="term-dot d1" aria-hidden="true"></span>
+            <span class="term-dot d2" aria-hidden="true"></span>
+            <span class="term-dot d3" aria-hidden="true"></span>
+            <span class="term-file">docker-compose.yml — <b>编排</b></span>
+          </div>
+          <div class="term-body">
+<pre><code>services:
+  iot-daq-gateway:
+    image: wantstudy/iot-daq-gateway:0.1.0
+    container_name: iot-daq-gateway
+    ports:
+      - "9011:9011"   # API
+      - "9012:9012"   # Web 控制台
+    environment:
+      - IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing
+    restart: unless-stopped</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="deploy-note reveal" style="--d:.12s">
+        <span><b>镜像</b> wantstudy/iot-daq-gateway:0.1.0</span>
+        <span><b>9011</b> API 端口</span>
+        <span><b>9012</b> Web 控制台</span>
+        <span><b>环境变量</b> IOT_DAQ_LICENSE_SERVER_URL</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 快速开始 ===== -->
+  <section class="start" id="start">
+    <div class="container">
+      <div class="start-head reveal">
+        <div>
+          <p class="eyebrow">RUNBOOK // QUICK START</p>
+          <h2 class="sec-title">快速开始</h2>
+          <p class="sec-sub">三步完成部署，从安装到数据上云</p>
+        </div>
+      </div>
+      <ol class="steps reveal" style="--d:.08s">
+        <li class="step">
+          <span class="step-no">STEP 01</span>
+          <h3>下载并安装</h3>
+          <p>运行 Windows 安装包，或拉取 Docker 镜像启动容器。</p>
+        </li>
+        <li class="step">
+          <span class="step-no">STEP 02</span>
+          <h3>配置设备与点位</h3>
+          <p>通过 Web 控制台（http://127.0.0.1:9012）添加设备、点位和转发规则。</p>
+        </li>
+        <li class="step">
+          <span class="step-no">STEP 03</span>
+          <h3>启动采集</h3>
+          <p>数据自动采集、缓存、转发至 MQTT 平台。</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+</main>
+
+<!-- ===== 页脚 ===== -->
+<footer class="footer">
+  <div class="container">
+    <div class="footer-main">
+      <div class="footer-brand">
+        <span class="brand-mark" aria-hidden="true">GW</span>
+        <div>
+          <div class="footer-brand-name">IoT-DAQ Gateway</div>
+          <div class="footer-brand-sub">开源 · 工业级 · 边缘计算</div>
+        </div>
+      </div>
+      <div class="footer-contact">
+        <p class="footer-col-title">CONTACT // 联系方式</p>
+        <ul class="footer-contact-list">
+          <li><span class="fc-key">EMAIL</span><span class="fc-value">ww_today@163.com</span><button class="copy-mini" type="button" data-copy="ww_today@163.com" aria-label="复制邮箱地址">复制</button></li>
+          <li><span class="fc-key">TEL</span><span class="fc-value">19502937688</span><button class="copy-mini" type="button" data-copy="19502937688" aria-label="复制电话号码">复制</button></li>
+          <li><span class="fc-key">QQ</span><a href="https://wpa.qq.com/msgrd?v=3&uin=460604059&site=qq&menu=yes" target="_blank" rel="noopener noreferrer">460604059</a></li>
+          <li><span class="fc-key">WX</span><span>微信扫码添加</span></li>
+        </ul>
+      </div>
+      <div>
+        <p class="footer-col-title">LINKS // 快速链接</p>
+        <ul class="footer-links">
+          <li><a href="https://github.com/wantstudy/edge-gateway-hub" target="_blank" rel="noopener noreferrer">GitHub 仓库</a></li>
+          <li><a href="https://edge.webscad.cn/docs" target="_blank" rel="noopener noreferrer">在线文档</a></li>
+          <li><a href="#top">返回顶部 ↑</a></li>
+        </ul>
+      </div>
+      <div class="footer-wx">
+        <img src="https://base-agent-images.tos.coze.site/agent-images/session/3e/3e4b4319e57d011fecf1fe2ea26d55892a0d79af44224b8fc5493773ff4e88d5.jpg?sign=1793175504-a18811e4c1-0-d1506a9b074f7621007f5da326ba2944dea63d414d9f0a8d511d8a2cce164933" alt="微信二维码，扫码添加微信" width="110" height="110">
+        <span>WECHAT QR</span>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span class="footer-beian"><a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">陕ICP备2026011802号</a></span>
+      <span class="footer-copy">OPEN SOURCE · © 2026 IoT-DAQ Gateway Contributors — built for the edge, hardened for the plant floor.</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  'use strict';
+
+  // 页内锚点平滑滚动（原生降级保留）
+  document.querySelectorAll('a[href^="#"]').forEach(function (link) {
+    link.addEventListener('click', function (e) {
+      var id = this.getAttribute('href').slice(1);
+      if (!id) return;
+      var target = document.getElementById(id);
+      if (!target) return;
+      e.preventDefault();
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+
+  // 滚动渐显
+  var revealEls = document.querySelectorAll('.reveal');
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('in');
+          io.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -6% 0px' });
+    revealEls.forEach(function (el) { io.observe(el); });
+  } else {
+    revealEls.forEach(function (el) { el.classList.add('in'); });
+  }
+
+  // 复制命令
+  document.querySelectorAll('.copy-btn, .copy-mini').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var text = btn.getAttribute('data-copy') || '';
+      if (!text) return;
+      try {
+        navigator.clipboard.writeText(text).then(function () {
+          var old = btn.textContent;
+          btn.textContent = '已复制';
+          setTimeout(function () { btn.textContent = old; }, 1800);
+        }).catch(function () {});
+      } catch (err) { /* 静默降级 */ }
+    });
+  });
+})();
+</script>
+</body>
+</html>
