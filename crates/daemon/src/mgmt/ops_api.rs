@@ -1,0 +1,2432 @@
+//! 运维端点四类（E 项收口；`GET /api/updates/check` + `POST /api/updates/apply`
+//! + `GET /api/service/autostart` + `POST /api/settings/backups`
+//! + `GET /api/diagnostics/selfcheck`）
+//! + 备份策略（B-2 收口：`GET|PUT /api/settings/backup-policy` + 周期备份 + retention）。
+//!
+//! ## 诚实性红线
+//! 每个能力：实现了就真实现；没实现就**结构化返回「未实现 + 原因」**，严禁假成功。
+//! 更新检查的真相源是 `[gateway.ota]`（[`crate::config::OtaSection::is_ready`]）：
+//! 就绪 → `check_supported:true` 并如实回显落盘 pending 版本；未就绪 →
+//! `check_supported:false` + **面向用户**的原因（现状 + 怎么办）。
+//! `POST /api/updates/apply` 先校验**危险操作四要素**（`reason` / `note` / `confirm`
+//! 三独立字段），随后按真实状态分流：有 pending → `accepted:true`（待重启生效）；
+//! 否则诚实返回 `supported:false`。**`applied` 恒 false**——本进程不做二进制替换，
+//! 绝不伪造「升级成功」；自启注册读写在 Windows 下真实现（`reg query` /
+//! `reg add|delete` HKCU Run 键），非 Windows 如实 501。
+//!
+//! ## 备份策略语义（B-2）
+//! - `auto_before_write`：写路径落盘前自动备份（既有行为显式化，闸门在
+//!   `GatewayConfig::save`，全写路径统一生效）；
+//! - `retention_count`：`{config}.bak-*` 最大保留份数（超出删最旧；**只清本服务
+//!   自产的该前缀文件**——`config.rs`/`migrations.rs` 同一命名模式；`0` = 不清理）；
+//! - `interval_min`：周期备份间隔（分钟，`0` = 关闭）。本模块 30s tick 轮询实现，
+//!   每拍读热快照——PUT 热重载后下一拍即按新间隔生效。
+//!
+//! ## 消费方
+//! - `UpdatePage.vue`（读 `/api/overview` 的 version + `GET /api/updates/check`
+//!   的诚实状态；后端声明 `check_supported:false` 时页面**禁用**「执行更新」按钮并
+//!   直接展示 `reason`，不允许点了才报错）；
+//! - `StartupPage.vue`（自启状态）；
+//! - `SettingsPage.vue`（手动备份动作；清单读既有 `GET /api/settings/backups`）；
+//! - `DiagnosePage.vue`（自检清单，当前只调 `/api/health`；本端点提供逐项判定）。
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
+use serde_json::{json, Value};
+use tokio::time::MissedTickBehavior;
+
+use super::rbac::{AuthedRole, Permission};
+use super::remote_ops::{
+    OpsAction, OUTCOME_ACCEPTED, OUTCOME_BAD_REQUEST, OUTCOME_DENIED, OUTCOME_NOT_IMPLEMENTED,
+};
+use super::writeapi::{audit, validation_error, write_guard, OUTCOME_FAILED};
+use super::MgmtState;
+
+/// 当前 Unix 毫秒（时钟回退为 0，不阻塞）。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ---- 更新检查 / 执行 ----
+
+/// **面向用户**的「OTA 未就绪」说明：现状 + 怎么办，不出现内部术语。
+///
+/// 指向**真实开关 `[gateway.ota]`**（不再是已废弃的 `[settings.updates]`），并给出
+/// 容器形态的 env 通道（只读根文件系统下唯一可注入路径）。
+const UPDATE_NO_SOURCE_REASON: &str = "系统更新尚未就绪，暂时无法检查或安装更新。\
+请在网关配置文件 config.toml 的 [gateway.ota] 段设置 enabled = true 并填写 signing_key_b64\
+（授权端 Ed25519 公钥 base64）；manifest_url 可省略，会按授权服务的 cloud_url 自动推导\
+（canonical：http://license.webscad.cn/licensing/updates/manifest）。\
+容器形态请在部署 env 中设置 IOT_DAQ_OTA_ENABLED=true 与 IOT_DAQ_OTA_SIGNING_KEY_B64\
+（IOT_DAQ_OTA_MANIFEST_URL 可留空自动推导、IOT_DAQ_OTA_CURRENT_VERSION 可选）。\
+保存配置或重启后自动生效，随后回到本页点击「检查更新」即可。";
+
+/// `GET /api/updates/check` → 更新检查（**诚实反映真实状态**）。
+///
+/// 就绪判定 = [`crate::config::OtaSection::is_ready`]（`enabled` + 有生效 manifest 端点
+/// （显式或由 `cloud_url` 推导）+ `signing_key_b64` 非空白）。
+/// - 就绪 → 读**全进程唯一** OTA 管理器的落盘状态：`check_supported:true`、
+///   `update_available` = 是否存在待重启生效的 pending 版本、`available_version` = pending
+///   版本号、`source` = 生效 manifest 端点。配置就绪但**运行期管理器未装配**（如公钥
+///   无法解析）→ 同样 `check_supported:false`，reason 单独点名运行期缺口（配置确实就绪，
+///   故 `source_configured` 仍为 true）。
+/// - 未就绪 → **诚实降级**：`check_supported:false` + [`UPDATE_NO_SOURCE_REASON`]。
+///   绝不伪造「已是最新」。
+///
+/// wire 契约（响应字段）：
+/// - `check_supported`   bool         —— 后端是否能完成一次升级检查；
+/// - `current_version`   string       —— 网关版本（`CARGO_PKG_VERSION`，构建期包版本串）；
+/// - `ota_current_version` string|null —— **另一口径**：OTA 自身 u64 单调序当前版本号
+///   （来自落盘 `meta.json`；未就绪 / 无存储 = null）。二者不可混用；
+/// - `update_available`  bool         —— 是否存在待重启生效的新版本（= 有 pending）；
+/// - `available_version` string|null  —— 待安装版本号（无 = null，不臆造）；
+/// - `source`            string       —— 生效 manifest 端点 / `"unconfigured"`；
+/// - `source_configured` bool         —— 是否已声明升级源（显式或可推导）；
+/// - `reason`            string       —— 面向用户的说明（现状 + 怎么办）。
+pub async fn updates_check(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
+    if let Err(resp) = authed.ensure(Permission::OpsLogsRead) {
+        return resp.into_response();
+    }
+    let current = env!("CARGO_PKG_VERSION");
+    let config = state.config();
+    let ota = config.gateway.ota.clone();
+    let cloud_url = config.gateway.licensing.cloud_url.clone();
+    let cloud = cloud_url.as_deref();
+    let endpoint = ota.effective_manifest_url(cloud);
+
+    // ① OTA 就绪：如实反映真实轮询 / 落盘状态（不再恒 false）。
+    if ota.is_ready(cloud) {
+        let manifest_url = endpoint.clone().unwrap_or_default();
+        let mut update_available = false;
+        let mut available_version = Value::Null;
+        let mut ota_current_version = ota.current_version.to_string();
+        let mut reason = format!(
+            "已配置升级源 {manifest_url}，但更新运行期尚未就绪（签名公钥不可用或未装配），暂时无法检查待安装版本。"
+        );
+        if let Some(manager) = state.daemon().ota_manager() {
+            let guard = manager.lock().await;
+            if let Ok(Some(stored)) = guard.stored_current_version().await {
+                ota_current_version = stored;
+            }
+            match guard.pending_version().await {
+                Ok(Some(pending)) if !pending.trim().is_empty() => {
+                    update_available = true;
+                    available_version = Value::String(pending.clone());
+                    reason = format!(
+                        "已配置升级源 {manifest_url}；新版本 {pending} 已下载并通过验签，重启网关后由宿主安装器完成替换。"
+                    );
+                }
+                Ok(_) => {
+                    reason = format!("已配置升级源 {manifest_url}；当前没有待安装的新版本。");
+                }
+                Err(err) => {
+                    reason = format!(
+                        "已配置升级源 {manifest_url}，但读取本机更新状态失败（{err}），暂时无法判定待安装版本。"
+                    );
+                }
+            }
+        } else {
+            // 配置层就绪但运行期管理器未装配（典型：`signing_key_b64` 无法解析导致
+            // bootstrap 装配失败）。此时**不能承诺能完成一次检查**：`check_supported`
+            // 如实为 false（缺口在运行期，配置确实已就绪），reason 指向真实修复路径。
+            // `ota_current_version` 恒 null——统一规则：只有读到落盘 meta 才给值。
+            return Json(json!({
+                "check_supported": false,
+                "current_version": current,
+                "ota_current_version": Value::Null,
+                "update_available": false,
+                "available_version": Value::Null,
+                "source": manifest_url,
+                "source_configured": true,
+                "reason": format!(
+                    "已配置升级源 {manifest_url}，但更新运行期尚未就绪（通常是签名公钥无法解析或装配失败）。\
+                     请核对 [gateway.ota].signing_key_b64（容器形态为 IOT_DAQ_OTA_SIGNING_KEY_B64）后重启网关，\
+                     再回到本页检查更新。"
+                ),
+            }))
+            .into_response();
+        }
+        return Json(json!({
+            "check_supported": true,
+            "current_version": current,
+            "ota_current_version": ota_current_version,
+            "update_available": update_available,
+            "available_version": available_version,
+            "source": manifest_url,
+            "source_configured": true,
+            "reason": reason,
+        }))
+        .into_response();
+    }
+
+    // ② OTA 未就绪：诚实降级（reason 指向真实开关 [gateway.ota] 与 env 通道）。
+    Json(json!({
+        "check_supported": false,
+        "current_version": current,
+        "ota_current_version": Value::Null,
+        "update_available": false,
+        "available_version": Value::Null,
+        "source": endpoint.unwrap_or_else(|| "unconfigured".to_string()),
+        "source_configured": ota.effective_manifest_url(cloud).is_some(),
+        "reason": UPDATE_NO_SOURCE_REASON,
+    }))
+    .into_response()
+}
+
+/// `POST /api/updates/apply` → 执行更新（**危险操作**；诚实反映可执行状态）。
+///
+/// ## ⚠️ 危险操作四要素硬契约
+/// body 必须是 JSON 对象，且**同时**含 `reason` / `note` / `confirm` 三个**彼此
+/// 独立**的字段（`note` **绝不允许**拼进 `reason`）；三者 trim 后均须非空。
+/// 任一缺失 / 非字符串 / trim 后空白 / 出现未知字段 → **400 `validation_failed`**
+/// （不进入执行路径，fail-closed）。此契约**四个要素校验逻辑一字未改**。
+///
+/// ## wire 契约
+/// - 方法 / 路径：`POST /api/updates/apply`；
+/// - 请求体：`{"reason": string, "note": string, "confirm": string}`（三字段必填且独立）；
+/// - 鉴权：`Authorization: Bearer <JWT>`；权限 `ops.collectors`（服务运行期控制，仅 system）；
+/// - 四要素校验**通过后**按真实状态分流：
+///   - `[gateway.ota]` 已配置且存在待安装 pending 版本 → 接受（HTTP 200）：
+///     `{"supported": true, "accepted": true, "applied": false, "current_version": string,
+///       "target_version": "<pending 版本>", "source": "<manifest_url>",
+///       "source_configured": true, "reason": string}`
+///     —— 新版本已下载并通过验签、待重启由宿主安装器替换；**本进程不做二进制替换**，
+///     故 `applied` **恒 false**；
+///   - 未配置 OTA / 无 pending → 诚实降级：`supported:false` + `accepted:false` +
+///     `applied:false` + `reason`（现状与怎么办）。
+/// - 失败：缺字段 / 非字符串 / 空白 / 未知字段 → **400**；未带 token → 401；
+///   权限不足 → 403。
+///
+/// ## 审计
+/// 本端点已接入 `remote_ops` 审计环，动作字面量 = `update_apply`（**独立**动作，
+/// 不复用其它字面量）：鉴权被拒 → `denied`；body 校验失败 → `bad_request`；
+/// 三要素齐全但无待安装版本（诚实降级 200）→ `not_implemented`；
+/// 三要素齐全且已接受待安装版本 → `accepted`。
+/// 审计经 `writeapi::audit` 同步落持久安全审计；持久写失败仅记 warn，**不**改变
+/// 业务响应（响应语义只由上方 wire 契约决定，不产生伪造的成功痕迹）。
+pub async fn updates_apply(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    const REQUIRED: &[&str] = &["reason", "note", "confirm"];
+    let actor = authed.claims.sub.clone();
+    if let Err(rejection) = authed.ensure(Permission::OpsCollectors) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::UpdateApply,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let req: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => return updates_apply_bad_request(&state, &actor, "body must be a JSON object"),
+    };
+    let Some(obj) = req.as_object() else {
+        return updates_apply_bad_request(&state, &actor, "body must be a JSON object");
+    };
+    for key in obj.keys() {
+        if !REQUIRED.contains(&key.as_str()) {
+            return updates_apply_bad_request(
+                &state,
+                &actor,
+                &format!("unknown field {key:?}; allowed fields: reason | note | confirm"),
+            );
+        }
+    }
+    // 四要素：reason / note / confirm 三个独立字段，trim 后均非空。
+    for field in REQUIRED {
+        match obj.get(*field).and_then(Value::as_str).map(str::trim) {
+            Some(value) if !value.is_empty() => {}
+            Some(_) => {
+                return updates_apply_bad_request(
+                    &state,
+                    &actor,
+                    &format!(
+                        "field {field:?} must not be blank (dangerous-op contract: `reason`, \
+                         `note` and `confirm` are three independent non-empty fields)"
+                    ),
+                );
+            }
+            None => {
+                return updates_apply_bad_request(
+                    &state,
+                    &actor,
+                    &format!(
+                        "missing required field {field:?} (dangerous-op contract: body must carry \
+                         independent `reason`, `note` and `confirm`)"
+                    ),
+                );
+            }
+        }
+    }
+    // 四要素校验通过后的**执行语义**（契约与校验逻辑一字未改，仅在其后分流）：
+    // OTA 已配置且存在待安装版本 → 接受（待重启生效）；本进程**不做二进制替换**，
+    // 故 `applied` 恒 false，绝不伪造升级成功。
+    let config = state.config();
+    let ota = config.gateway.ota.clone();
+    let cloud_url = config.gateway.licensing.cloud_url.clone();
+    let cloud = cloud_url.as_deref();
+    let endpoint = ota.effective_manifest_url(cloud);
+    if ota.is_ready(cloud) {
+        if let Some(manager) = state.daemon().ota_manager() {
+            let pending = {
+                let guard = manager.lock().await;
+                guard.pending_version().await
+            };
+            if let Ok(Some(pending)) = pending {
+                if !pending.trim().is_empty() {
+                    let manifest_url = endpoint.clone().unwrap_or_default();
+                    audit(
+                        &state,
+                        &actor,
+                        OpsAction::UpdateApply,
+                        true,
+                        OUTCOME_ACCEPTED,
+                        &format!(
+                            "update {pending} accepted; staged in the pending slot, will be \
+                             installed by the host installer after restart (no in-process \
+                             binary replacement)"
+                        ),
+                    );
+                    return Json(json!({
+                        "supported": true,
+                        "accepted": true,
+                        "applied": false,
+                        "current_version": env!("CARGO_PKG_VERSION"),
+                        "target_version": pending,
+                        "source": manifest_url,
+                        "source_configured": true,
+                        "reason": format!(
+                            "新版本 {pending} 已下载并通过验签，重启网关后由宿主安装器完成替换；\
+                             本进程不做二进制替换，因此 applied 恒为 false。"
+                        ),
+                    }))
+                    .into_response();
+                }
+            }
+        }
+    }
+    // 组装诚实降级响应（OTA 未就绪 / 无待安装版本）。
+    let current = env!("CARGO_PKG_VERSION");
+    let source = endpoint.unwrap_or_else(|| "unconfigured".to_string());
+    // 未就绪：入审计（not_implemented，请求已放行但未执行任何更新），
+    // 再诚实返回 supported:false + 面向用户原因，绝不伪造成功。
+    audit(
+        &state,
+        &actor,
+        OpsAction::UpdateApply,
+        true,
+        OUTCOME_NOT_IMPLEMENTED,
+        &format!(
+            "update apply requested but no staged update is available (source: {source}); \
+             no update downloaded or applied"
+        ),
+    );
+    Json(json!({
+        "supported": false,
+        "accepted": false,
+        "applied": false,
+        "current_version": current,
+        "target_version": Value::Null,
+        "source": source,
+        "source_configured": ota.effective_manifest_url(cloud).is_some(),
+        "reason": UPDATE_NO_SOURCE_REASON,
+    }))
+    .into_response()
+}
+
+/// 更新执行请求校验失败：入审计（bad_request，含被拒）后返回 400（结构化错误；
+/// 不进入执行路径）。审计失败仅告警，不改变该 400 响应。
+fn updates_apply_bad_request(state: &MgmtState, actor: &str, detail: &str) -> Response {
+    audit(
+        state,
+        actor,
+        OpsAction::UpdateApply,
+        false,
+        OUTCOME_BAD_REQUEST,
+        detail,
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "validation_failed", "message": detail })),
+    )
+        .into_response()
+}
+
+// ---- 启动与自启 ----
+
+/// 自启注册表键（HKCU Run；桌面用户自启，按当前登录用户作用域）。
+const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_VALUE: &str = "iot-daq";
+
+/// compose 注入的重启策略**声明值**（`IOT_DAQ_RESTART_POLICY`；页面回显用）。
+///
+/// 容器内**无法**读取 compose 的 `restart:` 字段（那需要 docker.sock —— 红线禁止），
+/// 因此这里回显的只是宿主声明进来的值，`provenance` 一律 `"declared"`，绝不冒充实测。
+const RESTART_POLICY_ENV: &str = "IOT_DAQ_RESTART_POLICY";
+/// 未注入 [`RESTART_POLICY_ENV`] 时的回显值（与 `docker-compose.yml` 的 `restart:` 一致）。
+const DEFAULT_RESTART_POLICY: &str = "unless-stopped";
+
+/// 当前运行形态 + 部署形态字面量（与 `/api/overview.deployMode` 同口径）。
+fn deploy_form() -> (crate::platform::RuntimeForm, &'static str) {
+    let detection = crate::platform::detect();
+    (
+        detection.form,
+        crate::platform::deploy_mode_label(detection),
+    )
+}
+
+/// 自启的托管方：由谁负责「开机把网关拉起来」。
+fn managed_by(form: crate::platform::RuntimeForm) -> &'static str {
+    match form {
+        crate::platform::RuntimeForm::LinuxDocker => "container-orchestrator",
+        crate::platform::RuntimeForm::LinuxSystemd => "systemd",
+        crate::platform::RuntimeForm::WindowsService
+        | crate::platform::RuntimeForm::WindowsDesktop => "registry-run",
+    }
+}
+
+/// `autostart_guaranteed` 字段体：`{value, provenance, hint}`。
+///
+/// # 诚实边界（为什么没有 `detected` 的容器值）
+/// - **容器形态**：网关是容器内的一个进程，既看不到 compose 的 `restart:`（需
+///   docker.sock，红线禁止），也看不到宿主 `docker.service` 是否 enabled。因此
+///   只能回显宿主声明注入的 [`RESTART_POLICY_ENV`]，`provenance="declared"`，
+///   并在 `hint` 里点明「宿主 docker.service 需 enabled 才会随开机拉起」；
+/// - **systemd 形态**：自启由宿主 systemd 托管，网关不代为执行 `systemctl`，
+///   也不探测 unit 是否已 enable（探测会诱导「替用户改宿主」的越界实现），
+///   故 `provenance="unknown"` + 指引式 `hint`；
+/// - **Windows**：HKCU Run 键在**本进程可读**，是真实测到的，`provenance="detected"`。
+fn autostart_guarantee_json(
+    form: crate::platform::RuntimeForm,
+    registered: Option<bool>,
+    command: &str,
+) -> Value {
+    let (value, provenance, hint) = match form {
+        crate::platform::RuntimeForm::LinuxDocker => {
+            let declared = std::env::var(RESTART_POLICY_ENV)
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_RESTART_POLICY.to_string());
+            (
+                declared,
+                "declared",
+                "容器自启由宿主 docker.service + compose restart 策略共同决定：宿主 docker.service 需 enabled，容器才会随开机拉起。此处为 compose 注入的声明值，网关在容器内无法实测。",
+            )
+        }
+        crate::platform::RuntimeForm::LinuxSystemd => (
+            String::new(),
+            "unknown",
+            "Linux 原生部署自启由宿主 systemd 托管；如需开机自启请在宿主执行 systemctl enable --now iot-daq.service（网关不代为执行、也不探测 unit 状态）。",
+        ),
+        crate::platform::RuntimeForm::WindowsService
+        | crate::platform::RuntimeForm::WindowsDesktop => (
+            if registered == Some(true) {
+                command.to_string()
+            } else {
+                String::new()
+            },
+            "detected",
+            "Windows 自启由 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 的 iot-daq 值决定（当前用户登录时拉起）。",
+        ),
+    };
+    json!({
+        "value": value,
+        "provenance": provenance,
+        "hint": hint,
+    })
+}
+
+/// 解析自启注册目标：优先 `IOTDAQ_SHELL_EXE`（Tauri 壳注入；须指向**存在的文件**），
+/// 否则回退 `current_exe()`（保持既有「注册 daemon 自身」行为不回归）。
+/// 返回 (路径, 目标类型)：`"shell"` = 壳、`"daemon"` = daemon 自身。
+fn resolve_autostart_target() -> (PathBuf, &'static str) {
+    if let Ok(val) = std::env::var("IOTDAQ_SHELL_EXE") {
+        if !val.is_empty() {
+            let p = PathBuf::from(val);
+            if p.is_file() {
+                return (p, "shell");
+            }
+        }
+    }
+    (std::env::current_exe().unwrap_or_default(), "daemon")
+}
+
+/// 纯函数：目标路径 → `reg` argv（add / delete）。供单测断言（不真写注册表）。
+/// `enable=false` 一律返回 delete argv（幂等注销）。
+fn autostart_registry_args(target: &Path, enable: bool) -> Vec<String> {
+    if enable {
+        let cmd_value = format!("\"{}\"", target.display());
+        vec![
+            "add".into(),
+            AUTOSTART_RUN_KEY.into(),
+            "/v".into(),
+            AUTOSTART_VALUE.into(),
+            "/t".into(),
+            "REG_SZ".into(),
+            "/d".into(),
+            cmd_value,
+            "/f".into(),
+        ]
+    } else {
+        vec![
+            "delete".into(),
+            AUTOSTART_RUN_KEY.into(),
+            "/v".into(),
+            AUTOSTART_VALUE.into(),
+            "/f".into(),
+        ]
+    }
+}
+
+/// Windows：读取 `HKCU\...\Run` 的 `iot-daq` 值（`reg query`，按 **exit code** 判定——
+/// 0 = 命中，1 = 未注册，其他 = 查询失败）。GET 与 PUT（写后回读）共用该形状；
+/// 新增 `target`（实际将注册 / 已注册路径）与 `target_kind`（`"shell"` / `"daemon"`）。
+#[cfg(target_os = "windows")]
+fn autostart_status_body() -> Value {
+    let output = std::process::Command::new("reg")
+        .args(["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
+        .output();
+    let (registered, command, query_error) = match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let command = stdout
+                .lines()
+                .find_map(|line| {
+                    let idx = line.find("REG_SZ")?;
+                    Some(line[idx + "REG_SZ".len()..].trim().to_string())
+                })
+                .unwrap_or_default();
+            (json!(true), json!(command), Value::Null)
+        }
+        Ok(out) if out.status.code() == Some(1) => (json!(false), Value::Null, Value::Null),
+        Ok(out) => (
+            Value::Null,
+            Value::Null,
+            json!(format!("reg query exited {:?}", out.status.code())),
+        ),
+        Err(err) => (Value::Null, Value::Null, json!(err.to_string())),
+    };
+    let (intended, kind) = resolve_autostart_target();
+    let (form, form_label) = deploy_form();
+    let registered_flag = registered.as_bool();
+    let command_text = command.as_str().unwrap_or("").to_string();
+    json!({
+        "supported": true,
+        "registered": registered,
+        "command": command,
+        "target": intended.display().to_string(),
+        "target_kind": kind,
+        "source": "registry-hkcu-run",
+        "query_error": query_error,
+        "form": form_label,
+        "managed_by": managed_by(form),
+        "autostart_guaranteed": autostart_guarantee_json(form, registered_flag, &command_text),
+    })
+}
+
+/// `GET /api/service/autostart` → 自启注册状态。
+pub async fn service_autostart(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
+    if let Err(resp) = authed.ensure(Permission::OpsLogsRead) {
+        return resp.into_response();
+    }
+    let _ = state;
+    #[cfg(target_os = "windows")]
+    {
+        let mut body = autostart_status_body();
+        body["write_supported"] = json!(true);
+        body["write_reason"] = Value::Null;
+        Json(body).into_response()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (target, kind) = resolve_autostart_target();
+        let (form, form_label) = deploy_form();
+        Json(json!({
+            "supported": false,
+            "registered": Value::Null,
+            "command": Value::Null,
+            "target": target.display().to_string(),
+            "target_kind": kind,
+            "source": "unimplemented",
+            "reason": "autostart status is only implemented for Windows (registry HKCU Run)",
+            "write_supported": false,
+            "write_reason": "autostart registration is only implemented for Windows",
+            "form": form_label,
+            "managed_by": managed_by(form),
+            "autostart_guaranteed": autostart_guarantee_json(form, None, ""),
+        }))
+        .into_response()
+    }
+}
+
+/// `PUT /api/service/autostart` → 注册 / 注销 HKCU Run 自启项（team-lead 追加项）。
+///
+/// - body：`{"enable": bool}`（必填；可选 `reason` 进审计）；
+/// - `enable=true`：`reg add HKCU\...\Run /v iot-daq /t REG_SZ /d "<current_exe>" /f`
+///   （值带引号——Run 键惯例，含空格路径也能解析）；
+/// - `enable=false`：`reg delete HKCU\...\Run /v iot-daq /f`；exit 1 = 本就未注册，
+///   **幂等成功**；
+/// - 成功后回读注册表真实状态（与 GET 同形状 + `accepted:true`）；
+/// - 写失败 → 500 `autostart_write_failed`；非 Windows → 501 `not_supported`；
+/// - 守卫：`OpsCollectors`（服务运行期控制，仅 system），写动作含被拒入审计环。
+#[cfg(target_os = "windows")]
+pub async fn service_autostart_put(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    let actor = authed.claims.sub.clone();
+    if let Err(rejection) = authed.ensure(Permission::OpsCollectors) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::AutostartWrite,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let req: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return autostart_audit_bad_request(&state, &actor, "body must be a JSON object");
+        }
+    };
+    let enable = match req.get("enable") {
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            return autostart_audit_bad_request(&state, &actor, "\"enable\" must be a boolean");
+        }
+        None => {
+            return autostart_audit_bad_request(
+                &state,
+                &actor,
+                "missing required field \"enable\"",
+            );
+        }
+    };
+    let reason = req
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("<unspecified>");
+
+    let _guard = write_guard();
+    let (target, kind) = resolve_autostart_target();
+    let result = if enable {
+        std::process::Command::new("reg")
+            .args(autostart_registry_args(&target, true))
+            .output()
+    } else {
+        std::process::Command::new("reg")
+            .args(autostart_registry_args(&target, false))
+            .output()
+    };
+    match result {
+        // 0 = 成功；enable=false 且 exit 1 = 本就未注册（幂等成功）。
+        Ok(out) if out.status.success() || (!enable && out.status.code() == Some(1)) => {
+            audit(
+                &state,
+                &actor,
+                OpsAction::AutostartWrite,
+                true,
+                OUTCOME_ACCEPTED,
+                &format!(
+                    "autostart {} (reason: {reason})",
+                    if enable { "registered" } else { "unregistered" }
+                ),
+            );
+            let mut body = autostart_status_body();
+            body["accepted"] = json!(true);
+            body["write_supported"] = json!(true);
+            body["target"] = json!(target.display().to_string());
+            body["target_kind"] = json!(kind);
+            Json(body).into_response()
+        }
+        Ok(out) => {
+            let detail = format!("reg exited {:?} (enable={enable})", out.status.code());
+            audit(
+                &state,
+                &actor,
+                OpsAction::AutostartWrite,
+                false,
+                OUTCOME_FAILED,
+                &detail,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "autostart_write_failed",
+                    "message": detail,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            let detail = format!("reg spawn failed: {err}");
+            audit(
+                &state,
+                &actor,
+                OpsAction::AutostartWrite,
+                false,
+                OUTCOME_FAILED,
+                &detail,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "autostart_write_failed",
+                    "message": detail,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// 非 Windows：PUT 无实现 → 501（诚实占位；读取见 GET 的 `supported:false`）。
+#[cfg(not(target_os = "windows"))]
+pub async fn service_autostart_put(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    let actor = authed.claims.sub.clone();
+    if let Err(rejection) = authed.ensure(Permission::OpsCollectors) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::AutostartWrite,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    audit(
+        &state,
+        &actor,
+        OpsAction::AutostartWrite,
+        false,
+        OUTCOME_BAD_REQUEST,
+        "autostart write is only implemented for Windows (registry HKCU Run)",
+    );
+    let (target, kind) = resolve_autostart_target();
+    let (form, form_label) = deploy_form();
+    let managed = managed_by(form);
+    // 501 也要说清「那到底由谁管」——前端据此渲染只读说明，不用猜平台。
+    let hint = match form {
+        crate::platform::RuntimeForm::LinuxDocker => {
+            "当前为容器部署形态：自启由宿主 docker.service + compose restart 策略托管，网关不改写宿主配置。"
+        }
+        _ => {
+            "当前为 Linux 原生部署形态：自启由宿主 systemd 托管，请在宿主执行 systemctl enable --now iot-daq.service。"
+        }
+    };
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "not_supported",
+            "message": "autostart registration is only implemented for Windows (registry HKCU Run)",
+            "target": target.display().to_string(),
+            "target_kind": kind,
+            "write_supported": false,
+            "write_reason": "autostart registration is only implemented for Windows",
+            "form": form_label,
+            "managed_by": managed,
+            "hint": hint,
+        })),
+    )
+        .into_response()
+}
+
+/// 自启 PUT 校验失败：入审计（bad_request）后返回 400。
+fn autostart_audit_bad_request(state: &MgmtState, actor: &str, detail: &str) -> Response {
+    audit(
+        state,
+        actor,
+        OpsAction::AutostartWrite,
+        false,
+        OUTCOME_BAD_REQUEST,
+        detail,
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "validation_failed", "message": detail })),
+    )
+        .into_response()
+}
+
+// ---- 手动备份 ----
+
+/// `POST /api/settings/backups` → 手动创建一份配置备份。
+///
+/// 采用统一备份命名 `config.toml.YYYYMMDD-HHmmss-NNN.bak`（内嵌 UTC+8 可读时刻，
+/// 见 [`crate::migrations::next_backup_path`]；`GET /api/settings/backups` 自动可见）。
+/// 复制当前 config.toml 原文（字节级快照，不做序列化重写）。
+pub async fn create_backup(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
+    let actor = authed.claims.sub.clone();
+    if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::SettingsWrite,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let _guard = write_guard();
+    let Some(path) = state.config_path() else {
+        audit(
+            &state,
+            &actor,
+            OpsAction::SettingsWrite,
+            false,
+            OUTCOME_BAD_REQUEST,
+            "config path not configured; manual backup refused",
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "internal",
+                "message": "config file path not configured; backup refused (fail-closed)",
+            })),
+        )
+            .into_response();
+    };
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::borrow::ToOwned::to_owned,
+        );
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml")
+        .to_string();
+    let target = crate::migrations::next_backup_path(&dir, &file_name);
+    let result = std::fs::copy(&path, &target);
+    match result {
+        Ok(bytes) => {
+            let backup_name = target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            // retention 清理（与写前备份同一策略；0 = 不清理）。
+            let policy = state.config().settings.backup_policy.clone();
+            let pruned = state
+                .config_path()
+                .map(|p| crate::migrations::enforce_backup_retention(&p, policy.retention_count))
+                .unwrap_or(0);
+            audit(
+                &state,
+                &actor,
+                OpsAction::SettingsWrite,
+                true,
+                OUTCOME_ACCEPTED,
+                &format!(
+                    "manual backup created {backup_name:?} ({bytes} bytes); retention pruned {pruned}"
+                ),
+            );
+            Json(json!({
+                "accepted": true,
+                "backup": backup_name,
+                "bytes": bytes.to_string(),
+                "pruned": pruned.to_string(),
+            }))
+            .into_response()
+        }
+        Err(err) => {
+            audit(
+                &state,
+                &actor,
+                OpsAction::SettingsWrite,
+                false,
+                OUTCOME_BAD_REQUEST,
+                &format!("manual backup failed: {err}"),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "internal",
+                    "message": format!("manual backup failed: {err}"),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---- 备份策略（B-2） ----
+
+/// `GET /api/settings/backup-policy` → 备份策略只读视图（读，开放——与
+/// `/api/settings` 同口径）。
+///
+/// 数字一律字符串（大数红线）；`source:"config"` 表示值来自配置热快照
+/// （未做过 PUT 时即默认策略）。
+pub async fn backup_policy_get(State(state): State<MgmtState>) -> Response {
+    let policy = &state.config().settings.backup_policy;
+    Json(json!({
+        "auto_before_write": policy.auto_before_write,
+        "retention_count": policy.retention_count.to_string(),
+        "interval_min": policy.interval_min.to_string(),
+        "source": "config",
+    }))
+    .into_response()
+}
+
+/// `PUT /api/settings/backup-policy` → 备份策略持久化（`device.write`，仅 system）。
+///
+/// Body：`{"auto_before_write": bool, "retention_count": string, "interval_min":
+/// string, "reason": string, "note": string}`（`retention_count` / `interval_min`
+/// 数字一律字符串——大数红线；`auto_before_write` / `retention_count` /
+/// `interval_min` 漏传 = 保持现值；`reason` **必填**进审计，`note` 可选）。
+///
+/// 非危险操作：不强制 confirm 三要素；写走 persist_config 既有链路（写锁 →
+/// 写前备份（若开启）→ 原子落盘 → 热替换）→ `ConfigReloaded` 广播 →
+/// **落盘后按新 retention 触发一次清理**（即使 `auto_before_write=false`，
+/// 手动/周期备份也受 retention 约束，PUT 即验证策略可达）。
+pub async fn backup_policy_put(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    const ALLOWED: &[&str] = &[
+        "auto_before_write",
+        "retention_count",
+        "interval_min",
+        "reason",
+        "note",
+    ];
+    let actor = authed.claims.sub.clone();
+    if let Err(rejection) = authed.ensure(Permission::DeviceWrite) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::BackupPolicyWrite,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let req: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) | Err(_) => {
+            return audit_policy_bad_request(
+                &state,
+                &actor,
+                "malformed json body",
+                validation_error(
+                    "body",
+                    "body must be a JSON object",
+                    "object {auto_before_write?, retention_count?, interval_min?, reason, note?}",
+                ),
+            );
+        }
+    };
+    let Some(obj) = req.as_object() else {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "unreachable: body verified as JSON object",
+            validation_error("body", "body must be a JSON object", "object"),
+        );
+    };
+    for key in obj.keys() {
+        if !ALLOWED.contains(&key.as_str()) {
+            return audit_policy_bad_request(
+                &state,
+                &actor,
+                "body carries unknown fields",
+                validation_error(
+                    &format!("body.{key}"),
+                    &format!("unknown field {key:?}"),
+                    &format!("allowed fields: {}", ALLOWED.join(" | ")),
+                ),
+            );
+        }
+    }
+    // reason 必填（进审计 detail；非危险操作不强制 confirm 三要素）。
+    let reason = obj
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if reason.is_empty() {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "reason is required",
+            validation_error(
+                "reason",
+                "reason must not be empty",
+                "non-empty change reason",
+            ),
+        );
+    }
+    let note = obj
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let current = state.config().settings.backup_policy.clone();
+    let mut next = current.clone();
+    if let Some(raw) = obj.get("auto_before_write") {
+        match raw.as_bool() {
+            Some(value) => next.auto_before_write = value,
+            None => {
+                return audit_policy_bad_request(
+                    &state,
+                    &actor,
+                    "auto_before_write is not a boolean",
+                    validation_error("auto_before_write", "must be a boolean", "true | false"),
+                );
+            }
+        }
+    }
+    if let Some(raw) = obj.get("retention_count") {
+        match parse_u32_string(raw) {
+            Ok(value) => next.retention_count = value,
+            Err(resp) => {
+                return audit_policy_bad_request(
+                    &state,
+                    &actor,
+                    "retention_count is not a valid u32",
+                    resp,
+                );
+            }
+        }
+    }
+    if let Some(raw) = obj.get("interval_min") {
+        match parse_u32_string(raw) {
+            Ok(value) => next.interval_min = value,
+            Err(resp) => {
+                return audit_policy_bad_request(
+                    &state,
+                    &actor,
+                    "interval_min is not a valid u32",
+                    resp,
+                );
+            }
+        }
+    }
+
+    let _guard = write_guard();
+    let mut config = (*state.config()).clone();
+    config.settings.backup_policy = next.clone();
+    let detail = if note.is_empty() {
+        format!("persist backup policy (reason: {reason})")
+    } else {
+        format!("persist backup policy (reason: {reason}; note: {note})")
+    };
+    // pruned 口径：本次 PUT 触发的清理净删除数（写前备份 +1、清理后现存 -1
+    // 全部计入；persist 失败路径不返回该字段）。
+    let backup_delta = if next.auto_before_write { 1usize } else { 0 };
+    let bak_before = state
+        .config_path()
+        .map(|p| crate::migrations::count_backup_files(&p))
+        .unwrap_or(0);
+    match super::pages::persist_config(
+        &state,
+        config,
+        &actor,
+        OpsAction::BackupPolicyWrite,
+        &detail,
+    ) {
+        Ok(version) => {
+            state.publish(super::MgmtEvent::ConfigReloaded { version });
+            // 落盘后按新策略立即触发一次 retention（0 = 不清理）。
+            let pruned = state
+                .config_path()
+                .map(|p| {
+                    let after = crate::migrations::count_backup_files(&p);
+                    bak_before
+                        .saturating_add(backup_delta)
+                        .saturating_sub(after)
+                })
+                .unwrap_or(0);
+            Json(json!({
+                "accepted": true,
+                "config_version": version.to_string(),
+                "backup_policy": {
+                    "auto_before_write": next.auto_before_write,
+                    "retention_count": next.retention_count.to_string(),
+                    "interval_min": next.interval_min.to_string(),
+                },
+                "pruned": pruned.to_string(),
+            }))
+            .into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+// ---- 计划重启（每日定时） ----
+
+/// 计划重启的二次确认固定对象名（与对象全名口径一致，写入审计）。
+pub(crate) const SCHEDULED_RESTART_CONFIRM: &str = "scheduled-restart";
+
+/// `GET /api/ops/scheduled-restart` → 当前计划重启配置与已触发状态。
+///
+/// **读开放**（仅回显配置里的一个时间字符串，无可推断的运维动作面；写侧才要
+/// `ops.restart`）。`last_fired` 取自 `[ops] last_restart_date`（已落盘，进程
+/// 重启后由新进程重新装载），未触发过为 `null`。
+pub async fn scheduled_restart_get(State(state): State<MgmtState>) -> Response {
+    let ops = state.config().ops.clone();
+    Json(json!({
+        "enabled": ops.scheduled_restart_enabled(),
+        "at": ops.scheduled_restart_at.clone(),
+        "last_fired": if ops.last_restart_date.is_empty() { Value::Null } else { json!(ops.last_restart_date) },
+        "timezone": "local",
+        "note": "每日定时重启；命中后走与 POST /api/ops/restart 相同的优雅停机通道，\
+                 同日只触发一次。",
+    }))
+    .into_response()
+}
+
+/// `PUT /api/ops/scheduled-restart` → 设置 / 清除每日定时重启（P0-8 危险操作三要素）。
+///
+/// body：`{at: "HH:MM" | "", reason, note?, confirm}`，`confirm` 固定回显
+/// `scheduled-restart`（trim + 大小写不敏感）。`at` 空串 = 关闭定时重启；
+/// 非法时刻（非 `HH:MM`）→ 400 `validation_failed`。落盘后调度器下一拍（≤30s）
+/// 按新值生效。权限与立即重启同档（`ops.restart`）。
+#[allow(clippy::too_many_lines)]
+pub async fn scheduled_restart_put(
+    State(state): State<MgmtState>,
+    authed: AuthedRole,
+    body: Bytes,
+) -> Response {
+    let actor = authed.claims.sub.clone();
+    if let Err(rejection) = authed.ensure(Permission::OpsRestart) {
+        audit(
+            &state,
+            &actor,
+            OpsAction::Restart,
+            false,
+            OUTCOME_DENIED,
+            &rejection.to_string(),
+        );
+        return rejection.into_response();
+    }
+    let req = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(obj)) => obj,
+        Ok(_) | Err(_) => {
+            return audit_policy_bad_request(
+                &state,
+                &actor,
+                "malformed json body",
+                validation_error(
+                    "body",
+                    "body must be a JSON object",
+                    "object {at, reason, note?, confirm}",
+                ),
+            );
+        }
+    };
+    for key in req.keys() {
+        if !["at", "reason", "note", "confirm"].contains(&key.as_str()) {
+            return audit_policy_bad_request(
+                &state,
+                &actor,
+                "body carries unknown fields",
+                validation_error(
+                    &format!("body.{key}"),
+                    &format!("unknown field {key:?}"),
+                    "allowed fields: at | reason | note | confirm",
+                ),
+            );
+        }
+    }
+    // 三要素：`reason` 必填、`note` 非空则 ≥10 字、`confirm` = scheduled-restart。
+    let reason = req
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if reason.is_empty() {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "reason is required",
+            validation_error(
+                "reason",
+                "reason must not be empty",
+                "non-empty change reason",
+            ),
+        );
+    }
+    let note = req
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !note.is_empty() && note.chars().count() < 10 {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "note is too short",
+            validation_error(
+                "note",
+                "note must be at least 10 characters when non-empty",
+                "≥10 characters",
+            ),
+        );
+    }
+    let confirm = req
+        .get("confirm")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if confirm.is_empty() {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "confirm is required",
+            validation_error(
+                "confirm",
+                "confirm is required (echo the fixed target `scheduled-restart`)",
+                SCHEDULED_RESTART_CONFIRM,
+            ),
+        );
+    }
+    if !confirm.eq_ignore_ascii_case(SCHEDULED_RESTART_CONFIRM) {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "confirm mismatch",
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "confirm_mismatch",
+                    "field": "confirm",
+                    "reason": format!(
+                        "confirm does not match {:?}",
+                        SCHEDULED_RESTART_CONFIRM
+                    ),
+                    "allowed": SCHEDULED_RESTART_CONFIRM,
+                })),
+            )
+                .into_response(),
+        );
+    }
+    // `at`：空串 = 关闭；否则必须能解析成 `HH:MM`。
+    let raw_at = req
+        .get("at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !raw_at.is_empty() && crate::scheduler::scheduled_restart::parse_at(raw_at).is_none() {
+        return audit_policy_bad_request(
+            &state,
+            &actor,
+            "invalid scheduled restart time",
+            validation_error(
+                "at",
+                &format!("not a valid daily time: {raw_at:?}"),
+                "HH:MM in 24-hour local time; empty string disables the schedule",
+            ),
+        );
+    }
+    let _guard = write_guard();
+    let mut config = (*state.config()).clone();
+    config.ops.scheduled_restart_at = raw_at.to_string();
+    let detail = format!(
+        "set scheduled restart at {:?} (reason: {reason}; note: {note})",
+        raw_at
+    );
+    match super::pages::persist_config(&state, config, &actor, OpsAction::SettingsWrite, &detail) {
+        Ok(version) => {
+            state.publish(super::MgmtEvent::ConfigReloaded { version });
+            Json(json!({
+                "accepted": true,
+                "enabled": !raw_at.is_empty(),
+                "at": raw_at,
+                "config_version": version.to_string(),
+            }))
+            .into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// 备份策略 PUT 校验失败：入审计（bad_request）后返回 400。
+fn audit_policy_bad_request(
+    state: &MgmtState,
+    actor: &str,
+    detail: &str,
+    resp: Response,
+) -> Response {
+    audit(
+        state,
+        actor,
+        OpsAction::BackupPolicyWrite,
+        true,
+        OUTCOME_BAD_REQUEST,
+        detail,
+    );
+    resp
+}
+
+/// u32 字段解析（接受 string——大数红线推荐形态——或 JSON number）。
+#[allow(clippy::result_large_err)]
+fn parse_u32_string(raw: &Value) -> Result<u32, Response> {
+    let parsed = match raw {
+        Value::Number(number) => number.as_u64(),
+        Value::String(value) => value.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    match parsed {
+        Some(value) if value <= u32::MAX as u64 => Ok(value as u32),
+        _ => Err(validation_error(
+            "value",
+            &format!("not a valid u32: {raw}"),
+            "integer >= 0 (u32); string or number",
+        )),
+    }
+}
+
+// ---- 周期备份（interval_min > 0 时生效） ----
+
+/// 上次周期备份时刻（Unix 毫秒；进程内状态，重启后重置为启动时刻——
+/// 重启后的第一次到期备份最早发生在 `interval_min` 之后，不立即补打）。
+static LAST_PERIODIC_BACKUP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 生产入口：启动周期备份循环（30s tick 轮询；`interval_min == 0` 时每拍空转）。
+///
+/// 每拍读配置热快照——PUT 备份策略热重载后下一拍即按新间隔/新 retention 生效。
+/// 测试服务不挂本循环（生产装配 `bin/iot-daq-daemon.rs` 独占调用）。
+pub fn spawn_periodic_backup(state: &MgmtState) {
+    let state = state.clone();
+    LAST_PERIODIC_BACKUP_MS.store(now_ms(), Ordering::Relaxed);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let policy = state.config().settings.backup_policy.clone();
+            if policy.interval_min == 0 {
+                continue;
+            }
+            let interval_ms = u64::from(policy.interval_min).saturating_mul(60_000);
+            let last = LAST_PERIODIC_BACKUP_MS.load(Ordering::Relaxed);
+            if now_ms().saturating_sub(last) < interval_ms {
+                continue;
+            }
+            LAST_PERIODIC_BACKUP_MS.store(now_ms(), Ordering::Relaxed);
+            periodic_backup_once(&state, policy.retention_count);
+        }
+    });
+}
+
+/// 执行一次周期备份（`config.toml.YYYYMMDD-HHmmss-NNN.bak` 字节级快照 +
+/// retention 清理；失败仅告警——周期任务绝不打断主流程，也不假成功）。
+fn periodic_backup_once(state: &MgmtState, retention: u32) {
+    let Some(path) = state.config_path() else {
+        tracing::warn!("periodic backup: config path not bound; skipped");
+        return;
+    };
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::borrow::ToOwned::to_owned,
+        );
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    let target = crate::migrations::next_backup_path(&dir, file_name);
+    match std::fs::copy(&path, &target) {
+        Ok(bytes) => {
+            let pruned = crate::migrations::enforce_backup_retention(&path, retention);
+            let backup_name = target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            tracing::info!(
+                backup = %backup_name,
+                bytes,
+                pruned,
+                "periodic backup created"
+            );
+            audit(
+                state,
+                "system-periodic",
+                OpsAction::SettingsWrite,
+                true,
+                OUTCOME_ACCEPTED,
+                &format!(
+                    "periodic backup created {backup_name:?} ({bytes} bytes); retention pruned {pruned}"
+                ),
+            );
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "periodic backup failed; will retry next interval");
+            audit(
+                state,
+                "system-periodic",
+                OpsAction::SettingsWrite,
+                true,
+                OUTCOME_FAILED,
+                &format!("periodic backup failed: {err}"),
+            );
+        }
+    }
+}
+
+// ---- 自检清单 ----
+
+/// 自检单项。
+struct CheckItem {
+    name: &'static str,
+    ok: bool,
+    detail: Value,
+}
+
+/// `GET /api/diagnostics/selfcheck` → 自检清单（DiagnosePage 消费）。
+///
+/// 每项都是**真实判定**（读当前运行态，不缓存、不伪造）：
+/// - `config_writable`：config 目录可写（临时文件探针，写后即删）；
+/// - `scheduler`：调度器是否在跑 + 各组累计样本 / 错误；
+/// - `alarm_engine`：告警规则数 + 存储记录数；
+/// - `license`：授权状态与北向闸门；
+/// - `audit_logger`：持久审计是否挂载；
+/// - `machine_code`：机器码来源（license 指纹 / 占位）；
+/// - `clock`：系统时钟可用性（UNIX_EPOCH 之后）。
+pub async fn selfcheck(State(state): State<MgmtState>, authed: AuthedRole) -> Response {
+    if let Err(resp) = authed.ensure(Permission::OpsLogsRead) {
+        return resp.into_response();
+    }
+    let daemon = state.daemon();
+    let config = state.config();
+    let mut items: Vec<CheckItem> = Vec::new();
+
+    // ① config 目录可写探针（临时文件写后即删；不产生备份、不碰配置本体）。
+    // 相对路径（如 `config.toml`）的 parent 为空 → 用 `.`（与 rollback 同口径）。
+    let config_ok = state.config_path().is_some();
+    let write_probe = state.config_path().map(|path| {
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from("."),
+                std::borrow::ToOwned::to_owned,
+            );
+        let probe = dir.join(format!(".selfcheck-probe-{}", now_ms()));
+        let write = std::fs::write(&probe, b"ok").is_ok();
+        if write {
+            let _ = std::fs::remove_file(&probe);
+        }
+        write
+    });
+    items.push(CheckItem {
+        name: "config_writable",
+        ok: write_probe.unwrap_or(false),
+        detail: json!({
+            "config_path_bound": config_ok,
+            "probe": write_probe,
+        }),
+    });
+
+    // ② 调度器：在跑的组 + 累计计数。
+    let (scheduler_running, group_stats) = {
+        let scheduler = daemon.scheduler();
+        match scheduler.as_ref() {
+            Some(s) => {
+                let stats: Vec<Value> = s
+                    .group_names()
+                    .iter()
+                    .filter_map(|name| {
+                        s.stats(name).map(|g| {
+                            json!({
+                                "group": name,
+                                "samples": g.samples(),
+                                "errors": g.errors(),
+                            })
+                        })
+                    })
+                    .collect();
+                (true, stats)
+            }
+            None => (false, Vec::new()),
+        }
+    };
+    items.push(CheckItem {
+        name: "scheduler",
+        ok: scheduler_running,
+        detail: json!({ "running": scheduler_running, "groups": group_stats }),
+    });
+
+    // ③ 告警引擎：规则数 + 记录数（读侧真实统计）。
+    let alarm_rules = config.alarms.as_ref().map(|a| a.rules.len()).unwrap_or(0);
+    let alarm_records = daemon.alarms_store().len();
+    items.push(CheckItem {
+        name: "alarm_engine",
+        ok: true, // 引擎随数据面挂载；有无规则都是合法态
+        detail: json!({ "rules": alarm_rules, "records": alarm_records }),
+    });
+
+    // ④ 授权状态（runtime 缺席 = 未配置授权，如实 degrade 信息）。
+    let license = daemon.license_runtime();
+    let (license_state, forward_allowed, assembly_error) = match &license {
+        Some(rt) => {
+            use crate::auth::client::LicenseState;
+            let label = match rt.state() {
+                LicenseState::Unlicensed => "unlicensed",
+                LicenseState::Trial { .. } => "trial",
+                LicenseState::Licensed { .. } => "licensed",
+                LicenseState::Grace { .. } => "grace",
+                LicenseState::Degraded { .. } => "degraded",
+            };
+            (label.to_string(), rt.north_forward_allowed(), Value::Null)
+        }
+        None => (
+            "absent".to_string(),
+            false,
+            json!(daemon
+                .license_assembly_error()
+                .unwrap_or_else(|| { "licensing not configured".to_string() })),
+        ),
+    };
+    items.push(CheckItem {
+        name: "license",
+        ok: forward_allowed || license.is_none(),
+        detail: json!({
+            "state": license_state,
+            "north_forward_allowed": forward_allowed,
+            "assembly_error": assembly_error,
+        }),
+    });
+
+    // ⑤ 持久审计挂载。
+    let audit_mounted = daemon.audit_logger().is_some();
+    items.push(CheckItem {
+        name: "audit_logger",
+        ok: audit_mounted,
+        detail: json!({ "mounted": audit_mounted }),
+    });
+
+    // ⑥ 机器码来源（与 overview 同口径）。
+    let machine_code_source = match &license {
+        Some(_rt) => "license-fingerprint",
+        None => "placeholder-unlicensed",
+    };
+    items.push(CheckItem {
+        name: "machine_code",
+        ok: true,
+        detail: json!({ "source": machine_code_source }),
+    });
+
+    // ⑦ 时钟可用性。
+    let clock_ok = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .is_ok();
+    items.push(CheckItem {
+        name: "clock",
+        ok: clock_ok,
+        detail: json!({ "now_ms": now_ms().to_string() }),
+    });
+
+    let all_ok = items.iter().all(|i| i.ok);
+    let rows: Vec<Value> = items
+        .into_iter()
+        .map(|i| json!({ "name": i.name, "ok": i.ok, "detail": i.detail }))
+        .collect();
+    Json(json!({
+        "ok": all_ok,
+        "checks": rows,
+        "checked_at": now_ms().to_string(),
+    }))
+    .into_response()
+}
+
+// ---- 测试 ----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootstrap::DaemonShared;
+    use crate::config::{ConfigShared, GatewayConfig};
+    use crate::mgmt::auth_jwt::{now_unix_secs, sign, Claims};
+    use crate::mgmt::rbac::Role;
+    use crate::mgmt::remote_ops;
+    use crate::ota::{InMemoryOtaStore, OtaManager, OtaMeta, OtaStore};
+    use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
+
+    /// 测试种子配置（[gateway] 最小段）。
+    const SEED_TOML: &str = r#"
+[gateway]
+gateway_id = "gw-ops-test"
+data_dir = "./data"
+"#;
+
+    /// 以自定义 TOML 构造绑定临时配置文件的 MgmtState（各测试共用装配口径）。
+    fn make_state_with(dir: &tempfile::TempDir, toml: &str) -> (MgmtState, std::path::PathBuf) {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).expect("seed config");
+        let config = Arc::new(GatewayConfig::load(&path).expect("load"));
+        let daemon = DaemonShared::new();
+        daemon.set_config(Arc::new(ConfigShared::new((*config).clone())));
+        let state = MgmtState::new(daemon, config).with_config_path(&path);
+        remote_ops::install(&state, Arc::new(remote_ops::DenyAllOpsAuthorizer));
+        (state, path)
+    }
+
+    /// 构造绑定临时配置文件的 MgmtState（默认种子配置）。
+    fn make_state(dir: &tempfile::TempDir) -> (MgmtState, std::path::PathBuf) {
+        make_state_with(dir, SEED_TOML)
+    }
+
+    /// 以 state 的实际签名密钥签发测试 token。
+    fn token_for(state: &MgmtState, role: Role) -> String {
+        let now = now_unix_secs();
+        let claims = Claims {
+            sub: "ops-admin".to_string(),
+            role: role.as_str().to_string(),
+            perms: None,
+            exp: now + 600,
+            iat: now,
+            nbf: None,
+            jti: "test-jti-ops".to_string(),
+        };
+        sign(&claims, state.auth().key()).expect("sign test token")
+    }
+
+    /// 在 127.0.0.1 随机端口启动 axum 服务（本机回环）。
+    async fn spawn_server(state: MgmtState) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, crate::mgmt::router(state))
+                .await
+                .expect("serve error");
+        });
+        port
+    }
+
+    /// 解析原始 HTTP 响应 → (状态码, body)。
+    fn parse_response(raw: &str) -> (u16, String) {
+        let (head, body) = raw.split_once("\r\n\r\n").expect("header/body separator");
+        let status: u16 = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .expect("status code");
+        (status, body.to_string())
+    }
+
+    /// 手写 HTTP 请求（3s 超时防挂死）。
+    async fn http(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        token: Option<&str>,
+    ) -> (u16, String) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let body = body.unwrap_or("");
+            let auth = token
+                .map(|t| format!("Authorization: Bearer {t}\r\n"))
+                .unwrap_or_default();
+            let request = if method == "GET" {
+                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n")
+            } else {
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            stream.write_all(request.as_bytes()).await.expect("write");
+            stream.flush().await.expect("flush");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read");
+            parse_response(&String::from_utf8(buf).expect("utf8"))
+        })
+        .await
+        .expect("http timed out")
+    }
+
+    /// QA Happy: GET 默认策略（读开放 + 数字字符串红线 + source=config）；
+    /// PUT 落盘往返 + GET 立即反映。
+    #[tokio::test]
+    async fn backup_policy_get_defaults_and_put_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, path) = make_state(&dir);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // 默认策略（旧配置无 [settings] 段）。
+        let (status, body) = http(port, "GET", "/api/settings/backup-policy", None, None).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["auto_before_write"], true);
+        assert_eq!(value["retention_count"], "20", "大数红线：字符串编码");
+        assert_eq!(value["interval_min"], "0");
+        assert_eq!(value["source"], "config");
+
+        // PUT：显式覆盖（reason 必填）。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/settings/backup-policy",
+            Some(
+                r#"{"auto_before_write":true,"retention_count":"5","interval_min":"30","reason":"tighten retention","note":"ops request"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["accepted"], true);
+        assert!(value["config_version"].is_string(), "大数红线");
+        assert_eq!(value["backup_policy"]["retention_count"], "5");
+        assert_eq!(value["backup_policy"]["interval_min"], "30");
+
+        // 落盘往返：重读配置文件语义一致。
+        let reloaded = GatewayConfig::load(&path).expect("reload");
+        assert_eq!(reloaded.settings.backup_policy.retention_count, 5);
+        assert_eq!(reloaded.settings.backup_policy.interval_min, 30);
+        assert!(reloaded.settings.backup_policy.auto_before_write);
+
+        // GET 立即反映热快照。
+        let (status, body) = http(port, "GET", "/api/settings/backup-policy", None, None).await;
+        assert_eq!(status, 200);
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["retention_count"], "5");
+    }
+
+    /// QA Error: 未知字段 / 缺 reason / 非法数字 → 400；ops 角色 → 403；
+    /// 未携带 token → 401；全部失败路径零落盘。
+    #[tokio::test]
+    async fn backup_policy_rejects_invalid_input_and_unauthorized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, path) = make_state(&dir);
+        let system = token_for(&state, Role::System);
+        let ops = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        // 未知字段。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/settings/backup-policy",
+            Some(r#"{"reason":"x","hacker":"true"}"#),
+            Some(&system),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+
+        // reason 缺失 / 空白 → 400（必填进审计）。
+        for body_raw in [r#"{"retention_count":"5"}"#, r#"{"reason":"   "}"#] {
+            let (status, body) = http(
+                port,
+                "PUT",
+                "/api/settings/backup-policy",
+                Some(body_raw),
+                Some(&system),
+            )
+            .await;
+            assert_eq!(status, 400, "{body_raw}: {body}");
+        }
+
+        // 非法数字 / 超界 / 类型错 → 400。
+        for body_raw in [
+            r#"{"reason":"x","retention_count":"abc"}"#,
+            r#"{"reason":"x","retention_count":"99999999999"}"#,
+            r#"{"reason":"x","interval_min":true}"#,
+            r#"{"reason":"x","auto_before_write":"yes"}"#,
+        ] {
+            let (status, _) = http(
+                port,
+                "PUT",
+                "/api/settings/backup-policy",
+                Some(body_raw),
+                Some(&system),
+            )
+            .await;
+            assert_eq!(status, 400, "{body_raw}");
+        }
+
+        // ops（不持 device.write）→ 403。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/settings/backup-policy",
+            Some(r#"{"reason":"x"}"#),
+            Some(&ops),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+
+        // 无 token → 401。
+        let (status, _) = http(
+            port,
+            "PUT",
+            "/api/settings/backup-policy",
+            Some(r#"{"reason":"x"}"#),
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+
+        // 全部失败路径零落盘。
+        let reloaded = GatewayConfig::load(&path).expect("reload");
+        assert_eq!(
+            reloaded.settings.backup_policy.retention_count, 20,
+            "no disk change"
+        );
+    }
+
+    /// QA（autostart PUT 本地分支）：401 无 token / 403 ops 角色无
+    /// OpsCollectors / 400 缺 enable / 400 非布尔 / 400 非 JSON。
+    /// **只测不触注册表的分支**（enable 合法路径由真机 curl 验收并清理现场）。
+    #[tokio::test]
+    async fn autostart_put_local_branches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir);
+        let system = token_for(&state, Role::System);
+        let ops = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        // 401：无 token。
+        let (status, _) = http(
+            port,
+            "PUT",
+            "/api/service/autostart",
+            Some(r#"{"enable":true}"#),
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+
+        // 403：ops 角色无 OpsCollectors（仅 system）。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/service/autostart",
+            Some(r#"{"enable":true}"#),
+            Some(&ops),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+
+        // 400：缺 enable。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/service/autostart",
+            Some(r#"{"reason":"x"}"#),
+            Some(&system),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("missing required field"));
+
+        // 400：enable 非布尔。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/service/autostart",
+            Some(r#"{"enable":"yes"}"#),
+            Some(&system),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("must be a boolean"));
+
+        // 400：非 JSON body。
+        let (status, _) = http(
+            port,
+            "PUT",
+            "/api/service/autostart",
+            Some("not-json"),
+            Some(&system),
+        )
+        .await;
+        assert_eq!(status, 400);
+
+        // GET 形状守卫：write_supported 已翻转为 true（Windows 下）。
+        let (status, body) = http(port, "GET", "/api/service/autostart", None, Some(&system)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["supported"], true);
+        assert_eq!(value["write_supported"], true);
+    }
+
+    /// QA（task B 纯函数）：目标路径 → `reg` argv 形状（不真写注册表）。
+    #[test]
+    fn autostart_registry_args_shape() {
+        let target = std::path::Path::new(r"C:\Program Files\iot\shell.exe");
+        let add = autostart_registry_args(target, true);
+        assert_eq!(add[0], "add");
+        assert!(add.contains(&AUTOSTART_RUN_KEY.to_string()));
+        assert!(add.contains(&AUTOSTART_VALUE.to_string()));
+        assert!(add.contains(&"/d".to_string()));
+        // 值带引号（Run 键含空格路径惯例）。
+        let d = add
+            .iter()
+            .find(|a| a.starts_with('"'))
+            .expect("quoted /d value");
+        assert!(d.starts_with("\"C:\\Program Files\\iot\\shell.exe\""));
+        assert!(add.iter().any(|a| a == "/f"));
+
+        let del = autostart_registry_args(target, false);
+        assert_eq!(del[0], "delete");
+        assert!(del.contains(&AUTOSTART_RUN_KEY.to_string()));
+        assert!(del.contains(&AUTOSTART_VALUE.to_string()));
+        assert!(del.iter().any(|a| a == "/f"));
+    }
+
+    /// QA（task B 目标解析）：无 env / 不存在文件 → `"daemon"`；存在文件 → `"shell"`。
+    #[test]
+    fn autostart_resolve_target_kind() {
+        std::env::remove_var("IOTDAQ_SHELL_EXE");
+        let (path, kind) = resolve_autostart_target();
+        assert_eq!(kind, "daemon");
+        assert!(
+            !path.as_os_str().is_empty(),
+            "daemon fallback = current_exe"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shell = dir.path().join("shell.exe");
+        std::fs::write(&shell, b"x").expect("seed shell");
+        std::env::set_var("IOTDAQ_SHELL_EXE", shell.as_os_str());
+        let (resolved, kind) = resolve_autostart_target();
+        assert_eq!(kind, "shell");
+        assert_eq!(resolved, shell);
+
+        // 指向不存在文件 → 回退 daemon。
+        let missing = dir.path().join("nope.exe");
+        std::env::set_var("IOTDAQ_SHELL_EXE", missing.as_os_str());
+        let (_, kind) = resolve_autostart_target();
+        assert_eq!(kind, "daemon");
+
+        std::env::remove_var("IOTDAQ_SHELL_EXE");
+    }
+
+    /// QA（retention 实证）: 造 25 个假 `.bak-*`（自产前缀）→ PUT retention=20
+    /// → 响应 pruned="6"（25 旧 + 1 新写前备份 = 26 → 删 6 留 20）；
+    /// 用户自建前缀文件不动。
+    #[tokio::test]
+    async fn backup_policy_put_enforces_retention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir);
+        for i in 0..25 {
+            std::fs::write(dir.path().join(format!("config.toml.bak-{i:020}")), b"old")
+                .expect("seed bak");
+        }
+        std::fs::write(dir.path().join("config.toml.userbak"), b"keep").expect("seed user file");
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/settings/backup-policy",
+            Some(r#"{"reason":"enforce retention","retention_count":"20"}"#),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            value["pruned"], "6",
+            "25 old + 1 fresh write-backup = 26 → prune 6 (大数红线: 字符串)"
+        );
+
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(ToString::to_string))
+            .filter(|n| crate::migrations::is_backup_file_name(n, "config.toml"))
+            .collect();
+        assert_eq!(remaining.len(), 20, "exactly 20 backups remain");
+        assert!(
+            dir.path().join("config.toml.userbak").exists(),
+            "user files never touched"
+        );
+    }
+
+    // ---- 更新检查 / 执行 ----
+
+    /// QA（updates check）: OTA 未就绪 → `check_supported:false` + **面向用户**原因
+    /// （指向真实开关 `[gateway.ota]` 与容器 env 通道）；已声明端点但缺签名公钥 →
+    /// `source` 如实回显、`source_configured:true`、仍 `check_supported:false`；
+    /// 两种状态的 reason 都**不含**「写端点 / 接口 / 端点」等内部术语。    #[tokio::test]
+    async fn updates_check_is_honest_and_user_facing() {
+        // ① 完全未配置 [gateway.ota]。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], false);
+        assert_eq!(value["update_available"], false);
+        assert_eq!(value["available_version"], Value::Null);
+        assert_eq!(value["source"], "unconfigured");
+        assert_eq!(value["source_configured"], false);
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("[gateway.ota]") && reason.contains("IOT_DAQ_OTA_ENABLED"),
+            "reason must point at the real switch + container env: {reason}"
+        );
+        for term in ["写端点", "未提供更新执行接口", "接口", "端点"] {
+            assert!(
+                !reason.contains(term),
+                "reason leaked internal term {term:?}: {reason}"
+            );
+        }
+
+        // ② 已声明 manifest_url 但缺签名公钥 → 未就绪；source 如实回显。
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let toml = format!(
+            "{SEED_TOML}\n[gateway.ota]\nenabled = true\n\
+             manifest_url = \"http://license.webscad.cn/licensing/updates/manifest\"\n"
+        );
+        let (state2, _p2) = make_state_with(&dir2, &toml);
+        let token2 = token_for(&state2, Role::System);
+        let port2 = spawn_server(state2.clone()).await;
+        let (status, body) = http(port2, "GET", "/api/updates/check", None, Some(&token2)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            value["check_supported"], false,
+            "缺签名公钥 → 未就绪（仍诚实降级）"
+        );
+        assert_eq!(
+            value["source"],
+            "http://license.webscad.cn/licensing/updates/manifest"
+        );
+        assert_eq!(value["source_configured"], true);
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("IOT_DAQ_OTA_SIGNING_KEY_B64"),
+            "reason must name the missing env knob: {reason}"
+        );
+    }
+
+    /// QA（updates apply 危险契约）: 缺 `reason`/`note`/`confirm` 任一 → 400；空白 /
+    /// 非字符串 / 未知字段 → 400；三要素齐全 → 200 + `supported:false` +
+    /// `applied:false` + 面向用户原因（**不伪造升级成功**）；无 token → 401。
+    #[tokio::test]
+    async fn updates_apply_enforces_danger_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = make_state(&dir);
+        let system = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // 缺字段 / 空白 / 非字符串 / 未知字段 → 一律 400。
+        for body_raw in [
+            r#"{"note":"n","confirm":"c"}"#,
+            r#"{"reason":"r","confirm":"c"}"#,
+            r#"{"reason":"r","note":"n"}"#,
+            r#"{}"#,
+            r#"{"reason":"r","note":"n","confirm":"   "}"#,
+            r#"{"reason":"r","note":"n","confirm":123}"#,
+            r#"{"reason":"r","note":"n","confirm":"c","extra":"x"}"#,
+            "not-json",
+        ] {
+            let (status, body) = http(
+                port,
+                "POST",
+                "/api/updates/apply",
+                Some(body_raw),
+                Some(&system),
+            )
+            .await;
+            assert_eq!(status, 400, "{body_raw} → {body}");
+        }
+
+        // OTA 未就绪 → 200 诚实降级（绝不伪造成功）。
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(
+                r#"{"reason":"月度维护窗口","note":"现场工程师要求升级到 0.2.0","confirm":"确认执行更新"}"#,
+            ),
+            Some(&system),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["supported"], false);
+        assert_eq!(value["accepted"], false);
+        assert_eq!(
+            value["applied"], false,
+            "must never fake a successful update"
+        );
+        assert_eq!(value["source"], "unconfigured");
+        assert!(value["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("[gateway.ota]"));
+
+        // 无 token → 401（未进入校验）。
+        let (status, _) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(r#"{"reason":"r","note":"n","confirm":"c"}"#),
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+    }
+
+    // ---- 更新检查 / 执行：OTA（[gateway.ota]）已配置后的真实状态 ----
+
+    /// 带 `[gateway.ota]` 三要素的配置模板（显式 manifest_url + 公钥 + enabled，
+    /// [`crate::config::OtaSection::is_ready`] 为真）。
+    const OTA_TOML: &str = r#"
+[gateway]
+gateway_id = "gw-ops-ota-test"
+data_dir = "./data"
+
+[gateway.ota]
+enabled = true
+manifest_url = "http://ota.example.com/updates/manifest"
+signing_key_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+current_version = 1
+"#;
+
+    /// 把一个「全进程唯一」OTA 管理器挂到 state 的共享态上，落盘 meta 标注 pending。
+    async fn wire_ota_manager(state: &MgmtState, pending: Option<&str>) {
+        let store = Arc::new(InMemoryOtaStore::default());
+        store
+            .persist_meta(&OtaMeta {
+                current_version: "1".to_string(),
+                pending_version: pending.map(str::to_string),
+                updated_ts_ns: "1".to_string(),
+            })
+            .await
+            .expect("persist meta");
+        let manager = OtaManager::new(
+            store as Arc<dyn OtaStore>,
+            SigningKey::from_bytes(&[0x5au8; 32]).verifying_key(),
+            1,
+        );
+        state
+            .daemon()
+            .set_ota_manager(Arc::new(tokio::sync::Mutex::new(manager)));
+    }
+
+    /// QA：`[gateway.ota]` 已配置且存在 pending → check 如实报 `check_supported:true` /
+    /// `update_available:true` / `available_version` = pending；`ota_current_version`
+    /// 与 `current_version`（Cargo 包版本串）是两个不同口径。
+    #[tokio::test]
+    async fn updates_check_reports_ota_pending_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, Some("2")).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], true);
+        assert_eq!(value["update_available"], true);
+        assert_eq!(value["available_version"], "2");
+        assert_eq!(value["source"], "http://ota.example.com/updates/manifest");
+        assert_eq!(value["source_configured"], true);
+        assert_eq!(
+            value["ota_current_version"], "1",
+            "OTA 单调序当前版本来自落盘 meta"
+        );
+        assert!(
+            value["current_version"].is_string(),
+            "Cargo 包版本串必须保留"
+        );
+        assert_ne!(
+            value["current_version"], value["ota_current_version"],
+            "两个版本口径不得混用"
+        );
+    }
+
+    /// QA：`[gateway.ota]` 已配置但无 pending → `check_supported:true` 且
+    /// `update_available:false` / `available_version:null`（不臆造）。
+    #[tokio::test]
+    async fn updates_check_ota_without_pending_is_honest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, None).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], true);
+        assert_eq!(value["update_available"], false);
+        assert_eq!(value["available_version"], Value::Null);
+    }
+
+    /// QA：`[gateway.ota]` 已配置且存在 pending → apply 接受（`accepted:true`），但
+    /// `applied` **恒 false**（本进程不做二进制替换）；`target_version` = pending。
+    #[tokio::test]
+    async fn updates_apply_accepts_staged_pending_without_claiming_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, Some("2")).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(r#"{"reason":"维护窗口","note":"升级到 2","confirm":"确认执行"}"#),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["accepted"], true);
+        assert_eq!(
+            value["applied"], false,
+            "绝不伪造升级成功（本进程不做二进制替换）"
+        );
+        assert_eq!(value["target_version"], "2");
+        assert_eq!(value["source"], "http://ota.example.com/updates/manifest");
+        assert_eq!(value["source_configured"], true);
+    }
+
+    /// QA：`[gateway.ota]` 已配置但**无 pending** → apply 回到诚实降级
+    /// （`accepted:false` / `applied:false`）。
+    #[tokio::test]
+    async fn updates_apply_ota_without_pending_stays_honest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        wire_ota_manager(&state, None).await;
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/updates/apply",
+            Some(r#"{"reason":"r","note":"n","confirm":"c"}"#),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["accepted"], false);
+        assert_eq!(value["applied"], false);
+    }
+
+    /// QA：`[gateway.ota]` 已配置但运行期管理器未装配 → `check_supported:false`
+    /// （不能承诺能完成一次检查），但 `source` 如实回显、`source_configured:true`
+    /// （配置层确实就绪，缺口在运行期），reason 非空且点名「尚未就绪」；
+    /// `ota_current_version` 恒 null（统一规则：只有读到落盘 meta 才给值）。
+    #[tokio::test]
+    async fn updates_check_ota_configured_but_manager_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _p) = make_state_with(&dir, OTA_TOML);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, body) = http(port, "GET", "/api/updates/check", None, Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["check_supported"], false);
+        assert_eq!(value["update_available"], false);
+        assert_eq!(value["available_version"], Value::Null);
+        assert_eq!(value["source_configured"], true);
+        assert_eq!(value["ota_current_version"], Value::Null);
+        let reason = value["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("尚未就绪"),
+            "reason 应点名运行期未就绪，实际：{reason}"
+        );
+    }
+
+    /// 计划重启：`GET` 回显当前配置；`PUT` 校验非法时刻 / 三要素缺失，合法则落盘。
+    #[tokio::test]
+    async fn scheduled_restart_get_and_put_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, path) = make_state(&dir);
+        let token = token_for(&state, Role::System);
+        let port = spawn_server(state.clone()).await;
+
+        // ① 初始（未配置）→ enabled=false、at 空、last_fired=null。
+        let (status, body) = http(port, "GET", "/api/ops/scheduled-restart", None, None).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["at"].as_str(), Some(""));
+        assert_eq!(value["last_fired"], Value::Null);
+
+        // ② 缺 `reason` → 400 validation_failed。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(r#"{"at":"02:30","confirm":"scheduled-restart"}"#),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"].as_str(),
+            Some("reason")
+        );
+
+        // ③ `note` 不足 10 字 → 400 validation_failed。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护","note":"太短","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"].as_str(),
+            Some("note")
+        );
+
+        // ④ 非法时刻 → 400 validation_failed（落盘零变更）。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"25:99","reason":"每日维护窗口","note":"时刻超出合法值域范围","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["field"].as_str(),
+            Some("at")
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("config")
+                .contains("scheduled_restart_at"),
+            "非法时刻不得落盘（空值不写段，避免旧版 daemon 读到脏配置）"
+        );
+
+        // ⑤ `confirm` 不匹配 → 400 confirm_mismatch。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护窗口","note":"每日凌晨例行重启窗口","confirm":"02:30"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["error"], "confirm_mismatch");
+        assert_eq!(value["allowed"], SCHEDULED_RESTART_CONFIRM);
+
+        // ⑥ 合法 → 200 落盘（复核配置文件）。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护窗口","note":"每日凌晨例行重启窗口","confirm":"SCHEDULED-RESTART"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let saved = std::fs::read_to_string(&path).expect("config");
+        assert!(
+            saved.contains("scheduled_restart_at = \"02:30\""),
+            "{saved}"
+        );
+
+        // ⑦ 读回显已启用。
+        let (status, body) = http(port, "GET", "/api/ops/scheduled-restart", None, None).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["at"].as_str(), Some("02:30"));
+        assert_eq!(value["last_fired"], Value::Null);
+
+        // ⑧ 空 `at` = 关闭。
+        let (status, body) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"","reason":"取消定时","note":"取消定时改为手动运维","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["enabled"], false);
+        // 空值不落字段（`skip_serializing_if`）：配置里只剩空的 `[ops]` 段，
+        // 缺省装载 = 关闭，语义等价且不会给旧版 daemon 留脏字段。
+        let saved = std::fs::read_to_string(&path).expect("config");
+        assert!(!saved.contains("scheduled_restart_at"), "{saved}");
+    }
+
+    /// 计划重启写：无 `ops.restart` 权限的角色 → 403（与立即重启同档）。
+    #[tokio::test]
+    async fn scheduled_restart_put_denied_without_ops_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _) = make_state(&dir);
+        let ops = token_for(&state, Role::Ops);
+        let port = spawn_server(state.clone()).await;
+
+        let (status, _) = http(
+            port,
+            "PUT",
+            "/api/ops/scheduled-restart",
+            Some(
+                r#"{"at":"02:30","reason":"每日维护窗口","note":"每日凌晨例行重启窗口","confirm":"scheduled-restart"}"#,
+            ),
+            Some(&ops),
+        )
+        .await;
+        assert_eq!(status, 403);
+    }
+}

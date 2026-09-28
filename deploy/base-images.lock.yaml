@@ -1,0 +1,68 @@
+# =============================================================================
+# iot-daq 基础镜像 digest 锁文件（task 60 · supply-chain §3.1）
+# =============================================================================
+# 定位：**基础镜像 tag ↔ digest ↔ 锁定元数据**的唯一事实源。
+#   Dockerfile 内**不手写 digest**；CI / 构建前由
+#   `deploy/scripts/render-dockerfile-digests.sh` 读取本文件渲染出
+#   `FROM <repo>:<tag>@sha256:<hex>` 行（禁可变 tag，supply-chain §3）。
+#
+# 红线（container-supply-chain.md §3 / §9）：
+#   - 基础镜像必须 digest pin；`latest` / 可变 tag 禁止出现在任何交付物；
+#   - digest 变更 = 一次受审变更（填 locked_at / approver / reason 后方可合入）；
+#   - **digest 为空即「未锁定」**：render 脚本遇空 digest 会 fail-closed（非零退出），
+#     使「未 pin 的构建」不可能静默成功。
+#
+# ⚠️ 当前状态：已锁定（D-04 修复，2026-09-25）。
+#   digest 由 deploy-fix 在具备网络的环境 `docker pull` 后经
+#   `docker image inspect --format '{{json .RepoDigests}}'` 取得真实值填入：
+#     - builder-rust：docker.io/library/rust:1.88-slim-bookworm
+#       （sha256:38bc5a86…；rustc 1.88.x 满足 Cargo.lock 传递依赖的 rustc ≥ 1.88 要求）
+#     - runtime-distroless：gcr.io/distroless/static-debian12:nonroot
+#       （sha256:afa5c872…；经 gcr.m.daocloud.io 镜像源拉取，digest 为内容寻址，
+#       对 gcr.io 官方引用同样有效）
+#   digest 变更仍须走受审变更流程（填 locked_at / approver / reason）。
+#
+# 填写规范：
+#   digest: "sha256:<64位小写十六进制>"   # 含 sha256: 前缀
+#   locked_at / approver / reason：升级审批留痕（可留空，但 digest 变更时应填写）。
+# =============================================================================
+version: 1
+
+images:
+  # ---- 构建阶段基础镜像（rust 编译环境）----
+  - name: builder-rust
+    repository: docker.io/library/rust
+    tag: 1.88-slim-bookworm
+    digest: "sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89"
+    stage: builder
+    locked_at: "2026-09-25T13:16:38+08:00"
+    approver: "deploy-fix (task-61-fix / D-04)"
+    reason: "Cargo.lock 传递依赖要求 rustc>=1.88（icu_properties_data 2.3.0 / time 0.3.55 / idna_adapter 等 34 条），1.85 容器内编译必失败；升级至 1.88-slim-bookworm 并 pin 实测拉取 digest"
+
+  # ---- 运行阶段基础镜像（nginx:alpine，内置反代）----
+  # nginx:1.25-alpine 轻量级 HTTP 服务器，负责：
+  #   1. 静态文件服务（/、/assets/*）
+  #   2. API 反代（/api/* → daemon:8081）
+  #   3. SSE 长连接（proxy_read_timeout 300s）
+  # digest: sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00
+  - name: runtime-nginx
+    repository: docker.io/library/nginx
+    tag: 1.25-alpine
+    digest: "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00"
+    stage: runtime
+    locked_at: "2026-09-27T21:17:00+08:00"
+    approver: "team-lead (task-container-nginx)"
+    reason: "容器内置 nginx 反代，替代 distroless/static；不再依赖宿主 nginx，消除跨域与单点故障"
+
+  # ---- 历史运行时基础镜像（已弃用，仅留审计记录）----
+  # 原 distroless/static-debian12:nonroot（sha256:afa5c872...），已替换为 nginx:1.25-alpine。
+  # ⚠️ stage 必须为 runtime-deprecated 而非 runtime：render 脚本按 stage 精确取值，
+  #    两条同为 stage: runtime 时只会取到文件中靠前的那条（顺序依赖 = 静默选错镜像）。
+  - name: runtime-distroless-deprecated
+    repository: gcr.io/distroless/static-debian12
+    tag: nonroot
+    digest: "sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab"
+    stage: runtime-deprecated
+    locked_at: ""
+    approver: ""
+    reason: "已弃用，替换为 nginx:1.25-alpine（container-nginx 任务，2026-09-27）"

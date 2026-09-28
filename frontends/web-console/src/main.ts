@@ -20,7 +20,6 @@ import './styles/global.css';
 import { watch } from 'vue';
 import App from './App.vue';
 import { router } from './router';
-import i18n from './i18n';
 import { getStoredToken } from './api/client';
 import { preloadRealData } from './api/repo';
 import { closeStream, connectStream, streamStatus } from './api/stream';
@@ -31,7 +30,6 @@ const app = createApp(App);
 app.use(ArcoVue);
 app.use(ArcoVueIcon);
 app.use(router);
-app.use(i18n);
 
 /**
  * 启动引导。

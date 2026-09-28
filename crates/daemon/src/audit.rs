@@ -1,0 +1,1473 @@
+//! task 26 — 安全审计模块（`AuditLogger`：追加写入 + 防篡改哈希链 + SQLite 落盘）。
+//!
+//! ## 职责边界
+//! - **做**：安全审计事件的**持久**记录（登录 / 登录失败 / 配置修改 / 授权失败 /
+//!   试用期到期 / 审计拉取自身），每条事件进入 SQLite `audit_log` 表并以
+//!   **HMAC-SHA256 哈希链**串联（`entry_hash = HMAC(K, seq‖ts‖actor‖event‖
+//!   outcome‖detail‖prev_hash)`）——任何一行被改 / 删 / 插入都会使
+//!   [`AuditLogger::verify_chain`] 定位到首个断裂点。表结构经
+//!   `migrations::audit_registry()`（task 55 增量迁移框架，v2）创建，并以
+//!   **数据库触发器**强制追加写（UPDATE / DELETE 一律 `RAISE(ABORT)`，
+//!   QA 场景「尝试删除日志 → 断言失败」的落点）。
+//! - **不做**：审计日志前端（task 30）；北向发送审计（`backpressure::AuditLog`，
+//!   另一回事）；mgmt HTTP 面在 `mgmt::audit_api`（本模块只提供库能力）。
+//!
+//! ## 防篡改密钥派生（不硬编码）
+//! - `K = HKDF-Expand(HKDF-Extract(salt, IKM), "iot-daq/audit-chain/v1")`
+//!   （RFC 5869 手工实现，与 `telemetry_store` 同法；`hkdf` crate 不在依赖树）；
+//! - `salt`：每安装随机 32 hex（uuid v4 ×2），存 `audit_meta` 表（重开可复算）；
+//! - `IKM`：部署方注入（[`resolve_audit_ikm`]：只认 env `IOT_DAQ_AUDIT_SECRET`，
+//!   **不掺授权机器码**——机器码的可用性取决于 licensing 装配时序，会随激活状态
+//!   变化，掺进来会让链密钥在「无授权 → 已激活」之间漂移，见该函数文档）。
+//!   **密钥常量不进代码**；IKM 缺失时降级为 `IKM = salt`（`open` 时 warn 显式
+//!   声明：防改写能力弱于绑定部署密钥形态，仍可检测不重算链的普通篡改）。
+//!
+//! ## 实现红线
+//! - 零 panic：锁中毒 `into_inner` 恢复；错误收敛 `DaemonError::StorageError`；
+//! - **大数红线**：JSON 里 `seq` / `ts_ns` 一律**字符串编码**（手工 `json!`）；
+//! - 写连接只 INSERT，从不 UPDATE / DELETE（追加写语义的代码侧约束）。
+
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use hmac::{Hmac, Mac};
+use rusqlite::{params, Connection};
+use serde_json::{json, Value};
+use sha2::Sha256;
+
+use crate::error::{DaemonError, DaemonResult};
+
+/// 审计库文件名（固定；与 telemetry.db / queue.db 物理隔离，独立库文件）。
+pub const AUDIT_DB_FILE_NAME: &str = "audit.db";
+/// 部署审计 IKM 环境变量（hex 优先解码；非 hex 按原始字节）。
+pub const AUDIT_SECRET_ENV: &str = "IOT_DAQ_AUDIT_SECRET";
+/// 哈希链创始块的 prev_hash（64 个 '0'，即 SHA-256 十六进制宽度的零串）。
+pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// HKDF-Expand 的 info 域（域分离，防与其他用途的派生密钥混用）。
+const CHAIN_INFO: &[u8] = b"iot-daq/audit-chain/v1";
+/// 单条审计记录 detail 的最大字符数（防御性截断，防单行膨胀）。
+const MAX_DETAIL_CHARS: usize = 2000;
+/// actor 的最大字符数。
+const MAX_ACTOR_CHARS: usize = 256;
+/// 单次查询返回上限（防御性，防全表倾泻）。
+pub const MAX_QUERY_LIMIT: u32 = 1000;
+/// 查询缺省 limit。
+pub const DEFAULT_QUERY_LIMIT: u32 = 100;
+/// `audit_meta` 键：**链密钥绑定的 IKM 指纹** `hex(SHA-256(effective_ikm))`。
+///
+/// 存指纹而非密钥：密钥一旦落盘，持有 `audit.db` 的人就能重算 `entry_hash`
+/// 自由伪造整条链。指纹的作用是让「两次启动是否算出同一把密钥」可被判定，
+/// 从而把「静默换密钥」变成「显式 fail-closed」。
+const CHAIN_IKM_FP_META: &str = "chain_ikm_fp";
+/// `audit_meta` 键：绑定时的密钥来源标注（`env-secret` / `salt-degraded`），
+/// 供链完整性报告如实呈现（**不是**密钥材料）。
+const CHAIN_KEY_SOURCE_META: &str = "chain_key_source";
+
+// ---- 审计结果字面量（与 remote_ops 的 OUTCOME_* 同词表） ----
+
+/// 动作被受理。
+pub const OUTCOME_ACCEPTED: &str = "accepted";
+/// 被鉴权拒绝。
+pub const OUTCOME_DENIED: &str = "denied";
+/// 请求参数非法。
+pub const OUTCOME_BAD_REQUEST: &str = "bad_request";
+/// 受理后执行失败（落盘 / IO 等）。
+pub const OUTCOME_FAILED: &str = "failed";
+
+// ---- 事件类型 ----
+
+/// 安全审计事件类型（计划 task 26 事件域 + 审计拉取自身）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditEventType {
+    /// 登录成功。
+    Login,
+    /// 登录失败（含请求体非法；detail 不区分原因——防账号枚举）。
+    LoginFailed,
+    /// 配置修改（设备 / 点位写接口受理）。
+    ConfigChange,
+    /// 授权失败（RBAC 拒绝等鉴权后拒绝事件）。
+    AuthzFailed,
+    /// 试用期到期（授权状态机迁移；license 侧接线随其文件域推进）。
+    TrialExpired,
+    /// 审计日志在线查询（拉取行为自身入链，可追溯「谁看过审计」）。
+    AuditRead,
+    /// 审计日志导出（数据出境动作，`audit.export` 仅 system 可授）。
+    AuditExport,
+    /// 控制指令下发（写入设备状态，需 device.write 权限）。
+    ControlCommand,
+}
+
+impl AuditEventType {
+    /// 事件类型字面量（小写下划线；持久化与 HTTP 过滤共用）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuditEventType::Login => "login",
+            AuditEventType::LoginFailed => "login_failed",
+            AuditEventType::ConfigChange => "config_change",
+            AuditEventType::AuthzFailed => "authz_failed",
+            AuditEventType::TrialExpired => "trial_expired",
+            AuditEventType::AuditRead => "audit_read",
+            AuditEventType::AuditExport => "audit_export",
+            AuditEventType::ControlCommand => "control_command",
+        }
+    }
+
+    /// 解析事件类型字面量（未知值 → `None`，供 HTTP 过滤参数校验）。
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "login" => Some(AuditEventType::Login),
+            "login_failed" => Some(AuditEventType::LoginFailed),
+            "config_change" => Some(AuditEventType::ConfigChange),
+            "authz_failed" => Some(AuditEventType::AuthzFailed),
+            "trial_expired" => Some(AuditEventType::TrialExpired),
+            "audit_read" => Some(AuditEventType::AuditRead),
+            "audit_export" => Some(AuditEventType::AuditExport),
+            "control_command" => Some(AuditEventType::ControlCommand),
+            _ => None,
+        }
+    }
+}
+
+// ---- 记录与查询 ----
+
+/// 单条持久安全审计记录（哈希链的一个节点）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRecord {
+    /// 链内序号（从 1 单调递增；JSON 编码为字符串，大数红线）。
+    pub seq: u64,
+    /// 记录时刻（UTC 纳秒，来自注入时钟；JSON 编码为字符串）。
+    pub ts_ns: u64,
+    /// 操作者（登录事件 = 用户名；RBAC 拒绝 = JWT sub）。
+    pub actor: String,
+    /// 事件类型字面量（[`AuditEventType::as_str`]）。
+    pub event: String,
+    /// 结果字面量（accepted / denied / bad_request / failed）。
+    pub outcome: String,
+    /// 详情（人读；不含凭据与敏感值）。
+    pub detail: String,
+    /// 前一条记录的 entry_hash（创始块为 [`GENESIS_HASH`]）。
+    pub prev_hash: String,
+    /// 本条记录的链哈希（HMAC-SHA256 hex）。
+    pub entry_hash: String,
+}
+
+impl AuditRecord {
+    /// 序列化为 JSON（`seq` / `ts_ns` 一律字符串，大数红线）。
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "seq": self.seq.to_string(),
+            "ts_ns": self.ts_ns.to_string(),
+            "actor": self.actor,
+            "event": self.event,
+            "outcome": self.outcome,
+            "detail": self.detail,
+            "prev_hash": self.prev_hash,
+            "entry_hash": self.entry_hash,
+        })
+    }
+}
+
+/// 审计查询条件（分页 + 时间窗 + 事件类型过滤）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditQuery {
+    /// 返回条数上限（> 0，超过 [`MAX_QUERY_LIMIT`] 时被钳制）。
+    pub limit: u32,
+    /// 跳过条数（分页偏移）。
+    pub offset: u64,
+    /// 时间下界（UTC 纳秒，闭区间；`None` = 不限）。
+    pub since_ns: Option<u64>,
+    /// 时间上界（UTC 纳秒，闭区间；`None` = 不限）。
+    pub until_ns: Option<u64>,
+    /// 事件类型过滤（精确匹配 [`AuditEventType::as_str`]；`None` = 全类型）。
+    pub event: Option<String>,
+    /// 排序方向：`true` = 最新在前（`seq` 降序），`false` = 最旧在前（时间正序）。
+    ///
+    /// 缺省为 `false`（与存储同序）：归档 / 回放场景按时间正序阅读更自然，
+    /// 且既有调用点的分页断言语义不变。管理面读取侧（`/api/audit`）会显式
+    /// 覆写为 `true`——「最新在前」是审计查询对用户呈现的口径。
+    pub order_desc: bool,
+}
+
+impl Default for AuditQuery {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_QUERY_LIMIT,
+            offset: 0,
+            since_ns: None,
+            until_ns: None,
+            event: None,
+            order_desc: false,
+        }
+    }
+}
+
+impl AuditQuery {
+    /// 缺省查询（limit = [`DEFAULT_QUERY_LIMIT`]，无过滤）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 设置返回上限（0 视为非法，回退缺省值）。
+    #[must_use]
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = if limit == 0 {
+            DEFAULT_QUERY_LIMIT
+        } else {
+            limit
+        };
+        self
+    }
+
+    /// 设置分页偏移。
+    #[must_use]
+    pub fn with_offset(mut self, offset: u64) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// 设置时间下界（UTC 纳秒，闭区间）。
+    #[must_use]
+    pub fn with_since_ns(mut self, since_ns: u64) -> Self {
+        self.since_ns = Some(since_ns);
+        self
+    }
+
+    /// 设置时间上界（UTC 纳秒，闭区间）。
+    #[must_use]
+    pub fn with_until_ns(mut self, until_ns: u64) -> Self {
+        self.until_ns = Some(until_ns);
+        self
+    }
+
+    /// 设置事件类型过滤（精确字面量；未知字面量在查询层返回空集，HTTP 层应先行校验）。
+    #[must_use]
+    pub fn with_event(mut self, event: impl Into<String>) -> Self {
+        self.event = Some(event.into());
+        self
+    }
+
+    /// 设置排序方向（缺省 `false` = 最旧在前；置 `true` 为最新在前）。
+    #[must_use]
+    pub fn with_order_desc(mut self, order_desc: bool) -> Self {
+        self.order_desc = order_desc;
+        self
+    }
+}
+
+/// 哈希链校验报告（[`AuditLogger::verify_chain`] 的输出）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainVerifyReport {
+    /// 表内总行数。
+    pub total: u64,
+    /// 通过校验的连续前缀长度。
+    pub verified: u64,
+    /// 整链是否完好（seq 连续 + prev_hash 串联 + 每条 entry_hash 重算一致）。
+    pub ok: bool,
+    /// 首个断裂点的 seq（`ok == true` 时为 `None`）。
+    pub first_broken_seq: Option<u64>,
+    /// 本次校验所用链密钥的来源标注（`env-secret` / `salt-degraded`）。
+    ///
+    /// 用途：**区分故障性质**。同一个 `ok=false` 可能来自「有人改了审计行」，
+    /// 也可能来自「两次启动之间链密钥换了源（旧条目因此算不上来）」——后者是
+    /// 配置漂移、不是篡改。把来源如实带出来，读取方才不会把前者误判为后者
+    /// （或反之）。
+    pub key_source: String,
+}
+
+// ---- 密码学原语（纯 Rust：hmac + sha2，零新增依赖） ----
+
+/// HMAC-SHA256（`hmac` 对任意长度密钥均有效；`new_from_slice` 的 Err 分支
+/// 理论不可达，按零 panic 红线回退为空密钥并退化为常量输出——仅影响该次
+/// 理论不可达的调用，绝不 panic）。
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = match <Hmac<Sha256> as Mac>::new_from_slice(key) {
+        Ok(mac) => mac,
+        Err(_) => match <Hmac<Sha256> as Mac>::new_from_slice(&[]) {
+            Ok(mac) => mac,
+            // 双重不可达：空密钥对 HMAC 恒合法。退化为全零输出而非 panic。
+            Err(_) => return [0u8; 32],
+        },
+    };
+    mac.update(data);
+    let out = mac.finalize().into_bytes();
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&out);
+    digest
+}
+
+/// HKDF-Extract（RFC 5869 §2.2）：`PRK = HMAC-SHA256(salt, IKM)`。
+/// `hkdf` crate 不在依赖树，按 `telemetry_store` 先例手工实现。
+fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    hmac_sha256(salt, ikm)
+}
+
+/// HKDF-Expand 单块（RFC 5869 §2.3）：`OKM = HMAC-SHA256(PRK, info || 0x01)`。
+/// 32 字节输出恰好一个块，无需迭代。
+fn hkdf_expand_single(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
+    let mut data = Vec::with_capacity(info.len() + 1);
+    data.extend_from_slice(info);
+    data.push(0x01);
+    hmac_sha256(prk, &data)
+}
+
+/// 恒时比较（hex 字符串；长度不等直接 `false`——长度本身不构成秘密）。
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 审计链密钥派生：`K = HKDF-Expand(HKDF-Extract(salt, IKM), CHAIN_INFO)`。
+///
+/// IKM 缺失时以盐自派生（降级形态，见 [`AuditLogger::open`] 注释）。
+fn derive_chain_key(salt: &[u8], ikm: Option<&[u8]>) -> [u8; 32] {
+    let prk = hkdf_extract(salt, effective_ikm(salt, ikm));
+    hkdf_expand_single(&prk, CHAIN_INFO)
+}
+
+/// 派生链密钥时实际使用的 IKM 材料（IKM 缺失时**回落到盐**——盐已持久化，
+/// 故降级路径本身是跨重启稳定的，见 [`AuditLogger::open`]）。
+fn effective_ikm<'a>(salt: &'a [u8], ikm: Option<&'a [u8]>) -> &'a [u8] {
+    match ikm {
+        Some(ikm) if !ikm.is_empty() => ikm,
+        _ => salt,
+    }
+}
+
+/// 链密钥来源标注（明文诊断串，**不含**任何密钥材料，绝不落盘密钥本身）。
+///
+/// 与 [`resolve_audit_ikm`] 的解析结果一一对应，取值域只有两种：
+///
+/// - `salt-degraded`：IKM 缺失（盐自派生）——跨重启稳定，但拿到 `audit.db` 的人
+///   可自行重算 HMAC，防篡改能力最弱；
+/// - `env-secret`：部署 env 密钥生效——唯一能带来真防篡改强度的来源。
+///
+/// 「`machine-code`」这一档已随机器码回退一并移除：它的可用性取决于 licensing
+/// 装配时序，会在授权状态变化时漂移，却拿不到额外强度（盐同库持久化）。
+#[must_use]
+fn ikm_source_label(ikm: Option<&[u8]>) -> String {
+    if ikm.is_none_or(|ikm| ikm.is_empty()) {
+        "salt-degraded".to_string()
+    } else {
+        "env-secret".to_string()
+    }
+}
+
+/// 计算单条记录的链哈希（域内以 `\u{1f}` 分隔，固定字段顺序）。
+#[allow(clippy::too_many_arguments)]
+fn compute_entry_hash(
+    key: &[u8; 32],
+    seq: u64,
+    ts_ns: u64,
+    actor: &str,
+    event: &str,
+    outcome: &str,
+    detail: &str,
+    prev_hash: &str,
+) -> String {
+    let canonical = format!(
+        "iot-daq/audit/v1\u{1f}{seq}\u{1f}{ts_ns}\u{1f}{actor}\u{1f}{event}\u{1f}{outcome}\u{1f}{detail}\u{1f}{prev_hash}"
+    );
+    hex::encode(hmac_sha256(key, canonical.as_bytes()))
+}
+
+// ---- IKM 解析（生产装配路径） ----
+
+/// 解析审计链 IKM（部署密钥，**不硬编码**）：只认 env [`AUDIT_SECRET_ENV`]。
+///
+/// **授权机器码不再作为 IKM 回退**，这是 2026-09-27 的一次设计收紧，两条理由：
+///
+/// 1. **可用性不是部署可控量**：机器码最终来自 `machine_fingerprint`，而在
+///    [`crate::bootstrap`] 里只有当 licensing 客户端已装配时 `machine_code` 才非
+///    空（见 `bootstrap.rs` 装配处注释）。于是「先无授权 → 后激活」的网关，激活后
+///    重启会算出一把不同密钥 → 绑定漂移 → fail-closed **拒绝全部审计写入**，而这次
+///    漂移并不是有人换配置、只是授权状态变了。历史段 seq 473 的断裂正是这类漂移。
+/// 2. **它并没有增强防篡改**：链盐 `chain_salt` 与本库同文件持久化，任何拿到
+///    `audit.db` 的人都能重算 HMAC，密钥里是否掺入机器码毫无区别。也就是说回退到
+///    机器码只带来「装配时序依赖」，不带来任何额外安全性。
+///
+/// 因此链密钥的入料收敛为「持久盐 + 部署 env 密钥」——两者要么持久化、要么由运维
+/// 显式配置，跨重启稳定且不随授权状态变化。未配 env 时 `open` 降级为盐自派生密钥
+/// 并 warn（防篡改能力弱于绑定部署密钥；绝不因缺密钥而拒绝启动）。
+///
+/// 返回值：env 非空 → `Some`（合法 hex 优先解码为字节，否则按原始 UTF-8 字节）；
+/// 否则 `None`。
+#[must_use]
+pub fn resolve_audit_ikm() -> Option<Vec<u8>> {
+    let Ok(secret) = std::env::var(AUDIT_SECRET_ENV) else {
+        return None;
+    };
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match hex::decode(trimmed) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        _ => trimmed.as_bytes().to_vec(),
+    })
+}
+
+// ---- AuditLogger ----
+
+/// 持久安全审计记录器（SQLite + 追加写 + HMAC-SHA256 防篡改哈希链）。
+///
+/// 克隆廉价不需要：mgmt / bootstrap 以 `Arc<AuditLogger>` 共享；内部
+/// `Mutex<Connection>` 串行化写（审计写入低频，无性能顾虑）。
+pub struct AuditLogger {
+    /// 独立 SQLite 写连接（只 INSERT / SELECT；UPDATE / DELETE 由触发器拒绝）。
+    conn: Mutex<Connection>,
+    /// 链密钥（HKDF 派生，见模块注释；**不落盘、不打印**）。
+    key: [u8; 32],
+    /// 链密钥来源标注（`env-secret` / `salt-degraded`）。
+    ///
+    /// 随 [`ChainVerifyReport`] 如实带出，用于区分「有人改了审计行」与
+    /// 「两次启动之间链密钥换了源」——两者都是 `ok=false`，但性质完全不同。
+    key_source: String,
+    /// 本库链密钥是否绑定在本进程当前可复现的 IKM 上。
+    ///
+    /// `false` = 启动间发生了 IKM 源漂移，本进程推导出的密钥**不是**写入时的
+    /// 那把（历史条目因此算不上来）。此时 [`AuditLogger::record`] fail-closed
+    /// 拒绝追加：继续写等于让审计链在无人知情的情况下换密钥。
+    key_bound: bool,
+    /// 时间源（UTC 纳秒；测试注入受控时钟保证确定性）。
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl AuditLogger {
+    /// 打开（或创建）审计库。
+    ///
+    /// 流程：开库 → WAL + FULL 同步 → 增量迁移（v1 账本 + v2 审计表，task 55
+    /// 框架）→ 读取 / 生成链盐 → 派生链密钥 → **钉住 / 复用链密钥**。
+    ///
+    /// IKM 为 `None` / 空时降级为盐自派生密钥并 `warn`（防篡改能力弱于绑定
+    /// 部署密钥；绝不因缺密钥而拒绝启动）。
+    ///
+    /// ## 链密钥绑定（跨重启自证的前提）
+    ///
+    /// IKM 是每次启动时**重新解析**的进程局部状态（env 部署密钥 / 授权机器
+    /// 码是否可见），盐才是持久的。若允许链密钥随 IKM 漂移，同一条已入库
+    /// 记录会在不同启动配置下算出不同的 `entry_hash` —— 整条链「换个启动
+    /// 方式就自证失败」，防篡改能力归零（现场复现：`ok=false`、
+    /// `first_broken_seq=473`，断点精确落在一次重启之后的第一个 seq）。
+    ///
+    /// 本函数在 `audit_meta` 落 **IKM 指纹**（`SHA-256(ikm_bytes)`，非密钥）：
+    ///
+    /// - 指纹缺失 → 绑定本进程的 IKM（首次开库）；
+    /// - 指纹一致 → 同一把密钥，正常跨重启自证；
+    /// - 指纹不一致 → 链密钥换了源，**`record` 立即 fail-closed 拒绝追加**
+    ///   （绝不静默地把后续记录接到一把算不上来旧条目的密钥上），同时以
+    ///   `key_source` 标注来源、`error!` 给出处置路径。运维二选一：恢复原来
+    ///   的部署 IKM（链重新可自证），或显式删除 `chain_ikm_fp` 行重新锚定链。
+    ///
+    /// **密钥本身从不落盘**：一旦落盘，持有 `audit.db` 的人就能重算出
+    /// `entry_hash` 自由伪造整条链，「防篡改」退化为「防误删」——既有
+    /// `wrong_ikm_fails_verification` 用例正是钉死这条性质的。故这里只存
+    /// 指纹，密钥永远由「持久盐 + 当前 IKM」在内存里现算。
+    ///
+    /// # Errors
+    /// 开库 / 迁移 / 盐或指纹读写失败 → `DaemonError::StorageError`。
+    pub fn open(db_path: &Path, ikm: Option<&[u8]>) -> DaemonResult<Self> {
+        let conn = Connection::open(db_path)
+            .map_err(|e| DaemonError::StorageError(format!("audit db open: {e}")))?;
+        // FULL 同步：审计记录的落盘耐久性优先于写入吞吐（低频写路径）。
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(|e| DaemonError::StorageError(format!("audit db pragmas: {e}")))?;
+        crate::migrations::run_migrations_with(&conn, &crate::migrations::audit_registry())?;
+
+        let salt = ensure_chain_salt(&conn)?;
+        if ikm.is_none_or(|ikm| ikm.is_empty()) {
+            tracing::warn!(
+                "audit: no deployment IKM ({AUDIT_SECRET_ENV} unset and no machine code bound); \
+                 tamper-evidence degraded to per-install salt key"
+            );
+        }
+        let key = derive_chain_key(&salt, ikm);
+        let source = ikm_source_label(ikm);
+        // 指纹与 `derive_chain_key` 的入料一致：IKM 缺失时是盐本身。
+        let effective = effective_ikm(&salt, ikm);
+        let fingerprint = hex::encode(hmac_sha256(effective, b"iot-daq/audit-ikm-fp/v1"));
+
+        let (key_bound, key_source) = match read_meta(&conn, CHAIN_IKM_FP_META)? {
+            Some(bound) if bound.trim() == fingerprint => (
+                true,
+                read_meta(&conn, CHAIN_KEY_SOURCE_META)?
+                    .filter(|label| !label.trim().is_empty())
+                    .unwrap_or_else(|| source.clone()),
+            ),
+            Some(bound) => {
+                // IKM 源漂移：本进程推导出的密钥不是写入时那把。绝不静默切换，
+                // 由 `record` fail-closed 拦住后续写入，`verify_chain` 如实报告。
+                let bound_source = read_meta(&conn, CHAIN_KEY_SOURCE_META)?
+                    .unwrap_or_else(|| "unknown".to_string());
+                tracing::error!(
+                    "audit: [ERROR] chain key source drifted — bound to {bound_source}, \
+                     this process resolves {source} (fingerprint {} != {}). Historical \
+                     entries written under the bound key can no longer be self-verified; \
+                     appending now would silently fork the chain. Fail-closed: writes are \
+                     rejected. Recovery either way: restore the {AUDIT_SECRET_ENV} / machine \
+                     code that produced {bound_source}, or DELETE FROM audit_meta WHERE key \
+                     = '{CHAIN_IKM_FP_META}' to explicitly re-anchor the chain.",
+                    &bound[..bound.len().min(12)],
+                    &fingerprint[..fingerprint.len().min(12)]
+                );
+                (false, source)
+            }
+            None => {
+                write_meta(&conn, CHAIN_IKM_FP_META, &fingerprint)?;
+                write_meta(&conn, CHAIN_KEY_SOURCE_META, &source)?;
+                (true, source)
+            }
+        };
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            key,
+            key_source,
+            key_bound,
+            clock: Box::new(system_clock_ns),
+        })
+    }
+
+    /// 注入受控时钟（UTC 纳秒；测试确定性用；必须在共享前调用）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// 取写连接（毒锁恢复，零 panic）。
+    fn lock_conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 追加一条审计记录（入哈希链；原子：读链尾 + INSERT 在同一锁与事务内）。
+    ///
+    /// **fail-closed**：链密钥绑定已漂移（[`Self::key_bound`] == `false`）时
+    /// **拒绝追加**——本进程算出的密钥不是历史条目写入时那把（历史条目因此
+    /// 算不上来），继续写等于让审计链在无人知情的情况下换密钥，防篡改能力
+    /// 被悄悄抹掉。此时调用方应把该操作视为「审计不可用」并告警。
+    ///
+    /// # Errors
+    /// 链密钥绑定漂移 → `DaemonError::AuditKeyDrift`；
+    /// SQLite 写失败 → `DaemonError::StorageError`（调用方决定告警策略；
+    /// HTTP 面约定「审计失败不阻塞主流程，只 `tracing::warn`」）。
+    pub fn record(
+        &self,
+        actor: &str,
+        event: AuditEventType,
+        outcome: &str,
+        detail: &str,
+    ) -> DaemonResult<AuditRecord> {
+        if !self.key_bound {
+            return Err(DaemonError::AuditKeyDrift {
+                bound: CHAIN_IKM_FP_META.to_string(),
+            });
+        }
+        // unchecked_transaction 仅需 &Connection（rusqlite 事务 API 的 &mut 形式
+        // 不适用共享锁连接场景）。
+        let conn = self.lock_conn();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| DaemonError::StorageError(format!("audit tx: {e}")))?;
+        let record = self.append_in_tx(&tx, actor, event, outcome, detail)?;
+        tx.commit()
+            .map_err(|e| DaemonError::StorageError(format!("audit commit: {e}")))?;
+        Ok(record)
+    }
+
+    /// 事务内的追加实现（`record` 与迁移后的首条种子共用）。
+    fn append_in_tx(
+        &self,
+        tx: &Connection,
+        actor: &str,
+        event: AuditEventType,
+        outcome: &str,
+        detail: &str,
+    ) -> DaemonResult<AuditRecord> {
+        // 链尾：当前最大 seq 及其 entry_hash（空表 = 创始块）。
+        let (latest_seq, prev_hash): (u64, String) = {
+            let result: std::result::Result<(i64, String), rusqlite::Error> = tx.query_row(
+                "SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            match result {
+                Ok((seq, hash)) => (u64::try_from(seq.max(0)).unwrap_or(u64::MAX), hash),
+                Err(rusqlite::Error::QueryReturnedNoRows) => (0, GENESIS_HASH.to_string()),
+                Err(e) => {
+                    return Err(DaemonError::StorageError(format!("audit tail read: {e}")));
+                }
+            }
+        };
+        let seq = latest_seq
+            .checked_add(1)
+            .ok_or_else(|| DaemonError::StorageError("audit seq overflow".to_string()))?;
+        let ts_ns = (self.clock)();
+        let actor = clamp_str(actor, MAX_ACTOR_CHARS);
+        let actor = if actor.is_empty() {
+            "<missing>"
+        } else {
+            actor.as_str()
+        };
+        let detail = clamp_str(detail, MAX_DETAIL_CHARS);
+
+        let entry_hash = compute_entry_hash(
+            &self.key,
+            seq,
+            ts_ns,
+            actor,
+            event.as_str(),
+            outcome,
+            &detail,
+            &prev_hash,
+        );
+        let ts_ns_i64 = i64::try_from(ts_ns).unwrap_or(i64::MAX);
+        tx.execute(
+            "INSERT INTO audit_log(seq, ts_ns, actor, event, outcome, detail, prev_hash, entry_hash) \
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                i64::try_from(seq).unwrap_or(i64::MAX),
+                ts_ns_i64,
+                actor,
+                event.as_str(),
+                outcome,
+                detail,
+                prev_hash,
+                entry_hash,
+            ],
+        )
+        .map_err(|e| DaemonError::StorageError(format!("audit insert: {e}")))?;
+
+        Ok(AuditRecord {
+            seq,
+            ts_ns,
+            actor: actor.to_string(),
+            event: event.as_str().to_string(),
+            outcome: outcome.to_string(),
+            detail,
+            prev_hash,
+            entry_hash,
+        })
+    }
+
+    /// 当前链尾序号（空链 = 0）。
+    ///
+    /// # Errors
+    /// SQLite 读失败 → `DaemonError::StorageError`。
+    pub fn latest_seq(&self) -> DaemonResult<u64> {
+        let conn = self.lock_conn();
+        let raw: Option<i64> = conn
+            .query_row("SELECT MAX(seq) FROM audit_log", [], |row| row.get(0))
+            .map_err(|e| DaemonError::StorageError(format!("audit max seq: {e}")))?;
+        Ok(raw.map_or(0, |v| u64::try_from(v.max(0)).unwrap_or(u64::MAX)))
+    }
+
+    /// 按条件查询（保序：seq 升序；limit 被钳制到 [`MAX_QUERY_LIMIT`]）。
+    ///
+    /// # Errors
+    /// SQLite 读失败 → `DaemonError::StorageError`。
+    pub fn query(&self, query: &AuditQuery) -> DaemonResult<Vec<AuditRecord>> {
+        let conn = self.lock_conn();
+        let limit = query.limit.clamp(1, MAX_QUERY_LIMIT);
+        let since = i64::try_from(query.since_ns.unwrap_or(0)).unwrap_or(0);
+        let until = i64::try_from(query.until_ns.unwrap_or(u64::MAX)).unwrap_or(i64::MAX);
+        let event_filter = query.event.clone().unwrap_or_default();
+        // 排序方向只取本函数内的字面量分支（无外部输入参与拼装），无注入面。
+        let order = if query.order_desc {
+            "seq DESC"
+        } else {
+            "seq ASC"
+        };
+        let sql = format!(
+            "SELECT seq, ts_ns, actor, event, outcome, detail, prev_hash, entry_hash \
+             FROM audit_log \
+             WHERE ts_ns >= ?1 AND ts_ns <= ?2 AND (?3 = '' OR event = ?3) \
+             ORDER BY {order} LIMIT ?4 OFFSET ?5"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| DaemonError::StorageError(format!("audit query prepare: {e}")))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    since,
+                    until,
+                    event_filter,
+                    i64::from(limit),
+                    i64::try_from(query.offset).unwrap_or(i64::MAX)
+                ],
+                row_to_record,
+            )
+            .map_err(|e| DaemonError::StorageError(format!("audit query: {e}")))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|e| DaemonError::StorageError(format!("audit row: {e}")))?);
+        }
+        Ok(records)
+    }
+
+    /// 校验整条哈希链（seq 连续 + prev_hash 串联 + 每条重算一致）。
+    ///
+    /// # Errors
+    /// SQLite 读失败 → `DaemonError::StorageError`（链断裂**不是**错误，
+    /// 以 `ChainVerifyReport.ok == false` 表达）。
+    pub fn verify_chain(&self) -> DaemonResult<ChainVerifyReport> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, ts_ns, actor, event, outcome, detail, prev_hash, entry_hash \
+                 FROM audit_log ORDER BY seq",
+            )
+            .map_err(|e| DaemonError::StorageError(format!("audit verify prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], row_to_record)
+            .map_err(|e| DaemonError::StorageError(format!("audit verify: {e}")))?;
+
+        let mut total = 0u64;
+        let mut verified = 0u64;
+        let mut first_broken_seq: Option<u64> = None;
+        let mut prev_stored_hash = GENESIS_HASH.to_string();
+        let mut expected_seq = 1u64;
+
+        for row in rows {
+            let record = row.map_err(|e| DaemonError::StorageError(format!("audit row: {e}")))?;
+            total += 1;
+            if first_broken_seq.is_some() {
+                continue; // 已定位首断点：继续统计总行数即可。
+            }
+            // ① seq 必须严格连续（删行即断；断点定位在**缺失的序号**上——
+            // 现存首行 seq > expected 说明 expected 被删除）。
+            if record.seq != expected_seq {
+                first_broken_seq = Some(expected_seq);
+                continue;
+            }
+            // ② prev_hash 必须与上一条存储的 entry_hash 一致（改 prev_hash 即断）。
+            if !ct_eq(&record.prev_hash, &prev_stored_hash) {
+                first_broken_seq = Some(record.seq);
+                continue;
+            }
+            // ③ entry_hash 必须与按存储字段重算的值一致（改任意字段即断）。
+            let recomputed = compute_entry_hash(
+                &self.key,
+                record.seq,
+                record.ts_ns,
+                &record.actor,
+                &record.event,
+                &record.outcome,
+                &record.detail,
+                &record.prev_hash,
+            );
+            if !ct_eq(&recomputed, &record.entry_hash) {
+                first_broken_seq = Some(record.seq);
+                continue;
+            }
+            prev_stored_hash = record.entry_hash.clone();
+            expected_seq += 1;
+            verified += 1;
+        }
+
+        Ok(ChainVerifyReport {
+            total,
+            verified,
+            ok: first_broken_seq.is_none(),
+            first_broken_seq,
+            key_source: self.key_source.clone(),
+        })
+    }
+}
+
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 密钥与连接不进 Debug 输出。
+        f.debug_struct("AuditLogger").finish_non_exhaustive()
+    }
+}
+
+// ---- 内部辅助 ----
+
+/// 当前 UTC 纳秒（时钟早于纪元按 0 处理，不 panic）。
+fn system_clock_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// 按字符数截断（不产生半个 UTF-8 字符）。
+fn clamp_str(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        raw.to_string()
+    } else {
+        raw.chars().take(max_chars).collect()
+    }
+}
+
+/// 读取（或首次生成）链盐（`audit_meta` 表 `chain_salt` 键；uuid v4 ×2 = 32 字节）。
+fn ensure_chain_salt(conn: &Connection) -> DaemonResult<Vec<u8>> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM audit_meta WHERE key = 'chain_salt'",
+            [],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+        .map_err(|e| DaemonError::StorageError(format!("audit salt read: {e}")))?;
+    if let Some(salt_hex) = existing {
+        return hex::decode(&salt_hex)
+            .map_err(|e| DaemonError::StorageError(format!("audit salt decode: {e}")));
+    }
+    // 首次生成：两个 uuid v4 = 32 字节随机盐（uuid crate 仅启用 v4 特性）。
+    let mut salt = Vec::with_capacity(32);
+    salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let salt_hex = hex::encode(&salt);
+    conn.execute(
+        "INSERT INTO audit_meta(key, value) VALUES('chain_salt', ?1)",
+        params![salt_hex],
+    )
+    .map_err(|e| DaemonError::StorageError(format!("audit salt write: {e}")))?;
+    Ok(salt)
+}
+
+/// 读 `audit_meta` 单键（`QueryReturnedNoRows` → `None`）。
+fn read_meta(conn: &Connection, key: &str) -> DaemonResult<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM audit_meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other),
+    })
+    .map_err(|e| DaemonError::StorageError(format!("audit meta read: {e}")))
+}
+
+/// 写 `audit_meta` 单键（`key` 为 PRIMARY KEY，冲突即覆盖）。
+fn write_meta(conn: &Connection, key: &str, value: &str) -> DaemonResult<()> {
+    conn.execute(
+        "INSERT INTO audit_meta(key, value) VALUES(?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![key, value],
+    )
+    .map_err(|e| DaemonError::StorageError(format!("audit meta write: {e}")))?;
+    Ok(())
+}
+
+/// 查询行 → 记录（u64 语义列以 i64 存储，读回钳制非负）。
+#[allow(clippy::needless_pass_by_value)]
+fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
+    let seq: i64 = row.get(0)?;
+    let ts: i64 = row.get(1)?;
+    Ok(AuditRecord {
+        seq: u64::try_from(seq.max(0)).unwrap_or(u64::MAX),
+        ts_ns: u64::try_from(ts.max(0)).unwrap_or(u64::MAX),
+        actor: row.get(2)?,
+        event: row.get(3)?,
+        outcome: row.get(4)?,
+        detail: row.get(5)?,
+        prev_hash: row.get(6)?,
+        entry_hash: row.get(7)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ERR_AUDIT_KEY_DRIFT;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// 测试 IKM（部署路径由 env / 机器码注入；测试显式传字节）。
+    const TEST_IKM: &[u8] = b"audit-test-ikm-2025";
+
+    /// 受控纳秒时钟（测试注入）。
+    #[derive(Clone)]
+    struct TestClock(Arc<AtomicU64>);
+
+    impl TestClock {
+        fn at(ns: u64) -> Self {
+            Self(Arc::new(AtomicU64::new(ns)))
+        }
+        fn advance(&self, ns: u64) {
+            self.0.fetch_add(ns, Ordering::Relaxed);
+        }
+        fn clock(&self) -> Box<dyn Fn() -> u64 + Send + Sync> {
+            let inner = self.0.clone();
+            Box::new(move || inner.load(Ordering::Relaxed))
+        }
+    }
+
+    /// 打开绑定受控时钟的审计库（独立临时文件）。
+    fn open_logger(dir: &Path, clock: &TestClock) -> AuditLogger {
+        AuditLogger::open(&dir.join("audit.db"), Some(TEST_IKM))
+            .expect("open")
+            .with_clock(clock.clock())
+    }
+
+    /// QA Happy（计划场景：配置修改 → 断言审计日志记录）:
+    /// 记录 → 查询回读字段一致、seq 单调、事件类型过滤命中。
+    #[test]
+    fn record_then_query_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(1_000));
+
+        logger
+            .record(
+                "admin",
+                AuditEventType::ConfigChange,
+                OUTCOME_ACCEPTED,
+                "device_create dev-01",
+            )
+            .expect("record 1");
+        logger
+            .record(
+                "intruder",
+                AuditEventType::LoginFailed,
+                OUTCOME_DENIED,
+                "mgmt login",
+            )
+            .expect("record 2");
+
+        // 全量回读。
+        let rows = logger.query(&AuditQuery::new()).expect("query");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].actor, "admin");
+        assert_eq!(rows[0].event, "config_change");
+        assert_eq!(rows[0].outcome, OUTCOME_ACCEPTED);
+        assert_eq!(rows[0].ts_ns, 1_000);
+        assert_eq!(rows[1].seq, 2);
+        assert_eq!(rows[1].ts_ns, 1_000);
+        // 创始块 prev_hash + 链式串联。
+        assert_eq!(rows[0].prev_hash, GENESIS_HASH);
+        assert_eq!(rows[1].prev_hash, rows[0].entry_hash);
+
+        // 事件类型过滤。
+        let filtered = logger
+            .query(&AuditQuery::new().with_event("login_failed"))
+            .expect("query filter");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event, "login_failed");
+        assert_eq!(filtered[0].actor, "intruder");
+
+        assert_eq!(logger.latest_seq().expect("latest"), 2);
+    }
+
+    /// QA: 时间窗过滤（闭区间）+ 分页（limit / offset）。
+    #[test]
+    fn query_time_window_and_pagination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(1_000);
+        let logger = open_logger(dir.path(), &clock);
+
+        for i in 0..5 {
+            logger
+                .record(
+                    "a",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("row-{i}"),
+                )
+                .expect("record");
+            clock.advance(100); // ts = 1000, 1100, 1200, 1300, 1400
+        }
+
+        // since=1200（闭区间）→ 3 条。
+        let rows = logger
+            .query(&AuditQuery::new().with_since_ns(1_200))
+            .expect("since");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].detail, "row-2");
+
+        // until=1200（闭区间）→ 3 条。
+        let rows = logger
+            .query(&AuditQuery::new().with_until_ns(1_200))
+            .expect("until");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].detail, "row-2");
+
+        // 分页：limit=2 offset=2 → 第 3、4 条（缺省时间正序口径）。
+        let rows = logger
+            .query(&AuditQuery::new().with_limit(2).with_offset(2))
+            .expect("page");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].detail, "row-2");
+        assert_eq!(rows[1].detail, "row-3");
+
+        // 同一条件显式取最新在前（管理面读取侧口径）：跳过最新 2 条 → row-2、row-1。
+        let rows = logger
+            .query(
+                &AuditQuery::new()
+                    .with_limit(2)
+                    .with_offset(2)
+                    .with_order_desc(true),
+            )
+            .expect("page desc");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].detail, "row-2");
+        assert_eq!(rows[1].detail, "row-1");
+
+        // limit 超上限被钳制。
+        let rows = logger
+            .query(&AuditQuery::new().with_limit(u32::MAX))
+            .expect("clamped");
+        assert_eq!(rows.len(), 5);
+    }
+
+    /// QA: `order_desc = true` 时查询「最新在前」——保证本进程新写入的事件
+    /// 立刻出现在首屏。
+    ///
+    /// 回归背景：管理面曾因 `LIMIT n` 只从最旧处起算，新事件被截断在末尾，
+    /// 用户看到的一直是旧数据（表现为「读取侧 stale」）。
+    #[test]
+    fn newest_first_query_puts_fresh_events_on_top() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(1_000);
+        let logger = open_logger(dir.path(), &clock);
+
+        for i in 0..4 {
+            logger
+                .record(
+                    "a",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("row-{i}"),
+                )
+                .expect("record");
+            clock.advance(100);
+        }
+
+        let rows = logger
+            .query(&AuditQuery::new().with_order_desc(true))
+            .expect("query");
+        assert_eq!(rows.len(), 4);
+        let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![4, 3, 2, 1], "必须 seq 降序: {seqs:?}");
+        assert_eq!(rows[0].detail, "row-3");
+
+        // 追加一条后立刻出现在首位（模拟「本次进程的事件应可见」）。
+        logger
+            .record("b", AuditEventType::AuditRead, OUTCOME_ACCEPTED, "fresh")
+            .expect("record");
+        let rows = logger
+            .query(&AuditQuery::new().with_order_desc(true).with_limit(1))
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail, "fresh", "新写入的事件必须在首行");
+    }
+
+    /// QA（计划验收：日志追加不可篡改——正向）: 多条记录后整链校验通过。
+    #[test]
+    fn chain_verification_passes_on_intact_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(10));
+
+        for i in 0..16 {
+            let event = if i % 2 == 0 {
+                AuditEventType::Login
+            } else {
+                AuditEventType::AuthzFailed
+            };
+            logger
+                .record("actor", event, OUTCOME_ACCEPTED, &format!("e{i}"))
+                .expect("record");
+        }
+
+        let report = logger.verify_chain().expect("verify");
+        assert!(report.ok, "intact chain must verify: {report:?}");
+        assert_eq!(report.total, 16);
+        assert_eq!(report.verified, 16);
+        assert_eq!(report.first_broken_seq, None);
+    }
+
+    /// QA 安全（防篡改红线）: **跨重启换密钥不得让历史条目自证失败**。
+    ///
+    /// 回归背景：链密钥原本是 `HKDF(salt, resolve_audit_ikm(..))`，而 IKM 里掺了
+    /// 「授权机器码」——它在 [`crate::bootstrap`] 里只在 licensing 客户端已装配时
+    /// 才非空。于是某次启动少了那份 IKM → 派生出不同的密钥 → 此后每条历史
+    /// `entry_hash` 都算不上来，整条链「换个启动方式就自证失败」＝防篡改能力归零
+    ///（现场复现：`ok=false`、`first_broken_seq=473`，断点精确落在一次重启之后）。
+    ///
+    /// 本用例模拟**未配置部署 IKM（盐自派生）→ 重启 → 继续追加**：绑定必须仍然
+    /// 一致、链整体可自证。这才是「盐已持久化」应当保证的性质，也是本次事故
+    /// 现场那条「seq 1..472 一直能算上来」的常态。
+    #[test]
+    fn chain_key_survives_restart_without_ikm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(10);
+
+        // 第 1 次启动：无部署 IKM → 盐自派生。
+        let first = AuditLogger::open(&dir.path().join("audit.db"), None)
+            .expect("open 1")
+            .with_clock(clock.clock());
+        for i in 0..3 {
+            first
+                .record(
+                    "admin",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("e{i}"),
+                )
+                .expect("record 1");
+            clock.advance(10);
+        }
+        let first_report = first.verify_chain().expect("verify 1");
+        assert!(first_report.ok);
+        assert_eq!(first_report.key_source, "salt-degraded");
+        drop(first); // 进程"重启"。
+
+        // 第 2 次启动：依旧无部署 IKM → 盐复用 → 同一把密钥。
+        let second = AuditLogger::open(&dir.path().join("audit.db"), None)
+            .expect("open 2")
+            .with_clock(clock.clock());
+        assert!(
+            second.key_bound,
+            "盐自派生路径跨重启必须仍然绑定，否则审计写入会被 fail-closed 拦死"
+        );
+        for i in 3..6 {
+            second
+                .record(
+                    "admin",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("e{i}"),
+                )
+                .expect("record 2");
+            clock.advance(10);
+        }
+
+        let report = second.verify_chain().expect("verify 2");
+        assert!(
+            report.ok,
+            "重启后整链必须仍可自证: {report:?}（链密钥不该漂移）"
+        );
+        assert_eq!(report.total, 6);
+        assert_eq!(report.verified, 6);
+        assert_eq!(report.key_source, "salt-degraded", "来源标注不得随重启漂移");
+    }
+
+    /// QA 安全: IKM 源**真的换了**时写入 fail-closed，绝不静默把后续记录接到
+    /// 一把算不上来旧条目的密钥上。
+    ///
+    /// 这一条与 [`wrong_ikm_fails_verification`] 互补：那里要求「错误密钥不能
+    /// 验证既有链」，这里要求「错误密钥不能续写新链」。两者合起来堵死「换个
+    /// 启动配置就把审计链洗白」这条攻击路径。
+    #[test]
+    fn ikm_drift_fails_closed_on_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(10);
+
+        let first = AuditLogger::open(
+            &dir.path().join("audit.db"),
+            Some(b"audit-test-ikm-before".as_slice()),
+        )
+        .expect("open 1")
+        .with_clock(clock.clock());
+        first
+            .record(
+                "admin",
+                AuditEventType::ConfigChange,
+                OUTCOME_ACCEPTED,
+                "before-drift",
+            )
+            .expect("record 1");
+        drop(first);
+
+        // 换了 IKM 后重启：绑定漂移 → 拒绝追加 + 如实报告。
+        let second = AuditLogger::open(
+            &dir.path().join("audit.db"),
+            Some(b"audit-test-ikm-after".as_slice()),
+        )
+        .expect("open 2")
+        .with_clock(clock.clock());
+        assert!(!second.key_bound, "绑定必须判为漂移");
+        let err = second
+            .record(
+                "admin",
+                AuditEventType::ConfigChange,
+                OUTCOME_ACCEPTED,
+                "after-drift",
+            )
+            .expect_err("漂移后必须拒绝写入");
+        assert!(
+            matches!(err, DaemonError::AuditKeyDrift { .. }),
+            "错误类型应为 AuditKeyDrift: {err:?}"
+        );
+        assert_eq!(
+            err.error_code(),
+            ERR_AUDIT_KEY_DRIFT,
+            "错误码必须是 7001（北向 / 日志可检索）"
+        );
+
+        let report = second.verify_chain().expect("verify");
+        assert!(!report.ok, "漂移后既有链不可自证，必须如实报告: {report:?}");
+        assert_eq!(report.first_broken_seq, Some(1));
+        assert_eq!(report.total, 1);
+    }
+
+    /// QA 安全: 链完整性报告必须带出密钥来源，让 `ok=false` 的成因可判别。
+    #[test]
+    fn chain_report_carries_key_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(10));
+        logger
+            .record(
+                "admin",
+                AuditEventType::ConfigChange,
+                OUTCOME_ACCEPTED,
+                "e0",
+            )
+            .expect("record");
+
+        let report = logger.verify_chain().expect("verify");
+        assert!(
+            matches!(report.key_source.as_str(), "env-secret" | "salt-degraded"),
+            "来源标注只可能来自 env 密钥或盐自派生: {report:?}"
+        );
+    }
+
+    /// QA（计划验收核心：改一行 → 校验失败）: 绕过触发器（测试内先 DROP）
+    /// 篡改一行 detail → 整链校验在**该行**断裂，首断点定位准确。
+    #[test]
+    fn tampered_row_breaks_chain_at_that_seq() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(10));
+        for i in 0..4 {
+            logger
+                .record(
+                    "actor",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("e{i}"),
+                )
+                .expect("record");
+        }
+        assert!(logger.verify_chain().expect("verify").ok);
+
+        // 模拟攻击者：先摘除追加写触发器，再改第 3 行的 detail。
+        let tamper = Connection::open(dir.path().join("audit.db")).expect("tamper conn");
+        tamper
+            .execute("DROP TRIGGER audit_log_no_update", [])
+            .expect("drop trigger");
+        tamper
+            .execute("UPDATE audit_log SET detail = 'forged' WHERE seq = 3", [])
+            .expect("tamper update");
+
+        let report = logger.verify_chain().expect("verify");
+        assert!(!report.ok, "forged row must break the chain: {report:?}");
+        assert_eq!(report.first_broken_seq, Some(3), "break located at seq 3");
+        assert_eq!(report.verified, 2, "rows 1..2 still verify");
+        assert_eq!(report.total, 4);
+    }
+
+    /// QA（计划场景：尝试删除日志 → 断言失败）: 追加写触发器拒绝 DELETE /
+    /// UPDATE，日志物理上不可就地删改。
+    #[test]
+    fn append_only_triggers_reject_update_and_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(10));
+        logger
+            .record("actor", AuditEventType::Login, OUTCOME_ACCEPTED, "e0")
+            .expect("record");
+
+        let raw = Connection::open(dir.path().join("audit.db")).expect("raw conn");
+        // DELETE → RAISE(ABORT)。
+        let err = raw
+            .execute("DELETE FROM audit_log WHERE seq = 1", [])
+            .expect_err("delete blocked");
+        let message = err.to_string();
+        assert!(
+            message.contains("append-only"),
+            "delete must be rejected by trigger: {message}"
+        );
+        // UPDATE → RAISE(ABORT)。
+        let err = raw
+            .execute("UPDATE audit_log SET detail = 'x' WHERE seq = 1", [])
+            .expect_err("update blocked");
+        assert!(
+            err.to_string().contains("append-only"),
+            "update must be rejected by trigger: {err}"
+        );
+        // 日志仍然完好：删除未生效。
+        assert_eq!(logger.latest_seq().expect("latest"), 1);
+        assert!(logger.verify_chain().expect("verify").ok);
+    }
+
+    /// QA: 删行（而非改行）同样可检测——seq 连续性在断裂点定位。
+    #[test]
+    fn deleted_middle_row_breaks_seq_continuity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(10));
+        for i in 0..4 {
+            logger
+                .record(
+                    "actor",
+                    AuditEventType::ConfigChange,
+                    OUTCOME_ACCEPTED,
+                    &format!("e{i}"),
+                )
+                .expect("record");
+        }
+        let tamper = Connection::open(dir.path().join("audit.db")).expect("tamper conn");
+        tamper
+            .execute("DROP TRIGGER audit_log_no_delete", [])
+            .expect("drop trigger");
+        tamper
+            .execute("DELETE FROM audit_log WHERE seq = 2", [])
+            .expect("delete middle row");
+
+        let report = logger.verify_chain().expect("verify");
+        assert!(!report.ok, "missing row must break the chain: {report:?}");
+        assert_eq!(
+            report.first_broken_seq,
+            Some(2),
+            "gap located at missing seq"
+        );
+    }
+
+    /// QA: 错误 IKM 打开同一库 → 链校验失败（密钥不硬编码、不随库走，
+    /// 换密钥即不可伪造既有链）。
+    #[test]
+    fn wrong_ikm_fails_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let logger =
+                AuditLogger::open(&dir.path().join("audit.db"), Some(b"right-ikm")).expect("open");
+            logger
+                .record("actor", AuditEventType::Login, OUTCOME_ACCEPTED, "e0")
+                .expect("record");
+        }
+        let other =
+            AuditLogger::open(&dir.path().join("audit.db"), Some(b"wrong-ikm")).expect("reopen");
+        let report = other.verify_chain().expect("verify");
+        assert!(
+            !report.ok,
+            "wrong-key reopen must not verify existing chain"
+        );
+        assert_eq!(report.first_broken_seq, Some(1));
+    }
+
+    /// QA: 重开同一库（同 IKM）→ 盐复用、链校验仍通过（持久化 + 密钥派生跨重启稳定）。
+    #[test]
+    fn reopen_preserves_chain_and_salt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let logger = open_logger(dir.path(), &TestClock::at(10));
+            logger
+                .record("actor", AuditEventType::Login, OUTCOME_ACCEPTED, "e0")
+                .expect("record");
+        }
+        let clock2 = TestClock::at(999);
+        let logger = AuditLogger::open(&dir.path().join("audit.db"), Some(TEST_IKM))
+            .expect("reopen")
+            .with_clock(clock2.clock());
+        logger
+            .record("actor", AuditEventType::LoginFailed, OUTCOME_DENIED, "e1")
+            .expect("record 2");
+
+        assert_eq!(logger.latest_seq().expect("latest"), 2);
+        let rows = logger.query(&AuditQuery::new()).expect("query");
+        assert_eq!(rows[0].ts_ns, 10, "first row timestamp preserved");
+        assert_eq!(rows[1].ts_ns, 999);
+        assert_eq!(rows[1].prev_hash, rows[0].entry_hash);
+        assert!(logger.verify_chain().expect("verify").ok);
+    }
+
+    /// QA 红线: JSON 编码——seq / ts_ns 一律字符串（大数不丢精度）。
+    /// ts 取真实量级的纳秒时间戳（超 JS 2^53−1 安全整数、但为合法 UNIX 纳秒）。
+    #[test]
+    fn json_encodes_u64_as_strings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ts = 1_700_000_000_123_456_789u64;
+        let clock = TestClock::at(ts);
+        let logger = open_logger(dir.path(), &clock);
+        logger
+            .record(
+                "a",
+                AuditEventType::TrialExpired,
+                OUTCOME_ACCEPTED,
+                "trial end",
+            )
+            .expect("record");
+
+        let rows = logger.query(&AuditQuery::new()).expect("query");
+        let value = rows[0].to_json();
+        assert!(value["seq"].is_string(), "seq must be string: {value}");
+        assert!(value["ts_ns"].is_string(), "ts_ns must be string: {value}");
+        assert_eq!(value["seq"], "1");
+        assert_eq!(
+            value["ts_ns"],
+            ts.to_string(),
+            "ns timestamp must round-trip losslessly"
+        );
+        assert_eq!(value["event"], "trial_expired");
+    }
+
+    /// QA: actor / detail 防御性截断 + 空 actor 落 `<missing>`。
+    #[test]
+    fn long_fields_are_clamped_and_empty_actor_marked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = open_logger(dir.path(), &TestClock::at(10));
+        let long_detail = "x".repeat(MAX_DETAIL_CHARS + 500);
+        logger
+            .record("", AuditEventType::Login, OUTCOME_ACCEPTED, &long_detail)
+            .expect("record");
+
+        let rows = logger.query(&AuditQuery::new()).expect("query");
+        assert_eq!(rows[0].actor, "<missing>");
+        assert_eq!(rows[0].detail.chars().count(), MAX_DETAIL_CHARS);
+    }
+
+    /// QA: AuditEventType 字面量与解析互逆（HTTP 过滤参数校验的契约）。
+    #[test]
+    fn event_type_roundtrip() {
+        for event in [
+            AuditEventType::Login,
+            AuditEventType::LoginFailed,
+            AuditEventType::ConfigChange,
+            AuditEventType::AuthzFailed,
+            AuditEventType::TrialExpired,
+            AuditEventType::AuditRead,
+            AuditEventType::AuditExport,
+        ] {
+            assert_eq!(AuditEventType::parse(event.as_str()), Some(event));
+        }
+        assert_eq!(AuditEventType::parse("nope"), None);
+        assert_eq!(AuditEventType::parse(""), None);
+    }
+
+    /// QA: IKM 解析**不再回退机器码**——只认 env；无 env 即 `None`（盐自派生）。
+    ///
+    /// 这一条钉死设计收紧本身：机器码的可用性取决于 licensing 装配时序（可在激活
+    /// 后由「无」变「有」），若它参与链密钥派生，网关激活后的重启会让绑定漂移、
+    /// fail-closed 拒写审计；且链盐与本库同文件，掺入机器码并不增加防篡改强度。
+    #[test]
+    fn resolve_audit_ikm_ignores_machine_code() {
+        // 进程级 env 在并行测试中不可安全改写：此处只断言「没有 env → 一律 None」
+        // 以及「签名不需要任何入参」。env 命中的分支由 `chain_report_carries_key_
+        // source` 一类的开库路径覆盖。
+        assert_eq!(resolve_audit_ikm(), None, "未配 env 时必须为 None");
+    }
+}

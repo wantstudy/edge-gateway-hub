@@ -1,0 +1,15 @@
+{
+  "name": "iot-daq-tauri-shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "IoT-DAQ 网关 Windows 桌面壳（Tauri 2.x）",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icon": "tauri icon src-tauri/icons/source-icon.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
