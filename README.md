@@ -16,7 +16,7 @@
 | 交付物 | 说明 |
 |---|---|
 | `IoT-DAQ-Gateway_0.1.0_x64-setup.exe` | Windows 10/11 x64 安装包（约 5.3MB） |
-| Docker 镜像 | `docker pull wantstudy/iot-daq-gateway:0.1.0`（linux/amd64，93.8MB） |
+| Docker 镜像 | `docker pull wantstudy/iot-daq-gateway:latest`（linux/amd64，93.8MB） |
 
 ---
 
@@ -31,23 +31,26 @@
 
 ## 快速开始 B：Docker（Linux amd64）
 
-### 一键部署（三行搞定）
+### 一键部署
 
 ```bash
-# 1. 导入镜像
-docker pull wantstudy/iot-daq-gateway:0.1.0
-
-# 2. 初始化（创建目录、生成密钥、启动容器）
-bash -c 'sudo mkdir -p /opt/iot-daq/gateway/{data,secrets} && sudo head -c 32 /dev/urandom | sudo tee /opt/iot-daq/gateway/secrets/iot-daq-fingerprint-key >/dev/null && sudo chown -R 65532:65532 /opt/iot-daq/gateway/data /opt/iot-daq/gateway/secrets && sudo chmod 600 /opt/iot-daq/gateway/secrets/iot-daq-fingerprint-key'
-
-# 3. 启动（从 docker/ 目录执行）
-cd docker && docker compose up -d
+docker run -d \
+--name edge-gateway-hub \
+--network host \
+--restart=always \
+-v /data/edge-gateway:/var/lib/iot-daq:rw \
+-v /etc/machine-id:/host/etc/machine-id:ro \
+-v /sys/class/dmi/id:/host/sys/class/dmi/id:ro \
+-e TZ=Asia/Shanghai \
+wantstudy/iot-daq-gateway:latest
 ```
+
+> 机器码自动取自宿主机（machine-id / DMI）；指纹密钥与授权状态随 `/data/edge-gateway` 持久化，首次启动自动生成，无需手工初始化。授权服务地址已内置镜像，无需任何环境变量。
 
 ### 查看状态
 
 ```bash
-docker logs -f iot-daq-gateway  # 看到 "bootstrap: daemon running" 即成功
+docker logs -f edge-gateway-hub  # 看到 "bootstrap: daemon running" 即成功
 ```
 
 ### Web 控制台地址
