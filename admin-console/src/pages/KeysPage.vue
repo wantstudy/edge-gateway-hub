@@ -52,15 +52,18 @@
             <dd class="ac-mono">{{ activeKey.fingerprint }}</dd>
           </dl>
 
-          <!-- 存量版本覆盖率：决定能否退役旧 kid 的唯一依据 -->
+          <!-- 存量版本覆盖率：决定能否退役旧 kid 的唯一依据。
+               后端 `GET /admin/keys` 的 SigningKeyItem 不含覆盖率字段（实读结论），
+               real 模式取不到该指标 → 诚实空态（—），绝不回退演示数字。 -->
           <div>
             <div style="display: flex; gap: 10px; font-size: 12px; margin-bottom: 5px">
               <span style="color: var(--text-2)">客户端内置公钥版本覆盖率</span>
-              <span style="margin-left: auto; color: var(--text-3)">{{ coverageNote }}</span>
+              <span style="margin-left: auto; color: var(--text-3)">—</span>
             </div>
-            <div class="ac-bar">
-              <div class="ac-bar__fill ac-bar__fill--ok" :style="{ width: `${coveragePercent}%` }" />
-            </div>
+            <p class="ac-note">
+              <span class="ac-note__icon">ⓘ</span>
+              <span>后端未提供存量公钥版本覆盖率指标，暂无法据此判断旧 kid 的退役时机。请先人工核对客户端的公钥集版本分布，再决定退役。</span>
+            </p>
           </div>
 
           <p class="ac-note">
@@ -123,7 +126,7 @@
     :title="`轮换签发密钥 → ${nextKid}`"
     :impacts="[
       '新 kid 生效后只用于签发新租约；旧客户端仍可验签（客户端内置公钥集，非单钥），现有租约不失效。',
-      `客户端内置公钥版本升级依赖客户端发布，须先评估存量版本覆盖率（当前 ${coveragePercent}%）再决定旧 kid 退役时间。`,
+      `客户端内置公钥版本升级依赖客户端发布，须先评估存量版本覆盖率再决定旧 kid 退役时间。`,
       '建议：旧 kid 先置为「已退役（仅验签）」，观察 30 天后再停用。',
     ]"
     :facts="rotateFacts"
@@ -176,11 +179,6 @@ const columns: readonly TableColumn[] = [
   { key: 'fingerprint', label: '公钥指纹', mono: true },
 ];
 
-/** 存量覆盖率（演示：v1.0.0 386 台 / 共 412 台）。 */
-const coveragePercent = 94;
-/** 覆盖率说明。 */
-const coverageNote = 'v1.0.0 386 台 · v0.9.x 26 台（内置旧公钥集）';
-
 /** 轮换可选原因。 */
 const ROTATE_REASONS: readonly string[] = ['计划性周期轮换', '密钥疑似泄露', '合规要求', '算法升级'];
 
@@ -201,7 +199,7 @@ const rotateOpen = ref(false);
 const rotateFacts = computed(() => [
   { label: '当前 kid', value: activeKey.value?.kid ?? '—' },
   { label: '新 kid', value: nextKid.value },
-  { label: '存量覆盖', value: coverageNote },
+  { label: '存量覆盖', value: '—（后端未提供该指标）' },
   { label: '建议', value: '旧 kid 先置「已退役（仅验签）」，观察 30 天后再停用' },
 ]);
 

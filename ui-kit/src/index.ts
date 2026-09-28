@@ -34,6 +34,7 @@ export {
   maskMachineSummary,
   maskMachineCode,
   formatMachineCode,
+  normalizeMachineCodeInput,
   maskIp,
   isValidMachineCode,
   formatDateTime,

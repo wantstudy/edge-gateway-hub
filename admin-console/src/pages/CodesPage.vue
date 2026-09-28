@@ -357,6 +357,7 @@ import {
   maskCode,
   maskMachineSummary,
   isValidMachineCode,
+  normalizeMachineCodeInput,
   formatDateTime,
   formatDate,
   can,
@@ -374,6 +375,19 @@ const isReal = API_MODE === 'real';
 
 /** 每页条数。 */
 const PAGE_SIZE = 8;
+
+/**
+ * 本地日期 `YYYY-MM-DD`（`offsetYears` 年之后）。
+ *
+ * 用途：发放 / 重发表单的**默认有效期**。默认值必须由当前日期派生，
+ * 绝不写死固定日期（写死会随日历过期，成为展示层「编造日期」）。
+ */
+function localIsoDate(offsetYears = 0): string {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() + offsetYears);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
 
 /** 操作级权限（真实门控：无权时按钮隐藏或禁用）。 */
 const canIssue = computed(() => can(session.state.role, 'code.issue'));
@@ -519,8 +533,8 @@ const issueOpen = ref(false);
 const issueForm = reactive({
   tenant: TENANT_NAMES[0],
   tier: TIER_NAMES[0],
-  validFrom: '2026-09-23',
-  validUntil: '2027-09-23',
+  validFrom: localIsoDate(0),
+  validUntil: localIsoDate(1),
   count: '1',
   prebindMachineCode: '',
   note: '',
@@ -528,9 +542,10 @@ const issueForm = reactive({
 /** 已生成码（结果弹窗）。 */
 const issuedCodes = ref<CodeRecord[]>([]);
 
-/** 预绑定机器码校验错误（2026-09-27 契约：机器码必填，空即报错）。 */
+/** 预绑定机器码校验错误（2026-09-27 契约：机器码必填，空即报错）。
+ *  校验前先 [`normalizeMachineCodeInput`] 归一：粘贴带 `-` 的展示态也必须通过校验。 */
 const prebindError = computed(() => {
-  const value = issueForm.prebindMachineCode.trim();
+  const value = normalizeMachineCodeInput(issueForm.prebindMachineCode);
   if (value.length === 0) {
     return '机器码为必填项：请在客户设备上获取后填入';
   }
@@ -539,7 +554,7 @@ const prebindError = computed(() => {
 
 /** 预绑定提示（写清语义，避免误用）。 */
 const prebindHint = computed(() => {
-  const value = issueForm.prebindMachineCode.trim();
+  const value = normalizeMachineCodeInput(issueForm.prebindMachineCode);
   if (value.length === 0) {
     return '一机一码：该码只能在填入的这台机器上激活';
   }
@@ -587,8 +602,8 @@ function openIssue(): void {
     issueForm.tenant = TENANT_NAMES[0];
   }
   issueForm.tier = TIER_NAMES[0];
-  issueForm.validFrom = '2026-09-23';
-  issueForm.validUntil = '2027-09-23';
+  issueForm.validFrom = localIsoDate(0);
+  issueForm.validUntil = localIsoDate(1);
   issueForm.count = '1';
   issueForm.prebindMachineCode = '';
   issueForm.note = '';
@@ -613,7 +628,7 @@ async function submitIssue(): Promise<void> {
     validFrom: issueForm.validFrom,
     validUntil: issueForm.validUntil,
     count: Number(issueForm.count),
-    prebindMachineCode: issueForm.prebindMachineCode.trim(),
+    prebindMachineCode: normalizeMachineCodeInput(issueForm.prebindMachineCode),
     note: issueForm.note.trim(),
     actor: DEFAULT_ACTOR,
   });
@@ -662,6 +677,12 @@ const voidFacts = computed(() => [
   { label: '影响设备', value: '无（该码尚未绑定任何设备）' },
 ]);
 
+/** 废弃目标绑定的设备（按机器码摘要从设备缓存取；real 模式取真实设备，取不到为 null）。 */
+const revokeDevice = computed(() => {
+  const summary = revokeTarget.value?.boundDeviceSummary;
+  return summary ? repo.allDevices().find((d) => d.machineSummary === summary) ?? null : null;
+});
+
 /** 废弃弹窗的对象摘要。 */
 const revokeFacts = computed(() => [
   { label: '租户', value: revokeTarget.value?.tenant ?? '—' },
@@ -671,7 +692,8 @@ const revokeFacts = computed(() => [
       ? `${maskMachineSummary(revokeTarget.value.boundDeviceSummary)}（${revokeTarget.value.boundDeviceName}）`
       : '—',
   },
-  { label: '最近心跳', value: '2026-09-23 12:25:11（6 分钟前）' },
+  // 最近心跳取真实设备记录；设备不在缓存（real 未加载到该设备）时诚实留空，绝不写死时间。
+  { label: '最近心跳', value: formatDateTime(revokeDevice.value?.lastHeartbeatAt) },
   { label: '双人复核', value: dualApproval.value ? '已开启（需第二审批人）' : '未开启' },
 ]);
 
@@ -734,7 +756,7 @@ const reissueForm = reactive({
   mode: 'later' as 'prebind' | 'later',
   machineCode: '',
   tier: TIER_NAMES[0],
-  validUntil: '2027-09-23',
+  validUntil: localIsoDate(1),
   note: '',
 });
 
@@ -772,9 +794,7 @@ function openReissue(row: CodeRecord): void {
   reissueForm.mode = 'later';
   reissueForm.machineCode = '';
   reissueForm.tier = row.tier;
-  const next = new Date();
-  next.setFullYear(next.getFullYear() + 1);
-  reissueForm.validUntil = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}-${String(next.getDate()).padStart(2, '0')}`;
+  reissueForm.validUntil = localIsoDate(1);
   reissueForm.note = '';
   reissueOpen.value = true;
 }
@@ -796,7 +816,7 @@ async function submitReissue(): Promise<void> {
     sourceId: reissueTargetId.value,
     inheritTier: reissueForm.tier,
     inheritValidUntil: reissueForm.validUntil,
-    prebindMachineCode: reissueForm.mode === 'prebind' ? reissueForm.machineCode.trim() : '',
+    prebindMachineCode: reissueForm.mode === 'prebind' ? normalizeMachineCodeInput(reissueForm.machineCode) : '',
     note: reissueForm.note.trim(),
     actor: DEFAULT_ACTOR,
   });

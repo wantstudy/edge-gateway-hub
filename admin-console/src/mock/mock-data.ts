@@ -39,6 +39,8 @@
  *  - 写操作只改本模块内存数组 + 深拷贝返回，**绝不**让页面层拿到引用后误改真相
  */
 
+import { normalizeMachineCodeInput } from '@ui-kit';
+
 /** 校验档位。 */
 export type Grade = 'A' | 'B' | 'C';
 
@@ -1288,7 +1290,11 @@ export const repo = {
         sourceId: source.id,
         inheritTier: input.inheritTier,
         inheritValidUntil: input.validUntil,
-        prebindMachineCode: input.prebindNew ? ticket.newMachineCode : '',
+        // 提交侧归一：工单里的 `newMachineCode` 可能是带 `-` 的展示态，必须归一为
+        // 无分隔符小写匹配态，否则服务端会把同机判成异机（`PREBIND_CONFLICT`）。
+        prebindMachineCode: input.prebindNew
+          ? normalizeMachineCodeInput(ticket.newMachineCode)
+          : '',
         note: input.note,
         actor: input.actor,
       });

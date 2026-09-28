@@ -543,24 +543,40 @@ pub struct ActivationCode {
     pub prebind_machine_code: Option<String>,
 }
 
-/// **机器码归一**（去首尾空白 + ASCII 小写）：全链路写入 / 查询 / 比较的**唯一入口**。
+/// **机器码归一**（去分隔符 + 去 ASCII 空白 + ASCII 小写）：全链路写入 / 查询 /
+/// 比较的**唯一入口**。
 ///
-/// # 为什么必须有它
-/// 机器码是 `hex::encode` 的产物（`0-9a-f`），**语义上大小写无关**。但 admin-console
-/// 曾在发放时把用户输入 `toUpperCase()` 后提交（2026-09-28 修复前的 `CodesPage.vue`），
-/// 而网关上报的是 `hex::encode` 的**小写**值；服务端当时用精确 `==` 比较，于是
-/// 「同机」被恒判为「异机」→ 一机一码把**合法激活**全部误杀为 `PREBIND_CONFLICT`。
+/// # 「展示态」与「匹配态」的由来
+/// 机器码是 `hex::encode` 的产物（`0-9a-f`），网关上报的**匹配态**恒为**无分隔符的
+/// 小写串**（如 `8f3a91c27d045be6`）。但运维在界面上看到、并会复制走的**展示态**是
+/// 分段大写（如 `8F3A-91C2-7D04-5BE6`，见 ui-kit `formatMachineCode`）。历史上这两态
+/// **互不归一**：网关控制台复制出的带 `-` 渲染码被原样填进授权端「预绑定机器码」,
+/// 服务端存成 `8f3a-91c2-7d04-5be6`；上报值为 `8f3a91c27d045be6`，精确比较不等 →
+/// 「同机」恒判「异机」→ 一机一码把**合法激活**全部误杀为 `PREBIND_CONFLICT`。
+///
+/// 因此归一**必须剥离展示用分隔符**：`-`、`:`、`_` 以及所有 ASCII 空白字符
+/// （含首尾空白与制表符 / 换行）。否则同一台机器的两种等价写法会被判为两台机器。
 ///
 /// # 纪律
 /// 任何读写 `activation_code.prebind_machine_code` / `device.machine_code` 的路径
-/// （含 SQL 查询入参）都**必须**先经本函数，否则会出现「库里小写、查询大写」的落空。
-/// 存量值的改写由 `store::migrate` 的下行迁移兜底（见 [`crate::store::MIGRATIONS`]）。
+/// （含 SQL 查询入参）都**必须**先经本函数，否则会出现「库里无分隔、查询带分隔」的落空。
+/// 存量值的改写由 `store::migrate` 的下行迁移兜底（见
+/// [`crate::store::MACHINE_CODE_NORMALIZE_MIGRATIONS`]）。
 ///
-/// # 为什么用 [`str::to_ascii_lowercase`] 而不是 [`str::to_lowercase`]
+/// # 红线：归一绝不等于模糊匹配
+/// 只剥离**分隔符与空白**这一组「纯排版字符」，不改动任何 `0-9a-f` 字符本身。
+/// 两个**实质不同**的机器码（`0-9a-f` 序列不同）归一后仍必须不相等 —— 见
+/// [`ActivationCode::prebind_matches`] 与测试
+/// `normalize_machine_code_keeps_distinct_codes_distinct`。不做前缀 / 相似度等模糊匹配。
+///
+/// # 为什么用 [`char::to_ascii_lowercase`] 而不是 [`char::to_lowercase`]
 /// 后者带 Unicode 语义（如 `İ` → `i̇`，长度可变），会让「归一后长度」与「字节比较」
 /// 产生漂移；机器码是 ASCII hex，ASCII 语义即可且行为稳定。
 pub fn normalize_machine_code(raw: &str) -> String {
-    raw.trim().to_ascii_lowercase()
+    raw.chars()
+        .filter(|c| !matches!(*c, '-' | ':' | '_') && !c.is_ascii_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 impl ActivationCode {
@@ -605,8 +621,9 @@ impl ActivationCode {
     /// 空白串统一归一为 `None`（"   " 不算「已提供」），保证
     /// 「留待首次激活绑定」与「显式留空」语义一致。
     ///
-    /// 大小写经 [`normalize_machine_code`] 归一小写：发放端可能提交大写机器码，
-    /// 而网关上报的恒为小写 hex，不归一就会把同机判成异机（一机一码误杀）。
+    /// 经 [`normalize_machine_code`] 归一（剥分隔符 / 空白 + 小写）：发放端可能提交
+    /// 带 `-` 的大写展示态机器码，而网关上报的恒为无分隔符小写 hex，不归一就会把
+    /// 同机判成异机（一机一码误杀）。
     pub fn with_prebind(mut self, machine_code: Option<String>) -> Self {
         self.prebind_machine_code = machine_code
             .map(|m| normalize_machine_code(&m))
@@ -619,8 +636,8 @@ impl ActivationCode {
     /// **两侧**都经 [`normalize_machine_code`] 归一：库里的预绑定值可能来自
     /// 归一前的历史数据（大写），上报值也可能来自任意客户端；只归一一侧仍会漏判。
     ///
-    /// 归一**只抹平大小写与空白**，不做模糊匹配 —— 不同的机器码仍必须拒绝
-    /// （一机一码红线：见 `service.rs` 的 `t46_prebind_case_insensitive_*` 测试）。
+    /// 归一**只抹平分隔符 / 空白 / 大小写**，不做模糊匹配 —— 实质不同的机器码仍必须
+    /// 拒绝（一机一码红线：见 `service.rs` 的 `t46_prebind_*` 系列测试）。
     pub fn prebind_matches(&self, machine_code: &str) -> bool {
         match self.prebind_machine_code.as_deref() {
             None => true,
@@ -1513,5 +1530,68 @@ mod tests {
         assert_eq!(OTA_SIGNING_DOMAIN_V1, "iotdaq.ota.v1|");
         // 域前缀必须是签名消息的前缀（防跨协议签名复用）。
         assert!(expected.starts_with("iotdaq.ota.v1|"));
+    }
+
+    // ---------------- 机器码归一（P0：展示态 vs 匹配态） ----------------
+
+    /// **回归 P0**：网关控制台复制出的带 `-` 大写展示态，必须与网关上报的无分隔符
+    /// 小写匹配态归一等价，否则同机判异机 → `PREBIND_CONFLICT`（HTTP 422）。
+    #[test]
+    fn normalize_machine_code_equates_display_and_match_forms() {
+        let match_form = "8f3a91c27d045be6";
+        assert_eq!(
+            normalize_machine_code("8F3A-91C2-7D04-5BE6"),
+            match_form,
+            "带 `-` 的大写展示态必须等价于无分隔符小写匹配态"
+        );
+        assert_eq!(normalize_machine_code(match_form), match_form);
+    }
+
+    /// 分隔符集合（`-` `:` `_`）与前后 / 内部空白都必须被剥离。
+    #[test]
+    fn normalize_machine_code_strips_all_display_separators_and_whitespace() {
+        let expected = "8f3a91c27d045be6";
+        for raw in [
+            "  8F3A-91C2-7D04-5BE6  ",
+            "8f3a:91c2:7d04:5be6",
+            "8F3A_91C2_7D04_5BE6",
+            "\t8f3a91c2\n7d045be6 ",
+            "8f3a 91c2 7d04 5be6",
+        ] {
+            assert_eq!(normalize_machine_code(raw), expected, "输入 = {raw:?}");
+        }
+    }
+
+    /// **红线：归一不是模糊匹配**。实质不同的机器码（`0-9a-f` 序列不同）归一后仍必须
+    /// 不相等，否则一机一码会被过度归一击穿。
+    #[test]
+    fn normalize_machine_code_keeps_distinct_codes_distinct() {
+        assert_ne!(
+            normalize_machine_code("8f3a91c27d045be6"),
+            normalize_machine_code("8f3a91c27d045be7"),
+            "末位不同 = 异机，绝不能归一为等值"
+        );
+        assert_ne!(
+            normalize_machine_code("8F3A91C27D045BE6"),
+            normalize_machine_code("8F3A91C27D045BE"),
+            "长度不同（截断）= 异机"
+        );
+        // 分隔符位置不同但去分隔后同一序列 → 视为同机（等价写法）。
+        assert_eq!(
+            normalize_machine_code("8f3a-91c2-7d04-5be6"),
+            normalize_machine_code("8f3a91c2-7d045be6")
+        );
+    }
+
+    /// `prebind_matches` 消费归一结果：带 `-` 预绑定值必须命中无分隔符上报值。
+    #[test]
+    fn prebind_matches_display_form_against_match_form() {
+        let code = sample_code(CodeStatus::Issued).with_prebind(Some("8F3A-91C2-7D04-5BE6".into()));
+        assert_eq!(
+            code.prebind_machine_code.as_deref(),
+            Some("8f3a91c27d045be6")
+        );
+        assert!(code.prebind_matches("8f3a91c27d045be6"));
+        assert!(!code.prebind_matches("8f3a91c27d045be7"));
     }
 }

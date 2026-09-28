@@ -10,6 +10,7 @@ import {
   maskMachineSummary,
   formatMachineCode,
   maskMachineCode,
+  normalizeMachineCodeInput,
   maskIp,
   isValidMachineCode,
   formatDateTime,
@@ -78,6 +79,30 @@ describe('机器码工具', () => {
     expect(maskIp('10.20.3.14')).toBe('10.20.3.**');
     expect(maskIp('bad-ip')).toBe('bad-ip');
     expect(maskIp(null)).toBe('—');
+  });
+});
+
+describe('normalizeMachineCodeInput（提交归一：展示态 → 匹配态）', () => {
+  it('带 `-` 的大写展示态归一为无分隔符小写匹配态', () => {
+    expect(normalizeMachineCodeInput('8F3A-91C2-7D04-5BE6')).toBe('8f3a91c27d045be6');
+    expect(normalizeMachineCodeInput('8f3a91c27d045be6')).toBe('8f3a91c27d045be6');
+  });
+
+  it('剥离 `:` `_` 与前后 / 内部空白', () => {
+    expect(normalizeMachineCodeInput('  8f3a:91c2:7d04:5be6  ')).toBe('8f3a91c27d045be6');
+    expect(normalizeMachineCodeInput('8F3A_91C2_7D04_5BE6')).toBe('8f3a91c27d045be6');
+    expect(normalizeMachineCodeInput('8f3a 91c2 7d04 5be6')).toBe('8f3a91c27d045be6');
+  });
+
+  it('幂等：对已归一输入再归一不变', () => {
+    const once = normalizeMachineCodeInput('8F3A-91C2-7D04-5BE6');
+    expect(normalizeMachineCodeInput(once)).toBe(once);
+  });
+
+  it('红线：实质不同的机器码归一后仍不相等（不做模糊匹配）', () => {
+    expect(normalizeMachineCodeInput('8f3a91c27d045be6')).not.toBe(
+      normalizeMachineCodeInput('8f3a91c27d045be7'),
+    );
   });
 });
 

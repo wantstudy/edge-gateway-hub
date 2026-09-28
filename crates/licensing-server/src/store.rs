@@ -52,26 +52,44 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// **存量机器码归一迁移**（2026-09-28）：把历史库里大小写混杂的机器码统一成小写。
+/// **存量机器码归一迁移**（2026-09-28）：把历史库里大小写混杂 / 带展示分隔符的机器码
+/// 统一成「无分隔符小写」这一**匹配态**。
 ///
 /// # 为什么必须落这条迁移
-/// 归一前 admin-console 在发放时把用户填的机器码 `toUpperCase()` 后提交，而网关上报的
-/// 是 `hex::encode` 的**小写**值。只改读写路径（[`crate::model::normalize_machine_code`]）
-/// **救不了存量**：库里已是大写的历史预绑定码仍与小写上报值不等 → 照样
-/// `PREBIND_CONFLICT`。故已落库的值必须一并改写。
+/// 网关上报的机器码是 `hex::encode` 的**无分隔符小写**串（如 `8f3a91c27d045be6`），
+/// 而历史库里的值可能来自两条污染路径：① 早期 admin-console 在发放时把用户输入
+/// `toUpperCase()` 后提交（大写）；② 运维从网关控制台复制的**带 `-` 展示态**
+/// （如 `8F3A-91C2-7D04-5BE6`）被原样填入预绑定。只改读写路径
+/// （[`crate::model::normalize_machine_code`]）**救不了存量**：库里已是污染值的历史
+/// 预绑定码仍与上报值不等 → 照样 `PREBIND_CONFLICT`（HTTP 422）。故已落库的值必须一并
+/// 改写。三列元组为 `(表名, 机器码列, 行标识列)`。
 ///
-/// # 为什么用 SQL `lower()` 而不是拉到 Rust 里改
+/// # 为什么用 SQL 内建函数而不是拉到 Rust 里改
 /// SQLite 内建 `lower()` **只对 ASCII 生效**（非 ASCII 字节原样保留），与 Rust 侧
-/// [`str::to_ascii_lowercase`] 语义严格一致；换用任何带 Unicode 语义的实现都会让
-/// 「SQL 存量值」与「Rust 新写入值」产生漂移。
+/// [`str::to_ascii_lowercase`] 语义严格一致；`replace()` 负责逐字符剥离分隔符。
+/// 换用任何带 Unicode 语义的实现都会让「SQL 存量值」与「Rust 新写入值」产生漂移。
 ///
-/// # 唯一性说明
-/// `device.machine_code` 带 UNIQUE 约束。若存在仅大小写不同的两行，`lower()` 会撞约束
-/// 而使迁移失败（fail-closed，宁可启动失败也不留半改写的库）。实际不会发生：机器码是
-/// 网关 `hex::encode` 的产物，恒为小写，本迁移对存量库是**零行命中**的空操作。
-const MACHINE_CODE_CASE_MIGRATIONS: &[(&str, &str)] = &[
-    ("activation_code", "prebind_machine_code"),
-    ("device", "machine_code"),
+/// # 分隔符集合的 SQL 表达与已知缺口
+/// Rust 侧 [`crate::model::normalize_machine_code`] 剥离 `-` `:` `_` 以及**所有** ASCII
+/// 空白；SQL 侧 `replace(x,' ','')` 只能剥离**单个半角空格**（SQLite 无内建「所有空白」
+/// 替换）。制表符 / 换行等极罕见出现在机器码里，接受该差异；若出现，启动后的
+/// 冲突告警与下一次读写路径归一仍会兜底。
+///
+/// # 唯一约束与冲突处理（fail-safe，绝不静默丢行）
+/// `device.machine_code` 带 `UNIQUE` 约束（见 [`SCHEMA`]）；`activation_code.prebind_machine_code`
+/// **只有非唯一索引** `idx_code_prebind`。故归一后**可能**撞 UNIQUE 的只有 `device` 表。
+/// 若两行归一后同值，直接 `UPDATE` 会在第二行抛约束错误使**迁移失败 / 启动失败**；
+/// 直接删行更会**丢设备记录**。两种都不可接受——处理策略是：
+///   1. 迁移前按归一值 `GROUP BY ... HAVING COUNT(*) > 1` 统计「归一后会重复」的组；
+///   2. 命中时用 `tracing::warn!` 打印**冲突的归一值、行标识与原始值**（可人工介入）；
+///   3. 改写改用 `UPDATE OR IGNORE`：撞约束的行**跳过不改**，迁移仍能完成，**不删任何行**。
+///
+/// # 幂等
+/// 重复启动时 `{column} <> {normalized}` 对已归一行恒为假 → 零行命中、不产生新变更、
+/// 不报错（仅当冲突残留未解决时重复告警）。
+const MACHINE_CODE_NORMALIZE_MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("activation_code", "prebind_machine_code", "code_id"),
+    ("device", "machine_code", "device_id"),
 ];
 
 /// 判断表中是否已存在某列（基于 `PRAGMA table_info`，不受 SQLite 版本差异影响）。
@@ -651,16 +669,46 @@ impl Store {
                 conn.execute_batch(ddl)?;
             }
         }
-        // 存量机器码归一（2026-09-28）：把历史库里大小写混杂的机器码统一成小写。
-        // 用 SQL `lower()`（仅 ASCII 生效，语义与 Rust 侧 `to_ascii_lowercase` 一致）。
-        // 只动「确实会变」的行（`col <> lower(col)`），避免无谓的 UNIQUE 重检。
-        // 若出现仅大小写不同的两行，`lower()` 会在第二行撞 UNIQUE 约束 → 启动失败
-        // （fail-closed，宁可起不来也不留半改写的库）。实际不会发生：机器码恒为网关
-        // `hex::encode` 的小写产物，本迁移对存量库是零行命中的空操作。
-        for (table, column) in MACHINE_CODE_CASE_MIGRATIONS {
+        // 存量机器码归一（2026-09-28）：把历史库里大小写混杂 / 带展示分隔符的机器码
+        // 统一成「无分隔符小写」匹配态（语义与 Rust 侧 `normalize_machine_code` 对齐）。
+        // 用 SQL 内建 `lower()` + 嵌套 `replace()`（仅 ASCII 生效）。只动「确实会变」的行
+        // （`col <> normalized`），避免无谓的 UNIQUE 重检，保证迁移**幂等**。
+        for (table, column, id_column) in MACHINE_CODE_NORMALIZE_MIGRATIONS {
+            // 归一表达式：lower(剥 `-` `:` `_` 与半角空格)。SQLite 的 `replace` 只替换
+            // 单个空格，制表符等极罕见，接受该缺口（见常量文档）。
+            let normalized = format!(
+                "lower(replace(replace(replace(replace({column},'-',''),':',''),'_',''),' ',''))"
+            );
+            // ① 冲突预检：按归一值分组，找出「归一后会撞值」的组并**告警全部细节**。
+            //    绝不静默 —— 这些行无法安全自动合并（可能是两台真机，或一机被重复登记）。
+            let detect = format!(
+                "SELECT {normalized}, group_concat({id_column}), group_concat({column}) \
+                 FROM {table} WHERE {column} IS NOT NULL \
+                 GROUP BY 1 HAVING COUNT(*) > 1"
+            );
+            {
+                let mut stmt = conn.prepare(&detect)?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let normalized_value: String = row.get(0)?;
+                    let ids: Option<String> = row.get(1)?;
+                    let raw_values: Option<String> = row.get(2)?;
+                    tracing::warn!(
+                        table = table,
+                        column = column,
+                        normalized = %normalized_value,
+                        row_ids = %ids.unwrap_or_default(),
+                        raw_values = %raw_values.unwrap_or_default(),
+                        "机器码归一迁移检测到归一后冲突：多行归一为同一值；\
+                         已保留全部行，撞 UNIQUE 的行将跳过不改，请人工核对"
+                    );
+                }
+            }
+            // ② 改写：`UPDATE OR IGNORE` 让撞 UNIQUE 的行被跳过而非让整个迁移失败，
+            //    **绝不删行**（删 `device` 行会丢设备记录）。
             conn.execute_batch(&format!(
-                "UPDATE {table} SET {column} = lower({column}) \
-                 WHERE {column} IS NOT NULL AND {column} <> lower({column})"
+                "UPDATE OR IGNORE {table} SET {column} = {normalized} \
+                 WHERE {column} IS NOT NULL AND {column} <> {normalized}"
             ))?;
         }
         Ok(())
@@ -2202,6 +2250,87 @@ mod tests {
             .expect("tenant");
     }
 
+    /// **P0 回归**：存量「带展示分隔符 / 大写」的机器码在迁移后归一为无分隔符小写匹配态
+    /// （`device.machine_code` 与 `activation_code.prebind_machine_code` 都要覆盖）。
+    #[test]
+    fn normalize_migration_rewrites_polluted_machine_codes() {
+        let (store, _) = fixture();
+
+        // 直接注入污染值（绕过 service 层归一，模拟历史库）。
+        store
+            .insert_device(&sample_device(
+                "dev-1",
+                "8F3A-91C2-7D04-5BE6",
+                DeviceStatus::Active,
+            ))
+            .expect("insert device");
+        let mut code = sample_code("c-1", "CODE-POLLUTED");
+        code.prebind_machine_code = Some("8F3A_91C2:7D04-5BE6".into());
+        store.insert_code(&code).expect("insert code");
+
+        store.migrate().expect("migrate");
+
+        let conn = store.conn.lock();
+        let dev_mc: String = conn
+            .query_row(
+                "SELECT machine_code FROM device WHERE device_id = 'dev-1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("device machine_code");
+        assert_eq!(
+            dev_mc, "8f3a91c27d045be6",
+            "设备机器码必须归一为无分隔符小写"
+        );
+        let prebind: String = conn
+            .query_row(
+                "SELECT prebind_machine_code FROM activation_code WHERE code_id = 'c-1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("prebind_machine_code");
+        assert_eq!(
+            prebind, "8f3a91c27d045be6",
+            "预绑定机器码必须归一为无分隔符小写"
+        );
+    }
+
+    /// **P0 回归**：归一后撞 UNIQUE 时迁移**不报错、不删行**（`UPDATE OR IGNORE` 跳过而非
+    /// fail-closed 启动失败，更不允许删 `device` 行掩盖冲突）。
+    #[test]
+    fn normalize_migration_tolerates_unique_collision_without_deleting_rows() {
+        let (store, _) = fixture();
+        // 两个原始值不同、但归一后同为 `abcd` 的设备。
+        store
+            .insert_device(&sample_device("dev-a", "ABCD", DeviceStatus::Active))
+            .expect("insert a");
+        store
+            .insert_device(&sample_device("dev-b", "ab-cd", DeviceStatus::Active))
+            .expect("insert b");
+
+        store
+            .migrate()
+            .expect("迁移必须完成（撞 UNIQUE 的行跳过而非失败）");
+
+        assert_eq!(store.count_devices(None).expect("count"), 2, "绝不删行");
+        let conn = store.conn.lock();
+        let values: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT machine_code FROM device ORDER BY device_id")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |r| r.get::<usize, String>(0))
+                .expect("query");
+            rows.map(|r| r.expect("row")).collect()
+        };
+        assert_eq!(values.len(), 2, "两行都必须保留");
+        assert_eq!(
+            values.iter().filter(|v| *v == "abcd").count(),
+            1,
+            "恰好一行归一为 abcd（另一行因撞 UNIQUE 被跳过）：{values:?}"
+        );
+    }
+
     #[test]
     fn tenant_insert_get_list_round_trip_optionals() {
         let (store, _) = fixture();
@@ -2230,8 +2359,9 @@ mod tests {
     fn device_round_trip_with_some_and_none_optionals() {
         let (store, _) = fixture();
 
-        // 全 None 形态。
-        let native = sample_device("dev-native", "mc-native", DeviceStatus::Active);
+        // 全 None 形态。机器码用**无分隔符**字面量：`get_device_by_machine_code` 会先
+        // 归一查询入参（剥分隔符 + 小写），而本测试的 `insert_device` 写的是原样值。
+        let native = sample_device("dev-native", "mcnative", DeviceStatus::Active);
         store.insert_device(&native).expect("insert native");
         assert_eq!(
             store.get_device("dev-native").expect("get"),
@@ -2239,7 +2369,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_device_by_machine_code("mc-native")
+                .get_device_by_machine_code("mcnative")
                 .expect("get by mc"),
             Some(native)
         );

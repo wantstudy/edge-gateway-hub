@@ -23,7 +23,7 @@
     <section class="ac-card">
       <div class="ac-card__head">
         <h3>{{ onlyPending ? '待处理工单' : '全部工单' }}</h3>
-        <span class="ac-card__sub">平均处理 2.1h · 目标 ≤3 次点击完成</span>
+        <span class="ac-card__sub">目标 ≤3 次点击完成</span>
       </div>
 
       <EmptyState
@@ -288,7 +288,7 @@ const newMachineStatus = computed(() => {
     return '（客户未提供，将留待首次激活时绑定）';
   }
   const occupied = repo.allDevices().some((d) => d.machineCode.toUpperCase() === code.replace(/[^A-Za-z0-9]/g, '').toUpperCase());
-  return occupied ? `${maskMachineCode(code)}（未被占用 ✓）` : `${maskMachineCode(code)}（未被占用 ✓）`;
+  return occupied ? `${maskMachineCode(code)}（已被占用 ✗）` : `${maskMachineCode(code)}（未被占用 ✓）`;
 });
 
 /** 备注错误。 */
@@ -352,8 +352,13 @@ const confirmFacts = computed(() => [
 
 /** 计算重发的有效期日期。 */
 function resolveValidUntil(): string {
+  // 「沿用源码到期日」：源码记录在缓存中时用其真实到期日；取不到时不写死固定日期，
+  // 回退到「当前日期顺延 12 个月」（与另一分支同口径，绝不伪造固定日期）。
   if (processForm.validity === 'keep') {
-    return repo.getCode(processTarget.value?.sourceCodeId ?? '')?.validUntil ?? '2027-09-23';
+    const source = repo.getCode(processTarget.value?.sourceCodeId ?? '')?.validUntil;
+    if (source) {
+      return source;
+    }
   }
   const next = new Date();
   next.setFullYear(next.getFullYear() + 1);

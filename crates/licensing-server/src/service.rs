@@ -2426,6 +2426,50 @@ mod tests {
         }
     }
 
+    /// **P0 端到端回归**：预绑定用「带 `-` 的大写展示态」写入（模拟运维从网关控制台
+    /// 复制），激活用「无分隔符小写」（模拟网关上报），必须**激活成功** —— 即
+    /// `prebind_matches` 命中。修复前这里会抛
+    /// `PrebindConflict::ActivationMachineMismatch`（HTTP 422）。
+    #[test]
+    fn t46_prebind_display_form_matches_gateway_report_form() {
+        let svc = build_service();
+        // 预绑定：带 `-` 的大写展示态（运维从网关控制台复制的形态）。
+        let resp = svc
+            .issue_codes(&issue_req("t-1", Some("8F3A-91C2-7D04-5BE6"), "p0-issue"))
+            .unwrap();
+        let code = &resp.codes[0];
+        assert_eq!(
+            code.prebind.as_deref(),
+            Some("8f3a91c27d045be6"),
+            "落库即归一为无分隔符小写匹配态"
+        );
+
+        // 激活：网关上报的无分隔符小写匹配态 → 必须命中。
+        let act = svc
+            .activate(&activate_req(&code.code, "8f3a91c27d045be6"))
+            .expect("展示态预绑定必须命中匹配态上报");
+        assert!(!act.lease_token.is_empty());
+
+        // 红线：实质不同的机器码仍必须被拒（一机一码未被过度归一击穿）。
+        let resp2 = svc
+            .issue_codes(&issue_req("t-1", Some("AAAA-BBBB-CCCC-DDDD"), "p0-issue-2"))
+            .unwrap();
+        let code2 = &resp2.codes[0];
+        let err = svc
+            .activate(&activate_req(&code2.code, "aaaabbbbccccddce"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LicenseError::PrebindConflict {
+                    kind: PrebindKind::ActivationMachineMismatch
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// （400 `MACHINE_CODE_REQUIRED`），不再归一为「无预绑定」。
     /// 2026-09-27 契约变更：发放侧一机一码闭环——缺失 / 空白机器码一律拒绝
     /// （400 `MACHINE_CODE_REQUIRED`），不再归一为「无预绑定」。
     #[test]

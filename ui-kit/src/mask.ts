@@ -113,6 +113,29 @@ export function maskMachineCode(raw: string | null | undefined): string {
 }
 
 /**
+ * 机器码**提交归一**（与后端 `normalize_machine_code` **同一套规则**）。
+ *
+ * # 为什么提交前必须归一
+ * 机器码存在两种**等价写法**：
+ * - **展示态**：分段大写、带 `-` 分隔（如 `8F3A-91C2-7D04-5BE6`，见
+ *   [`formatMachineCode`](./mask.ts)）——运维会从网关控制台复制它；
+ * - **匹配态**：无分隔符小写（如 `8f3a91c27d045be6`）——网关上报的即为此态。
+ *
+ * 若展示态被原样提交，服务端存下带 `-` 的值，与网关上报的无分隔符值精确比较不等，
+ * 「同机」恒判「异机」→ `PREBIND_CONFLICT`（HTTP 422）。故提交侧必须归一到匹配态。
+ *
+ * 规则：剥 `-` `:` `_` 与所有空白 + 小写。**仅**剥离这套「纯排版字符」，不改动任何
+ * 十六进制字符本身——实质不同的机器码仍保持不同（一机一码红线）。
+ * 展示 / 复制仍用 [`formatMachineCode`](./mask.ts)，二者互补、全链路归一后等价。
+ *
+ * @param raw 用户输入或从网关复制来的机器码
+ * @returns 无分隔符小写机器码（幂等：已归一输入再归一不变）
+ */
+export function normalizeMachineCodeInput(raw: string): string {
+  return raw.replace(/[-:_\s]/g, '').toLowerCase();
+}
+
+/**
  * 来源 IP 掩码（审计页默认脱敏末段）。
  *
  * @param ip 形如 `10.20.3.14`

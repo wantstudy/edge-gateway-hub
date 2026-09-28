@@ -2858,11 +2858,12 @@ mod tests {
         )
         .await;
         assert_eq!(miss["data"]["total"], "0");
-        // 关键字筛选（machine_code contains，大小写不敏感）。
+        // 关键字筛选（machine_code contains，大小写不敏感）。库内机器码已归一为
+        // 无分隔符小写（激活时 `normalize_machine_code` 剥分隔符），故检索串也用无分隔形态。
         let (_, kw) = call_with(
             &svc,
             "GET",
-            "/admin/devices?machine_code=mid-dev",
+            "/admin/devices?machine_code=middev",
             json!(null),
             &authed,
         )

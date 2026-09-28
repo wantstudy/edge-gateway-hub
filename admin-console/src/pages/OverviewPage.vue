@@ -5,7 +5,7 @@
   -->
   <PageHeader crumb="运营 / 总览" title="总览" desc="厂商侧运营全景：授权规模、回执健康度与待处理事项（B 档下回执是唯一在线证据）">
     <template #actions>
-      <button type="button" class="ac-btn" @click="notify('日报已导出（演示）')">导出日报</button>
+      <button type="button" class="ac-btn" @click="exportCsv">导出日报</button>
     </template>
   </PageHeader>
 
@@ -13,7 +13,7 @@
     <!-- 异常横幅：高优先级问题必须显著可见，不藏在二级页面 -->
     <div class="ac-banner ac-banner--warn">
       <div>
-        <b>待处理：{{ data.receiptGap }} 台设备回执跳空 · {{ data.receiptMissing }} 台超 24h 无回执 · 2 张激活码在宽限期 · {{ data.currentKid }} 将在 {{ data.kidRetireInDays }} 天后到期</b>
+        <b>待处理：{{ data.receiptGap }} 台设备回执跳空 · {{ data.receiptMissing }} 台超 24h 无回执 · {{ data.currentKid }} 将在 {{ data.kidRetireInDays }} 天后到期</b>
       </div>
       <div class="ac-banner__ops">
         <button type="button" class="ac-btn ac-btn--primary" @click="go('receipts')">去处理</button>
@@ -27,11 +27,11 @@
       <StatCard
         label="已授权设备"
         :value="String(data.licensedDevices)"
-        sub="本月新激活 46"
+        :sub="`本月新激活 ${data.newActivationsThisMonth}`"
         clickable
         @click="go('devices')"
       />
-      <StatCard label="试用中" :value="String(data.trialDevices)" sub="7 天内到期 9" tone="warn" />
+      <StatCard label="试用中" :value="String(data.trialDevices)" :sub="`7 天内到期 ${data.expiringIn7Days}`" tone="warn" />
       <StatCard
         label="在线设备"
         :value="String(data.onlineDevices)"
@@ -101,7 +101,7 @@
           <div class="ac-list__item">
             <div>
               <div class="ac-list__title">换机工单 待处理 {{ data.pendingTransfers }} 单</div>
-              <div class="ac-list__desc">平均处理时长 2.1h · 目标 ≤3 次点击完成</div>
+              <div class="ac-list__desc">目标 ≤3 次点击完成</div>
             </div>
             <div class="ac-list__ops">
               <button type="button" class="ac-btn ac-btn--sm ac-btn--primary" @click="go('transfers')">去处理</button>
@@ -120,7 +120,7 @@
             <div>
               <div class="ac-list__title">密钥需求</div>
               <div class="ac-list__desc">
-                {{ data.currentKid }} 计划退役 2026-10-01；存量旧公钥集客户端 {{ data.legacyClientCount }} 台
+                {{ data.currentKid }} 将在 {{ data.kidRetireInDays }} 天后到期；存量旧公钥集客户端 {{ data.legacyClientCount }} 台
               </div>
             </div>
             <div class="ac-list__ops">
@@ -190,9 +190,36 @@ function go(id: PageId): void {
   void router.push({ name: id });
 }
 
-/** 轻提示（原型用原生 alert，避免依赖 Arco 全局 API 注入顺序）。 */
-function notify(message: string): void {
-  window.alert(message);
+/** 导出总览快照为 CSV（前端即时生成真实文件）。
+ *  real 模式后端未提供的维度导出为 `—`（与页面一致），绝不补造数字、绝不伪造导出成功。 */
+function exportCsv(): void {
+  const rows: readonly (readonly [string, string])[] = [
+    ['租户数', data.tenantCount],
+    ['已授权设备', data.licensedDevices],
+    ['试用中', data.trialDevices],
+    ['在线设备', data.onlineDevices],
+    ['离线设备', data.offlineDevices],
+    ['回执正常', data.receiptOk],
+    ['回执序号跳空', data.receiptGap],
+    ['回执缺失 >24h', data.receiptMissing],
+    ['回执签名无效', data.receiptBadSig],
+    ['待处理换机工单', data.pendingTransfers],
+    ['待核查回执异常', data.pendingAnomalies],
+    ['当前签署 kid', data.currentKid],
+    ['kid 剩余有效期（天）', data.kidRetireInDays],
+    ['存量旧公钥集客户端', data.legacyClientCount],
+    ['本月新激活', data.newActivationsThisMonth],
+    ['7 天内到期', data.expiringIn7Days],
+  ];
+  const header = '指标,数值';
+  const body = rows.map(([k, v]) => `${k},${v}`).join('\n');
+  const blob = new Blob([`\uFEFF${header}\n${body}`], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `overview-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 </script>
 
