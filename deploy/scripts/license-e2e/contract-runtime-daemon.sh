@@ -114,7 +114,10 @@ trap 'cleanup' INT TERM
 
 up=0
 for _ in $(seq 1 40); do
-    if curl -fsS -o /dev/null "${BASE}/api/license/status" 2>/dev/null; then up=1; break; fi
+    # `--noproxy '*'`：本机常驻 HTTP(S)_PROXY 会让 keep-alive 复用错乱
+    # （症状：首个请求成功、之后全 404）；`--max-time 2` 防探测卡死。
+    if curl -fsS --noproxy '*' --max-time 2 -o /dev/null \
+        "${BASE}/api/license/status" 2>/dev/null; then up=1; break; fi
     sleep 0.5
 done
 if [ "$up" -ne 1 ]; then
@@ -128,8 +131,11 @@ sleep 2
 
 # --- 授权状态是**只读**接口 ---
 call() { # call <METHOD> <PATH>
-    curl -sS -o "${WORKDIR}/body" -w '%{http_code}' -X "$1" "${BASE}${2}" \
-        -H 'content-type: application/json' -d '{}' 2>/dev/null || echo 000
+    # `--noproxy '*'`：本机常驻 HTTP(S)_PROXY 会让 keep-alive 复用错乱
+    # （症状：首个请求成功、之后全 404）；`--max-time` 防卡死。
+    curl -sS --noproxy '*' --max-time 10 -o "${WORKDIR}/body" -w '%{http_code}' \
+        -X "$1" "${BASE}${2}" -H 'content-type: application/json' -d '{}' \
+        2>/dev/null || echo 000
 }
 assert_eq "D2.1 GET /api/license/status → 200（唯一授权只读接口）" "200" "$(call GET /api/license/status)"
 
@@ -159,7 +165,7 @@ done
 section "契约 2/3：授权状态与试用标记落宿主持久卷（data_dir）"
 
 assert_true "D3.1 授权状态接口返回合法 status 字段" \
-    "$(curl -sS "${BASE}/api/license/status" 2>/dev/null \
+    "$(curl -sS --noproxy '*' --max-time 10 "${BASE}/api/license/status" 2>/dev/null \
         | python3 -c 'import json,sys
 try:
     s=json.load(sys.stdin).get("status","")

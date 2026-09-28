@@ -75,15 +75,39 @@ cleanup() {
 trap cleanup EXIT
 trap 'cleanup' INT TERM
 
-# 等待监听（最多 15s）；起不来就是环境问题，不是契约问题
+# 等待监听（最多 15s）。
+#
+# ⚠️ 探测端点必须选**匿名可达**端点：`GET /admin/keys`（http.rs:835）第一件事就是
+# `authenticate()`，匿名必返 401，而 `curl -f` 把 401 当失败 → 探测恒不成功，
+# 会把「服务其实已成功监听」误报成「环境问题」。改用 `GET /updates/manifest`
+# （http.rs:161，设备端拉取口径，无管理端 JWT，正常返回 200）。
+# `--noproxy '*'`：本机常驻 HTTP(S)_PROXY 会让 keep-alive 复用错乱
+# （症状：首个请求成功、之后全 404）；`--max-time 2` 防探测卡死。
 up=0
 for _ in $(seq 1 30); do
-    if curl -fsS -o /dev/null "${BASE}/admin/keys" 2>/dev/null; then up=1; break; fi
+    if curl -fsS --noproxy '*' --max-time 2 -o /dev/null \
+        "${BASE}/updates/manifest" 2>/dev/null; then
+        up=1; break
+    fi
+    # 进程提前退出：不必再空等满 15s，立即如实报退出码（不要一律归因环境）。
+    if ! kill -0 "${SRV_PID}" 2>/dev/null; then
+        srv_rc=0
+        wait "${SRV_PID}" 2>/dev/null || srv_rc=$?
+        printf '%sFAIL%s licensing-server 进程提前退出（退出码 %s），未能在 %s 上监听\n' \
+            "$C_RED" "$C_OFF" "$srv_rc" "$BASE"
+        printf '        失败步骤：等待监听（进程已死）\n'
+        printf '        —— 服务端日志尾部 ——\n'
+        sed 's/^/        /' "${LOG}" | tail -30
+        exit 2
+    fi
     sleep 0.5
 done
 if [ "$up" -ne 1 ]; then
-    printf '%sFAIL%s licensing-server 未能在 15s 内起监听（环境问题）\n' "$C_RED" "$C_OFF"
-    sed 's/^/        /' "${LOG}" | tail -20
+    printf '%sFAIL%s 就绪探测失败：15s 内 GET %s/updates/manifest 未返回成功\n' \
+        "$C_RED" "$C_OFF" "$BASE"
+    printf '        失败步骤：等待监听（进程仍在运行，端口未就绪或探测端点异常）\n'
+    printf '        —— 服务端日志尾部 ——\n'
+    sed 's/^/        /' "${LOG}" | tail -30
     exit 2
 fi
 ok "licensing-server 已监听 ${BASE}"
@@ -101,16 +125,25 @@ call() { # call <METHOD> <PATH> [JSON] [curl args...]
     if [ -n "$body" ]; then args+=( -d "$body" ); fi
     local a
     for a in "$@"; do [ -n "$a" ] && args+=( "$a" ); done
-    curl -sS -o "${WORKDIR}/body" -w '%{http_code}' "${args[@]}" 2>/dev/null \
-        || echo 000 >"${WORKDIR}/status"
+    # `-w '%{http_code}'` 输出到 **stdout**，必须由命令替换捕获。
+    # 早期实现误以为它写文件（`|| echo 000 >"${WORKDIR}/status"`），而 curl 成功时
+    # 该分支不执行 → 状态码文件从不生成 → `cat` 恒回退 "000"，所有断言都落在 000 上。
+    # `--noproxy '*'`：本机常驻 HTTP(S)_PROXY 会让 keep-alive 复用错乱
+    # （症状：首个请求成功、之后全 404，极具误导性）；`--max-time` 防卡死。
     local status
-    status="$(cat "${WORKDIR}/status" 2>/dev/null || echo 000)"
+    status="$(curl -sS --noproxy '*' --max-time 10 -o "${WORKDIR}/body" \
+        -w '%{http_code}' "${args[@]}" 2>/dev/null)" || status="000"
+    [ -n "$status" ] || status="000"
     HTTP_STATUS="$status"
     BODY_FILE="${WORKDIR}/body"
 }
-# code_of <path in json>：从响应体取 code 字段（无则空串）
+# code_of <k1> [k2 ...]：按嵌套路径从响应体取值（无则空串）。
+# ⚠️ 必须把**全部**路径分量透传给 python（`"$@"`）。早期实现只传 `"$1"`，
+# 于是 `code_of data token` 只走到 `data` 就停下、把整个对象 repr 当结果返回
+# （表现为「JWT 是一坨 dict」→ `Bearer {…}` → 所有鉴权请求 401）。同属
+# 「位置参数被吃掉」这一类事故（见下方 call() 注释）。
 code_of() {
-    python3 - "$BODY_FILE" "$1" <<'PY'
+    python3 - "$BODY_FILE" "$@" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
@@ -120,6 +153,27 @@ try:
     print(str(v) if v is not None else "")
 except Exception:
     print("")
+PY
+}
+
+# issue_body <tenant_id> <idempotency_key> [tier]：构造 `POST /admin/codes/issue` 请求体。
+# 2026-09-27 契约：`valid_from` / `valid_until` 是**字符串** epoch 秒；
+# `prebind_machine_code` 缺省/空白 → 400 MACHINE_CODE_REQUIRED（一机一码发放侧闭环）。
+# 字段缺失会被 axum 的 Json 提取器在**鉴权之前**拒为 422，从而掩盖真实的 401/403 判据。
+issue_body() {
+    python3 - "$1" "$2" "${3:-standard}" <<'PY'
+import json, sys, time
+tenant, idem, tier = sys.argv[1], sys.argv[2], sys.argv[3]
+now = int(time.time())
+print(json.dumps({
+    "tenant_id": tenant,
+    "tier": tier,
+    "valid_from": str(now - 1000),
+    "valid_until": str(now + 365 * 86400),
+    "count": 1,
+    "prebind_machine_code": "mc-" + idem,
+    "idempotency_key": idem,
+}))
 PY
 }
 
@@ -141,19 +195,26 @@ call POST /admin/tenants '{"tenant_id":"e2e-t1","name":"E2E Tenant","contact":"e
 assert_eq "C1.1 建租户 200" "200" "${HTTP_STATUS}"
 assert_eq "C1.1b 建租户未指定档位 → 默认 B" "B" "$(code_of data verify_mode_default)"
 
-ISSUE_BODY='{"tenant_id":"e2e-t1","tier":"standard","count":1,"idempotency_key":"e2e-issue-1"}'
+ISSUE_BODY="$(issue_body e2e-t1 e2e-issue-1)"
 call POST /admin/codes/issue "${ISSUE_BODY}" "${AUTH[@]}"
 assert_eq "C1.2 发码 200" "200" "${HTTP_STATUS}"
-CODE="$(python3 - "$BODY_FILE" <<'PY'
+FIRST_CODE="$(python3 - "$BODY_FILE" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding='utf-8', errors='replace'))
-    print(((d.get("data") or {}).get("codes") or [{}])[0].get("code", ""))
+    c = ((d.get("data") or {}).get("codes") or [{}])[0]
+    # 输出两行：code_id（内部标识，revoke 路由用）与 code（展示值）。
+    print(c.get("code_id", ""))
+    print(c.get("code", ""))
 except Exception:
+    print("")
     print("")
 PY
 )"
+CODE_ID="$(printf '%s\n' "${FIRST_CODE}" | sed -n '1p')"
+CODE="$(printf '%s\n' "${FIRST_CODE}" | sed -n '2p')"
 assert_ne "C1.2b 拿到激活码" "" "${CODE}"
+assert_ne "C1.2c 拿到激活码 ID（revoke 路由按 code_id 定位，不是码值）" "" "${CODE_ID}"
 
 # 关键断言：设备端 /activation **不携带任何认证**，用不存在的码激活。
 # 期望：被拒绝（400 INVALID_CODE / 验签失败），且**绝不能**返回 200 租约。
@@ -174,7 +235,12 @@ skip_assert "C1.4 同码异机（含锚点 ≤3/5）实跑 403 CODE_BOUND_TO_OTH
 # require_tenant_header），缺了返回 400 —— 这正是「客户端/匿名无法越权废弃」的一环。
 call GET "/admin/codes?tenant_id=e2e-t1" '' "${AUTH[@]}"
 assert_ne "C1.4b 带 JWT 可列码（证明 401 不是鉴权系统的常态）" "401" "${HTTP_STATUS}"
-call POST "/admin/codes/${CODE}/revoke" "$(python3 -c 'import json;print(json.dumps({"reason":"e2e cleanup","note":"e2e cleanup note for contract run","confirm_tail8":"'${CODE: -8}'"}))')" "${AUTH[@]}" -H "x-tenant-id: e2e-t1"
+# confirm_tail8 契约（service.rs:549）：**去分隔符后**尾 8 位（大写），
+# 不是原始末 8 字符（原始含连字符会 412）。revoke 路由是 `:code_id`，必须传 code_id
+# 而非码值——传码值会在 get_code_by_id 处查不到 → 400 BAD_REQUEST。
+TAIL8="$(python3 -c 'import sys;print("".join(c for c in sys.argv[1] if c.isalnum())[-8:].upper())' "${CODE}")"
+REVOKE_BODY="$(python3 -c 'import json,sys;print(json.dumps({"reason":"e2e cleanup","note":"e2e cleanup note for contract run","confirm_tail8":sys.argv[1]}))' "${TAIL8}")"
+call POST "/admin/codes/${CODE_ID}/revoke" "${REVOKE_BODY}" "${AUTH[@]}" -H "x-tenant-id: e2e-t1"
 REV_STATUS="${HTTP_STATUS}"
 assert_true "C1.5 已发放码可被厂商后台废弃（状态 ${REV_STATUS}）" \
     "$( [ "${REV_STATUS}" = "200" ] || [ "${REV_STATUS}" = "412" ] && echo 0 || echo 1 )" \
@@ -202,7 +268,7 @@ src_contains "C5.4 服务端档位解析覆盖 A/B/C" "crates/licensing-server/s
 section "C4 / fail-closed：客户端侧无管理端入口（实跑验证）"
 
 # 设备端请求一律不带 /admin 凭据 → 必须被挡（403 ADMIN_ONLY / 401 SESSION_EXPIRED）
-call POST /admin/codes/issue '{"tenant_id":"e2e-t1","tier":"standard","count":1,"idempotency_key":"anon-1"}'
+call POST /admin/codes/issue "$(issue_body e2e-t1 anon-1)"
 assert_ne "C4.1 无 JWT 发放码不得成功（200/201）" "200" "${HTTP_STATUS}"
 assert_ne "C4.1b 亦不得为 201" "201" "${HTTP_STATUS}"
 A_CODE="$(code_of code)"
@@ -214,7 +280,7 @@ assert_ne "C4.2 错误凭据登录不得 200" "200" "${HTTP_STATUS}"
 
 # 客户端若真有「废弃/重发」入口，会打在 daemon 的管理面上；此处只验证 licensing-server
 # 侧的管理端写端点必须由厂商管理员调用（RBAC 门控实跑）
-call POST /admin/codes/issue '{"tenant_id":"e2e-t1","tier":"standard","count":1,"idempotency_key":"lic-ops-1"}' -H "authorization: Bearer not-a-real-jwt"
+call POST /admin/codes/issue "$(issue_body e2e-t1 lic-ops-1)" -H "authorization: Bearer not-a-real-jwt"
 assert_ne "C4.3 伪造 JWT 不得发码成功" "200" "${HTTP_STATUS}"
 
 # ===========================================================================
@@ -234,6 +300,8 @@ assert_eq "FC.2 合法档位 A 写入 200" "200" "${HTTP_STATUS}"
 section "服务端日志关键字（授权事件留痕）"
 LOG_TEXT="$(cat "${LOG}" 2>/dev/null || true)"
 assert_contains "LOG.1 启动行含监听地址" "${LOG_TEXT}" "licensing-server listening"
-assert_contains "LOG.2 日志含授权相关事件/级别" "${LOG_TEXT}" "info"
+# tracing_subscriber 把级别打印为**大写** `INFO`（且带 ANSI 颜色码）；断言须用大写，
+# 否则对着 `\x1b[32m INFO\x1b[0m` 永远匹配不到小写 `info`（脚本侧假 FAIL）。
+assert_contains "LOG.2 日志含授权相关事件/级别" "${LOG_TEXT}" "INFO"
 
 report "contract-runtime-server.sh"
