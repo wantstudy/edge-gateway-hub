@@ -18,7 +18,7 @@
 | 交付物 | 说明 |
 |---|---|
 | [`IoT-DAQ-Gateway_0.1.0_x64-setup.exe`](https://github.com/wantstudy/edge-gateway-hub/raw/main/downloads/IoT-DAQ-Gateway_0.1.0_x64-setup.exe) | Windows 10/11 x64 安装包（NSIS，含 daemon 与桌面控制台） |
-| [`iot-daq-gateway_v0.1.0_amd64.tar.gz`](https://github.com/wantstudy/edge-gateway-hub/raw/main/downloads/iot-daq-gateway_v0.1.0_amd64.tar.gz) | Linux amd64 Docker 镜像（`docker load` 导入） |
+| **Docker 镜像** | `docker pull wantstudy/iot-daq-gateway:0.1.0`（linux/amd64，93.8MB 源镜像） |
 
 ---
 
@@ -33,11 +33,11 @@
 
 ## 快速开始 B：Docker（Linux amd64）
 
-### 1. 导入镜像
+### 1. 拉取镜像
 
 ```bash
-docker load < iot-daq-gateway_v0.1.0_amd64.tar.gz
-# → Loaded image: iot-daq-gateway:0.1.0
+docker pull wantstudy/iot-daq-gateway:0.1.0
+# → 93.8MB 源镜像，约 26MB 最终容器体积
 ```
 
 ### 2. 准备宿主目录
