@@ -91,35 +91,23 @@
             <span class="ac-card__sub">B 档核心证据</span>
           </div>
           <div class="ac-card__body">
-            <div class="ac-coverage">
-              <div
-                v-for="cell in coverage"
-                :key="cell.hour"
-                class="ac-coverage__cell"
-                :class="{ 'ac-coverage__cell--gap': cell.kind === 'gap', 'ac-coverage__cell--miss': cell.kind === 'missing' }"
-                :title="`第 ${cell.hour} 小时：${cell.kind === 'gap' ? '序号跳空' : cell.kind === 'missing' ? '未收到回执' : '回执正常'}`"
-              />
-            </div>
-            <div class="ac-legend">
-              <span><i style="background: #e8ffea; border: 1px solid #b5f0ce" />回执正常</span>
-              <span><i style="background: #ffece8; border: 1px solid #ffcdc5" />序号跳空</span>
-              <span><i style="background: #f2f3f5; border: 1px solid var(--border)" />缺失</span>
-            </div>
+            <EmptyState
+              title="无逐小时回执覆盖数据"
+              desc="授权端当前只有设备级回执摘要（状态 / 跳空次数），没有逐小时序号区间明细接口。此处按诚实空态处理，不用演示数据填充。"
+            />
             <dl class="ac-kv">
-              <dt>最新区间号</dt>
-              <dd class="ac-mono">#1216</dd>
-              <dt>近 24h 条数</dt>
-              <dd class="ac-mono">1,796,400</dd>
-              <dt>摘要哈希</dt>
-              <dd class="ac-mono">b7c1e9…44a0</dd>
-              <dt>回执延迟</dt>
-              <dd>平均 42s（允许延迟补报）</dd>
+              <dt>回执状态</dt>
+              <dd><StatusTag :status="device.receiptStatus" /></dd>
+              <dt>跳空次数</dt>
+              <dd class="ac-mono">{{ device.gapCount && device.gapCount !== '0' ? device.gapCount : '0' }}</dd>
+              <dt>最近心跳</dt>
+              <dd class="ac-mono">{{ formatDateTime(device.lastHeartbeatAt) }}</dd>
             </dl>
             <p class="ac-note">
               <span class="ac-note__icon">ⓘ</span>
               <span>
-                每格为 1 小时的序号区间覆盖。<b>回执异常不等于破解</b>，
-                须先核实是否检修 / 断电 / 更换硬件，再判定处置（运维手册第 4 章）。
+                <b>回执异常不等于破解</b>，须先核实是否检修 / 断电 / 更换硬件，
+                再判定处置（运维手册第 4 章）。
               </span>
             </p>
           </div>
@@ -133,10 +121,13 @@
           <span class="ac-card__sub">缺失点标红</span>
         </div>
         <div class="ac-card__body">
-          <BarChart :labels="hbLabels" :series="hbSeries" :height="150" />
+          <EmptyState
+            title="无心跳时序数据"
+            desc="授权端未提供按日心跳序列（仅有设备级「最近心跳」）。此处按诚实空态处理，不用演示数据填充。"
+          />
           <p class="ac-note">
             <span class="ac-note__icon">ⓘ</span>
-            <span>09-21 缺失一次心跳：客户端在 7 天离线宽限期内仍正常转发（设计如此，属宽限而非故障）。</span>
+            <span>客户端在 7 天离线宽限期内仍正常转发（设计如此，属宽限而非故障）。</span>
           </p>
         </div>
       </section>
@@ -229,7 +220,6 @@ import {
   formatDateTime,
   can,
 } from '@ui-kit';
-import BarChart, { type BarSeries } from '../components/BarChart.vue';
 import { repo, REVOKE_REASONS, DEFAULT_ACTOR } from '../api/repo';
 import { session } from '../store/session';
 
@@ -253,28 +243,6 @@ const dualApproval = computed(() => session.state.dualApproval);
 
 /** 机器码锚点来源。 */
 const anchors: readonly string[] = ['宿主板 UUID（HMAC-SHA256 已签名）', '宿主物理网卡 MAC', '磁盘序列号'];
-
-/** 回执覆盖图（24 格；本设备有 2 处跳空 + 1 处缺失）。 */
-const coverage = computed(() =>
-  Array.from({ length: 24 }, (_, i) => {
-    const hour = i + 1;
-    const kind: 'ok' | 'gap' | 'missing' = hour === 9 || hour === 10 ? 'gap' : hour === 23 ? 'missing' : 'ok';
-    return { hour, kind };
-  }),
-);
-
-/** 心跳时序标签。 */
-const hbLabels: readonly string[] = ['09-17', '09-18', '09-19', '09-20', '09-21', '09-22', '09-23'];
-
-/** 心跳序列（09-21 缺失点标红）。 */
-const hbSeries: BarSeries[] = [
-  {
-    name: '心跳次数',
-    color: '#1F6FEB',
-    data: [1, 1, 1, 1, 0, 1, 1],
-    missFlag: [false, false, false, false, true, false, false],
-  },
-];
 
 /** 关联激活码原文（用于废弃确认的后 8 位校验）。 */
 const boundCodeRaw = computed(() => {

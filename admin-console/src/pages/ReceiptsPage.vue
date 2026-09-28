@@ -294,7 +294,7 @@ function submitDispose(): void {
 function exportCsv(): void {
   const rows = filtered.value;
   const header = '设备摘要,租户,异常类型,明细,首次出现,次数,处置状态';
-  const body = rows.map((r) => [r.deviceSummary, r.tenant, r.type, r.detail, r.firstSeen, r.count, r.disposition].join(',')).join('\n');
+  const body = rows.map((r) => [r.deviceSummary, r.tenant, r.type, r.detail, formatDateTime(r.firstSeen), r.count, r.disposition].join(',')).join('\n');
   const blob = new Blob([`\uFEFF${header}\n${body}`], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

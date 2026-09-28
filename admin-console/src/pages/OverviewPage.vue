@@ -143,7 +143,7 @@
  */
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import { PageHeader, StatCard, StatusTag, SEMANTIC, type PageId } from '@ui-kit';
+import { PageHeader, StatCard, StatusTag, SEMANTIC, formatMonthDay, type PageId } from '@ui-kit';
 import { repo, type ActivationTrendPoint } from '../api/repo';
 import BarChart, { type BarSeries } from '../components/BarChart.vue';
 
@@ -172,16 +172,8 @@ onMounted(async () => {
 /** 空态：无任何日桶（后端无记录 / 端点不可用——真实原因见全局横幅）。 */
 const trendEmpty = computed(() => trendPoints.value.length === 0);
 
-/** unix 秒字符串 → `MM-DD` 标签（时间戳为秒级整数，安全转换）。 */
-function dayLabel(dateSecs: string): string {
-  const secs = Number(dateSecs);
-  if (dateSecs === '' || !Number.isFinite(secs)) {
-    return '—';
-  }
-  const d = new Date(secs * 1000);
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
+/** unix 秒字符串 → `MM-DD` 标签（收敛到 @ui-kit/time 单一出口；UTC 日锚点避免跨时区偏一天）。 */
+const dayLabel = (dateSecs: string): string => formatMonthDay(dateSecs);
 
 /** 趋势 X 轴标签。 */
 const trendLabels = computed<readonly string[]>(() => trendPoints.value.map((p) => dayLabel(p.date)));

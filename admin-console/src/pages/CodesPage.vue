@@ -88,7 +88,7 @@
           </template>
           <!-- 有效期 -->
           <template #cell-validUntil="{ row }">
-            <span class="ac-mono">{{ row.validUntil }}</span>
+            <span class="ac-mono">{{ formatDate(row.validUntil) }}</span>
           </template>
           <!-- 溯源 -->
           <template #cell-trace="{ row }">
@@ -358,6 +358,7 @@ import {
   maskMachineSummary,
   isValidMachineCode,
   formatDateTime,
+  formatDate,
   can,
   type SelectOption,
   type RadioOption,
@@ -497,7 +498,7 @@ function exportCsv(): void {
   const header = '激活码,状态,租户,tier,有效期,绑定设备摘要,创建时间';
   const body = rows
     .map((r) =>
-      [maskCode(r.code), r.status, r.tenant, r.tier, r.validUntil, r.boundDeviceSummary ? maskMachineSummary(r.boundDeviceSummary) : '-', r.createdAt].join(','),
+      [maskCode(r.code), r.status, r.tenant, r.tier, formatDate(r.validUntil), r.boundDeviceSummary ? maskMachineSummary(r.boundDeviceSummary) : '-', formatDateTime(r.createdAt)].join(','),
     )
     .join('\n');
   const blob = new Blob([`\uFEFF${header}\n${body}`], { type: 'text/csv;charset=utf-8' });

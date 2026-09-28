@@ -55,7 +55,7 @@ import {
 export * from '../mock/mock-data';
 
 import { API_MODE, ApiError, adminRequest } from './client';
-import { formatTimestampText } from '../utils/time';
+import { formatDateTime, formatTimestampText } from '../utils/time';
 
 // 再导出模式常量，页面可统一从本模块取用
 export { API_MODE } from './client';
@@ -634,7 +634,9 @@ function buildCodeRecordFromDetail(raw: Record<string, unknown>): CodeRecord {
     const t = asRecord(entry);
     const mapped = mapTimelineAction(pickStr(t, 'action', ''));
     return {
-      time: pickStr(t, 'at', ''),
+      // 后端 `at` 是**裸 epoch 秒串**（proto.rs TimelineEntry.at），必须在此边界格式化：
+      // 页面 / ui-kit 组件严禁裸显时间戳（否则时间线会直接显示 10 位数字）。
+      time: formatDateTime(pickStr(t, 'at', '')),
       action: mapped.action,
       tone: mapped.tone,
       operator: pickStr(t, 'actor', ''),

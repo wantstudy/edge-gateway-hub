@@ -42,6 +42,9 @@ export {
   MACHINE_CODE_PATTERN,
 } from './mask';
 
+// ---------- 时间格式化（唯一出口；页面严禁裸显 epoch）----------
+export { parseTime, formatDate, formatMonthDay, formatClock, formatRelative, TIME_PLACEHOLDER } from './time';
+
 // ---------- RBAC（页面级 + 操作级矩阵）----------
 export {
   ROLES,

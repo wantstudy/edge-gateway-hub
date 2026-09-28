@@ -1,60 +1,27 @@
 /**
- * 把 10 位 epoch 秒或 13 位 epoch 毫秒格式化为本地日期时间。
+ * @file time.ts
+ * @module web-console/utils/time
+ * @description 时间戳展示格式化（**严禁页面裸显 epoch**）。
  *
- * JSON 大数红线：只在纯 10/13 位数字通过正则校验后进行 Number 转换，
- * 且转换结果仅传给 Date 用于展示。uint64 / 纳秒时间戳等超过 15 位的字符串
- * 绝不数值化，统一返回空态，避免精度损失或把原始时间戳暴露到页面。
+ * **实现已收敛到 [`@ui-kit/time`](../../../ui-kit/src/time.ts) 单一出口**：
+ * 网关端（web-console）与授权端（admin-console）共用同一套
+ * 「按位数识别单位（秒/毫秒/微秒/纳秒） + BigInt 取秒 + 位数不可判定即诚实空态」
+ * 的逻辑，避免出现两份漂移口径。
+ *
+ * 这里保留历史函数名（`formatTimestampText` / `formatNanoTimestampText`）纯粹为了
+ * 兼容既有调用点，底层逻辑与页面完全同源。
  */
-export function formatTimestampText(value: string | number | null | undefined): string {
-  if (value === null || value === undefined) {
-    return '—';
-  }
+import { formatDateTime, TIME_PLACEHOLDER } from '@ui-kit/time';
 
-  const text = String(value).trim();
-  if (!text) {
-    return '—';
-  }
-
-  const millisecondsText = /^\d{10}$/.test(text) ? `${text}000` : /^\d{13}$/.test(text) ? text : '';
-  if (!millisecondsText) {
-    return '—';
-  }
-
-  const milliseconds = Number(millisecondsText);
-  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
-    return '—';
-  }
-
-  const date = new Date(milliseconds);
-  if (Number.isNaN(date.getTime())) {
-    return '—';
-  }
-
-  const pad = (part: number): string => String(part).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-}
+export { formatDateTime, formatDateTime as formatTimestampText, TIME_PLACEHOLDER } from '@ui-kit/time';
 
 /**
  * epoch 纳秒字符串（SSE 帧 `ts` / 审计 `ts_ns`，约 19 位）→ `YYYY-MM-DD HH:mm:ss`。
  *
- * JSON 大数红线：纳秒串远超 `Number` 安全整数区间，**绝不整串数值化**；只截取秒段
- * （去掉末 9 位）后交给 `formatTimestampText`。10 位秒 / 13 位毫秒按原样识别；
- * 非纯数字或位数不足（无法判定位意）一律回 `—`。
+ * 新实现**原生支持** 19 位纳秒（按位数识别单位 + BigInt 整除，全程不把整串数值化），
+ * 故本函数即 [`formatTimestampText`] 的同义别名；非纯数字 / 位数不可判定时回 `—`。
  */
-export function formatNanoTimestampText(value: string | number | null | undefined): string {
-  if (value === null || value === undefined) {
-    return '—';
-  }
-
-  const text = String(value).trim();
-  if (!/^\d+$/.test(text)) {
-    return '—';
-  }
-
-  // >13 位视为纳秒：截掉末 9 位得到 10 位秒段，全程不把整串转成 Number。
-  const secondsText = text.length > 13 ? text.slice(0, -9) : text;
-  return formatTimestampText(secondsText);
-}
+export const formatNanoTimestampText = formatDateTime;
 
 /** 自由文本中可识别的内嵌 epoch 数字段：19 位纳秒 / 13 位毫秒 / 10 位秒（词边界精确匹配）。 */
 const EMBEDDED_EPOCH_RE = /(?<!\d)(\d{19}|\d{13}|\d{10})(?!\d)/g;
@@ -75,8 +42,8 @@ export function formatEmbeddedTimestamps(text: string): string {
     return text;
   }
   return text.replace(EMBEDDED_EPOCH_RE, (run) => {
-    const formatted = run.length === 19 ? formatNanoTimestampText(run) : formatTimestampText(run);
-    if (formatted === '—') {
+    const formatted = formatDateTime(run);
+    if (formatted === TIME_PLACEHOLDER) {
       return run;
     }
     const year = Number(formatted.slice(0, 4));

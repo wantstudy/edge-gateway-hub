@@ -45,9 +45,9 @@
             <dt>状态</dt>
             <dd><StatusTag :status="activeKey.status" /></dd>
             <dt>启用时间</dt>
-            <dd class="ac-mono">{{ activeKey.activatedAt }}</dd>
+            <dd class="ac-mono">{{ formatDateTime(activeKey.activatedAt) }}</dd>
             <dt>计划退役</dt>
-            <dd class="ac-mono">{{ activeKey.plannedRetireAt === '—' ? '—（未设置）' : `${activeKey.plannedRetireAt}（14 天后）` }}</dd>
+            <dd class="ac-mono">{{ activeKey.plannedRetireAt === '—' ? '—（未设置）' : formatDateTime(activeKey.plannedRetireAt) }}</dd>
             <dt>公钥指纹</dt>
             <dd class="ac-mono">{{ activeKey.fingerprint }}</dd>
           </dl>
@@ -93,10 +93,10 @@
           <StatusTag :status="row.status" />
         </template>
         <template #cell-activatedAt="{ row }">
-          <span class="ac-mono">{{ row.activatedAt }}</span>
+          <span class="ac-mono">{{ formatDateTime(row.activatedAt) }}</span>
         </template>
         <template #cell-retiredAt="{ row }">
-          <span class="ac-mono">{{ row.retiredAt }}</span>
+          <span class="ac-mono">{{ formatDateTime(row.retiredAt) }}</span>
         </template>
         <template #cell-fingerprint="{ row }">
           <span class="ac-mono">{{ row.fingerprint }}</span>
@@ -144,7 +144,7 @@
  * @description 签名密钥管理页（仅 system 角色）。
  */
 import { computed, ref } from 'vue';
-import { PageHeader, StatusTag, UiTable, EmptyState, RoleGate, DangerConfirmModal, can, type TableColumn } from '@ui-kit';
+import { PageHeader, StatusTag, UiTable, EmptyState, RoleGate, DangerConfirmModal, formatDateTime, can, type TableColumn } from '@ui-kit';
 import { repo, DEFAULT_ACTOR } from '../api/repo';
 import { session } from '../store/session';
 

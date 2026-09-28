@@ -55,7 +55,7 @@
               <dt>tier</dt>
               <dd>{{ code.tier }}</dd>
               <dt>有效期</dt>
-              <dd class="ac-mono">{{ code.validFrom }} → {{ code.validUntil }}</dd>
+              <dd class="ac-mono">{{ formatDate(code.validFrom) }} → {{ formatDate(code.validUntil) }}</dd>
               <dt>来源订单</dt>
               <dd class="ac-mono">{{ code.orderId }}</dd>
               <dt>预绑定机器码</dt>
@@ -208,6 +208,7 @@ import {
   maskCode,
   maskMachineSummary,
   formatDateTime,
+  formatDate,
   can,
   type TimelineNode,
 } from '@ui-kit';

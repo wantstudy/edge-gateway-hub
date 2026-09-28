@@ -72,7 +72,8 @@
             <StatusTag :status="row.licenseStatus" />
           </template>
           <template #cell-lastHeartbeatAt="{ row }">
-            <span class="ac-mono">{{ shortTime(row.lastHeartbeatAt) }}</span>
+            <!-- 后端下发裸 epoch 串：必须格式化，绝不再用「按空格切分」的假紧凑（对 epoch 无空格会原样透传） -->
+            <span class="ac-mono" :title="formatRelative(row.lastHeartbeatAt)">{{ formatDateTime(row.lastHeartbeatAt) }}</span>
           </template>
           <template #cell-receiptStatus="{ row }">
             <StatusTag
@@ -108,6 +109,8 @@ import {
   StatusTag,
   EmptyState,
   maskMachineSummary,
+  formatDateTime,
+  formatRelative,
   type SelectOption,
   type TableColumn,
 } from '@ui-kit';
@@ -183,12 +186,6 @@ const columns: readonly TableColumn[] = [
   { key: 'receiptStatus', label: '回执异常' },
 ];
 
-/** 只显示时分（列表紧凑）。 */
-function shortTime(value: string): string {
-  const parts = value.split(' ');
-  return parts.length === 2 ? parts[1] : value;
-}
-
 /** 换页。 */
 function onPage(next: number): void {
   page.value = next;
@@ -217,7 +214,7 @@ function exportCsv(): void {
   const header = '设备ID,租户,设备名,机器码摘要,部署形态,镜像digest,档位,租约状态,最近心跳,回执';
   const body = rows
     .map((d) =>
-      [d.id, d.tenant, d.name, maskMachineSummary(d.machineSummary), d.deployMode, d.imageDigest ?? '-', d.grade, d.licenseStatus, d.lastHeartbeatAt, d.receiptStatus].join(','),
+      [d.id, d.tenant, d.name, maskMachineSummary(d.machineSummary), d.deployMode, d.imageDigest ?? '-', d.grade, d.licenseStatus, formatDateTime(d.lastHeartbeatAt), d.receiptStatus].join(','),
     )
     .join('\n');
   const blob = new Blob([`\uFEFF${header}\n${body}`], { type: 'text/csv;charset=utf-8' });

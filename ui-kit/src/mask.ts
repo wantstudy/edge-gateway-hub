@@ -148,45 +148,19 @@ export function isValidMachineCode(raw: string | null | undefined): boolean {
   return MACHINE_CODE_PATTERN.test(raw.replace(/[^A-Za-z0-9]/g, ''));
 }
 
-/** 时间统一显示格式（设计系统 §5：`YYYY-MM-DD HH:mm:ss`）。 */
-export function formatDateTime(input: string | number | Date | null | undefined): string {
-  if (input === null || input === undefined || input === '') {
-    return '—';
-  }
-  const d = input instanceof Date ? input : new Date(input);
-  if (Number.isNaN(d.getTime())) {
-    return String(input);
-  }
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
 /**
- * 相对时间（「6 分钟前」），用于表格辅助列与悬停提示。
+ * 时间统一显示格式（设计系统 §5：`YYYY-MM-DD HH:mm:ss`）。
  *
- * @param input 时间
- * @param now 基准时间（便于测试注入）
+ * **实现已迁移至 [`./time`](./time.ts)**：旧实现在 `new Date(epoch 数字串)` 解析失败时
+ * `return String(input)`，把 10 位 epoch 串原样透传回页面（裸显根因）。此处仅保留
+ * 再导出，保持既有导入路径（`@ui-kit` → `./mask`）不变。
  */
-export function relativeTime(input: string | number | Date | null | undefined, now: Date = new Date()): string {
-  if (input === null || input === undefined || input === '') {
-    return '—';
-  }
-  const d = input instanceof Date ? input : new Date(input);
-  if (Number.isNaN(d.getTime())) {
-    return '—';
-  }
-  const diffSec = Math.floor((now.getTime() - d.getTime()) / 1000);
-  if (diffSec < 0) {
-    return '刚刚';
-  }
-  if (diffSec < 60) {
-    return `${diffSec} 秒前`;
-  }
-  if (diffSec < 3600) {
-    return `${Math.floor(diffSec / 60)} 分钟前`;
-  }
-  if (diffSec < 86400) {
-    return `${Math.floor(diffSec / 3600)} 小时前`;
-  }
-  return `${Math.floor(diffSec / 86400)} 天前`;
-}
+export {
+  formatDateTime,
+  formatDate,
+  formatClock,
+  formatRelative,
+  relativeTime,
+  parseTime,
+  TIME_PLACEHOLDER,
+} from './time';

@@ -5,7 +5,7 @@
   -->
   <ol class="uik-tl">
     <li v-for="(node, i) in nodes" :key="i" class="uik-tl__item" :class="`uik-tl__item--${node.tone}`">
-      <div class="uik-tl__time">{{ node.time }}</div>
+      <div class="uik-tl__time">{{ renderTime(node.time) }}</div>
       <div class="uik-tl__title">
         <span class="uik-tl__badge">{{ node.action }}</span>
         <span v-if="node.target" class="uik-tl__target">{{ node.target }}</span>
@@ -26,6 +26,7 @@
  * @description 激活码生命周期时间线（纯展示）。
  */
 import type { Tone } from '../tokens';
+import { formatDateTime } from '../time';
 
 /** 时间线节点。 */
 export interface TimelineNode {
@@ -51,6 +52,18 @@ interface Props {
 }
 
 defineProps<Props>();
+
+/**
+ * 渲染节点时间。
+ *
+ * 组件是**纯展示**层，但仍对「裸 epoch」做最后一道防御：若调用方漏了格式化、
+ * 直接把后端 epoch 串（纯数字，≥8 位）塞进来，这里兜底格式化，
+ * **绝不把数字串透传到页面**（项目红线）。已是 `YYYY-MM-DD HH:mm:ss` 的
+ * 可读串原样透传（幂等，不会二次格式化）。
+ */
+function renderTime(value: string): string {
+  return /^\d{8,}$/.test(value.trim()) ? formatDateTime(value) : value;
+}
 </script>
 
 <style scoped>

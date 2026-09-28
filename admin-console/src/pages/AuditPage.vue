@@ -61,7 +61,7 @@
       <template v-else>
         <UiTable :columns="columns" :rows="paged.items" row-key-field="id">
           <template #cell-ts="{ row }">
-            <span class="ac-mono">{{ row.ts }}</span>
+            <span class="ac-mono">{{ formatDateTime(row.ts) }}</span>
           </template>
           <template #cell-actor="{ row }">
             {{ row.actor }}（{{ row.actorType === 'human' ? '人工' : '系统' }}）
@@ -108,6 +108,7 @@ import {
   EmptyState,
   RoleGate,
   maskIp,
+  formatDateTime,
   can,
   type SelectOption,
   type TableColumn,
@@ -202,7 +203,7 @@ function exportCsv(): void {
   const rows = repo.queryAudit({ actorType: '', action: '', entityType: '', entityId: '', page: 1, pageSize: 100000 }).items;
   const header = '时间,操作者,操作者类型,操作,对象类型,对象标识,原因备注,来源IP,结果';
   const body = rows
-    .map((r) => [r.ts, r.actor, r.actorType, r.action, r.entityLabel, r.entityId, r.detail, maskIp(r.ip), r.result].join(','))
+    .map((r) => [formatDateTime(r.ts), r.actor, r.actorType, r.action, r.entityLabel, r.entityId, r.detail, maskIp(r.ip), r.result].join(','))
     .join('\n');
   const blob = new Blob([`\uFEFF${header}\n${body}`], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
