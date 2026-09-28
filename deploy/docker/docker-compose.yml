@@ -123,9 +123,24 @@ services:
       IOT_DAQ_HOST_MAC: ${IOT_DAQ_HOST_MAC:-}
       # 容器内自行采集开关：必须为 0（禁止回退到容器内 machine-id / 容器 MAC / 主机名）
       IOT_DAQ_ALLOW_CONTAINER_ANCHORS: "0"
+      # ★ 已接线：覆盖 [gateway.licensing].cloud_url。
+      #   容器内配置文件位于只读的 /etc/iot-daq/gateway.toml（read_only: true 且未挂载本路径），
+      #   运行期无法改文件 → 本 env 是容器形态下唯一可用的授权基址注入通道（daemon config.rs）。
+      #   留空 = 纯本地模式（不启用云端激活）。
       IOT_DAQ_LICENSE_SERVER_URL: ${IOT_DAQ_LICENSE_SERVER_URL:-}
+      # ★ 已接线：单位【秒】；覆盖 [gateway.licensing].heartbeat_interval_secs。
+      #   非法值（0 / 非数字）记 warn 并回退配置文件值，绝不降级为 0 秒心跳。
       IOT_DAQ_LEASE_HEARTBEAT_SECS: ${IOT_DAQ_LEASE_HEARTBEAT_SECS:-300}
-      IOT_DAQ_LEASE_GRACE_SECS: ${IOT_DAQ_LEASE_GRACE_SECS:-86400}
+      # 注：离线宽限期旋钮是 [gateway.licensing].grace_days（单位【天】），无秒级同名键；
+      #     daemon 侧不存在 IOT_DAQ_LEASE_GRACE_SECS 消费者，故不在此声明。
+      # ★ 已接线：系统更新（OTA）——容器形态启用 OTA 的唯一通道（config.rs 逐项覆盖
+      #   [gateway.ota]）。默认空 = 不启用；口径与 deploy/.env.example §5 一致。
+      #   IOT_DAQ_OTA_MANIFEST_URL 留空时按 IOT_DAQ_LICENSE_SERVER_URL 推导
+      #   （{cloud_url}/updates/manifest）。
+      IOT_DAQ_OTA_ENABLED: ${IOT_DAQ_OTA_ENABLED:-}
+      IOT_DAQ_OTA_SIGNING_KEY_B64: ${IOT_DAQ_OTA_SIGNING_KEY_B64:-}
+      IOT_DAQ_OTA_MANIFEST_URL: ${IOT_DAQ_OTA_MANIFEST_URL:-}
+      IOT_DAQ_OTA_CURRENT_VERSION: ${IOT_DAQ_OTA_CURRENT_VERSION:-}
       IOT_DAQ_HTTP_BIND: ${IOT_DAQ_HTTP_BIND:-0.0.0.0}
       # daemon 管理面端口（容器内监听，nginx 反代目标 = 此值）
       IOT_DAQ_HTTP_PORT: ${IOT_DAQ_HTTP_PORT:-8081}
@@ -138,8 +153,10 @@ services:
       # gateway 容器内置 nginx，不再依赖宿主 nginx
       IOT_DAQ_LOG_LEVEL: ${IOT_DAQ_LOG_LEVEL:-info}
       IOT_DAQ_LOG_JSON: ${IOT_DAQ_LOG_JSON:-false}
-      IOT_DAQ_TAMPER_POLICY: ${IOT_DAQ_TAMPER_POLICY:-restricted}
-      IOT_DAQ_OFFLINE_MODE: ${IOT_DAQ_OFFLINE_MODE:-1}
+      # 注：daemon 运行时自检发现篡改当前恒按 restricted 处理；策略可配尚未实现，
+      #     不存在 IOT_DAQ_TAMPER_POLICY 消费者，故不在此声明。
+      # 注：IOT_DAQ_OFFLINE_MODE 仅影响安装期（install.sh：跳过 registry 登录 /
+      #     在线验签 / 时间同步），运行时无消费者，故不在容器运行环境声明。
       TZ: ${IOT_DAQ_TZ:-Asia/Shanghai}
 
     # ---- 资源限制（deploy.md §2.3；≤8 设备用默认值）----

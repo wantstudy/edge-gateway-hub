@@ -16,9 +16,14 @@ gateway_id = "gw-local-dev"
 # ── 云端授权（**必配**：否则激活 / 心跳不可用）──
 # ⚠️ 必须配置本段（至少 `cloud_url`），否则新装实例「激活必然不通」，
 #    心跳与授权状态判定均不可用；仅在纯离线本地联调时才可整段留空。
-#    `cloud_url` 指向**部署方自有的授权服务基址**，勿填任何示例 / 看似真实的域名。
+#    `cloud_url` 指向**部署方自有的授权服务基址**；生产填部署方真实域名
+#      （如 `http://license.webscad.cn/licensing`），非「示例域名」。
 # [gateway.licensing]
-# cloud_url = "https://<授权端主机>:<端口>/v1"     # 【必配】云授权服务基址
+# cloud_url = "http://license.webscad.cn/licensing"    # 【必配】厂商授权服务基址（域名已固定）
+#   ⚠️ 末段必须是 `/licensing`：宿主 nginx 会**剥掉该前缀**再反代给授权端容器
+#      （授权端路由本身不带前缀，如 `/activate`、`/heartbeat`、`/admin/*`）。
+#      拼接示例：`{cloud_url}/activate` → `http://license.webscad.cn/licensing/activate`。
+#      不要再写 `/v1` —— 授权端**没有** `/v1` 前缀，写了必然 404。
 # heartbeat_interval_secs = 86400                 # 心跳间隔（秒，默认 24h）
 # trial_days = 3                                  # 试用天数（默认 3）
 # grace_days = 7                                  # 离线宽限天数（默认 7）
@@ -41,7 +46,11 @@ gateway_id = "gw-local-dev"
 #       机密性无保障；生产部署建议走可信内网。未配置 / enabled=false = 不发请求。
 # [gateway.ota]
 # enabled = false                                 # 【总开关】true 才启用检查；缺省 false
-# manifest_url = "http://<授权端主机>:<端口>/updates/manifest"   # 授权端下发端点（http）
+# manifest_url = "http://license.webscad.cn/licensing/updates/manifest"  # 授权端下发端点（http，不带端口）
+#   ⚠️ manifest_url **可省略**：省略时按 `{cloud_url}/updates/manifest` 推导
+#      （推导值只存内存、**不写回配置文件**，避免日后改 cloud_url 时残留陈旧 URL）；
+#      形态与 cloud_url 同基址，仅把路径换成 `{cloud_url}/updates/manifest`。
+#   仍须齐备「enabled + 有效 manifest 端点（显式或推导）+ 公钥」三者才发起检查，缺一即 no-op 只记 warn。
 # signing_key_b64 = "<授权端 OTA Ed25519 公钥 base64（32 字节）>"  # 验签公钥（缺则视为未配置）
 # poll_interval_secs = 3600                       # 轮询周期（秒，默认 3600；首个周期后才检查）
 # current_version = 0                             # 网关当前 OTA 版本号（u64 单调；缺省 0）

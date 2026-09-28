@@ -104,7 +104,8 @@ F:/xy/iot-daq
 │   │   ├── context/web-console-dist/     ★ 打进镜像的前端产物（跟踪入库，CI 守卫对象）
 │   │   └── healthprobe/main.rs           零依赖 TCP 探针（distroless 无 shell）
 │   ├── licensing/              授权端单机部署：docker-compose.yml + .env.example
-│   ├── nginx/                  宝塔宿主 nginx vhost：iot-daq-licensing.conf
+│   ├── nginx/                  宝塔宿主 nginx vhost：iot-daq-licensing.conf（线上落地名 iot-daq-both.conf，`:9013`）
+│   │                           + iot-daq-license-domain.conf（公网域名 `license.webscad.cn` 的 `:80` 入口）
 │   ├── scripts/                install/uninstall/build-offline-bundle/sign-and-verify/
 │   │                           render-dockerfile-digests/check-image-contents/
 │   │                           check-web-console-dist/detect-serial + license-e2e/
@@ -181,7 +182,8 @@ cd /f/xy/iot-daq
 cargo run -p licensing-server
 ```
 
-- 监听 **`0.0.0.0:7080`**（`IOT_DAQ_LISTEN_ADDR` 覆盖）；数据库默认 `./licensing.db`
+- 监听 **`0.0.0.0:7080`**（`IOT_DAQ_LISTEN_ADDR` 覆盖；此 7080 为**本地直跑默认值**，
+  容器部署统一用 **9010**，见 §5.2 端口对照）；数据库默认 `./licensing.db`
   （`IOT_DAQ_LICENSE_DB` 覆盖，已被 `.gitignore` 忽略）。
 - 管理员凭据（fail-closed：`_SHA256` 与明文都缺 → 登录全拒）：
   `IOTDAQ_ADMIN_USER`（默认 `admin`）、`IOTDAQ_ADMIN_PASSWORD_SHA256`（推荐，恰好 64 位小写 hex，
@@ -213,8 +215,10 @@ cd /f/xy/iot-daq/admin-console && npm install && npm run dev   # → http://loca
 
 **授权端 baseURL 的前缀陷阱**：`admin-console/src/api/client.ts` 里 `BASE_PATH = '/licensing'` 是
 **硬编码同源相对前缀**，而后端路由本身不带前缀（如 `/admin/auth/login`）。因此
-**生产环境的宿主 nginx 必须 `proxy_pass http://127.0.0.1:7080/`（带尾斜杠）来剥前缀**
-——见 `deploy/nginx/iot-daq-licensing.conf`。少写尾斜杠会导致 404。
+**生产环境的宿主 nginx 必须 `proxy_pass http://127.0.0.1:9010/`（带尾斜杠）来剥前缀**
+——见 `deploy/nginx/iot-daq-licensing.conf`（线上落地名 `iot-daq-both.conf`）。少写尾斜杠会导致 404。
+（另有 `deploy/nginx/iot-daq-license-domain.conf` 提供**公网域名 `license.webscad.cn` 的 80 入口**，
+同样剥 `/licensing` 前缀转发到 `127.0.0.1:9010`。）
 
 ---
 
@@ -314,7 +318,7 @@ IOT_DAQ_VERSION='1.0.0' \
 | 基础镜像 **digest pin** | 禁可变 tag / `:latest`；digest 由 `base-images.lock.yaml` 渲染注入，不手写 |
 | **机器码取宿主** | 只读挂载宿主 `/etc/machine-id`、`/sys/class/dmi/id`；`IOT_DAQ_ALLOW_CONTAINER_ANCHORS=0` 禁止回退容器内标识 |
 | **授权状态落宿主卷** | `read_only: true` + 唯一 rw 卷 `${IOT_DAQ_DATA_DIR}:/var/lib/iot-daq`；`docker rm && docker run` 不能重置试用 |
-| **端口联动** | `IOT_DAQ_WEB_PORT`（对外，默认 8080）/ `IOT_DAQ_HTTP_PORT`（容器内 daemon，默认 8081），由 `deploy/docker/start.sh` 用 `envsubst` 渲染进 nginx 模板；写死其一即会产生「页面能开、API 全 502」 |
+| **端口联动** | `IOT_DAQ_WEB_PORT`（对外，默认 8080；**本现场为 9012**，见 §5.2）/ `IOT_DAQ_HTTP_PORT`（容器内 daemon，默认 8081；**本现场为 9011**），由 `deploy/docker/start.sh` 用 `envsubst` 渲染进 nginx 模板；写死其一即会产生「页面能开、API 全 502」 |
 | **运行身份固定** | compose 显式 `user: "65532:65532"`，宿主卷与 tmpfs 属主必须对齐（否则 `cap_drop: ALL` 下写拒） |
 | **安全** | 非 root、`cap_drop: ALL`、`no-new-privileges`；禁 `--privileged`、禁挂 `/var/run/docker.sock`；镜像层不含密钥/激活码/指纹 |
 | 现有基础镜像 | builder `rust:1.88-slim-bookworm`（含 `musl-tools`，编 musl 静态二进制）；runtime `nginx:1.25-alpine`（容器内置 nginx，同时承载静态页与反代） |
@@ -336,18 +340,35 @@ IOT_DAQ_VERSION='1.0.0' \
 
 ### 5.2 正式服务器（实测现状）
 
-| 项 | 值 | 来源 |
-|---|---|---|
-| 主机 | `60.205.8.146`（root） | `.workbuddy/memory/MEMORY.md`、`deploy/nginx/iot-daq-licensing.conf:24` |
-| 系统 | Alibaba Cloud Linux 3 / 4 核 / 内存 ~7.4G（可用 ~2.4G） | `.workbuddy/memory/MEMORY.md` |
-| 容器运行时 | Docker 26.1.3 + Compose v2.27 | 同上 |
-| 宿主 nginx | **由宝塔 v11.4.1 托管**；vhost 目录 `/www/server/panel/vhost/nginx/*.conf` | `deploy/nginx/iot-daq-licensing.conf:13` |
-| 端口占用 | `80` / `443` / `888` / `1122` **已被他人既有站点占用**（`lnanyuda.com` 等）——**勿动他人服务** | `.workbuddy/memory/MEMORY.md` |
-| 授权端容器 | `iot-daq-licensing-server`，端口**只绑回环 `127.0.0.1:7080`**，外网经宿主 nginx `:80` 反代 | `deploy/licensing/docker-compose.yml:57`、`deploy/nginx/iot-daq-licensing.conf:47` |
-| 授权端数据卷 | `/opt/iot-daq/licensing/data`（宿主，须 `chown 65532:65532`） | `deploy/licensing/docker-compose.yml:19-20,63` |
-| 授权端凭据 | `/opt/iot-daq/licensing/.env`（**不入库**） | `.workbuddy/memory/MEMORY.md` |
-| 网关端对外端口 | 现场用 **9012**（宿主 8080 被宝塔的他人 Java 服务占用，故 `IOT_DAQ_WEB_PORT=9012`）；客户环境无冲突时用默认 8080 | `.workbuddy/memory/2026-09-27.md` |
-| 网关端内网授权地址 | `gateway.toml` 的 `[gateway.licensing].cloud_url` 指向宿主上的授权端点 | 同上 |
+| 项 | 值 |
+|---|---|
+| 主机 | `60.205.8.146`（root）；公网域名 **`license.webscad.cn` → `60.205.8.146`**（已解析） |
+| 系统 | Alibaba Cloud Linux 3 / 4 核 / 内存 ~7.4G（可用 ~2.4G） |
+| 容器运行时 | Docker 26.1.3 + Compose v2.27 |
+| 宿主 nginx | 由**宝塔 v11.4.1 托管**；vhost 目录 `/www/server/panel/vhost/nginx/*.conf` |
+| 端口占用 | `80` / `443` / `888` / `1122` **已被他人既有站点占用**（`lnanyuda.com` 等）——**勿动他人服务** |
+| 授权端容器 | `iot-daq-licensing-server`，端口**只绑回环 `127.0.0.1:9010`**，外网经宿主 nginx 反代 |
+| 授权端 vhost | `iot-daq-both.conf`（`:9013`，同 IP 直连）与 `iot-daq-license-domain.conf`（`:80`，域名入口） |
+| 授权端数据卷 | `/opt/iot-daq/licensing/data`（宿主，须 `chown 65532:65532`） |
+| 授权端凭据 | `/opt/iot-daq/licensing/.env`（**不入库**，权限 0600） |
+| 网关端容器 | `iot-daq-gateway`（**host 网络**，无 published 端口）：daemon 管理面 `9011`、容器内置 nginx web `9012` |
+| 网关端授权基址 | `[gateway.licensing].cloud_url = "http://license.webscad.cn/licensing"`（**域名，不带端口**） |
+
+#### 端口对照：本地开发 vs 线上部署
+
+iot-daq 在线上占用**专用端口段 `9010-9013`**（宿主 `80/443` 已被他人占用）。
+
+| 用途 | 本地开发（默认值） | 线上部署 | 覆盖方式 |
+|---|---|---|---|
+| 授权端容器监听 | `7080` | **`9010`** | `IOT_DAQ_LISTEN_ADDR`（容器内） |
+| 网关 daemon 管理面 | `8080` | **`9011`** | `IOT_DAQ_MGMT_BIND`（或 `IOT_DAQ_HTTP_PORT`） |
+| 网关 web（容器内置 nginx） | `8080` | **`9012`** | `IOT_DAQ_WEB_PORT` |
+| 授权端 vhost（IP 直连） | — | **`9013`** | 宿主 nginx `iot-daq-both.conf` |
+| 授权端域名入口 | — | **`80`**（`license.webscad.cn`） | 宿主 nginx `iot-daq-license-domain.conf` |
+| admin-console dev 代理目标 | `127.0.0.1:7080` | — | `admin-console/vite.config.ts`（**不随部署改变**） |
+
+> 口径：代码内 `DEFAULT_LISTEN_ADDR`（授权端）/ daemon 管理面默认端口是**本地直跑**默认值，
+> 容器部署一律由 env 覆盖为 `901x`。
 
 ### 5.3 授权端（licensing-server）部署
 
@@ -375,29 +396,40 @@ mkdir -p /opt/iot-daq/licensing/data && chown -R 65532:65532 /opt/iot-daq/licens
 cp deploy/licensing/.env.example /opt/iot-daq/licensing/.env   # 填真实值；.env 严禁入库
 # 关键变量：IOTDAQ_ADMIN_USER / IOTDAQ_ADMIN_PASSWORD_SHA256（64 hex）/ IOTDAQ_JWT_SECRET
 #           IOT_DAQ_LICENSE_SIGNING_KID + IOT_DAQ_LICENSE_SIGNING_KEY（成对，缺则签发 fail-closed）
+#           IOT_DAQ_LISTEN_ADDR / IOT_DAQ_HTTP_PORT（容器部署统一 9010）
 ```
 
 **④ 启动 + 健康检查**
 
 ```bash
 cd /opt/iot-daq/licensing && docker compose up -d
-docker compose ps        # 应为 Up (healthy)：healthprobe 每 30s TCP connect 容器内 7080
-curl -fsS http://127.0.0.1:7080/healthz
+docker compose ps        # 应为 Up (healthy)：healthprobe 每 30s TCP connect 容器内 9010
+curl -fsS http://127.0.0.1:9010/healthz
 ```
 
 **⑤ 宿主 nginx（宝塔）挂站点 + 上传前端产物**
 
 ```bash
-# 站点文件与 vhost 均已在仓库中准备好
-scp deploy/nginx/iot-daq-licensing.conf root@60.205.8.146:/www/server/panel/vhost/nginx/
+# 站点文件与 vhost 均已在仓库中准备好。⚠️ 仓库文件名 ≠ 线上文件名：
+#   deploy/nginx/iot-daq-licensing.conf → 线上落地为 iot-daq-both.conf（:9013）
+scp deploy/nginx/iot-daq-licensing.conf root@60.205.8.146:/www/server/panel/vhost/nginx/iot-daq-both.conf
+# 公网域名 80 入口（:80，server_name license.webscad.cn）
+scp deploy/nginx/iot-daq-license-domain.conf root@60.205.8.146:/www/server/panel/vhost/nginx/
 scp -r admin-console/dist/* root@60.205.8.146:/www/wwwroot/iot-daq-licensing/
 ssh root@60.205.8.146 'nginx -t && nginx -s reload'
 ```
 
-该 vhost 的行为（见文件内注释）：`listen 80` + `server_name 60.205.8.146`（精确匹配优先于既有
-`server_name _;` 默认块，**不侵入他人站点**）；`root /www/wwwroot/iot-daq-licensing`；
-`location /` 用 `try_files $uri $uri/ /index.html`（hash 路由，无需 history fallback）；
-`/assets/` 强缓存 30d；`location /licensing/` → `proxy_pass http://127.0.0.1:7080/`（**剥前缀**）。
+两个 vhost 的行为（见文件内注释）：
+
+- `iot-daq-both.conf`：`listen 9013` + `server_name license.webscad.cn 60.205.8.146`（精确匹配，
+  不侵入他人站点）；`root /www/wwwroot/iot-daq-licensing`；`location /` 用
+  `try_files $uri $uri/ /index.html`（hash 路由，无需 history fallback）；`/assets/` 强缓存 30d；
+  `location /licensing/` → `proxy_pass http://127.0.0.1:9010/`（**剥前缀**）。
+- `iot-daq-license-domain.conf`：`listen 80` + `server_name license.webscad.cn`，与 `:9013` 站点
+  同构同上游，提供**不带端口的公网域名**入口（网关 `cloud_url` 即指向它）。
+
+> 验证：`curl -sS -o /dev/null -w '%{http_code}\n' http://license.webscad.cn/licensing/admin/overview`
+> 期望 **401**（无 Bearer）——401 恰证明「域名 → nginx 剥前缀 → 授权端容器」链路是通的。
 
 > 前端必须用 `VITE_API_MODE=real` 构建（`admin-console/.env.production` 已内置），
 > 否则页面走 mock 根本不打后端。
@@ -434,8 +466,10 @@ cp deploy/.env.example deploy/.env     # 填 IOT_DAQ_IMAGE(digest) / IOT_DAQ_DAT
 
 `gateway.toml`（容器内 `/etc/iot-daq/gateway.toml`）需满足**授权可用三要件**：
 
-1. `[gateway.licensing].cloud_url` 必须配置（否则授权装配为 `NotConfigured` 被跳过，页面报
-   `trial_enabled=false`）；
+1. `[gateway.licensing].cloud_url` 必须配置为**授权服务域名基址**
+   （生产：`http://license.webscad.cn/licensing`，**不带端口**；宿主 nginx 剥 `/licensing` 前缀后
+   转发到 `127.0.0.1:9010`）。未配置 → 授权装配为 `NotConfigured` 被跳过，页面报
+   `trial_enabled=false`；
 2. 指纹密钥文件（`IOT_DAQ_FINGERPRINT_KEY_FILE`，默认 `/run/secrets/iot-daq-fingerprint-key`）
    **必须真实挂载进容器**，否则装配 fail-closed 且**北向保持关闭**；
 3. 该密钥属主 = 容器运行 uid `65532`、权限 `0600`、且落在**持久**路径
@@ -462,6 +496,36 @@ curl -fsS http://127.0.0.1:${IOT_DAQ_WEB_PORT}/healthz    # 200，body 的 mode 
 ```
 
 禁止以「删指纹文件 / 改挂载点 / 调参数」的方式绕过启动自检（会被运行期判为环境变更）。
+
+### 5.5 系统更新（OTA）的两种配置方式
+
+授权端 `GET /updates/manifest` 下发升级包清单；网关侧拉取 → **Ed25519 验签** → 版本单调性
+（新版本号必须**严格大于** `current_version`）→ 写入**落盘** pending 槽，等待重启确认
+（防降级 / 防重放旧包）。**未就绪 = no-op**：只记一条 warn 并跳过，绝不伪造「已是最新」。
+
+**① 配置文件 `[gateway.ota]`**（本地直跑 / 客户环境）
+
+| 键 | 说明 |
+|---|---|
+| `enabled` | 总开关，缺省 `false` = 不做任何检查、不发网络请求 |
+| `manifest_url` | manifest 端点，**可省略**——省略时按 `{gateway.licensing.cloud_url}/updates/manifest` 推导（**推导值不写回配置文件**；canonical：`http://license.webscad.cn/licensing/updates/manifest`） |
+| `poll_interval_secs` | 轮询周期（秒，缺省 3600；首个周期后才检查） |
+| `signing_key_b64` | 授权端 OTA **Ed25519 公钥** base64（32 字节） |
+| `current_version` | 网关当前 OTA 版本号（u64 单调，缺省 `0`） |
+
+**② 容器形态用 env**（根文件系统只读，这是唯一可用的注入通道）
+
+| env | 覆盖 |
+|---|---|
+| `IOT_DAQ_OTA_ENABLED` | `enabled`（`1`/`true`/`yes`/`on`） |
+| `IOT_DAQ_OTA_MANIFEST_URL` | `manifest_url`（**可留空** → 按 `IOT_DAQ_LICENSE_SERVER_URL` 推导） |
+| `IOT_DAQ_OTA_SIGNING_KEY_B64` | `signing_key_b64` |
+| `IOT_DAQ_OTA_CURRENT_VERSION` | `current_version` |
+
+> 只有 **`enabled` + 有效 manifest 端点（显式，或由 `cloud_url` 推导）+ 公钥**三者齐备，才会真正
+> 发起升级检查；缺任一项只记一条 warn 并跳过。实现见 `crates/daemon/src/config.rs` 的
+> `OtaSection::is_ready` / `effective_manifest_url`。**当前部署为明文 `http://`**：完整性由 Ed25519
+> 验签保证，**机密性无保障**。
 
 ---
 
