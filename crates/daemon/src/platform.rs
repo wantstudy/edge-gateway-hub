@@ -86,6 +86,24 @@ pub enum DetectionConfidence {
     Low,
 }
 
+/// 部署形态字面量（`/api/overview` 的 `deployMode` 与自启端点的 `form` 同口径）。
+///
+/// 前端据此分支（如 `StartupPage.vue` 的容器形态只读说明），故字符串本身即契约：
+/// - `windows-service` / `windows-desktop` / `linux-systemd` / `docker`；
+/// - 证据不足（[`DetectionConfidence::Low`]）→ `"unknown"`——**不猜**，让页面走
+///   诚实降级而非误判成某一形态（红线上报：宁可未知，不可谎报）。
+pub fn deploy_mode_label(detection: Detection) -> &'static str {
+    if detection.confidence == DetectionConfidence::Low {
+        return "unknown";
+    }
+    match detection.form {
+        RuntimeForm::WindowsService => "windows-service",
+        RuntimeForm::WindowsDesktop => "windows-desktop",
+        RuntimeForm::LinuxSystemd => "linux-systemd",
+        RuntimeForm::LinuxDocker => "docker",
+    }
+}
+
 /// 形态检测结论：形态 + 可信度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detection {
@@ -552,6 +570,55 @@ mod tests {
         let fallback = docker_verdict(None, None);
         assert_eq!(fallback.form, RuntimeForm::LinuxSystemd);
         assert_eq!(fallback.confidence, DetectionConfidence::Low);
+    }
+
+    /// T03a 部署形态字面量：四形态各自映射；证据不足（`Low`）→ `"unknown"`（不猜）。
+    #[test]
+    fn deploy_mode_label_maps_form_and_degrades_to_unknown() {
+        let high = DetectionConfidence::High;
+        assert_eq!(
+            deploy_mode_label(Detection {
+                form: RuntimeForm::WindowsService,
+                confidence: high,
+            }),
+            "windows-service"
+        );
+        assert_eq!(
+            deploy_mode_label(Detection {
+                form: RuntimeForm::WindowsDesktop,
+                confidence: high,
+            }),
+            "windows-desktop"
+        );
+        assert_eq!(
+            deploy_mode_label(Detection {
+                form: RuntimeForm::LinuxSystemd,
+                confidence: high,
+            }),
+            "linux-systemd"
+        );
+        assert_eq!(
+            deploy_mode_label(Detection {
+                form: RuntimeForm::LinuxDocker,
+                confidence: high,
+            }),
+            "docker"
+        );
+        // 保守回落形态（探测失败 / 未知平台）一律 unknown —— 页面走诚实降级。
+        assert_eq!(
+            deploy_mode_label(Detection {
+                form: RuntimeForm::LinuxSystemd,
+                confidence: DetectionConfidence::Low,
+            }),
+            "unknown"
+        );
+        assert_eq!(
+            deploy_mode_label(Detection {
+                form: RuntimeForm::LinuxDocker,
+                confidence: DetectionConfidence::Low,
+            }),
+            "unknown"
+        );
     }
 
     /// T03 服务模式环境变量解析：仅 `1` 生效；缺失 / 其它值均非服务模式。

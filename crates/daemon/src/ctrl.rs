@@ -53,7 +53,11 @@ pub trait ControlWritePort: Send + Sync {
 
     /// 真实下发一组已解析写点（已通过 [`Self::assert_writable`]）。逐点汇总
     /// [`WriteOutcome`]，任一失败即整批失败（调用方据此整批结构化为错误）。
-    async fn dispatch(&self, device_id: &str, points: &[WritePoint]) -> DaemonResult<Vec<WriteOutcome>>;
+    async fn dispatch(
+        &self,
+        device_id: &str,
+        points: &[WritePoint],
+    ) -> DaemonResult<Vec<WriteOutcome>>;
 }
 
 /// 单点写结果。
@@ -243,9 +247,7 @@ fn to_issue_error(err: DaemonError) -> ControlIssueError {
                 ControlIssueError::Unsupported(msg)
             }
         }
-        ERR_NETWORK => ControlIssueError::DeliveryFailed(format!(
-            "device unreachable: {err}"
-        )),
+        ERR_NETWORK => ControlIssueError::DeliveryFailed(format!("device unreachable: {err}")),
         ERR_PROTOCOL => ControlIssueError::DeliveryFailed(format!(
             "device rejected write (protocol exception): {err}"
         )),
@@ -653,17 +655,18 @@ impl ControlRegistry {
 
     /// 挂载南向写端口（bootstrap run 内调用；实现方 = [`crate::southbound::DevicePollHandler`]）。
     pub fn set_port(&self, port: Arc<dyn ControlWritePort>) {
-        let mut guard = self
-            .port
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.port.lock().unwrap_or_else(|p| p.into_inner());
         *guard = Some(port);
     }
 
     /// 安全审计链记录（被受理的写；审计失败仅 warn，不阻塞）。
     fn audit_security(&self, actor: &str, result: &ControlIssueResult) {
         if let Some(logger) = self.shared.audit_logger() {
-            let outcome = if result.duplicate { "replayed" } else { "issued" };
+            let outcome = if result.duplicate {
+                "replayed"
+            } else {
+                "issued"
+            };
             let detail = format!(
                 "control issue: {} command(s), idempotency_key={:?}",
                 result.commands.len(),
@@ -677,10 +680,7 @@ impl ControlRegistry {
 
     /// 取写端口（未装配 → Internal 错误，诚实 fail-closed）。
     fn port(&self) -> Result<Arc<dyn ControlWritePort>, ControlIssueError> {
-        let guard = self
-            .port
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let guard = self.port.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {
             Some(port) => Ok(Arc::clone(port)),
             None => Err(ControlIssueError::Internal(
@@ -762,17 +762,16 @@ impl ControlRegistry {
             }
             let oc = cmd.op.as_str();
             if let Err(e) = port
-                .assert_writable(
-                    &cmd.device_id,
-                    cmd.point_id.as_deref(),
-                    &cmd.address,
-                )
+                .assert_writable(&cmd.device_id, cmd.point_id.as_deref(), &cmd.address)
                 .await
             {
                 failed = Some(to_issue_error(e));
                 continue;
             }
-            match port.dispatch(&cmd.device_id, std::slice::from_ref(&cmd.point)).await {
+            match port
+                .dispatch(&cmd.device_id, std::slice::from_ref(&cmd.point))
+                .await
+            {
                 Ok(mut outs) => {
                     // 每点必产出一个 outcome；缺失即视为内部异常（绝不靠 expect 兜底）。
                     let out = match outs.pop() {
@@ -862,12 +861,10 @@ impl ControlRegistry {
     pub fn history(&self, limit: usize) -> Vec<ControlIssueResult> {
         let limit = limit.max(1).min(1000) as i64;
         match &self.ledger {
-            Some(ledger) => ledger
-                .list_recent(limit)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "control ledger history read failed");
-                    Vec::new()
-                }),
+            Some(ledger) => ledger.list_recent(limit).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "control ledger history read failed");
+                Vec::new()
+            }),
             None => self
                 .memory
                 .lock()
@@ -913,9 +910,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::driver::modbus::{
-        ModbusConfig, ModbusDriver, ModbusFraming,
-    };
+    use crate::driver::modbus::{ModbusConfig, ModbusDriver, ModbusFraming};
     use crate::driver::{Driver, PointAddressParser, Reconnector};
     use tokio_modbus::server::tcp::{accept_tcp_connection, Server};
     use tokio_modbus::server::Service;
@@ -967,14 +962,17 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             let server = Server::new(listener);
-            let on_connected = move |stream: tokio::net::TcpStream, socket_addr: std::net::SocketAddr| {
-                let state = Arc::clone(&state);
-                async move {
-                    accept_tcp_connection(stream, socket_addr, move |_| {
-                        Ok(Some(MockService { state: Arc::clone(&state) }))
-                    })
-                }
-            };
+            let on_connected =
+                move |stream: tokio::net::TcpStream, socket_addr: std::net::SocketAddr| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        accept_tcp_connection(stream, socket_addr, move |_| {
+                            Ok(Some(MockService {
+                                state: Arc::clone(&state),
+                            }))
+                        })
+                    }
+                };
             let _ = server
                 .serve(&on_connected, |err| eprintln!("mock: {err}"))
                 .await;
@@ -1114,7 +1112,9 @@ mod tests {
     #[tokio::test]
     async fn registry_issue_unknown_device_is_structured_error() {
         let registry = ControlRegistry::new(DaemonShared::new(), default_clock());
-        registry.set_port(Arc::new(handler_with_device("127.0.0.1:1".parse().expect("addr"))));
+        registry.set_port(Arc::new(handler_with_device(
+            "127.0.0.1:1".parse().expect("addr"),
+        )));
         let raw = RawIssueRequest {
             idempotency_key: None,
             commands: vec![RawCommand {

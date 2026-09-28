@@ -99,6 +99,21 @@ function pickBool(src: Record<string, unknown>, key: string, dflt: boolean): boo
   return dflt;
 }
 
+/**
+ * 读 `autostart_guaranteed` 对象：`{value, provenance, hint}`。
+ *
+ * 后端未上报 / 形状不符 → 回落 `{value:'', provenance:'unknown', hint:''}`：
+ * `provenance:'unknown'` 是**诚实值**，页面据此说「不可得」，不冒充 detected。
+ */
+function readGuarantee(raw: unknown): AutostartGuarantee {
+  const rec = asRecord(raw);
+  return {
+    value: pickStr(rec, 'value', ''),
+    provenance: pickStr(rec, 'provenance', 'unknown'),
+    hint: pickStr(rec, 'hint', ''),
+  };
+}
+
 /** 字段是否「后端已上报」（既不缺失、也非 null）。 */
 function present(src: Record<string, unknown>, key: string): boolean {
   const v = src[key];
@@ -1254,6 +1269,25 @@ export interface AutostartStatus {
   target?: string | null;
   /** 注册目标形态；后端按实际守护类型返回，可能缺省。 */
   targetKind?: 'shell' | 'daemon' | null;
+  /** 部署形态：`windows-service` / `windows-desktop` / `linux-systemd` / `docker`；证据不足为 `unknown`。 */
+  form: string;
+  /** 自启托管方：`registry-run` / `systemd` / `container-orchestrator`。 */
+  managedBy: string;
+  /**
+   * 自启保障声明。容器形态 `provenance` 恒为 `declared`——网关在容器内**测不到**
+   * compose 的 restart 策略与宿主 docker.service 状态，只回显宿主声明注入的值。
+   */
+  autostartGuaranteed: AutostartGuarantee;
+}
+
+/** 自启保障声明（`autostart_guaranteed`）。 */
+export interface AutostartGuarantee {
+  /** 保障值：容器形态 = compose 注入的 restart 策略声明值；systemd 形态为空串。 */
+  value: string;
+  /** `declared` = 宿主声明值 / `detected` = 真实探测 / `unknown` = 不可得。 */
+  provenance: string;
+  /** 面向用户的说明与指引（诚实：不承诺网关能改写宿主）。 */
+  hint: string;
 }
 
 /** `GET|PUT /api/settings/backup-policy` 的备份策略。
@@ -1408,6 +1442,8 @@ function buildOps(): OpsApi {
     async autostartStatus(): Promise<AutostartStatus> {
       // wire（ops_api.rs）：Windows 真实现（reg query HKCU Run）；非 Windows /
       // 查询失败 → `registered:null`；写入未实现 → `write_supported:false` + 原因。
+      // 形态字段（form / managed_by / autostart_guaranteed）为后端派生，缺失一律回落
+      // 空值 / unknown，绝不猜平台。
       try {
         const raw = await apiRequest<Record<string, unknown>>('/api/service/autostart');
         const registeredRaw = raw['registered'];
@@ -1420,6 +1456,9 @@ function buildOps(): OpsApi {
           queryError: pickStr(raw, 'queryError', pickStr(raw, 'query_error', '')),
           writeSupported: pickBool(raw, 'writeSupported', pickBool(raw, 'write_supported', false)),
           writeReason: pickStr(raw, 'writeReason', pickStr(raw, 'write_reason', '')),
+          form: pickStr(raw, 'form', 'unknown'),
+          managedBy: pickStr(raw, 'managedBy', pickStr(raw, 'managed_by', '')),
+          autostartGuaranteed: readGuarantee(raw['autostartGuaranteed'] ?? raw['autostart_guaranteed']),
         };
       } catch (cause) {
         return {
@@ -1430,6 +1469,9 @@ function buildOps(): OpsApi {
           queryError: describeFailure(cause, '自启状态'),
           writeSupported: false,
           writeReason: '',
+          form: 'unknown',
+          managedBy: '',
+          autostartGuaranteed: { value: '', provenance: 'unknown', hint: '' },
         };
       }
     },
@@ -1444,6 +1486,18 @@ function buildOps(): OpsApi {
           return {
             ok: false,
             message: '后端尚未提供自启写接口（PUT /api/service/autostart 未落地，真机实测 405），本次未做任何变更。',
+          };
+        }
+        // 501 = 后端明确「当前部署形态不支持由网关改写自启」（非 Windows 恒此分支）。
+        // 优先透传后端 hint（说明到底由谁托管），不给「请升级网关」这类误导文案。
+        if (cause instanceof ApiError && cause.status === 501) {
+          // 501 响应体带 `hint`：说明该形态下自启到底由谁托管（容器编排 / 宿主 systemd）。
+          const hint = pickStr(asRecord(cause.body), 'hint', '');
+          return {
+            ok: false,
+            message: hint
+              ? `当前部署形态不支持由网关改写自启：${hint}本次未做任何变更。`
+              : '当前部署形态不支持由网关改写自启（自启由宿主托管），本次未做任何变更。',
           };
         }
         return { ok: false, message: describeFailure(cause, '设置开机自启') };

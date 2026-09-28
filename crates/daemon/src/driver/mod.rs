@@ -340,9 +340,7 @@ impl PointAddressParser {
             .parse()
             .map_err(|_| format!("invalid modbus coil number {coil_raw:?}"))?;
         if number == 0 {
-            return Err(
-                "modbus coil number must be 1-based (e.g. 00001, not 00000)".to_string(),
-            );
+            return Err("modbus coil number must be 1-based (e.g. 00001, not 00000)".to_string());
         }
         if number > u32::from(u16::MAX) + 1 {
             return Err(format!(

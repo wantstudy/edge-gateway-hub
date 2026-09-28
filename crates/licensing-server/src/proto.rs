@@ -1036,9 +1036,135 @@ pub fn http_status(code: &str) -> u16 {
 /// 发放批量上限（防一次生成过多，设计 §2.1 未给具体值，实施取 1000）。
 pub const MAX_ISSUE_BATCH: u32 = 1000;
 
+// ----------------------------------------------------------------------------
+// §2.0c OTA 升级包（网关系统更新的发布物仓库）
+// ----------------------------------------------------------------------------
+
+/// 合法发布通道（与网关 `[settings.updates]` 的通道口径一致）。
+pub const OTA_CHANNELS: [&str; 2] = ["stable", "beta"];
+
+/// OTA 升级包条目（`GET /admin/updates`）。
+///
+/// **大数红线**：`version` / `size` / `published_at` 全为 JSON **字符串**——
+/// 网关侧 `daemon::ota::parse_manifest` 对 manifest 的数值型字段显式拒绝。
+/// `payload_b64` **不下发**到列表（包体可达数十 MB，列表页不需要）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtaPackageItem {
+    /// 版本号（u64 单调序的十进制字符串）。
+    pub version: String,
+    /// 通道（`stable` / `beta`）。
+    pub channel: String,
+    /// 包体字节数（字符串）。
+    pub size: String,
+    /// 包体 SHA-256（小写 hex）。
+    pub payload_sha256: String,
+    /// 签名密钥标识。
+    pub kid: String,
+    /// 状态（`draft` / `published` / `disabled` / `revoked`）。
+    pub status: String,
+    /// 发布时间（UTC 秒字符串；未发布为 `""`）。
+    pub published_at: String,
+    /// 发布人。
+    pub published_by: String,
+    /// 发布说明。
+    pub note: String,
+}
+
+/// `POST /admin/updates` 请求体（仅 system；上传并签名，落库为 `draft`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UploadOtaRequest {
+    /// 版本号（u64 单调序的十进制字符串，必填、无前导零）。
+    #[serde(default)]
+    pub version: String,
+    /// 通道（缺省 `stable`）。
+    #[serde(default)]
+    pub channel: String,
+    /// 包体 base64（必填）。
+    #[serde(default)]
+    pub payload_b64: String,
+    /// 发布说明（可选）。
+    #[serde(default)]
+    pub note: String,
+    /// 危险操作原因（必填非空）。
+    #[serde(default)]
+    pub reason: String,
+    /// 补充说明（≥10 字符，与 `reason` **彼此独立**，绝不拼接）。
+    #[serde(default)]
+    pub note_detail: Option<String>,
+    /// 二次校验串（必须等于版本号，大小写不敏感精确匹配）。
+    #[serde(default)]
+    pub confirm: String,
+}
+
+/// `POST /admin/updates/:version/publish` / `:version/disable` 请求体（仅 system）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtaStatusRequest {
+    /// 通道（缺省 `stable`）。
+    #[serde(default)]
+    pub channel: String,
+    /// 危险操作原因（必填非空）。
+    #[serde(default)]
+    pub reason: String,
+    /// 补充说明（≥10 字符，与 `reason` **彼此独立**）。
+    #[serde(default)]
+    pub note: String,
+    /// 二次校验串（必须等于版本号，大小写不敏感精确匹配）。
+    #[serde(default)]
+    pub confirm: String,
+}
+
+/// `GET /updates/manifest` 响应体（**供网关拉取**，字段与 `daemon::ota` 的
+/// manifest 契约逐字段同名同义）。
+///
+/// 网关侧 `parse_manifest` 强校验：`version` / `ts_ns` / `size` 必须是 JSON 字符串，
+/// `size` 与 `payload_sha256` 必须与 `payload_b64` 解码结果一致，随后用 `kid`
+/// 对应公钥对 `iotdaq.ota.v1|` 域消息验签。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtaManifestResponse {
+    /// 是否已配置可下发的包（`false` 时其余字段为空串，**诚实空态**）。
+    pub available: bool,
+    /// 版本号（字符串）。
+    pub version: String,
+    /// 签名时刻（Unix 纳秒字符串；未发布为 `""`）。
+    pub ts_ns: String,
+    /// 包体字节数（字符串）。
+    pub size: String,
+    /// 包体 SHA-256（小写 hex）。
+    pub payload_sha256: String,
+    /// 包体 base64。
+    pub payload_b64: String,
+    /// Ed25519 签名（base64）。
+    pub sig_b64: String,
+    /// 签名密钥标识。
+    pub kid: String,
+    /// 不可用时面向用户的说明（现状 + 怎么办；不出现内部术语）。
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OTA manifest 的 `version` / `ts_ns` / `size` 序列化后必须是 JSON **字符串**——
+    /// 网关 `parse_manifest` 对数值型字段**显式拒绝**（大数红线双向守护）。
+    #[test]
+    fn ota_manifest_big_ints_are_strings() {
+        let resp = OtaManifestResponse {
+            available: true,
+            version: "9007199254740993".into(), // 2^53 + 1：JSON number 会丢精度
+            ts_ns: "1700000000000000000".into(),
+            size: "12".into(),
+            payload_sha256: "ab".repeat(32),
+            payload_b64: "aGVsbG8=".into(),
+            sig_b64: "sig".into(),
+            kid: "kid-1".into(),
+            reason: String::new(),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["version"], serde_json::json!("9007199254740993"));
+        assert_eq!(v["ts_ns"], serde_json::json!("1700000000000000000"));
+        assert_eq!(v["size"], serde_json::json!("12"));
+    }
 
     /// **大整数红线**：`seq_from` / `seq_to` / `count` / `ts` 序列化后必须是 JSON **字符串**。
     #[test]

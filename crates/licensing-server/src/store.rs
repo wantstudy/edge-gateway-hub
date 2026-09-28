@@ -28,8 +28,8 @@ use crate::admin_auth::AdminAccount;
 use crate::error::{LicenseError, LicenseResult};
 use crate::model::{
     now_unix_secs, ActivationCode, ActorType, AuditLog, AuditReceipt, CodeStatus, DeployMode,
-    Device, DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, NonceCache, SigningKey,
-    SigningKeyStatus, Tenant, VerifyMode,
+    Device, DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, NonceCache, OtaPackage,
+    OtaStatus, SigningKey, SigningKeyStatus, Tenant, VerifyMode,
 };
 
 /// **增量列迁移表**：`(表名, 列名, 补齐该列的 DDL)`。
@@ -50,6 +50,28 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "device_pubkey",
         "ALTER TABLE device ADD COLUMN device_pubkey TEXT",
     ),
+];
+
+/// **存量机器码归一迁移**（2026-09-28）：把历史库里大小写混杂的机器码统一成小写。
+///
+/// # 为什么必须落这条迁移
+/// 归一前 admin-console 在发放时把用户填的机器码 `toUpperCase()` 后提交，而网关上报的
+/// 是 `hex::encode` 的**小写**值。只改读写路径（[`crate::model::normalize_machine_code`]）
+/// **救不了存量**：库里已是大写的历史预绑定码仍与小写上报值不等 → 照样
+/// `PREBIND_CONFLICT`。故已落库的值必须一并改写。
+///
+/// # 为什么用 SQL `lower()` 而不是拉到 Rust 里改
+/// SQLite 内建 `lower()` **只对 ASCII 生效**（非 ASCII 字节原样保留），与 Rust 侧
+/// [`str::to_ascii_lowercase`] 语义严格一致；换用任何带 Unicode 语义的实现都会让
+/// 「SQL 存量值」与「Rust 新写入值」产生漂移。
+///
+/// # 唯一性说明
+/// `device.machine_code` 带 UNIQUE 约束。若存在仅大小写不同的两行，`lower()` 会撞约束
+/// 而使迁移失败（fail-closed，宁可启动失败也不留半改写的库）。实际不会发生：机器码是
+/// 网关 `hex::encode` 的产物，恒为小写，本迁移对存量库是**零行命中**的空操作。
+const MACHINE_CODE_CASE_MIGRATIONS: &[(&str, &str)] = &[
+    ("activation_code", "prebind_machine_code"),
+    ("device", "machine_code"),
 ];
 
 /// 判断表中是否已存在某列（基于 `PRAGMA table_info`，不受 SQLite 版本差异影响）。
@@ -235,6 +257,24 @@ const SCHEMA: &[&str] = &[
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id)"#,
+    // OTA 升级包（网关系统更新的发布物仓库；网关侧 `GET /updates/manifest` 拉取）。
+    // ⚠️ `version` / `size` / `published_at` 一律 TEXT：网关 `daemon::ota::parse_manifest`
+    // 对 manifest 的数值型字段**显式拒绝**（大数红线），本侧必须存字符串才能下发。
+    r#"CREATE TABLE IF NOT EXISTS ota_package (
+        version         TEXT NOT NULL,
+        channel         TEXT NOT NULL,
+        size            TEXT NOT NULL,
+        payload_sha256  TEXT NOT NULL,
+        payload_b64     TEXT NOT NULL,
+        sig_b64         TEXT NOT NULL,
+        kid             TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'draft',
+        published_at    TEXT NOT NULL DEFAULT '',
+        published_by    TEXT NOT NULL DEFAULT '',
+        note            TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (version, channel)
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_ota_channel_status ON ota_package(channel, status)"#,
     // 管理端账号表（可配置账号 / 角色；口令只存 64-hex SHA-256 摘要，明文绝不落盘）。
     r#"CREATE TABLE IF NOT EXISTS admin_account (
         account         TEXT PRIMARY KEY,
@@ -433,6 +473,28 @@ fn row_to_signing_key(row: &Row<'_>) -> rusqlite::Result<SigningKey> {
     })
 }
 
+/// 从行读取 `OtaPackage`（状态字面量非法 → 行映射错误，**不 panic**、不猜测）。
+fn row_to_ota_package(row: &Row<'_>) -> rusqlite::Result<OtaPackage> {
+    let status_raw: String = row.get(7)?;
+    Ok(OtaPackage {
+        version: row.get(0)?,
+        channel: row.get(1)?,
+        size: row.get(2)?,
+        payload_sha256: row.get(3)?,
+        payload_b64: row.get(4)?,
+        sig_b64: row.get(5)?,
+        kid: row.get(6)?,
+        status: parse_enum(&status_raw, |raw| {
+            OtaStatus::parse(raw).ok_or_else(|| {
+                LicenseError::Storage(format!("ota_package.status is not a valid status: {raw}"))
+            })
+        })?,
+        published_at: row.get(8)?,
+        published_by: row.get(9)?,
+        note: row.get(10)?,
+    })
+}
+
 /// 从行读取 `AdminAccount`。
 fn row_to_admin_account(row: &Row<'_>) -> rusqlite::Result<AdminAccount> {
     Ok(AdminAccount {
@@ -589,6 +651,18 @@ impl Store {
                 conn.execute_batch(ddl)?;
             }
         }
+        // 存量机器码归一（2026-09-28）：把历史库里大小写混杂的机器码统一成小写。
+        // 用 SQL `lower()`（仅 ASCII 生效，语义与 Rust 侧 `to_ascii_lowercase` 一致）。
+        // 只动「确实会变」的行（`col <> lower(col)`），避免无谓的 UNIQUE 重检。
+        // 若出现仅大小写不同的两行，`lower()` 会在第二行撞 UNIQUE 约束 → 启动失败
+        // （fail-closed，宁可起不来也不留半改写的库）。实际不会发生：机器码恒为网关
+        // `hex::encode` 的小写产物，本迁移对存量库是零行命中的空操作。
+        for (table, column) in MACHINE_CODE_CASE_MIGRATIONS {
+            conn.execute_batch(&format!(
+                "UPDATE {table} SET {column} = lower({column}) \
+                 WHERE {column} IS NOT NULL AND {column} <> lower({column})"
+            ))?;
+        }
         Ok(())
     }
 
@@ -719,6 +793,10 @@ impl Store {
 
     /// 按机器码查询（`machine_code` 唯一，故至多一条）。
     pub fn get_device_by_machine_code(&self, machine_code: &str) -> LicenseResult<Option<Device>> {
+        // 查询侧归一：库内 `device.machine_code` 已是小写（写入时归一 + 存量迁移），
+        // 但调用方可能传任意大小写（例如网关上报 / 测试断言）；只归一查询入参，
+        // 不对库内值再 lower()（防止 UNIQUE 重复）。
+        let machine_code = crate::model::normalize_machine_code(machine_code);
         let conn = self.conn.lock();
         let found = conn
             .query_row(
@@ -1675,6 +1753,134 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    // ================= ota_package =================
+
+    /// 插入升级包（`(version, channel)` 主键冲突 → `Storage` 错误，由调用方转为 400）。
+    ///
+    /// **不做 upsert**：同版本同通道重复上传必须显式失败——静默覆盖会让「已发布
+    /// 的包被换掉字节」无从察觉，而网关侧版本单调性又禁止降级，等于把现场锁死在
+    /// 一个已被替换的包上。
+    pub fn insert_ota_package(&self, pkg: &OtaPackage) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO ota_package
+               (version, channel, size, payload_sha256, payload_b64, sig_b64, kid,
+                status, published_at, published_by, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                pkg.version,
+                pkg.channel,
+                pkg.size,
+                pkg.payload_sha256,
+                pkg.payload_b64,
+                pkg.sig_b64,
+                pkg.kid,
+                pkg.status.as_str(),
+                pkg.published_at,
+                pkg.published_by,
+                pkg.note,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按 `(version, channel)` 查询（无此包 → `None`）。
+    pub fn get_ota_package(
+        &self,
+        version: &str,
+        channel: &str,
+    ) -> LicenseResult<Option<OtaPackage>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT version, channel, size, payload_sha256, payload_b64, sig_b64, kid,
+                        status, published_at, published_by, note
+                 FROM ota_package WHERE version = ?1 AND channel = ?2",
+                params![version, channel],
+                row_to_ota_package,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// 列出全部升级包（按版本号数值降序、通道升序）。
+    ///
+    /// 排序用 `CAST(version AS INTEGER)`：版本号是 u64 单调序的十进制串，按 TEXT
+    /// 字典序排会把 `"9"` 排到 `"10"` 之后（列表观感错乱）。
+    pub fn list_ota_packages(&self) -> LicenseResult<Vec<OtaPackage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT version, channel, size, payload_sha256, payload_b64, sig_b64, kid,
+                    status, published_at, published_by, note
+             FROM ota_package
+             ORDER BY CAST(version AS INTEGER) DESC, channel ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_ota_package)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 按状态过滤升级包（列表页筛选；`None` = 不过滤）。
+    pub fn list_ota_packages_by_status(
+        &self,
+        status: Option<OtaStatus>,
+    ) -> LicenseResult<Vec<OtaPackage>> {
+        let all = self.list_ota_packages()?;
+        Ok(match status {
+            Some(s) => all.into_iter().filter(|p| p.status == s).collect(),
+            None => all,
+        })
+    }
+
+    /// 更新状态（`rows_affected == 0` 表示目标包不存在，由调用方转 404）。
+    pub fn update_ota_status(
+        &self,
+        version: &str,
+        channel: &str,
+        status: OtaStatus,
+        published_at: &str,
+        published_by: &str,
+    ) -> LicenseResult<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE ota_package
+                SET status = ?3, published_at = ?4, published_by = ?5
+              WHERE version = ?1 AND channel = ?2",
+            params![
+                version,
+                channel,
+                status.as_str(),
+                published_at,
+                published_by
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// 某通道**最新已发布**的包（供网关拉取；无人发布 → `None`，诚实空态）。
+    ///
+    /// 只认 [`OtaStatus::Published`]：draft 包尚未过审、disabled / revoked 包已下架，
+    /// 三者都**绝不**下发给网关（宁可让网关报「无可升级版本」，也不发一个不该发的包）。
+    pub fn latest_published_ota(&self, channel: &str) -> LicenseResult<Option<OtaPackage>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT version, channel, size, payload_sha256, payload_b64, sig_b64, kid,
+                        status, published_at, published_by, note
+                 FROM ota_package
+                 WHERE channel = ?1 AND status = 'published'
+                 ORDER BY CAST(version AS INTEGER) DESC
+                 LIMIT 1",
+                params![channel],
+                row_to_ota_package,
+            )
+            .optional()?;
+        Ok(found)
     }
 
     // ================= audit_log =================
@@ -3104,7 +3310,10 @@ mod tests {
             ],
         );
         // 空动作白名单 → 空结果。
-        assert!(store.count_actions_by_day(&[], day0).expect("empty").is_empty());
+        assert!(store
+            .count_actions_by_day(&[], day0)
+            .expect("empty")
+            .is_empty());
     }
 
     #[test]

@@ -453,7 +453,7 @@ impl NorthDataPlane {
     /// 任何处理：其 `error!` 已由 `NorthRuntime::start` 记录，这里仅摘除对应
     /// 泳道，避免每拍对未知出口反复报错。
     pub fn attach(&self, runtime: Arc<NorthRuntime>) {
-        let started: HashSet<&str> = runtime.outlet_names().into_iter().collect();
+        let started: HashSet<String> = runtime.outlet_names().into_iter().collect();
         let mut lanes = lock_or_recover(&self.lanes);
         let before = lanes.len();
         lanes.retain(|lane| started.contains(lane.name.as_str()));

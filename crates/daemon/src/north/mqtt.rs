@@ -904,6 +904,15 @@ impl NorthSendQueue {
         lock_or_recover(&self.inner).bytes()
     }
 
+    /// 卸下全部在途条目（**出口热重建 / 删除前的数据安全收口**）。
+    ///
+    /// 发送队列只存在于内存：直接丢弃出口句柄会让未确认批次静默消失。调用方
+    /// 必须在摘除出口前取回这些负载并回灌 [`OfflineQueue::enqueue`]，由补发路径
+    /// 继续投递（「超限落盘 → 幂等补发」闭环不断裂）。
+    pub fn drain_all(&self) -> Vec<PendingSend> {
+        lock_or_recover(&self.inner).drain_all()
+    }
+
     /// 当前水位等级。
     #[must_use]
     pub fn level(&self) -> WaterLevel {

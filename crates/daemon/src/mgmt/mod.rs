@@ -304,9 +304,7 @@ impl MgmtState {
     pub fn with_control_api(mut self, api: ctrl_api::ControlApiState) -> Self {
         match Arc::get_mut(&mut self.inner) {
             Some(inner) => inner.control_api = Some(Arc::new(api)),
-            None => tracing::warn!(
-                "with_control_api must be called before cloning/sharing"
-            ),
+            None => tracing::warn!("with_control_api must be called before cloning/sharing"),
         }
         self
     }
@@ -622,10 +620,7 @@ pub fn router(state: MgmtState) -> Router {
         .route("/api/audit/export", get(audit_api::export))
         // BE-CTRL / task 140：控制指令下发（POST /api/control/issue + GET /api/control/status + GET /api/control/history）
         // 控制面未装配时 handler 内部诚实返回 503。
-        .route(
-            "/api/control/issue",
-            axum::routing::post(ctrl_api::issue),
-        )
+        .route("/api/control/issue", axum::routing::post(ctrl_api::issue))
         .route("/api/control/status", get(ctrl_api::status))
         .route(
             "/api/control/history",
@@ -1169,7 +1164,9 @@ async fn overview(State(state): State<MgmtState>) -> Response {
         "name": config.gateway.gateway_id,
         "machineCode": machine_code,
         "machineCodeSource": machine_code_source,
-        "deployMode": "edge",
+        // 部署形态：由 `platform::detect()` 实时派生（原先硬编码 "edge"，导致前端
+        // `deployMode === 'docker'` 分支成为死代码）。证据不足 → "unknown"，页面诚实降级。
+        "deployMode": crate::platform::deploy_mode_label(crate::platform::detect()),
         "version": env!("CARGO_PKG_VERSION"),
         "hostname": hostname,
         "manageUrl": "",

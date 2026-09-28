@@ -110,9 +110,7 @@ impl SimSpec {
             ));
         }
         if min > max {
-            return Err(format!(
-                "sim_min ({min}) must not exceed sim_max ({max})"
-            ));
+            return Err(format!("sim_min ({min}) must not exceed sim_max ({max})"));
         }
         Ok(Self {
             mode,
@@ -200,32 +198,38 @@ mod tests {
     fn spec_rejects_inverted_or_non_finite_range() {
         assert!(SimSpec::from_fields(Some("random"), Some(10.0), Some(5.0), None).is_err());
         assert!(SimSpec::from_fields(Some("random"), Some(f64::NAN), Some(5.0), None).is_err());
-        assert!(SimSpec::from_fields(Some("random"), Some(0.0), Some(f64::INFINITY), None).is_err());
+        assert!(
+            SimSpec::from_fields(Some("random"), Some(0.0), Some(f64::INFINITY), None).is_err()
+        );
         // 相等区间合法（恒定值）。
         assert!(SimSpec::from_fields(Some("fixed"), Some(3.0), Some(3.0), None).is_ok());
     }
 
     #[test]
     fn spec_caps_sim_dec_at_max() {
-        let spec = SimSpec::from_fields(Some("fixed"), Some(1.0), Some(1.0), Some(99))
-            .expect("valid");
+        let spec =
+            SimSpec::from_fields(Some("fixed"), Some(1.0), Some(1.0), Some(99)).expect("valid");
         assert_eq!(spec.dec, MAX_SIM_DEC);
     }
 
     #[test]
     fn fixed_mode_is_constant_min() {
-        let spec = SimSpec::from_fields(Some("fixed"), Some(12.345), Some(99.0), Some(2))
-            .expect("valid");
+        let spec =
+            SimSpec::from_fields(Some("fixed"), Some(12.345), Some(99.0), Some(2)).expect("valid");
         let seed = seed_for("40001");
         for tick in 0..8 {
-            assert_eq!(spec.value_at(seed, tick), 12.35, "fixed must round min to dec");
+            assert_eq!(
+                spec.value_at(seed, tick),
+                12.35,
+                "fixed must round min to dec"
+            );
         }
     }
 
     #[test]
     fn random_mode_is_bounded_and_deterministic() {
-        let spec = SimSpec::from_fields(Some("random"), Some(-5.0), Some(5.0), Some(3))
-            .expect("valid");
+        let spec =
+            SimSpec::from_fields(Some("random"), Some(-5.0), Some(5.0), Some(3)).expect("valid");
         let seed = seed_for("40001");
         let first: Vec<f64> = (0..32).map(|t| spec.value_at(seed, t)).collect();
         // 确定性：同 seed 同 tick 恒同值。
@@ -236,7 +240,9 @@ mod tests {
             assert!((-5.0..=5.0).contains(v), "value {v} out of [min,max]");
         }
         // 不同点位种子应产生不同序列（避免所有点同波形）。
-        let other: Vec<f64> = (0..32).map(|t| spec.value_at(seed_for("40002"), t)).collect();
+        let other: Vec<f64> = (0..32)
+            .map(|t| spec.value_at(seed_for("40002"), t))
+            .collect();
         assert_ne!(first, other, "distinct points must not share one waveform");
         // 序列不应恒定（否则 random 退化成 fixed）。
         assert!(first.windows(2).any(|w| w[0] != w[1]));
@@ -244,8 +250,8 @@ mod tests {
 
     #[test]
     fn ramp_mode_cycles_between_bounds() {
-        let spec = SimSpec::from_fields(Some("ramp"), Some(0.0), Some(10.0), Some(1))
-            .expect("valid");
+        let spec =
+            SimSpec::from_fields(Some("ramp"), Some(0.0), Some(10.0), Some(1)).expect("valid");
         let seed = seed_for("40001");
         assert_eq!(spec.value_at(seed, 0), 0.0);
         assert_eq!(spec.value_at(seed, 50), 5.0);

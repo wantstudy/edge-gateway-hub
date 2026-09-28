@@ -265,6 +265,85 @@ fn updates_apply_bad_request(state: &MgmtState, actor: &str, detail: &str) -> Re
 const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE: &str = "iot-daq";
 
+/// compose 注入的重启策略**声明值**（`IOT_DAQ_RESTART_POLICY`；页面回显用）。
+///
+/// 容器内**无法**读取 compose 的 `restart:` 字段（那需要 docker.sock —— 红线禁止），
+/// 因此这里回显的只是宿主声明进来的值，`provenance` 一律 `"declared"`，绝不冒充实测。
+const RESTART_POLICY_ENV: &str = "IOT_DAQ_RESTART_POLICY";
+/// 未注入 [`RESTART_POLICY_ENV`] 时的回显值（与 `docker-compose.yml` 的 `restart:` 一致）。
+const DEFAULT_RESTART_POLICY: &str = "unless-stopped";
+
+/// 当前运行形态 + 部署形态字面量（与 `/api/overview.deployMode` 同口径）。
+fn deploy_form() -> (crate::platform::RuntimeForm, &'static str) {
+    let detection = crate::platform::detect();
+    (
+        detection.form,
+        crate::platform::deploy_mode_label(detection),
+    )
+}
+
+/// 自启的托管方：由谁负责「开机把网关拉起来」。
+fn managed_by(form: crate::platform::RuntimeForm) -> &'static str {
+    match form {
+        crate::platform::RuntimeForm::LinuxDocker => "container-orchestrator",
+        crate::platform::RuntimeForm::LinuxSystemd => "systemd",
+        crate::platform::RuntimeForm::WindowsService
+        | crate::platform::RuntimeForm::WindowsDesktop => "registry-run",
+    }
+}
+
+/// `autostart_guaranteed` 字段体：`{value, provenance, hint}`。
+///
+/// # 诚实边界（为什么没有 `detected` 的容器值）
+/// - **容器形态**：网关是容器内的一个进程，既看不到 compose 的 `restart:`（需
+///   docker.sock，红线禁止），也看不到宿主 `docker.service` 是否 enabled。因此
+///   只能回显宿主声明注入的 [`RESTART_POLICY_ENV`]，`provenance="declared"`，
+///   并在 `hint` 里点明「宿主 docker.service 需 enabled 才会随开机拉起」；
+/// - **systemd 形态**：自启由宿主 systemd 托管，网关不代为执行 `systemctl`，
+///   也不探测 unit 是否已 enable（探测会诱导「替用户改宿主」的越界实现），
+///   故 `provenance="unknown"` + 指引式 `hint`；
+/// - **Windows**：HKCU Run 键在**本进程可读**，是真实测到的，`provenance="detected"`。
+fn autostart_guarantee_json(
+    form: crate::platform::RuntimeForm,
+    registered: Option<bool>,
+    command: &str,
+) -> Value {
+    let (value, provenance, hint) = match form {
+        crate::platform::RuntimeForm::LinuxDocker => {
+            let declared = std::env::var(RESTART_POLICY_ENV)
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_RESTART_POLICY.to_string());
+            (
+                declared,
+                "declared",
+                "容器自启由宿主 docker.service + compose restart 策略共同决定：宿主 docker.service 需 enabled，容器才会随开机拉起。此处为 compose 注入的声明值，网关在容器内无法实测。",
+            )
+        }
+        crate::platform::RuntimeForm::LinuxSystemd => (
+            String::new(),
+            "unknown",
+            "Linux 原生部署自启由宿主 systemd 托管；如需开机自启请在宿主执行 systemctl enable --now iot-daq.service（网关不代为执行、也不探测 unit 状态）。",
+        ),
+        crate::platform::RuntimeForm::WindowsService
+        | crate::platform::RuntimeForm::WindowsDesktop => (
+            if registered == Some(true) {
+                command.to_string()
+            } else {
+                String::new()
+            },
+            "detected",
+            "Windows 自启由 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 的 iot-daq 值决定（当前用户登录时拉起）。",
+        ),
+    };
+    json!({
+        "value": value,
+        "provenance": provenance,
+        "hint": hint,
+    })
+}
+
 /// 解析自启注册目标：优先 `IOTDAQ_SHELL_EXE`（Tauri 壳注入；须指向**存在的文件**），
 /// 否则回退 `current_exe()`（保持既有「注册 daemon 自身」行为不回归）。
 /// 返回 (路径, 目标类型)：`"shell"` = 壳、`"daemon"` = daemon 自身。
@@ -336,6 +415,9 @@ fn autostart_status_body() -> Value {
         Err(err) => (Value::Null, Value::Null, json!(err.to_string())),
     };
     let (intended, kind) = resolve_autostart_target();
+    let (form, form_label) = deploy_form();
+    let registered_flag = registered.as_bool();
+    let command_text = command.as_str().unwrap_or("").to_string();
     json!({
         "supported": true,
         "registered": registered,
@@ -344,6 +426,9 @@ fn autostart_status_body() -> Value {
         "target_kind": kind,
         "source": "registry-hkcu-run",
         "query_error": query_error,
+        "form": form_label,
+        "managed_by": managed_by(form),
+        "autostart_guaranteed": autostart_guarantee_json(form, registered_flag, &command_text),
     })
 }
 
@@ -363,6 +448,7 @@ pub async fn service_autostart(State(state): State<MgmtState>, authed: AuthedRol
     #[cfg(not(target_os = "windows"))]
     {
         let (target, kind) = resolve_autostart_target();
+        let (form, form_label) = deploy_form();
         Json(json!({
             "supported": false,
             "registered": Value::Null,
@@ -373,6 +459,9 @@ pub async fn service_autostart(State(state): State<MgmtState>, authed: AuthedRol
             "reason": "autostart status is only implemented for Windows (registry HKCU Run)",
             "write_supported": false,
             "write_reason": "autostart registration is only implemented for Windows",
+            "form": form_label,
+            "managed_by": managed_by(form),
+            "autostart_guaranteed": autostart_guarantee_json(form, None, ""),
         }))
         .into_response()
     }
@@ -531,6 +620,17 @@ pub async fn service_autostart_put(
         "autostart write is only implemented for Windows (registry HKCU Run)",
     );
     let (target, kind) = resolve_autostart_target();
+    let (form, form_label) = deploy_form();
+    let managed = managed_by(form);
+    // 501 也要说清「那到底由谁管」——前端据此渲染只读说明，不用猜平台。
+    let hint = match form {
+        crate::platform::RuntimeForm::LinuxDocker => {
+            "当前为容器部署形态：自启由宿主 docker.service + compose restart 策略托管，网关不改写宿主配置。"
+        }
+        _ => {
+            "当前为 Linux 原生部署形态：自启由宿主 systemd 托管，请在宿主执行 systemctl enable --now iot-daq.service。"
+        }
+    };
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
@@ -540,6 +640,9 @@ pub async fn service_autostart_put(
             "target_kind": kind,
             "write_supported": false,
             "write_reason": "autostart registration is only implemented for Windows",
+            "form": form_label,
+            "managed_by": managed,
+            "hint": hint,
         })),
     )
         .into_response()

@@ -27,7 +27,6 @@
 //!   被 `error!` 拒绝并计入 [`NorthRuntimeStats::skipped`]），**绝不**静默降级明文。
 //! - 停机 = `abort()` 全部驱动任务（幂等、不阻塞宽限期）。
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
@@ -476,27 +475,160 @@ impl Counters {
     }
 }
 
+/// 北向运行期**重建输入**（热生效的唯一装配来源）。
+///
+/// [`NorthRuntimeConfig`] 被 [`NorthRuntime::start`] 消费掉、且不 `Clone`
+/// （`gate` 私有 + `OfflineQueue` 无 Clone 语义），而 `NorthRuntime` 原本只留下
+/// `queue` —— 运行期改了 `[[outlets]]` 就**无从重建**（只能重启进程）。这里把
+/// 重建一个出口所需的全部入参留存下来（全部 `Arc` / `Copy`，可廉价克隆），
+/// 使 [`NorthRuntime::resync`] 能在运行期按名增删出口。
+///
+/// ⚠ `queue` 必须与采集侧、补发路径是**同一个实例**，否则「发送队列超限 → 落盘
+/// 降级」的批次不会被补发路径看到。
+#[derive(Clone)]
+pub struct NorthRebuildInputs {
+    /// 共享离线队列（落盘降级目标 + 补发源）。
+    pub queue: Arc<OfflineQueue>,
+    /// 时钟（审计时间戳 / `PendingSend::enqueued_ns`）。
+    pub clock: Arc<dyn Clock>,
+    /// 审计上报出口（`AuditLog::drain()` 的落点）。
+    pub audit_sink: Arc<dyn AuditSink>,
+    /// 驱动轮询周期。
+    pub tick: Duration,
+    /// 北向转发授权闸门（`None` = 恒放行）。
+    pub gate: Option<Arc<dyn NorthForwardGate>>,
+}
+
+impl NorthRebuildInputs {
+    /// 由装配输入派生（保留 `gate` 等私有字段的当前取值）。
+    #[must_use]
+    pub fn from_config(cfg: &NorthRuntimeConfig) -> Self {
+        Self {
+            queue: Arc::clone(&cfg.queue),
+            clock: Arc::clone(&cfg.clock),
+            audit_sink: Arc::clone(&cfg.audit_sink),
+            tick: cfg.tick,
+            gate: cfg.gate.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for NorthRebuildInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NorthRebuildInputs")
+            .field("queue_db", &self.queue.queue_db_path())
+            .field("tick", &self.tick)
+            .field("gate", &self.gate.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 出口运行期**身份指纹**（影响连接的全部字段）。
+///
+/// 用于判定「配置改了但连接无需重建」与「必须重建」：`[[outlets]]` 的任一连接
+/// 字段变化 ⇒ 该出口必须重新建 `MqttClient`（旧连接仍指向旧 broker / 旧证书）。
+#[must_use]
+pub fn outlet_fingerprint(outlet: &OutletConfig) -> String {
+    // 分隔符取控制字符，避免字段值内的普通字符造成指纹碰撞。
+    const SEP: char = '\u{1f}';
+    [
+        outlet.name.as_str(),
+        outlet.broker.as_str(),
+        outlet.topic_prefix.as_str(),
+        &outlet.qos.to_string(),
+        if outlet.tls { "1" } else { "0" },
+        outlet.ca_cert_path.as_deref().unwrap_or(""),
+        outlet.client_cert_path.as_deref().unwrap_or(""),
+        outlet.client_key_path.as_deref().unwrap_or(""),
+        outlet.server_name.as_deref().unwrap_or(""),
+        &outlet.alpn.join(","),
+        match outlet.encoding {
+            crate::config::OutletEncoding::Protobuf => "protobuf",
+            crate::config::OutletEncoding::Json => "json",
+        },
+        outlet.username.as_deref().unwrap_or(""),
+        outlet.password.as_deref().unwrap_or(""),
+    ]
+    .join(&SEP.to_string())
+}
+
+/// `[[outlets]]` 是否发生了「必须重建出口」的变化（供热重载任务判定）。
+///
+/// 与调度组的 `groups_changed` 同口径：**只有真差异才重建**——无谓的 abort /
+/// 重连会让在途批次白等一轮，也会打断正常连接。
+#[must_use]
+pub fn outlets_changed(before: &[OutletConfig], after: &[OutletConfig]) -> bool {
+    if before.len() != after.len() {
+        return true;
+    }
+    before
+        .iter()
+        .zip(after.iter())
+        .any(|(a, b)| outlet_fingerprint(a) != outlet_fingerprint(b))
+}
+
+/// 一次 [`NorthRuntime::resync`] 的结果（可观测、可断言）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NorthResyncReport {
+    /// 新建成功的出口名。
+    pub added: Vec<String>,
+    /// 因配置变更而重建的出口名（先摘旧、再起新）。
+    pub updated: Vec<String>,
+    /// 被摘除的出口名（配置里已删除）。
+    pub removed: Vec<String>,
+    /// 重建失败的出口名（保留旧出口继续跑，**绝不半重建**）。
+    pub failed: Vec<String>,
+    /// 摘除前从发送队列回灌离线队列的批次数（数据安全收口证据）。
+    pub rescued: u64,
+    /// 回灌失败（离线队列不可用）的批次数（> 0 必须告警：数据已不在内存）。
+    pub rescue_lost: u64,
+}
+
+impl NorthResyncReport {
+    /// 是否完全成功（无失败出口）。
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// 本次是否真的动了出口（供调用方决定要不要打日志 / 推事件）。
+    #[must_use]
+    pub fn touched(&self) -> bool {
+        !self.added.is_empty() || !self.updated.is_empty() || !self.removed.is_empty()
+    }
+}
+
 /// 一个已启动出口的运行句柄。
 struct OutletRuntime {
     /// 出口名（与 `[[outlets]].name` 一致）。
     name: String,
+    /// 该出口启动时的配置指纹（判定是否必须重建）。
+    fingerprint: String,
     /// 背压接线束（采集侧发布入口 + 观测）。
     outlet: Arc<NorthOutlet>,
+    /// 该出口的驱动任务（轮询 + 发送）；摘除时只 abort 这两个。
+    tasks: Vec<JoinHandle<()>>,
 }
 
 /// 北向运行期：按 `[[outlets]]` 为每个出口构造 `MqttClient` + `NorthOutlet`
 /// （共享同一 `OfflineQueue` / `Clock` / 审计出口）并启动驱动任务。
+///
+/// 出口注册表在 **`StdMutex` 内**（而非启动期一次性冻结）：管理面新增 / 修改 /
+/// 删除出口后由 [`Self::resync`] 按名增删，无需重启进程（热生效）。锁只在
+/// 「取 / 放回句柄」的极短临界区内持有，**不在锁内 await**（采集路径永不阻塞）。
 pub struct NorthRuntime {
-    /// 已启动出口（保序）。
-    outlets: Vec<OutletRuntime>,
-    /// 出口名 → 下标（O(1) 查表）。
-    by_name: HashMap<String, usize>,
+    /// 已启动出口（保序），运行期可增删。
+    outlets: StdMutex<Vec<OutletRuntime>>,
     /// 共享离线队列。
     queue: Arc<OfflineQueue>,
+    /// 重建输入（热生效装配来源；与启动入参同源）。
+    inputs: NorthRebuildInputs,
+    /// 网关标识（新建出口的批次 `gateway_id`）。
+    gateway_id: String,
+    /// 停机信号（新建驱动任务时克隆给它）。
+    shutdown: watch::Receiver<bool>,
     /// 计数器。
     counters: Arc<Counters>,
-    /// 驱动任务句柄（停机时全部 abort）。
-    tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl NorthRuntime {
@@ -514,12 +646,37 @@ impl NorthRuntime {
         shutdown: watch::Receiver<bool>,
     ) -> Self {
         let counters = Arc::new(Counters::default());
-        let mut started: Vec<OutletRuntime> = Vec::new();
-        let mut by_name: HashMap<String, usize> = HashMap::new();
-        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        let started = Self::build_outlets(
+            gateway_id,
+            outlets,
+            &NorthRebuildInputs::from_config(&cfg),
+            &counters,
+            &shutdown,
+        );
 
+        Self {
+            outlets: StdMutex::new(started),
+            queue: Arc::clone(&cfg.queue),
+            inputs: NorthRebuildInputs::from_config(&cfg),
+            gateway_id: gateway_id.to_string(),
+            shutdown,
+            counters,
+        }
+    }
+
+    /// 按出口配置批量构造出口句柄（启动与热重建共用同一条构造路径）。
+    ///
+    /// 非法 / TLS 出口不中断整体：记 `error!`、计入 `skipped`，其余继续。
+    fn build_outlets(
+        gateway_id: &str,
+        outlets: &[OutletConfig],
+        inputs: &NorthRebuildInputs,
+        counters: &Arc<Counters>,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Vec<OutletRuntime> {
+        let mut started: Vec<OutletRuntime> = Vec::new();
         for outlet_cfg in outlets {
-            if by_name.contains_key(&outlet_cfg.name) {
+            if started.iter().any(|o| o.name == outlet_cfg.name) {
                 Counters::bump(&counters.skipped);
                 error!(
                     outlet = %outlet_cfg.name,
@@ -527,8 +684,8 @@ impl NorthRuntime {
                 );
                 continue;
             }
-            let endpoint = match endpoint_from_outlet(outlet_cfg) {
-                Ok(endpoint) => endpoint,
+            match Self::build_outlet(gateway_id, outlet_cfg, inputs, counters, shutdown) {
+                Ok(entry) => started.push(entry),
                 Err(err) => {
                     Counters::bump(&counters.skipped);
                     error!(
@@ -536,87 +693,224 @@ impl NorthRuntime {
                         error = %err,
                         "north runtime: outlet rejected; skipped (see `[[outlets]]` broker/tls fields)"
                     );
-                    continue;
                 }
-            };
-            // 每个出口一个审计环（有界）；发送 / 补发 / 消费闸门三者共享，
-            // 形成「超限落盘 → 幂等补发 → 审计统一上报」的闭环。
-            let audit_log = Arc::new(crate::backpressure::AuditLog::default());
-            let outlet = Arc::new(NorthOutlet::with_audit_log(
-                gateway_id.to_string(),
-                Arc::clone(&cfg.queue),
-                Arc::clone(&cfg.clock),
-                audit_log,
-                Arc::clone(&cfg.audit_sink),
-            ));
-            // ⚠ 背压接线缺口修复：`MqttClient` 必须挂载同一 [`NorthOutlet`]，
-            // 否则驱动任务的 `pump`（pump_send / pump_replay）拿不到发送队列，
-            // 出口将永远不发报文（发送队列只进不出）。此前缺这一步，
-            // 由授权门控恢复转发的集成测试暴露。
-            let client = match MqttClient::new(endpoint).map(|c| c.with_outlet(Arc::clone(&outlet)))
-            {
-                Ok(client) => client,
-                Err(err) => {
-                    Counters::bump(&counters.skipped);
-                    error!(
-                        outlet = %outlet_cfg.name,
-                        error = %err,
-                        "north runtime: MQTT client build failed; skipped"
-                    );
-                    continue;
+            }
+        }
+        started
+    }
+
+    /// 构造**单个**出口（端点 → `MqttClient` → `NorthOutlet` → 驱动任务）。
+    ///
+    /// 与 [`Self::start`] 的循环体同源，供热重建按名复用——绝不出现第二套构造逻辑。
+    fn build_outlet(
+        gateway_id: &str,
+        outlet_cfg: &OutletConfig,
+        inputs: &NorthRebuildInputs,
+        counters: &Arc<Counters>,
+        shutdown: &watch::Receiver<bool>,
+    ) -> DaemonResult<OutletRuntime> {
+        let endpoint = endpoint_from_outlet(outlet_cfg)?;
+        // 每个出口一个审计环（有界）；发送 / 补发 / 消费闸门三者共享，
+        // 形成「超限落盘 → 幂等补发 → 审计统一上报」的闭环。
+        let audit_log = Arc::new(crate::backpressure::AuditLog::default());
+        let outlet = Arc::new(NorthOutlet::with_audit_log(
+            gateway_id.to_string(),
+            Arc::clone(&inputs.queue),
+            Arc::clone(&inputs.clock),
+            audit_log,
+            Arc::clone(&inputs.audit_sink),
+        ));
+        // ⚠ 背压接线缺口修复：`MqttClient` 必须挂载同一 [`NorthOutlet`]，
+        // 否则驱动任务的 `pump`（pump_send / pump_replay）拿不到发送队列，
+        // 出口将永远不发报文（发送队列只进不出）。
+        let client = MqttClient::new(endpoint).map(|c| c.with_outlet(Arc::clone(&outlet)))?;
+        let (poll_task, send_task) = spawn_driver(
+            outlet_cfg.name.clone(),
+            outlet_cfg.topic_prefix.clone(),
+            client,
+            Arc::clone(&outlet),
+            Arc::clone(counters),
+            shutdown.clone(),
+            inputs.tick,
+            inputs.gate.clone(),
+        );
+        Ok(OutletRuntime {
+            name: outlet_cfg.name.clone(),
+            fingerprint: outlet_fingerprint(outlet_cfg),
+            outlet,
+            tasks: vec![poll_task, send_task],
+        })
+    }
+
+    /// 按新的 `[[outlets]]` 对齐运行期（**北向热生效点**）。
+    ///
+    /// 只动「新增 / 变更 / 删除」的出口：未变出口的 `MqttClient`、驱动任务与
+    /// 发送队列**原样保留**（改一个出口绝不牵连其它出口的在途批次）。
+    ///
+    /// - 删除 / 重建前先把该出口发送队列的在途批次回灌 [`OfflineQueue`]
+    ///   （内存数据不会因重建而丢；回灌失败如实计数 `rescue_lost` 并 `error!`）；
+    /// - 单个出口重建失败 → 记入 `failed`，保留旧出口（或不起新出口），
+    ///   **绝不半重建**，也绝不 panic。
+    pub fn resync(&self, desired: &[OutletConfig]) -> NorthResyncReport {
+        let mut report = NorthResyncReport::default();
+        let desired_fps: Vec<(String, String)> = desired
+            .iter()
+            .map(|o| (o.name.clone(), outlet_fingerprint(o)))
+            .collect();
+
+        // ---- ① 摘除：配置里已删除 / 指纹已变（变更走「先摘后起」） ----
+        let mut rebuilding: Vec<OutletConfig> = Vec::new();
+        {
+            let mut outlets = lock_or_recover(&self.outlets);
+            let mut kept: Vec<OutletRuntime> = Vec::with_capacity(outlets.len());
+            for entry in outlets.drain(..) {
+                let wanted = desired_fps
+                    .iter()
+                    .find(|(name, _)| *name == entry.name)
+                    .map(|(_, fp)| fp.as_str());
+                match wanted {
+                    Some(fp) if fp == entry.fingerprint => {
+                        kept.push(entry); // 未变更：原样保留（连接 / 在途批次都不动）
+                    }
+                    Some(_) => {
+                        // 变更：先摘旧（数据回灌），再由 ② 用新配置起一个。
+                        let cfg = desired.iter().find(|o| o.name == entry.name).cloned();
+                        let name = entry.name.clone();
+                        self.retire_outlet(entry, &mut report);
+                        report.updated.push(name);
+                        if let Some(cfg) = cfg {
+                            rebuilding.push(cfg);
+                        }
+                    }
+                    None => {
+                        // 删除。
+                        let name = entry.name.clone();
+                        self.retire_outlet(entry, &mut report);
+                        report.removed.push(name);
+                    }
                 }
-            };
-            let (poll_task, send_task) = spawn_driver(
-                outlet_cfg.name.clone(),
-                outlet_cfg.topic_prefix.clone(),
-                client,
-                Arc::clone(&outlet),
-                Arc::clone(&counters),
-                shutdown.clone(),
-                cfg.tick,
-                cfg.gate.clone(),
-            );
-            by_name.insert(outlet_cfg.name.clone(), started.len());
-            started.push(OutletRuntime {
-                name: outlet_cfg.name.clone(),
-                outlet,
-            });
-            // 每个出口两个并发任务（轮询 + 发送）；停机时全部 abort。
-            tasks.push(poll_task);
-            tasks.push(send_task);
+            }
+            *outlets = kept;
         }
 
-        NorthRuntime {
-            outlets: started,
-            by_name,
-            queue: cfg.queue,
-            counters,
-            tasks: StdMutex::new(tasks),
+        // ---- ② 新增 / 变更：按新配置起出口 ----
+        let mut adding: Vec<OutletConfig> = Vec::new();
+        for (name, _) in &desired_fps {
+            if report.updated.iter().any(|n| n == name) {
+                // 变更项由 rebuilding 携带。
+                continue;
+            }
+            let exists = lock_or_recover(&self.outlets)
+                .iter()
+                .any(|o| o.name == *name);
+            if exists {
+                continue;
+            }
+            if let Some(cfg) = desired.iter().find(|o| o.name == *name) {
+                adding.push(cfg.clone());
+            }
         }
+        adding.extend(rebuilding);
+
+        for cfg in &adding {
+            let is_update = report.updated.contains(&cfg.name);
+            match Self::build_outlet(
+                &self.gateway_id,
+                cfg,
+                &self.inputs,
+                &self.counters,
+                &self.shutdown,
+            ) {
+                Ok(entry) => {
+                    lock_or_recover(&self.outlets).push(entry);
+                    if is_update {
+                        info!(outlet = %cfg.name, "north runtime: outlet rebuilt after config change");
+                    } else {
+                        report.added.push(cfg.name.clone());
+                        info!(outlet = %cfg.name, "north runtime: outlet started (hot)");
+                    }
+                }
+                Err(err) => {
+                    Counters::bump(&self.counters.skipped);
+                    error!(
+                        outlet = %cfg.name,
+                        error = %err,
+                        "north runtime: outlet rebuild failed; keeping the previous state \
+                         (restart the gateway after fixing `[[outlets]]`)"
+                    );
+                    report.failed.push(cfg.name.clone());
+                    // 变更项失败：旧出口已被摘除，如实留在 failed（不伪造成功）。
+                }
+            }
+        }
+        report
+    }
+
+    /// 摘除一个出口：abort 驱动任务 → 在途批次回灌离线队列 → 落盘兜底。
+    ///
+    /// **顺序不可颠倒**：先 abort（不再有新发布），再回灌（内存批次进 `queue.db`），
+    /// 否则驱动任务的最后一拍可能把已回灌的批次又发一遍。
+    fn retire_outlet(&self, entry: OutletRuntime, report: &mut NorthResyncReport) {
+        for task in &entry.tasks {
+            task.abort();
+        }
+        let pending = entry.outlet.send().drain_all();
+        let mut rescued = 0u64;
+        let mut lost = 0u64;
+        for item in pending {
+            match self.queue.enqueue(item.payload) {
+                Ok(_) => rescued = rescued.saturating_add(1),
+                Err(err) => {
+                    lost = lost.saturating_add(1);
+                    error!(
+                        outlet = %entry.name,
+                        seq = item.seq,
+                        error = %err,
+                        "north runtime: [ERROR] failed to rescue an in-flight batch into the \
+                         offline queue while retiring the outlet; batch is no longer in memory"
+                    );
+                }
+            }
+        }
+        report.rescued = report.rescued.saturating_add(rescued);
+        report.rescue_lost = report.rescue_lost.saturating_add(lost);
+        info!(
+            outlet = %entry.name,
+            rescued, lost,
+            "north runtime: outlet retired (in-flight batches handed back to the offline queue)"
+        );
     }
 
     /// 出口数（实际启动的）。
     #[must_use]
     pub fn outlet_count(&self) -> usize {
-        self.outlets.len()
+        lock_or_recover(&self.outlets).len()
     }
 
     /// 出口名清单（保序）。
     #[must_use]
-    pub fn outlet_names(&self) -> Vec<&str> {
-        self.outlets.iter().map(|o| o.name.as_str()).collect()
+    pub fn outlet_names(&self) -> Vec<String> {
+        lock_or_recover(&self.outlets)
+            .iter()
+            .map(|o| o.name.clone())
+            .collect()
     }
 
     /// 按名取背压接线束（采集侧发布入口 / 观测）。
+    ///
+    /// 返回 `Arc` 克隆而非引用：出口注册表在运行期可变（热生效），引用会跨越
+    /// 注册表锁的生命周期；克隆只占一次原子自增，热路径零分配。
     #[must_use]
-    pub fn outlet(&self, name: &str) -> Option<&Arc<NorthOutlet>> {
-        self.by_name
-            .get(name)
-            .and_then(|index| self.outlets.get(*index))
-            .map(|entry| &entry.outlet)
+    pub fn outlet(&self, name: &str) -> Option<Arc<NorthOutlet>> {
+        lock_or_recover(&self.outlets)
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| Arc::clone(&entry.outlet))
     }
 
     /// 提交一个批次到指定出口的有界发送队列（**同步、永不阻塞采集路径**）。
+    ///
+    /// 临界区只做「查表 + 克隆句柄」，**不在锁内做网络 / 落盘**（采集路径永不阻塞）。
     ///
     /// # Errors
     /// 出口名未知 → `ConfigError`（2000）。硬上限且落盘失败**不是错误**：
@@ -641,7 +935,7 @@ impl NorthRuntime {
     #[must_use]
     pub fn stats(&self) -> NorthRuntimeStats {
         let mut stats = NorthRuntimeStats {
-            outlets: self.outlets.len(),
+            outlets: self.outlet_count(),
             skipped: Counters::get(&self.counters.skipped),
             poll_cycles: Counters::get(&self.counters.poll_cycles),
             polls_ok: Counters::get(&self.counters.polls_ok),
@@ -652,7 +946,7 @@ impl NorthRuntime {
             gated_cycles: Counters::get(&self.counters.gated_cycles),
             ..NorthRuntimeStats::default()
         };
-        for entry in &self.outlets {
+        for entry in lock_or_recover(&self.outlets).iter() {
             let send = entry.outlet.send().stats();
             stats.admitted = stats.admitted.saturating_add(send.admitted);
             stats.spilled = stats.spilled.saturating_add(send.spilled);
@@ -667,8 +961,9 @@ impl NorthRuntime {
     /// 存活驱动任务数。
     #[must_use]
     pub fn running_tasks(&self) -> usize {
-        lock_or_recover(&self.tasks)
+        lock_or_recover(&self.outlets)
             .iter()
+            .flat_map(|o| o.tasks.iter())
             .filter(|task| !task.is_finished())
             .count()
     }
@@ -678,8 +973,10 @@ impl NorthRuntime {
     /// 驱动任务被中止前已由 `SendQueue` 的落盘降级保证数据安全（内存中条目
     /// 仍由队列自身的内存/磁盘双写兜底）。
     pub fn shutdown(&self) {
-        for task in lock_or_recover(&self.tasks).drain(..) {
-            task.abort();
+        for outlet in lock_or_recover(&self.outlets).iter() {
+            for task in &outlet.tasks {
+                task.abort();
+            }
         }
     }
 }

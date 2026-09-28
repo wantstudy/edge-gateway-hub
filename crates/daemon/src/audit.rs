@@ -847,9 +847,11 @@ fn ensure_chain_salt(conn: &Connection) -> DaemonResult<Vec<u8>> {
 
 /// 读 `audit_meta` 单键（`QueryReturnedNoRows` → `None`）。
 fn read_meta(conn: &Connection, key: &str) -> DaemonResult<Option<String>> {
-    conn.query_row("SELECT value FROM audit_meta WHERE key = ?1", params![key], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT value FROM audit_meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
     .map(Some)
     .or_else(|e| match e {
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -1016,7 +1018,12 @@ mod tests {
 
         // 同一条件显式取最新在前（管理面读取侧口径）：跳过最新 2 条 → row-2、row-1。
         let rows = logger
-            .query(&AuditQuery::new().with_limit(2).with_offset(2).with_order_desc(true))
+            .query(
+                &AuditQuery::new()
+                    .with_limit(2)
+                    .with_offset(2)
+                    .with_order_desc(true),
+            )
             .expect("page desc");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].detail, "row-2");
@@ -1062,12 +1069,7 @@ mod tests {
 
         // 追加一条后立刻出现在首位（模拟「本次进程的事件应可见」）。
         logger
-            .record(
-                "b",
-                AuditEventType::AuditRead,
-                OUTCOME_ACCEPTED,
-                "fresh",
-            )
+            .record("b", AuditEventType::AuditRead, OUTCOME_ACCEPTED, "fresh")
             .expect("record");
         let rows = logger
             .query(&AuditQuery::new().with_order_desc(true).with_limit(1))

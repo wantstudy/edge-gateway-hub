@@ -543,6 +543,26 @@ pub struct ActivationCode {
     pub prebind_machine_code: Option<String>,
 }
 
+/// **机器码归一**（去首尾空白 + ASCII 小写）：全链路写入 / 查询 / 比较的**唯一入口**。
+///
+/// # 为什么必须有它
+/// 机器码是 `hex::encode` 的产物（`0-9a-f`），**语义上大小写无关**。但 admin-console
+/// 曾在发放时把用户输入 `toUpperCase()` 后提交（2026-09-28 修复前的 `CodesPage.vue`），
+/// 而网关上报的是 `hex::encode` 的**小写**值；服务端当时用精确 `==` 比较，于是
+/// 「同机」被恒判为「异机」→ 一机一码把**合法激活**全部误杀为 `PREBIND_CONFLICT`。
+///
+/// # 纪律
+/// 任何读写 `activation_code.prebind_machine_code` / `device.machine_code` 的路径
+/// （含 SQL 查询入参）都**必须**先经本函数，否则会出现「库里小写、查询大写」的落空。
+/// 存量值的改写由 `store::migrate` 的下行迁移兜底（见 [`crate::store::MIGRATIONS`]）。
+///
+/// # 为什么用 [`str::to_ascii_lowercase`] 而不是 [`str::to_lowercase`]
+/// 后者带 Unicode 语义（如 `İ` → `i̇`，长度可变），会让「归一后长度」与「字节比较」
+/// 产生漂移；机器码是 ASCII hex，ASCII 语义即可且行为稳定。
+pub fn normalize_machine_code(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
 impl ActivationCode {
     /// 构造一个**新发放**（`issued`、未绑定）的激活码。
     ///
@@ -584,18 +604,29 @@ impl ActivationCode {
     ///
     /// 空白串统一归一为 `None`（"   " 不算「已提供」），保证
     /// 「留待首次激活绑定」与「显式留空」语义一致。
+    ///
+    /// 大小写经 [`normalize_machine_code`] 归一小写：发放端可能提交大写机器码，
+    /// 而网关上报的恒为小写 hex，不归一就会把同机判成异机（一机一码误杀）。
     pub fn with_prebind(mut self, machine_code: Option<String>) -> Self {
         self.prebind_machine_code = machine_code
-            .map(|m| m.trim().to_string())
+            .map(|m| normalize_machine_code(&m))
             .filter(|m| !m.is_empty());
         self
     }
 
     /// 预绑定是否命中给定机器码（`None` = 未预绑定 → 任意机器均可激活）。
+    ///
+    /// **两侧**都经 [`normalize_machine_code`] 归一：库里的预绑定值可能来自
+    /// 归一前的历史数据（大写），上报值也可能来自任意客户端；只归一一侧仍会漏判。
+    ///
+    /// 归一**只抹平大小写与空白**，不做模糊匹配 —— 不同的机器码仍必须拒绝
+    /// （一机一码红线：见 `service.rs` 的 `t46_prebind_case_insensitive_*` 测试）。
     pub fn prebind_matches(&self, machine_code: &str) -> bool {
         match self.prebind_machine_code.as_deref() {
             None => true,
-            Some(expected) => expected == machine_code,
+            Some(expected) => {
+                normalize_machine_code(expected) == normalize_machine_code(machine_code)
+            }
         }
     }
 
@@ -820,6 +851,227 @@ pub struct AuditLog {
     pub ts: i64,
     /// 来源 IP / 来源标识。
     pub ip: String,
+}
+
+// ---- OTA 升级包（网关系统更新的发布物仓库） ----
+
+/// OTA 签名域分隔前缀（**与 `daemon::ota::OTA_SIGNING_DOMAIN_V1` 逐字节一致**）。
+///
+/// ⚠️ 该常量是两端能否打通的关键：网关侧 `verify_manifest_signature` 用它重建
+/// 待验消息，本服务用它构造待签消息。任一侧改动都会导致全部存量包验签失败
+/// （fail-closed），改动必须同步 `crates/daemon/src/ota.rs`。
+pub const OTA_SIGNING_DOMAIN_V1: &str = "iotdaq.ota.v1|";
+
+/// 单个 OTA 升级包包体的**解码后**字节数上限（base64 之前）。
+///
+/// 网关更新包含 daemon 二进制 + 资源，实测可达数十 MB；此处取 200 MB 作为
+/// 上传闸门，既拦住明显异常的超大请求（OOM / 慢速写入），又不卡住正常发布。
+/// 网关侧 `daemon::ota` 不需镜像此常量（它只验签 + 落盘到临时区间，由分区容量兜底）。
+pub const MAX_OTA_PAYLOAD_BYTES: usize = 200 * 1024 * 1024;
+
+/// OTA 升级包状态（发布物生命周期）。
+///
+/// 状态机：`draft → published → disabled`；`disabled → published`（重新启用）；
+/// `revoked` 为终态（包已废止，不可再发布）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaStatus {
+    /// 已上传并签名，尚未发布（网关拉取不到）。
+    Draft,
+    /// 已发布（网关可拉取）。
+    Published,
+    /// 已停用（曾发布，现不可拉取）。
+    Disabled,
+    /// 已废止（终态；不可再发布）。
+    Revoked,
+}
+
+impl OtaStatus {
+    /// 稳定字符串（落库 / 下发 / 日志统一口径）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OtaStatus::Draft => "draft",
+            OtaStatus::Published => "published",
+            OtaStatus::Disabled => "disabled",
+            OtaStatus::Revoked => "revoked",
+        }
+    }
+
+    /// 解析状态字面量（大小写不敏感；未知 → `None`，**不 panic**）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "draft" => Some(OtaStatus::Draft),
+            "published" => Some(OtaStatus::Published),
+            "disabled" => Some(OtaStatus::Disabled),
+            "revoked" => Some(OtaStatus::Revoked),
+            _ => None,
+        }
+    }
+
+    /// 该状态下网关是否可拉取。
+    pub fn is_pullable(self) -> bool {
+        matches!(self, OtaStatus::Published)
+    }
+}
+
+/// `ota_package` 表：可下发给网关的升级包（发布物仓库）。
+///
+/// ## 大数红线
+/// `version` / `size` / `published_at` 在**数据库与 JSON 两侧一律字符串**
+/// （与 `http.rs::paged()` 同口径）：网关侧 `daemon::ota::parse_manifest`
+/// 对 manifest 的数值型字段**显式拒绝**（必须是 JSON 字符串），本侧若存成
+/// 数值再序列化，网关将整体拒收。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtaPackage {
+    /// 版本号（u64 单调序的十进制字符串；网关侧严格递增校验）。
+    pub version: String,
+    /// 发布通道（`stable` / `beta`）。
+    pub channel: String,
+    /// payload 字节数（十进制字符串）。
+    pub size: String,
+    /// payload SHA-256（**小写** hex；签名对象里就是它，大小写必须稳定）。
+    pub payload_sha256: String,
+    /// payload base64（`payload_b64`，与网关 manifest 同字段名）。
+    pub payload_b64: String,
+    /// Ed25519 签名（base64）。
+    pub sig_b64: String,
+    /// 签名密钥标识（网关据此选公钥验签）。
+    pub kid: String,
+    /// 状态。
+    pub status: OtaStatus,
+    /// 发布时间（UTC 秒字符串，`draft` 时为 `""`）。
+    pub published_at: String,
+    /// 发布人（登录用户名）。
+    pub published_by: String,
+    /// 备注（发布说明，可空）。
+    pub note: String,
+}
+
+/// 构造 OTA 签名消息：`DOMAIN || ver=<len>:<dec>| || sha256=<len>:<hex>|`。
+///
+/// **与 `crates/daemon/src/ota.rs::ota_signing_message` 逐字节同构**：长度入消息
+/// 防拼接歧义，`version` 用其十进制字符串长度（故传入的必须是无前导零的十进制
+/// 串）。本函数只做字节拼装，不校验 `payload_sha256` 形状——调用方须先确保其
+/// 为 64 位小写 hex（见 [`crate::service::LicensingService::admin_upload_ota`]）。
+pub fn ota_signing_message(version: &str, payload_sha256_hex: &str) -> Vec<u8> {
+    let mut msg: Vec<u8> = Vec::with_capacity(OTA_SIGNING_DOMAIN_V1.len() + 96);
+    msg.extend_from_slice(OTA_SIGNING_DOMAIN_V1.as_bytes());
+    let version_field = format!("ver={}:{}|", version.len(), version);
+    msg.extend_from_slice(version_field.as_bytes());
+    let sha_field = format!(
+        "sha256={}:{}|",
+        payload_sha256_hex.len(),
+        payload_sha256_hex
+    );
+    msg.extend_from_slice(sha_field.as_bytes());
+    msg
+}
+
+// ---- 换机工单（客户换机申请的受理单） ----
+
+/// 换机工单状态（受理生命周期）。
+///
+/// 迁移规则：
+/// `pending → processed`（客服处理：废弃旧码，可选重发新码）；
+/// `pending → rejected`（驳回：不改动任何绑定 / 码状态）。
+/// `processed` / `rejected` 均为**终态**——工单不可二次处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketStatus {
+    /// 待处理。
+    Pending,
+    /// 已处理（废弃旧码，可选重发新码）。
+    Processed,
+    /// 已驳回（不改动绑定 / 码状态）。
+    Rejected,
+}
+
+impl TicketStatus {
+    /// 稳定字符串（落库 / 下发 / 前端 `TransferTicket.status` 统一口径）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TicketStatus::Pending => "pending",
+            TicketStatus::Processed => "processed",
+            TicketStatus::Rejected => "rejected",
+        }
+    }
+
+    /// 从落库字符串解析（**未知一律 `Err`，绝不静默兜底为 pending**——
+    /// 那会让脏数据工单被重复处理）。
+    pub fn parse(s: &str) -> LicenseResult<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pending" => Ok(TicketStatus::Pending),
+            "processed" => Ok(TicketStatus::Processed),
+            "rejected" => Ok(TicketStatus::Rejected),
+            other => Err(LicenseError::Storage(format!(
+                "unknown transfer_ticket.status: {other}"
+            ))),
+        }
+    }
+}
+
+/// `transfer_ticket` 表：换机工单（客户换机申请的唯一受理入口）。
+///
+/// ## 语义边界（一机一码红线）
+/// 工单**只是受理凭据**，处理动作本身走既有「废弃 + 重发」链路：
+/// - 批准 = 旧码 `revoked → reissued` + 新码（可选预绑定新机器码）+ `reissued_from_id` 溯源；
+/// - **绝不**做「旧机器码解绑 → 新机器码绑定」：解绑会把已发放码打回可首激态，
+///   等于一码流转多机，直接破一机一码（见 `store::bind_code_to_device` 的竞态防线注释）；
+///   旧 `device` 行与其 `machine_code` **原样保留**作历史，不删不改写。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferTicket {
+    /// 工单 ID（主键，`now_ns_id("tr")`）。
+    pub ticket_id: String,
+    /// 所属租户（外键 → `tenant.tenant_id`）。
+    pub tenant_id: String,
+    /// 原机器码（客户报修的旧机指纹；可为空 = 客户未提供）。
+    pub old_machine_code: String,
+    /// 新机器码（客户换机后的新机指纹；空串 = 留待新机首次激活时绑定）。
+    pub new_machine_code: String,
+    /// 原激活码 ID（外键 → `activation_code.code_id`）。
+    pub source_code_id: String,
+    /// 换机原因（必填，非空白）。
+    pub reason: String,
+    /// 提交时间（UTC 秒）。
+    pub submitted_at: i64,
+    /// 工单状态。
+    pub status: TicketStatus,
+    /// 处理结果（处理后必填；驳回时为驳回说明）。
+    pub resolution: String,
+    /// 处理时间（UTC 秒；未处理为 `None`）。
+    pub processed_at: Option<i64>,
+    /// 处理人（登录用户名；未处理为 `None`）。
+    pub processed_by: Option<String>,
+    /// 处理备注（客服补充说明，≥10 字符由 service 层契约强制）。
+    pub note: String,
+}
+
+impl TransferTicket {
+    /// 构造一张**待处理**工单（终态字段一律留空）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_pending(
+        ticket_id: String,
+        tenant_id: String,
+        old_machine_code: String,
+        new_machine_code: String,
+        source_code_id: String,
+        reason: String,
+        submitted_at: i64,
+    ) -> Self {
+        TransferTicket {
+            ticket_id,
+            tenant_id,
+            old_machine_code,
+            new_machine_code,
+            source_code_id,
+            reason,
+            submitted_at,
+            status: TicketStatus::Pending,
+            resolution: String::new(),
+            processed_at: None,
+            processed_by: None,
+            note: String::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1216,5 +1468,50 @@ mod tests {
         );
         assert_eq!(device.anchor_drift_count(&v(&["p", "q", "r", "s", "t"])), 5);
         assert_eq!(device.anchor_drift_count(&[]), 5);
+    }
+
+    #[test]
+    fn ota_status_round_trips_and_case_insensitive() {
+        for s in [
+            OtaStatus::Draft,
+            OtaStatus::Published,
+            OtaStatus::Disabled,
+            OtaStatus::Revoked,
+        ] {
+            let parsed = OtaStatus::parse(s.as_str());
+            assert_eq!(parsed, Some(s), "{:?}", s);
+        }
+        // 大小写不敏感（手工录入 / 历史数据）。
+        assert_eq!(OtaStatus::parse(" Published "), Some(OtaStatus::Published));
+        assert_eq!(OtaStatus::parse("REVOKED"), Some(OtaStatus::Revoked));
+        assert_eq!(OtaStatus::parse(""), None);
+        assert_eq!(OtaStatus::parse("unknown"), None);
+        // 只有 published 可被网关拉取。
+        assert!(OtaStatus::Published.is_pullable());
+        assert!(!OtaStatus::Draft.is_pullable());
+        assert!(!OtaStatus::Disabled.is_pullable());
+        assert!(!OtaStatus::Revoked.is_pullable());
+    }
+
+    /// **两端打通的关键断言**：本侧构造的待签消息必须与 `daemon::ota` 的
+    /// `ota_signing_message` **逐字节一致**，否则网关验签必然失败。
+    /// 期望值按 `crates/daemon/src/ota.rs:119` 的实现逐字符展开。
+    #[test]
+    fn ota_signing_message_matches_daemon_byte_for_byte() {
+        let version = "42";
+        let sha = "ab".repeat(32);
+        let msg = ota_signing_message(version, &sha);
+        let expected = format!(
+            "{}ver={}:{}|sha256={}:{}|",
+            OTA_SIGNING_DOMAIN_V1,
+            version.len(),
+            version,
+            sha.len(),
+            sha
+        );
+        assert_eq!(msg, expected.as_bytes());
+        assert_eq!(OTA_SIGNING_DOMAIN_V1, "iotdaq.ota.v1|");
+        // 域前缀必须是签名消息的前缀（防跨协议签名复用）。
+        assert!(expected.starts_with("iotdaq.ota.v1|"));
     }
 }

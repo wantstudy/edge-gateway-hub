@@ -198,7 +198,7 @@
               :error="prebindError"
               full
             >
-              <UiInput v-model="issueForm.prebindMachineCode" :invalid="prebindError.length > 0" placeholder="C1D2-4E5F-6A7B-8C9D" />
+              <UiInput v-model="issueForm.prebindMachineCode" :invalid="prebindError.length > 0" placeholder="a1b2c3d4e5f6..." />
             </UiField>
           </div>
           <p class="ac-note">
@@ -295,7 +295,7 @@
             :hint="prebindHint"
             :error="prebindError"
           >
-            <UiInput v-model="reissueForm.machineCode" :invalid="prebindError.length > 0" placeholder="C1D2-4E5F-6A7B-8C9D" />
+            <UiInput v-model="reissueForm.machineCode" :invalid="prebindError.length > 0" placeholder="a1b2c3d4e5f6..." />
           </UiField>
 
           <div class="ac-grid ac-grid--2">
@@ -612,7 +612,7 @@ async function submitIssue(): Promise<void> {
     validFrom: issueForm.validFrom,
     validUntil: issueForm.validUntil,
     count: Number(issueForm.count),
-    prebindMachineCode: issueForm.prebindMachineCode.trim().toUpperCase(),
+    prebindMachineCode: issueForm.prebindMachineCode.trim(),
     note: issueForm.note.trim(),
     actor: DEFAULT_ACTOR,
   });
@@ -795,7 +795,7 @@ async function submitReissue(): Promise<void> {
     sourceId: reissueTargetId.value,
     inheritTier: reissueForm.tier,
     inheritValidUntil: reissueForm.validUntil,
-    prebindMachineCode: reissueForm.mode === 'prebind' ? reissueForm.machineCode.trim().toUpperCase() : '',
+    prebindMachineCode: reissueForm.mode === 'prebind' ? reissueForm.machineCode.trim() : '',
     note: reissueForm.note.trim(),
     actor: DEFAULT_ACTOR,
   });

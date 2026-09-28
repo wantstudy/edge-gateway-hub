@@ -26,24 +26,28 @@
 //!   的 `trim().is_empty()` 归一为 `None`，避免把设备永久锁死在空指纹上。
 //! - **G5 幂等键归一**：存储 / 查询前对 `idempotency_key` 做 `trim()` 归一，避免尾部空白割裂同一逻辑键。
 
-use crate::audit::{BatchOutcome, BatchRecord, ReceiptLedger};
 use crate::admin_auth::{sha256_hex, AdminAccount, Role};
+use crate::audit::{BatchOutcome, BatchRecord, ReceiptLedger};
 use crate::device_auth;
 use crate::error::{LicenseError, LicenseResult, PrebindKind};
 use crate::keys::{current_year, KeyRing};
 use crate::model::{
-    now_ns_id, now_unix_secs, ActivationCode, ActorType, AuditLog, CodeStatus, Device,
-    DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, Tenant, VerifyMode,
+    normalize_machine_code, now_ns_id, now_unix_secs, ota_signing_message, ActivationCode,
+    ActorType, AuditLog, CodeStatus, Device, DeviceStatus, Heartbeat, HeartbeatResult, Lease,
+    LeaseStatus, OtaPackage, OtaStatus, Tenant, VerifyMode, MAX_OTA_PAYLOAD_BYTES,
 };
 use crate::proto::{
     ActivationRequest, ActivationResponse, AuditReceiptRequest, AuditReceiptResponse, GapKind,
     HeartbeatRequest, HeartbeatResponse, IssueCodesRequest, IssueCodesResponse, IssuedCode,
-    ReceiptCursor, ReissueCodeRequest, ReissueCodeResponse, RevokeCodeRequest, VerifyRequest,
-    VerifyResponse,
+    OtaManifestResponse, OtaStatusRequest, ReceiptCursor, ReissueCodeRequest, ReissueCodeResponse,
+    RevokeCodeRequest, UploadOtaRequest, VerifyRequest, VerifyResponse, OTA_CHANNELS,
 };
 use crate::receipt;
 use crate::store::Store;
 use crate::token::{issue_lease_token, LeaseClaims, LeaseToken};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
 /// 心跳周期（小时），随激活响应下发（设计 §1.1）。
 const HEARTBEAT_HOURS: i64 = 24;
@@ -380,7 +384,9 @@ impl LicensingService {
             ));
         }
 
-        let machine_code = req.machine_code.clone();
+        // 机器码归一（小写）后再落库 / 入租约：保证 `device.machine_code` 在库内只有
+        // 一种表示，与 `store` 的下行迁移、读取侧的 [`normalize_machine_code`] 共同闭合。
+        let machine_code = normalize_machine_code(&req.machine_code);
         let device =
             self.resolve_or_create_device(&tenant_id, &machine_code, &req.anchor_hashes, now)?;
 
@@ -1362,7 +1368,11 @@ impl LicensingService {
         let mut rng = rand::rng();
         let groups: Vec<String> = (0..4)
             .map(|seg| {
-                let width = if seg == CODE_SEG_COUNT - 1 { CODE_TAIL_WIDTH } else { CODE_GROUP_WIDTH };
+                let width = if seg == CODE_SEG_COUNT - 1 {
+                    CODE_TAIL_WIDTH
+                } else {
+                    CODE_GROUP_WIDTH
+                };
                 let mut group = String::with_capacity(width);
                 for _ in 0..width {
                     let idx = rng.random_range(0..CODE_ALPHABET.len());
@@ -1371,7 +1381,11 @@ impl LicensingService {
                 group
             })
             .collect();
-        format!("IOT-{:04}-{}", current_year(now_unix_secs()), groups.join("-"))
+        format!(
+            "IOT-{:04}-{}",
+            current_year(now_unix_secs()),
+            groups.join("-")
+        )
     }
 
     /// 把 [`ActivationCode`] 投影为对外响应结构 [`IssuedCode`]。
@@ -1390,15 +1404,21 @@ impl LicensingService {
     /// 覆盖两条冲突路径（设计 §「一机一码」）：
     /// 1. **码侧**：已有仍可用码（`issued`/`bound`）预绑定到同机器码 → `MachineAlreadyClaimed`；
     /// 2. **设备侧**：该机器码对应设备已被另一张码实际绑定 → `MachineAlreadyBound`。
+    ///
+    /// **入参先归一**（[`normalize_machine_code`]）：库内值已由 `store` 的下行迁移
+    /// 统一为小写，若查询入参仍是发放端提交的大写原值，`WHERE ... = ?1` 会**静默落空**，
+    /// 使「同租户同机器码已发过码」的冲突检测被绕过（一机一码破口）。
+    /// 归一责任在**本层**，不在 store —— 见 [`Store::find_code_by_prebind`] 的注释。
     fn check_prebind_conflict(&self, tenant_id: &str, machine_code: &str) -> LicenseResult<()> {
-        if let Some(existing) = self.store.find_code_by_prebind(machine_code)? {
+        let machine_code = normalize_machine_code(machine_code);
+        if let Some(existing) = self.store.find_code_by_prebind(&machine_code)? {
             if existing.tenant_id == tenant_id {
                 return Err(LicenseError::prebind_conflict(
                     PrebindKind::MachineAlreadyClaimed,
                 ));
             }
         }
-        if let Some(device) = self.store.get_device_by_machine_code(machine_code)? {
+        if let Some(device) = self.store.get_device_by_machine_code(&machine_code)? {
             if let Some(bound) = self.store.find_bound_code_for_device(&device.device_id)? {
                 if bound.tenant_id == tenant_id {
                     return Err(LicenseError::prebind_conflict(
@@ -1477,7 +1497,10 @@ impl LicensingService {
         self.check_pinned_pubkey(&device, &req.device_pubkey)?;
 
         // ① 上报 machine_code 与绑定记录一致 → 同机（幂等恢复 / 重签租约）。
-        if req.machine_code == device.machine_code {
+        //    两侧归一（大小写 + 空白）：裸 `==` 会把「同机、仅大小写不同」误判为
+        //    需要走锚点 N-of-M，进而可能落到步骤 ③ 把合法运维拒成异机。
+        if normalize_machine_code(&req.machine_code) == normalize_machine_code(&device.machine_code)
+        {
             return self.activate_same_machine(code, &device, req, now);
         }
 
@@ -1580,7 +1603,8 @@ impl LicensingService {
         drifts: usize,
         now: i64,
     ) -> LicenseResult<ActivationResponse> {
-        let new_machine_code = req.machine_code.clone();
+        // 与首激路径（[`Self::activate`]）同一归一口径：改绑写入库内的机器码恒为小写。
+        let new_machine_code = normalize_machine_code(&req.machine_code);
 
         // nonce 防重放 + 公钥钉定（改绑事务之前认领；重放 → NonceReplay，零状态变更）。
         self.claim_activation_nonce(req, &device.device_id, now)?;
@@ -1731,6 +1755,399 @@ impl LicensingService {
         let message = render_response_signing_message(domain, lease_id, nonce, server_time);
         let (_kid, sig) = self.keyring.sign(message.as_bytes())?;
         Ok(sig)
+    }
+
+    // ------------------------- 管理端：OTA 升级包（发布物仓库） -------------------------
+
+    /// 列出升级包（`GET /admin/updates`；`status` 为 `None` / 空白 = 不过滤）。
+    ///
+    /// 排序由 [`crate::store::Store::list_ota_packages`] 保证：版本号**数值**降序
+    /// （不是字典序，否则 `"9"` 会排在 `"10"` 之后）。
+    pub fn admin_list_ota_packages(&self, status: Option<&str>) -> LicenseResult<Vec<OtaPackage>> {
+        let filter = match status.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(OtaStatus::parse(raw).ok_or_else(|| {
+                LicenseError::KeyStateIllegal(format!(
+                    "unknown ota status filter: {raw}; allowed: draft | published | disabled | revoked"
+                ))
+            })?),
+            None => None,
+        };
+        self.store.list_ota_packages_by_status(filter)
+    }
+
+    /// 上传升级包（`POST /admin/updates`；仅 system）：解码 → 算 SHA-256 → 用密钥环
+    /// 当前签发密钥对 **OTA 域消息**签名 → 落库为 `draft`。
+    ///
+    /// ## 签名域（两端打通的关键）
+    /// 待签消息 = [`crate::model::ota_signing_message`]，与
+    /// `crates/daemon/src/ota.rs:119` **逐字节同构**：
+    /// `iotdaq.ota.v1|ver=<len>:<dec>|sha256=<len>:<hex>|`。
+    /// `payload_sha256` 一律**小写** hex（网关 `parse_manifest` 会 `to_ascii_lowercase()`，
+    /// 本侧必须与签名对象一致，否则验签必然失败）。
+    ///
+    /// ## 危险操作四要素
+    /// `reason` / `note_detail` / `confirm` 三个**彼此独立**的字段（详见
+    /// [`Self::validate_ota_dangerous_contract`]）；`note`（发布说明）是业务字段，
+    /// **不参与**四要素校验。
+    ///
+    /// # Errors
+    /// - 版本号非法 / 通道非法 / payload 非 base64 / 超大 → [`LicenseError::KeyStateIllegal`]（400）；
+    /// - 四要素不符 → `ReasonRequired`（400）/ `ConfirmMismatch`（412）；
+    /// - 同 `(version, channel)` 已存在 → `KeyStateIllegal`（400，**不做 upsert**）；
+    /// - 无可用签发密钥 → [`LicenseError::TokenInvalid`]。
+    pub fn admin_upload_ota(
+        &self,
+        req: &UploadOtaRequest,
+        actor_id: &str,
+    ) -> LicenseResult<OtaPackage> {
+        let version = Self::validate_ota_version(&req.version)?;
+        let channel = Self::validate_ota_channel(&req.channel)?;
+        Self::validate_ota_dangerous_contract(
+            &req.reason,
+            req.note_detail.as_deref().unwrap_or(""),
+            &req.confirm,
+            &version,
+        )?;
+
+        let payload_b64 = req.payload_b64.trim();
+        if payload_b64.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "upload ota requires a non-empty payload_b64".into(),
+            ));
+        }
+        let payload = B64.decode(payload_b64.as_bytes()).map_err(|e| {
+            LicenseError::KeyStateIllegal(format!("payload_b64 is not valid base64: {e}"))
+        })?;
+        if payload.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "upload ota payload must not be empty".into(),
+            ));
+        }
+        if payload.len() > MAX_OTA_PAYLOAD_BYTES {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "ota payload is too large: {} bytes exceeds the {} byte limit",
+                payload.len(),
+                MAX_OTA_PAYLOAD_BYTES
+            )));
+        }
+
+        if self.store.get_ota_package(&version, &channel)?.is_some() {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "ota package already exists: version {version} on channel {channel}; \
+                 upload a different version instead of overwriting a published artifact"
+            )));
+        }
+
+        let payload_sha256 = Self::sha256_lower_hex(&payload);
+        let (kid, sig_b64) = self
+            .keyring
+            .sign(&ota_signing_message(&version, &payload_sha256))?;
+
+        let pkg = OtaPackage {
+            version: version.clone(),
+            channel,
+            size: payload.len().to_string(),
+            payload_sha256,
+            payload_b64: payload_b64.to_string(),
+            sig_b64,
+            kid,
+            status: OtaStatus::Draft,
+            published_at: String::new(),
+            published_by: String::new(),
+            note: req.note.trim().to_string(),
+        };
+        self.store.insert_ota_package(&pkg)?;
+        let now = now_unix_secs();
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            "ota_upload",
+            "ota_package",
+            &format!("{}:{}", pkg.version, pkg.channel),
+            &Self::ota_audit_detail(&req.reason, req.note_detail.as_deref().unwrap_or("")),
+            now,
+        )?;
+        Ok(pkg)
+    }
+
+    /// 发布升级包（`POST /admin/updates/:version/publish`；仅 system）：`draft | disabled
+    /// → published`。
+    ///
+    /// 只有 `published` 包会被 [`Self::ota_manifest`] 下发给网关——上传即发布会让
+    /// 「未过审的包」直接触达现场设备，故上传后必须显式发布。
+    ///
+    /// # Errors
+    /// 包不存在 → `KeyStateIllegal`（400）；`revoked` 为终态，不可再发布。
+    pub fn admin_publish_ota(
+        &self,
+        version_raw: &str,
+        req: &OtaStatusRequest,
+        actor_id: &str,
+    ) -> LicenseResult<OtaPackage> {
+        self.set_ota_status(version_raw, req, actor_id, OtaStatus::Published)
+    }
+
+    /// 停用升级包（`POST /admin/updates/:version/disable`；仅 system）：`published → disabled`。
+    ///
+    /// 停用是**可逆**的下架（与 `revoked` 终态不同）：包字节保留，可重新发布。
+    ///
+    /// # Errors
+    /// 包不存在 / 当前状态不是 `published` → `KeyStateIllegal`（400）。
+    pub fn admin_disable_ota(
+        &self,
+        version_raw: &str,
+        req: &OtaStatusRequest,
+        actor_id: &str,
+    ) -> LicenseResult<OtaPackage> {
+        self.set_ota_status(version_raw, req, actor_id, OtaStatus::Disabled)
+    }
+
+    /// 发布 / 停用共用路径（状态机收口在一处，避免两条分支各写一套校验而分叉）。
+    fn set_ota_status(
+        &self,
+        version_raw: &str,
+        req: &OtaStatusRequest,
+        actor_id: &str,
+        target: OtaStatus,
+    ) -> LicenseResult<OtaPackage> {
+        let version = Self::validate_ota_version(version_raw)?;
+        let channel = Self::validate_ota_channel(&req.channel)?;
+        Self::validate_ota_dangerous_contract(&req.reason, &req.note, &req.confirm, &version)?;
+
+        let existing = self
+            .store
+            .get_ota_package(&version, &channel)?
+            .ok_or_else(|| {
+                LicenseError::KeyStateIllegal(format!(
+                    "ota package not found: version {version} on channel {channel}"
+                ))
+            })?;
+        match (existing.status, target) {
+            // 幂等：已经是目标状态直接返回当前包（重复点击不报错、不重复入审计环语义）。
+            (s, t) if s == t => return Ok(existing),
+            (OtaStatus::Revoked, _) => {
+                return Err(LicenseError::KeyStateIllegal(format!(
+                    "ota package version {version} on channel {channel} is revoked and cannot be {target}",
+                    target = target.as_str()
+                )));
+            }
+            (_, OtaStatus::Published) => {}
+            (OtaStatus::Published, OtaStatus::Disabled) => {}
+            (from, _) => {
+                return Err(LicenseError::KeyStateIllegal(format!(
+                    "cannot set ota package status from {} to {}",
+                    from.as_str(),
+                    target.as_str()
+                )));
+            }
+        }
+
+        let now = now_unix_secs();
+        let published_at = match target {
+            OtaStatus::Published => now.to_string(),
+            _ => existing.published_at.clone(),
+        };
+        let published_by = match target {
+            OtaStatus::Published => actor_id.to_string(),
+            _ => existing.published_by.clone(),
+        };
+        let changed = self.store.update_ota_status(
+            &version,
+            &channel,
+            target,
+            &published_at,
+            &published_by,
+        )?;
+        if !changed {
+            return Err(LicenseError::Storage(
+                "ota package status update affected no rows".into(),
+            ));
+        }
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            match target {
+                OtaStatus::Published => "ota_publish",
+                _ => "ota_disable",
+            },
+            "ota_package",
+            &format!("{version}:{channel}"),
+            &Self::ota_audit_detail(&req.reason, &req.note),
+            now,
+        )?;
+        self.store
+            .get_ota_package(&version, &channel)?
+            .ok_or_else(|| LicenseError::Storage("ota package vanished right after update".into()))
+    }
+
+    /// 网关拉取 manifest（`GET /updates/manifest`）：返回该通道**最新已发布**的包。
+    ///
+    /// ## 诚实空态（绝不伪造）
+    /// - 该通道无任何 `published` 包 → `available:false` + 面向用户的 `reason`；
+    /// - 传了 `current` 且最新已发布版本 **不大于** 它 → `available:false`（网关
+    ///   `OtaManager::verify_and_stage` 强制版本严格递增，此时下发必然被拒，
+    ///   与其让网关验签后才报「版本回退」，不如在此诚实说明「当前已是最新版本」）。
+    ///
+    /// ## 传输（V1 已知限制）
+    /// 与激活同通道走 **HTTP 明文**（`daemon::ota` V1 不支持 TLS）。机密性无保障，
+    /// 完整性由 Ed25519 签名兜底；生产部署建议经可信内网下发。
+    pub fn ota_manifest(
+        &self,
+        channel_raw: Option<&str>,
+        current_raw: Option<&str>,
+    ) -> LicenseResult<OtaManifestResponse> {
+        let channel = Self::validate_ota_channel(channel_raw.unwrap_or("stable"))?;
+        let Some(pkg) = self.store.latest_published_ota(&channel)? else {
+            return Ok(OtaManifestResponse {
+                available: false,
+                version: String::new(),
+                ts_ns: String::new(),
+                size: String::new(),
+                payload_sha256: String::new(),
+                payload_b64: String::new(),
+                sig_b64: String::new(),
+                kid: String::new(),
+                reason: format!(
+                    "当前 {channel} 通道还没有已发布的更新包。请在授权管理后台的「系统更新」\
+                     页上传并发布一个更新包后，网关即可检查到更新。"
+                ),
+            });
+        };
+        if let Some(current) = current_raw.map(str::trim).filter(|s| !s.is_empty()) {
+            match (current.parse::<u64>(), pkg.version.parse::<u64>()) {
+                (Ok(cur), Ok(latest)) if latest <= cur => {
+                    return Ok(OtaManifestResponse {
+                        available: false,
+                        version: pkg.version.clone(),
+                        ts_ns: String::new(),
+                        size: String::new(),
+                        payload_sha256: String::new(),
+                        payload_b64: String::new(),
+                        sig_b64: String::new(),
+                        kid: String::new(),
+                        reason: format!(
+                            "当前版本 {cur} 已是 {channel} 通道的最新版本（已发布最高版本 \
+                             {}），没有需要安装的更新。",
+                            pkg.version
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        // `ts_ns` 由发布时刻（UTC 秒）派生为纳秒；网关侧仅作信息性字段（不进签名对象）。
+        let ts_ns = pkg
+            .published_at
+            .parse::<i64>()
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000)
+            .to_string();
+        Ok(OtaManifestResponse {
+            available: true,
+            version: pkg.version,
+            ts_ns,
+            size: pkg.size,
+            payload_sha256: pkg.payload_sha256,
+            payload_b64: pkg.payload_b64,
+            sig_b64: pkg.sig_b64,
+            kid: pkg.kid,
+            reason: String::new(),
+        })
+    }
+
+    /// 版本号归一（u64 单调序的**规范十进制串**）。
+    ///
+    /// 拒绝前导零 / 空白 / 非数字：`"007"` 与 `"7"` 若都合法，`(version, channel)`
+    /// 主键会出现两个逻辑同版本的包，且签名消息里的 `ver=<len>` 也会分叉。
+    fn validate_ota_version(raw: &str) -> LicenseResult<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "ota version must not be empty".into(),
+            ));
+        }
+        let parsed: u64 = trimmed.parse().map_err(|_| {
+            LicenseError::KeyStateIllegal(format!(
+                "ota version must be a decimal u64, got {trimmed:?}"
+            ))
+        })?;
+        if parsed == 0 {
+            return Err(LicenseError::KeyStateIllegal(
+                "ota version must be greater than 0".into(),
+            ));
+        }
+        let canonical = parsed.to_string();
+        if canonical != trimmed {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "ota version must be the canonical decimal form of {parsed} (no leading zeros), got {trimmed:?}"
+            )));
+        }
+        Ok(canonical)
+    }
+
+    /// 通道归一（缺省 / 空白 = `stable`；未知通道一律拒绝，不静默回退）。
+    fn validate_ota_channel(raw: &str) -> LicenseResult<String> {
+        let trimmed = raw.trim();
+        let channel = if trimmed.is_empty() {
+            "stable"
+        } else {
+            trimmed
+        };
+        if OTA_CHANNELS.contains(&channel) {
+            Ok(channel.to_string())
+        } else {
+            Err(LicenseError::KeyStateIllegal(format!(
+                "unknown ota channel: {channel}; allowed: {}",
+                OTA_CHANNELS.join(" | ")
+            )))
+        }
+    }
+
+    /// 危险操作四要素校验（`reason` / `note` / `confirm` 三个**彼此独立**的字段）。
+    ///
+    /// `note` **绝不允许**拼进 `reason`——二者分别入审计：前者是「为什么做」（枚举原因），
+    /// 后者是「补充说明」。拼接会让审计无法区分，也让「填了 reason 就算过」的绕过成立。
+    ///
+    /// - `reason` trim 后空白 → [`LicenseError::ReasonRequired`]（400 `REASON_REQUIRED`）；
+    /// - `note` trim 后少于 10 字符 → `KeyStateIllegal`（400 `BAD_REQUEST`）；
+    /// - `confirm` trim 后与 `expected` **大小写不敏感**精确匹配失败 →
+    ///   [`LicenseError::ConfirmMismatch`]（412 `CONFIRM_MISMATCH`，沿用本服务既有口径）。
+    fn validate_ota_dangerous_contract(
+        reason: &str,
+        note: &str,
+        confirm: &str,
+        expected: &str,
+    ) -> LicenseResult<()> {
+        if reason.trim().is_empty() {
+            return Err(LicenseError::reason_required(
+                "ota write requires a non-empty reason (independent of note)",
+            ));
+        }
+        if note.trim().chars().count() < 10 {
+            return Err(LicenseError::KeyStateIllegal(
+                "ota write note must be at least 10 characters and must not be merged into reason"
+                    .into(),
+            ));
+        }
+        let supplied = confirm.trim().to_uppercase();
+        let expected_upper = expected.trim().to_uppercase();
+        if supplied.is_empty() || supplied != expected_upper {
+            return Err(LicenseError::confirm_mismatch(
+                "confirm does not match the target ota version",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 审计详情（JSON；**不承载** payload / 签名等大字段与任何敏感值）。
+    fn ota_audit_detail(reason: &str, note: &str) -> String {
+        serde_json::json!({ "reason": reason.trim(), "note": note.trim() }).to_string()
+    }
+
+    /// payload → **小写** hex SHA-256（签名对象里就是它，大小写必须稳定）。
+    fn sha256_lower_hex(data: &[u8]) -> String {
+        let digest = Sha256::digest(data);
+        digest.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// 写入一条审计日志（后台动作统一入口，actor 固定为管理员）。
@@ -1983,7 +2400,11 @@ mod tests {
             .issue_codes(&issue_req("t-1", Some("M1"), "g1-issue"))
             .unwrap();
         let code = &resp.codes[0];
-        assert_eq!(code.prebind.as_deref(), Some("M1"), "预绑定必须落库");
+        assert_eq!(
+            code.prebind.as_deref(),
+            Some("m1"),
+            "预绑定必须落库（归一后小写）"
+        );
 
         // 正确机器激活成功。
         let act = svc.activate(&activate_req(&code.code, "M1")).unwrap();
@@ -3123,7 +3544,9 @@ mod tests {
     #[test]
     fn t_act_valid_request_activates_and_pins_pubkey_and_nonce() {
         let svc = build_service();
-        let resp = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-ok")).unwrap();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "act-ok"))
+            .unwrap();
         let code = &resp.codes[0];
         let req = activate_req(&code.code, "MID-A");
         let act = svc.activate(&req).expect("activation must succeed");
@@ -3195,7 +3618,9 @@ mod tests {
     #[test]
     fn t_act_pubkey_mismatch_on_pinned_device_rejected_without_side_effects() {
         let svc = build_service();
-        let resp = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-pk")).unwrap();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "act-pk"))
+            .unwrap();
         let code = &resp.codes[0];
         let first = svc
             .activate(&activate_req(&code.code, "MID-A"))
@@ -3251,7 +3676,9 @@ mod tests {
     #[test]
     fn t_act_stale_and_future_ts_rejected_without_side_effects() {
         let svc = build_service();
-        let resp = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-ts")).unwrap();
+        let resp = svc
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "act-ts"))
+            .unwrap();
         let code = &resp.codes[0];
         let count_audit_before = count_audit(&svc);
 
@@ -3342,8 +3769,12 @@ mod tests {
     fn t_act_nonce_is_global_across_codes() {
         let svc = build_service();
         // 2026-09-27 契约：发放必填机器码——两张码必须预绑定不同机器。
-        let r1 = svc.issue_codes(&issue_req("t-1", Some("MID-A"), "act-g1")).unwrap();
-        let r2 = svc.issue_codes(&issue_req("t-1", Some("MID-B"), "act-g2")).unwrap();
+        let r1 = svc
+            .issue_codes(&issue_req("t-1", Some("MID-A"), "act-g1"))
+            .unwrap();
+        let r2 = svc
+            .issue_codes(&issue_req("t-1", Some("MID-B"), "act-g2"))
+            .unwrap();
 
         let mk = |code_value: &str, machine: &str, nonce: &str| {
             let ts = now_unix_secs();
@@ -3495,8 +3926,14 @@ mod tests {
             assert!(gateway_code_shape_ok(&code), "码不符合网关格式: {code}");
             // 易混字符检查只看 payload（前缀 `IOT-` 自带 `I`，年份含 `0`）。
             let payload = &code[code.len() - 14..];
-            assert!(!payload.contains(['0', '1', 'I', 'O']), "码含易混字符: {code}");
-            assert!(code.starts_with(&format!("IOT-{year:04}-")), "年份前缀错: {code}");
+            assert!(
+                !payload.contains(['0', '1', 'I', 'O']),
+                "码含易混字符: {code}"
+            );
+            assert!(
+                code.starts_with(&format!("IOT-{year:04}-")),
+                "年份前缀错: {code}"
+            );
         }
     }
 

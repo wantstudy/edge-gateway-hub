@@ -117,7 +117,11 @@ impl MetricsState {
 
 /// 片边界纳秒长度（已对 `secs==0` 做夹紧与溢出保护）。
 fn slice_ns(secs: u64) -> i64 {
-    let s = if secs == 0 { 1 } else { secs.min(MAX_SLICE_SECONDS) };
+    let s = if secs == 0 {
+        1
+    } else {
+        secs.min(MAX_SLICE_SECONDS)
+    };
     (s as i64).saturating_mul(NS_PER_SEC)
 }
 
@@ -286,23 +290,11 @@ pub fn snapshot() -> Value {
     let ring_full = ring_len >= state.capacity;
 
     // 窗口内（已完成片 + 当前开放片）的点位与驱动结果聚合。
-    let window_points: u64 = state
-        .ring
-        .iter()
-        .map(|s| s.points)
-        .sum::<u64>()
+    let window_points: u64 = state.ring.iter().map(|s| s.points).sum::<u64>()
         + state.cur.as_ref().map(|s| s.points).unwrap_or(0);
-    let window_ok: u64 = state
-        .ring
-        .iter()
-        .map(|s| s.ok)
-        .sum::<u64>()
+    let window_ok: u64 = state.ring.iter().map(|s| s.ok).sum::<u64>()
         + state.cur.as_ref().map(|s| s.ok).unwrap_or(0);
-    let window_fail: u64 = state
-        .ring
-        .iter()
-        .map(|s| s.fail)
-        .sum::<u64>()
+    let window_fail: u64 = state.ring.iter().map(|s| s.fail).sum::<u64>()
         + state.cur.as_ref().map(|s| s.fail).unwrap_or(0);
 
     // ── 吞吐 ──
@@ -495,7 +487,11 @@ mod tests {
         record_batch(10); // slice 2
         clk.advance(NS);
         record_batch(10); // slice 3 → 淘汰最旧的 slice 0
-        assert_eq!(_ring_len(), 3, "超过容量后最旧一片必须被淘汰，ring 长度恒等于容量");
+        assert_eq!(
+            _ring_len(),
+            3,
+            "超过容量后最旧一片必须被淘汰，ring 长度恒等于容量"
+        );
         assert_eq!(_total_slices(), 4, "已录入 4 片（3 已完成 + 1 开放）");
     }
 

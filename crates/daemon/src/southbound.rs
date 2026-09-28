@@ -351,8 +351,8 @@ impl PollHandler for DevicePollHandler {
                 Some(SimPlan::Ready(_)) => sim_hits.push(point_id.clone()),
                 Some(SimPlan::Invalid(reason)) => {
                     return Err(DaemonError::ConfigError(format!(
-                        "southbound poll: point {point_id:?} has invalid simulation config: {reason}"
-                    )))
+                    "southbound poll: point {point_id:?} has invalid simulation config: {reason}"
+                )))
                 }
                 None => real_hits.push(point_id.clone()),
             }
@@ -484,7 +484,10 @@ impl ControlWritePort for DevicePollHandler {
         if PointAddressParser::parse_coil_address(address).is_ok() {
             return Ok(());
         }
-        if PointAddressParser::parse(address).map(|a| a.area == Some('4')).unwrap_or(false) {
+        if PointAddressParser::parse(address)
+            .map(|a| a.area == Some('4'))
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         Err(DaemonError::ProtocolError(format!(
@@ -519,9 +522,7 @@ impl ControlWritePort for DevicePollHandler {
                 Err(p) => p.into_inner(),
             };
             let plan = guard.get(device_id).ok_or_else(|| {
-                DaemonError::ConfigError(format!(
-                    "unknown device group {device_id:?}"
-                ))
+                DaemonError::ConfigError(format!("unknown device group {device_id:?}"))
             })?;
             (plan.protocol.clone(), plan.address.clone())
         };
@@ -995,7 +996,10 @@ mod tests {
         assert_eq!(samples.len(), 1, "one sim point → one sample");
         assert_eq!(samples[0].source_id, "40001");
         assert_eq!(samples[0].quality, Quality::Good);
-        assert!(samples[0].device_ts_ns.is_none(), "sim has no device timestamp");
+        assert!(
+            samples[0].device_ts_ns.is_none(),
+            "sim has no device timestamp"
+        );
         assert!(
             (0.0..=100.0).contains(&samples[0].value),
             "value {} outside [sim_min, sim_max]",
@@ -1051,8 +1055,7 @@ mod tests {
     /// 非法波形 → 该组 `ConfigError`（**绝不静默退回真实读**）。
     #[tokio::test]
     async fn sim_unknown_mode_fails_closed() {
-        let config = GatewayConfig::parse(&sim_point_toml("sim_mode = \"sine\"\n"))
-            .expect("parse");
+        let config = GatewayConfig::parse(&sim_point_toml("sim_mode = \"sine\"\n")).expect("parse");
         let handler = DevicePollHandler::from_config(&config);
         let err = handler
             .poll("simdev", &["40001".to_string()])
@@ -1109,7 +1112,11 @@ mod tests {
             .poll("mixed", &["40001".to_string(), "40002".to_string()])
             .await
             .expect("mixed poll");
-        assert_eq!(samples.len(), 2, "both points must yield a sample: {samples:?}");
+        assert_eq!(
+            samples.len(),
+            2,
+            "both points must yield a sample: {samples:?}"
+        );
         let sim = samples
             .iter()
             .find(|s| s.source_id == "40001")
@@ -1119,7 +1126,10 @@ mod tests {
             .iter()
             .find(|s| s.source_id == "40002")
             .expect("real sample");
-        assert_eq!(real.value, 22136.0, "real point still reads the slave (0x5678)");
+        assert_eq!(
+            real.value, 22136.0,
+            "real point still reads the slave (0x5678)"
+        );
         assert_eq!(
             connections.load(Ordering::SeqCst),
             1,
@@ -1142,7 +1152,11 @@ mod tests {
         let plans = handler.devices.read().expect("plan lock").clone();
         let plan = &plans["dev-a"];
         assert_eq!(plan.point_ids.len(), 2);
-        assert_eq!(plan.sims.len(), 1, "only the sim-enabled point is registered");
+        assert_eq!(
+            plan.sims.len(),
+            1,
+            "only the sim-enabled point is registered"
+        );
         assert!(matches!(plan.sims.get("40002"), Some(SimPlan::Ready(_))));
         assert!(!plan.sims.contains_key("40001"));
     }

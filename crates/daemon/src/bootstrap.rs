@@ -511,11 +511,7 @@ impl DaemonShared {
     /// 返回 `None` 表示控制面尚未装配（路由挂入但 handler 内部诚实返回 503）。
     /// 装配由 bootstrap 阶段调用 [`Self::attach_control_registry`] 完成。
     pub fn control_registry(&self) -> Option<Arc<crate::ctrl::ControlRegistry>> {
-        self.inner
-            .control
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or(None)
+        self.inner.control.lock().map(|g| g.clone()).unwrap_or(None)
     }
 
     /// 挂载控制面注册表（bootstrap 阶段调用一次）。

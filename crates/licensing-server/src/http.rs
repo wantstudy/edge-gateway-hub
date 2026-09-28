@@ -38,6 +38,7 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::admin_auth::{AdminAuth, AuthedAdmin, Role};
 use crate::error::LicenseError;
@@ -46,9 +47,9 @@ use crate::proto::{
     self, ActivationRequest, ActivationStatsDay, ActivationStatsQuery, ActivationStatsResponse,
     AdminLoginRequest, AdminLoginResponse, ApiEnvelope, AuditLogItem, AuditLogQuery, CodeDetail,
     CodeListQuery, CodeSummary, CreateTenantRequest, DeviceListItem, DeviceListQuery,
-    HeartbeatRequest, IssueCodesRequest, OverviewResponse, PagedResponse, ReceiptAnomalyItem,
-    ReissueCodeRequest, RevokeCodeRequest, SigningKeyItem, TenantItem, TimelineEntry,
-    UpdateTenantPolicyRequest,
+    HeartbeatRequest, IssueCodesRequest, OtaPackageItem, OtaStatusRequest, OverviewResponse,
+    PagedResponse, ReceiptAnomalyItem, ReissueCodeRequest, RevokeCodeRequest, SigningKeyItem,
+    TenantItem, TimelineEntry, UpdateTenantPolicyRequest, UploadOtaRequest,
 };
 use crate::service::LicensingService;
 use crate::store::{AuditFilter, CodeFilter};
@@ -131,6 +132,12 @@ pub fn router(service: SharedService, auth: Arc<AdminAuth>) -> Router {
         .route("/admin/codes/issue", post(issue_codes))
         .route("/admin/codes/:code_id/revoke", post(revoke_code))
         .route("/admin/codes/:code_id/reissue", post(reissue_code))
+        // 管理端：系统更新（OTA 升级包仓库；上传 / 发布 / 停用均仅 system）。
+        .route("/admin/updates", get(admin_ota_list).post(admin_ota_upload))
+        .route("/admin/updates/:version/publish", post(admin_ota_publish))
+        .route("/admin/updates/:version/disable", post(admin_ota_disable))
+        // 设备端（网关）拉取 manifest：无管理端 JWT，走设备签名体系由网关侧自行校验。
+        .route("/updates/manifest", get(ota_manifest))
         .with_state(state)
 }
 
@@ -633,10 +640,11 @@ async fn admin_delete_account(
     if let Err(resp) = require_role(&authed, &ROLES_ACCOUNT_ADMIN, "delete admin account") {
         return resp;
     }
-    match state
-        .service
-        .admin_delete_admin_account(&account, req.note.as_deref().unwrap_or(""), &authed.sub)
-    {
+    match state.service.admin_delete_admin_account(
+        &account,
+        req.note.as_deref().unwrap_or(""),
+        &authed.sub,
+    ) {
         Ok(()) => ok_json(()),
         Err(e) => error_response(&e),
     }
@@ -947,7 +955,8 @@ async fn admin_stats_activations(
         Ok(rows) => rows,
         Err(e) => return error_response(&e),
     };
-    let mut lookup: std::collections::HashMap<(i64, String), u64> = std::collections::HashMap::new();
+    let mut lookup: std::collections::HashMap<(i64, String), u64> =
+        std::collections::HashMap::new();
     for (day, action, count) in rows {
         lookup.insert((day, action), count);
     }
@@ -1052,6 +1061,122 @@ async fn reissue_code(
         .reissue(&tenant_id, &code_id, &req, &authed.sub)
     {
         Ok(resp) => ok_json(resp),
+        Err(e) => error_response(&e),
+    }
+}
+
+// ============================================================================
+// 系统更新（OTA）：升级包仓库（仅 system 可写；网关拉取 manifest 免 JWT）
+// ============================================================================
+
+/// `OtaPackage` → 列表条目（剥离 `payload_b64`：包体可达数十 MB，列表页不需要）。
+fn ota_package_item(p: &crate::model::OtaPackage) -> OtaPackageItem {
+    OtaPackageItem {
+        version: p.version.clone(),
+        channel: p.channel.clone(),
+        size: p.size.clone(),
+        payload_sha256: p.payload_sha256.clone(),
+        kid: p.kid.clone(),
+        status: p.status.as_str().to_string(),
+        published_at: p.published_at.clone(),
+        published_by: p.published_by.clone(),
+        note: p.note.clone(),
+    }
+}
+
+/// `GET /admin/updates`：升级包列表（任意已认证角色；`?status=` 可选过滤）。
+async fn admin_ota_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = authed;
+    let status = q.get("status").cloned();
+    match state.service.admin_list_ota_packages(status.as_deref()) {
+        Ok(pkgs) => ok_json(pkgs.iter().map(ota_package_item).collect::<Vec<_>>()),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `POST /admin/updates`：上传升级包（仅 system；危险操作四要素：reason / note_detail /
+/// confirm 彼此独立，由 service 层校验）。
+async fn admin_ota_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UploadOtaRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_TENANT_ADMIN, "upload ota package") {
+        return resp;
+    }
+    match state.service.admin_upload_ota(&req, &authed.sub) {
+        Ok(pkg) => ok_json(ota_package_item(&pkg)),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `POST /admin/updates/:version/publish`：发布（仅 system；draft/disabled → published）。
+async fn admin_ota_publish(
+    State(state): State<AppState>,
+    Path(version): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<OtaStatusRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_TENANT_ADMIN, "publish ota package") {
+        return resp;
+    }
+    match state.service.admin_publish_ota(&version, &req, &authed.sub) {
+        Ok(pkg) => ok_json(ota_package_item(&pkg)),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `POST /admin/updates/:version/disable`：停用（仅 system；published → disabled，可逆）。
+async fn admin_ota_disable(
+    State(state): State<AppState>,
+    Path(version): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<OtaStatusRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_TENANT_ADMIN, "disable ota package") {
+        return resp;
+    }
+    match state.service.admin_disable_ota(&version, &req, &authed.sub) {
+        Ok(pkg) => ok_json(ota_package_item(&pkg)),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `GET /updates/manifest`：网关拉取**最新已发布**升级包（免管理端 JWT）。
+///
+/// 响应体为**原始** `OtaManifestResponse`（不经 `ApiEnvelope` 包裹）——网关侧
+/// `daemon::ota::parse_manifest` 直接反序列化该形状并逐字段验签，套壳会导致解析失败。
+async fn ota_manifest(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let channel = q.get("channel").cloned();
+    let current = q.get("current").cloned();
+    match state
+        .service
+        .ota_manifest(channel.as_deref(), current.as_deref())
+    {
+        Ok(resp) => Json(resp).into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -1335,10 +1460,7 @@ mod tests {
     fn mask_code_preserves_prefix_and_tail_per_format() {
         let year = crate::keys::current_year(now_unix_secs());
         let code = format!("IOT-{year:04}-ACDE-FGJK-LMNP-QR");
-        assert_eq!(
-            mask_code(&code),
-            format!("IOT-{year:04}-****-****-****-QR")
-        );
+        assert_eq!(mask_code(&code), format!("IOT-{year:04}-****-****-****-QR"));
         // 旧格式：仅用于显示，段结构保持 4×4。
         assert_eq!(
             mask_code("IOTDAQ-ACDE-FGJK-LMNP-QRST"),
@@ -1587,8 +1709,8 @@ mod tests {
         assert_eq!(body["code"], "OK");
         let codes = body["data"]["codes"].as_array().expect("codes array");
         assert_eq!(codes.len(), 1);
-        // G1：预绑定必须落库并回显。
-        assert_eq!(body["data"]["codes"][0]["prebind"], "M1");
+        // G1：预绑定必须落库并回显（归一后小写，大小写不敏感）。
+        assert_eq!(body["data"]["codes"][0]["prebind"], "m1");
     }
 
     #[tokio::test]
@@ -1661,8 +1783,7 @@ mod tests {
             assert_eq!(status, bad_request(), "{label}");
             assert_eq!(resp["code"], "MACHINE_CODE_REQUIRED", "{label}");
             // 拒绝路径不得落码。
-            let (_, list) =
-                call_with(&svc, "GET", "/admin/codes", json!(null), &authed).await;
+            let (_, list) = call_with(&svc, "GET", "/admin/codes", json!(null), &authed).await;
             assert_eq!(list["data"]["total"], "0", "{label}");
         }
     }
@@ -2337,10 +2458,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (_, after) = call_with(&svc, "GET", "/admin/accounts", json!(null), &authed).await;
         let items2 = after["data"]["items"].as_array().expect("items");
-        assert!(
-            !items2.iter().any(|i| i["account"] == "new.guy"),
-            "{after}"
-        );
+        assert!(!items2.iter().any(|i| i["account"] == "new.guy"), "{after}");
 
         // ⑤ 角色清单（任意角色可访问，四角色）。
         let (status, roles) = call_with(&svc, "GET", "/admin/roles", json!(null), &authed).await;
@@ -2943,7 +3061,8 @@ mod tests {
         )
         .await;
         let code = issue["data"]["codes"][0]["code"].as_str().unwrap();
-        let (status, _) = call_with(&svc, "POST", "/activation", activate_body(code, "M1"), &[]).await;
+        let (status, _) =
+            call_with(&svc, "POST", "/activation", activate_body(code, "M1"), &[]).await;
         assert_eq!(status, StatusCode::OK);
 
         // days=3：3 个日桶，计数为字符串（大数红线），末日命中。
@@ -2969,7 +3088,14 @@ mod tests {
         assert_eq!(items[0]["bind"], "0");
 
         // 缺省 days=14 → 14 个日桶。
-        let (_, stats) = call_with(&svc, "GET", "/admin/stats/activations", json!(null), &authed).await;
+        let (_, stats) = call_with(
+            &svc,
+            "GET",
+            "/admin/stats/activations",
+            json!(null),
+            &authed,
+        )
+        .await;
         assert_eq!(stats["data"]["items"].as_array().unwrap().len(), 14);
 
         // 非法 days → 400。

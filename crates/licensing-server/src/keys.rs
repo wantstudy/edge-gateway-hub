@@ -542,7 +542,10 @@ mod tests {
         assert_eq!(current_year(1_767_225_600), 2026); // 2026-01-01T00:00:00Z
         assert_eq!(current_year(1_798_761_600), 2027); // 2027-01-01T00:00:00Z
         let now_year = current_year(crate::model::now_unix_secs());
-        assert!((1970..=9999).contains(&now_year), "year out of range: {now_year}");
+        assert!(
+            (1970..=9999).contains(&now_year),
+            "year out of range: {now_year}"
+        );
     }
 
     /// 生成密钥 → 注册 → 签发 → 验签成功；且 kid 与签名都非空。

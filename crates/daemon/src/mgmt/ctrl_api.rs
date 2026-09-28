@@ -15,10 +15,11 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 
 use crate::bootstrap::DaemonShared;
-use crate::ctrl::{
-    ControlIssueError, ControlLedger, ControlRegistry, RawIssueRequest,
+use crate::ctrl::{ControlIssueError, ControlLedger, ControlRegistry, RawIssueRequest};
+use crate::mgmt::{
+    rbac::{AuthedRole, Permission},
+    MgmtState,
 };
-use crate::mgmt::{rbac::{AuthedRole, Permission}, MgmtState};
 
 /// 注入到 axum `State` 的控制面句柄。
 ///

@@ -70,7 +70,9 @@
                 {{ autostartDesc }}
               </div>
             </div>
-            <RoleGate :allowed="canManage">
+            <!-- 容器形态：自启由宿主 docker.service + compose restart 策略托管，
+                 网关在容器内无权也无能力改写 → 不给开关，只给只读说明（诚实空态）。 -->
+            <RoleGate v-if="!isContainerForm" :allowed="canManage">
               <UiSwitch
                 v-model="autostartEnabled"
                 on-text="已启用"
@@ -79,8 +81,12 @@
                 @update:model-value="onAutostart"
               />
             </RoleGate>
-            <span v-if="!canManage" class="wc-tag wc-tag--neutral">仅管理员可改</span>
+            <span v-if="!isContainerForm && !canManage" class="wc-tag wc-tag--neutral">仅管理员可改</span>
+            <span v-else-if="isContainerForm" class="wc-tag wc-tag--neutral">由容器编排托管</span>
           </div>
+          <p v-if="isContainerForm && autostartGuaranteeHint" class="su-hint">
+            {{ autostartGuaranteeHint }}
+          </p>
 
           <div class="su-row">
             <div class="su-row__text">
@@ -179,7 +185,11 @@
 
         <div class="su-ops">
           <button type="button" class="wc-btn wc-btn--danger" data-testid="startup-restart" @click="openRestart">立即重启服务</button>
-          <button type="button" class="wc-btn wc-btn--danger" data-testid="startup-stop" @click="openStop">停止服务（不自动启动）</button>
+          <button type="button" class="wc-btn wc-btn--danger" data-testid="startup-stop" @click="openStop">{{ stopButtonText }}</button>
+          <p v-if="isContainerForm" class="su-hint">
+            容器部署下「停止」只会让容器内进程退出，compose 的 restart 策略会立即把容器拉起；
+            如需彻底停止，请在宿主执行 <code>docker compose down</code>。
+          </p>
         </div>
 
         <div v-if="lastAction" class="su-result" :class="`is-${lastKind}`">
@@ -401,6 +411,39 @@ async function onSupervisor(
 /** 自启真实状态（未取到 = null，页面按「未知」呈现，不猜）。 */
 const autostartStatus = ref<AutostartStatus | null>(null);
 
+/**
+ * 部署形态：优先取自启端点的 `form`（后端由 `platform::detect()` 实时派生），
+ * 兜底 `/api/overview` 的 `deployMode`；两者都不可得 → `'unknown'`（诚实降级）。
+ */
+const deployForm = computed<string>(() => {
+  const fromApi = (autostartStatus.value?.form || '').trim();
+  if (fromApi && fromApi !== 'unknown') {
+    return fromApi;
+  }
+  const fromOverview = (gateway.value.deployMode || '').trim();
+  return fromOverview && fromOverview !== '—' ? fromOverview : 'unknown';
+});
+
+/**
+ * 是否容器部署形态：该形态下「开机自启」由宿主 docker.service + compose
+ * restart 策略托管，网关在容器内**改写不了宿主**，故本页不提供自启开关。
+ */
+const isContainerForm = computed<boolean>(() => deployForm.value === 'docker');
+
+/** 自启保障声明（容器形态给 restart 策略声明值 + 宿主前提说明）。 */
+const autostartGuarantee = computed<{ value: string; provenance: string; hint: string }>(
+  () => autostartStatus.value?.autostartGuaranteed ?? { value: '', provenance: 'unknown', hint: '' },
+);
+
+/** 自启保障提示文案：优先后端 hint，缺失时给诚实兜底（不编造策略值）。 */
+const autostartGuaranteeHint = computed<string>(() => {
+  const g = autostartGuarantee.value;
+  if (g.hint) {
+    return g.hint;
+  }
+  return '自启保障状态不可得：网关未上报容器重启策略声明值，请确认 compose 已注入 IOT_DAQ_RESTART_POLICY。';
+});
+
 /** 写入进行中（防重复下发）。 */
 const autostartBusy = ref(false);
 
@@ -419,11 +462,14 @@ const autostartCapability = computed<{ text: string; cls: string }>(() => {
   return { text: status.writeReason || '本端当前未开放自启写入能力', cls: 'wc-tag--warn' };
 });
 
-/** 自启状态短标签（未注册 / 已注册 / 未知）。 */
+/** 自启状态短标签（未注册 / 已注册 / 未知；容器形态为「由编排托管」）。 */
 const autostartStateText = computed<string>(() => {
   const status = autostartStatus.value;
   if (!status) {
-    return '未知';
+    return isContainerForm.value ? '由编排托管' : '未知';
+  }
+  if (isContainerForm.value) {
+    return '由编排托管';
   }
   if (status.registered === true) {
     return '已注册';
@@ -434,14 +480,22 @@ const autostartStateText = computed<string>(() => {
 /** 自启说明：优先真实状态与命令，后端不支持写入时展示真实原因。 */
 const autostartDesc = computed<string>(() => {
   const status = autostartStatus.value;
+  // 容器形态：不给「开关语义」的描述，只说清由谁托管 + 声明的策略值（诚实）。
+  if (isContainerForm.value) {
+    const g = autostartGuarantee.value;
+    const policy = g.value ? g.value : '未声明';
+    const provenance =
+      g.provenance === 'declared'
+        ? '该值为 compose 注入的声明值，网关在容器内无法实测'
+        : '该值不可得';
+    return `自启由容器编排托管（restart 策略：${policy}，${provenance}）。本页不提供开关——如需变更请在宿主修改 compose 的 restart 字段。`;
+  }
   if (!status) {
-    return gateway.value.deployMode === 'docker'
-      ? '对应 compose 的 restart: unless-stopped，宿主重启/断电后自动拉起。'
-      : '对应 systemctl enable，宿主开机时由服务管理器自动拉起。';
+    return '对应 systemctl enable，宿主开机时由服务管理器自动拉起。';
   }
   const base =
-    gateway.value.deployMode === 'docker'
-      ? '对应 compose 的 restart: unless-stopped，宿主重启/断电后自动拉起。'
+    status.managedBy === 'systemd'
+      ? '对应宿主 systemd unit，宿主开机时由服务管理器自动拉起。'
       : '对应系统自启注册表，宿主开机时自动拉起。';
   // 注册目标（容错读 target / targetKind，缺失不报错）
   const targetText = status.target
@@ -547,6 +601,14 @@ const restartModal = reactive<{ open: boolean; impacts: readonly string[]; facts
   impacts: [],
   facts: [],
 });
+
+/**
+ * 停止按钮文案：容器形态下原文案「不自动启动」是**假陈述**——
+ * `restart: unless-stopped` 会在进程退出后立刻拉起容器，故如实改写。
+ */
+const stopButtonText = computed<string>(() =>
+  isContainerForm.value ? '停止服务（容器将被自动拉起）' : '停止服务（不自动启动）',
+);
 
 const stopModal = reactive<{ open: boolean; impacts: readonly string[]; facts: readonly { label: string; value: string }[] }>({
   open: false,

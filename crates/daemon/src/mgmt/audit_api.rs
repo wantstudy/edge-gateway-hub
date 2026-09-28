@@ -540,7 +540,11 @@ frequency_ms = 100
             .iter()
             .map(|r| r["seq"].as_str().expect("seq 大数红线：字符串").to_string())
             .collect();
-        assert_eq!(seqs, vec!["3".to_string(), "2".to_string()], "默认须最新在前: {seqs:?}");
+        assert_eq!(
+            seqs,
+            vec!["3".to_string(), "2".to_string()],
+            "默认须最新在前: {seqs:?}"
+        );
         assert_eq!(rows[0]["actor"], "carol");
         assert_eq!(rows[0]["detail"], "device_create");
         assert_eq!(rows[1]["actor"], "bob");

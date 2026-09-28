@@ -74,7 +74,10 @@ pub async fn heartbeat(
         Ok(ts) => ts,
         Err(err) => {
             tracing::warn!(error = %err, device = %id, "heartbeat: persist failed");
-            return internal(&format!("heartbeat persist failed: {err}"), err.error_code());
+            return internal(
+                &format!("heartbeat persist failed: {err}"),
+                err.error_code(),
+            );
         }
     };
     // 持久后端未能挂载（惰性打开失败）→ 本次心跳仅存内存、重启即失：如实 503，
@@ -167,10 +170,7 @@ async fn parse_beat_payload(request: Request) -> Result<Option<u64>, (String, u1
 
 /// 设备是否在配置中真实存在（登记段 ∪ 点位行）。
 fn device_exists(config: &GatewayConfig, id: &str) -> bool {
-    config
-        .devices
-        .iter()
-        .any(|d| d.device_id == id)
+    config.devices.iter().any(|d| d.device_id == id)
         || config.points.iter().any(|p| p.device_id == id)
 }
 
@@ -283,18 +283,16 @@ protocol = "modbus-tcp"
         let sys = token_for(&state, Role::System);
         let port = spawn_heartbeat_server(state).await;
 
-        let (status, _, body) = post_json(
-            port,
-            "/api/devices/dev-hb-str/heartbeat",
-            "{}",
-            &sys,
-        )
-        .await;
+        let (status, _, body) =
+            post_json(port, "/api/devices/dev-hb-str/heartbeat", "{}", &sys).await;
         assert_eq!(status, 200, "successful beat must be 200: {body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         // 大数红线：必须是字符串且非空。
         let last_beat = value.get("last_beat_at").expect("field present");
-        assert!(last_beat.is_string(), "last_beat_at must be a string (bignum red line)");
+        assert!(
+            last_beat.is_string(),
+            "last_beat_at must be a string (bignum red line)"
+        );
         let s = last_beat.as_str().expect("string");
         assert!(!s.is_empty(), "last_beat_at must not be empty");
         assert!(s.parse::<u64>().is_ok(), "must parse to u64 epoch ms");
@@ -308,13 +306,7 @@ protocol = "modbus-tcp"
         let sys = token_for(&state, Role::System);
         let port = spawn_heartbeat_server(state).await;
 
-        let (status, _, body) = post_json(
-            port,
-            "/api/devices/ghost/heartbeat",
-            "{}",
-            &sys,
-        )
-        .await;
+        let (status, _, body) = post_json(port, "/api/devices/ghost/heartbeat", "{}", &sys).await;
         assert_ne!(status, 200, "unknown device must NOT be 200: {body}");
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["error"], "device_not_found");
@@ -333,13 +325,8 @@ protocol = "modbus-tcp"
             (r#"{"t":"not-a-number"}"#, "t must be numeric string"),
             (r#"{"t":1700000000123}"#, "t as number (bignum red line)"),
         ] {
-            let (status, _, body) = post_json(
-                port,
-                "/api/devices/dev-hb-bad/heartbeat",
-                payload,
-                &sys,
-            )
-            .await;
+            let (status, _, body) =
+                post_json(port, "/api/devices/dev-hb-bad/heartbeat", payload, &sys).await;
             assert_eq!(status, 400, "{why}: {body}");
             let value: Value = serde_json::from_str(&body).expect("json");
             assert_eq!(value["error"], "bad_request");

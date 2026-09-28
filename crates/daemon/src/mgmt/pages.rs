@@ -2727,14 +2727,29 @@ fn activate_error_response(err: crate::error::DaemonError) -> Response {
             })),
         )
             .into_response(),
-        DaemonError::AuthError(_) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "error": "activation_rejected",
-                "message": err.to_string(),
-            })),
-        )
-            .into_response(),
+        DaemonError::AuthError(inner) => {
+            // 预绑定冲突（授权端 400 `PREBIND_CONFLICT` → 网关 422）：给中文可操作提示。
+            // 但 `error: "activation_rejected"` 契约不变——前端按此字段判定，绝不改。
+            let (message, hint) = if inner.to_lowercase().contains("prebind") {
+                (
+                    "激活被拒绝：该激活码已预绑定到另一台机器（一机一码约束）。".to_string(),
+                    "请确认本网关的机器码与授权后台「预绑定机器码」完全一致；若确属换机，"
+                        .to_string()
+                        + "请在授权后台提交换机工单并解绑旧机后，再重新激活。",
+                )
+            } else {
+                (inner.clone(), String::new())
+            };
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "activation_rejected",
+                    "message": message,
+                    "hint": hint,
+                })),
+            )
+                .into_response()
+        }
         DaemonError::SecurityError(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({

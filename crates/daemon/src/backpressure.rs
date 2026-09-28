@@ -1575,6 +1575,24 @@ impl SendQueue {
         out
     }
 
+    /// 卸下**全部**在途条目（热重建 / 停机前的**数据安全收口**）。
+    ///
+    /// `SendQueue` 的在途条目（`ready` + `sent`）只存在于内存：本类型没有 `Drop`
+    /// 实现（不会自动落盘），直接丢弃出口句柄 = 静默丢数据。北向出口被删除 /
+    /// 被重建前必须先调本方法把数据取走，再回灌 [`OfflineQueue`](crate::offline_queue::OfflineQueue)
+    /// ——这样「超限落盘 → 幂等补发」的闭环不断裂。
+    ///
+    /// 返回顺序按**入队先后**（`sent` 早于 `ready`）；调用后水位归零。
+    pub fn drain_all(&mut self) -> Vec<PendingSend> {
+        let mut out = Vec::with_capacity(self.sent.len().saturating_add(self.ready.len()));
+        out.extend(self.sent.drain(..));
+        out.extend(self.ready.drain(..));
+        self.bytes = 0;
+        self.high_entered = false;
+        self.note_level(self.gauge());
+        out
+    }
+
     /// PUBACK/PUBCOMP 到达：从在途窗口移除 `count` 条（按提交顺序）。
     ///
     /// 返回实际移除条数（不超过 `sent` 长度）。

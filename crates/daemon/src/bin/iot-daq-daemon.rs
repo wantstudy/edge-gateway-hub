@@ -47,8 +47,8 @@ use tracing::{info, warn};
 
 use daemon::bootstrap::{BootstrapBuilder, DaemonShared};
 use daemon::config::{ConfigShared, GatewayConfig};
-use daemon::mgmt::MgmtState;
 use daemon::mgmt::ctrl_api::ControlApiState;
+use daemon::mgmt::MgmtState;
 use daemon::platform::{self, AnchorMountStatus, DetectionConfidence, RuntimeForm};
 
 // ---------------------------------------------------------------------------
@@ -561,8 +561,7 @@ async fn main() -> ExitCode {
     let data_dir = config.gateway.data_dir.clone();
     // 构造 DevicePollHandler（未包装 Arc，后续按需克隆为 Arc<dyn ...>）。
     // DevicePollHandler 实现了 Clone（仅 clone 内部 Arc 指针，零数据拷贝）。
-    let southbound: Option<daemon::southbound::DevicePollHandler> = if config.points.is_empty()
-    {
+    let southbound: Option<daemon::southbound::DevicePollHandler> = if config.points.is_empty() {
         None
     } else {
         Some(daemon::southbound::DevicePollHandler::from_config(&config))
@@ -637,17 +636,14 @@ async fn main() -> ExitCode {
         let ctrl_port: Arc<dyn daemon::ctrl::ControlWritePort> = Arc::new(handler.clone());
         if let Some(registry) = shared.control_registry() {
             registry.set_port(ctrl_port);
-            info!(
-                "bootstrap: control write port mounted (DevicePollHandler → ControlWritePort)"
-            );
+            info!("bootstrap: control write port mounted (DevicePollHandler → ControlWritePort)");
         }
     }
 
     // 写接口落盘路径绑定：与 IOT_DAQ_CONFIG / --config 指向同一文件（热重载同源）。
-    let mgmt_state =
-        MgmtState::new(shared.clone(), Arc::new(config))
-            .with_config_path(args.config_path.clone())
-            .with_control_api(control_api);
+    let mgmt_state = MgmtState::new(shared.clone(), Arc::new(config))
+        .with_config_path(args.config_path.clone())
+        .with_control_api(control_api);
 
     let listener = match tokio::net::TcpListener::bind(&args.bind_addr).await {
         Ok(listener) => listener,

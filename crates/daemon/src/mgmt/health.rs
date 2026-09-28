@@ -177,9 +177,11 @@ impl DeviceHeartbeatStore {
     #[must_use]
     pub fn len(&self) -> usize {
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        conn.query_row("SELECT COUNT(*) FROM device_beat", [], |row| row.get::<_, i64>(0))
-            .map(|n| n.max(0) as usize)
-            .unwrap_or(0)
+        conn.query_row("SELECT COUNT(*) FROM device_beat", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|n| n.max(0) as usize)
+        .unwrap_or(0)
     }
 
     /// 是否无任何心跳记录。
@@ -654,7 +656,10 @@ mod tests {
         assert_eq!(stored, ts);
         assert_eq!(registry.last_beat_ms("dev-01").expect("read"), Some(ts));
         // 进程内叠加层命中，无需回查库即返回。
-        assert_eq!(registry.beat_status("dev-01", ts).expect("status"), BeatStatus::Online);
+        assert_eq!(
+            registry.beat_status("dev-01", ts).expect("status"),
+            BeatStatus::Online
+        );
     }
 
     /// 乱序上报不回退：小值被忽略，大值被采纳。
@@ -663,8 +668,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let registry =
             DeviceHealthRegistry::open_heartbeat_db(&dir.path().join("h.db")).expect("open");
-        registry.record_beat("dev-01", 2_000_000_000_000).expect("record");
-        registry.record_beat("dev-01", 1_000_000_000_000).expect("record");
+        registry
+            .record_beat("dev-01", 2_000_000_000_000)
+            .expect("record");
+        registry
+            .record_beat("dev-01", 1_000_000_000_000)
+            .expect("record");
         assert_eq!(
             registry.last_beat_ms("dev-01").expect("read"),
             Some(2_000_000_000_000)
@@ -696,7 +705,9 @@ mod tests {
         // 未上报过的设备：无探活数据 → Unknown，且不因库里有别的设备而串味。
         assert_eq!(registry.last_beat_ms("never").expect("read"), None);
         assert_eq!(
-            registry.beat_status("never", 1_700_000_000_123).expect("status"),
+            registry
+                .beat_status("never", 1_700_000_000_123)
+                .expect("status"),
             BeatStatus::Unknown
         );
     }
@@ -706,10 +717,7 @@ mod tests {
     fn heartbeat_status_semantics() {
         let now = 1_700_000_000_000u64;
         assert_eq!(beat_status_for(None, now), BeatStatus::Unknown);
-        assert_eq!(
-            beat_status_for(Some(now - 1), now),
-            BeatStatus::Online
-        );
+        assert_eq!(beat_status_for(Some(now - 1), now), BeatStatus::Online);
         assert_eq!(
             beat_status_for(Some(now - BEAT_FRESH_WINDOW_MS), now),
             BeatStatus::Online,
