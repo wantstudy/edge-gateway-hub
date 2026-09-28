@@ -68,6 +68,7 @@ const LICENSING_ONLY_PAGE_IDS: readonly string[] = [
   'transfers',
   'keys',
   'device-detail',
+  'updates',
 ];
 
 /**
@@ -92,6 +93,8 @@ const LICENSING_ONLY_ACTION_IDS: readonly string[] = [
   'key.view',
   'key.rotate',
   'device.mark_anomaly',
+  'update.view',
+  'update.publish',
 ];
 
 /** 具名导入声明（含 `type` 前缀与 `default, { … }` 混合形态）。 */

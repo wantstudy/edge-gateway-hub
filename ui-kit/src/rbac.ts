@@ -37,6 +37,7 @@ import {
   IconSwap,
   IconLock,
   IconHistory,
+  IconCloudDownload,
   IconUserGroup,
 } from '@arco-design/web-vue/es/icon';
 
@@ -58,7 +59,7 @@ export const ROLES = ['ops', 'lic_ops', 'risk', 'system'] as const;
 /** 角色标识类型。 */
 export type Role = (typeof ROLES)[number];
 
-/** 页面标识类型（11 个页面）。 */
+/** 页面标识类型（12 个页面）。 */
 export type PageId =
   | 'login'
   | 'overview'
@@ -71,7 +72,8 @@ export type PageId =
   | 'transfers'
   | 'keys'
   | 'audit'
-  | 'accounts';
+  | 'accounts'
+  | 'updates';
 
 /** 可授权操作清单（操作级权限的最小闭集）。 */
 export type Action =
@@ -93,7 +95,9 @@ export type Action =
   | 'audit.view'
   | 'audit.export'
   | 'account.view'
-  | 'account.update';
+  | 'account.update'
+  | 'update.view'
+  | 'update.publish';
 
 /** 角色元信息（用于顶栏角色切换与账号页权限矩阵表头）。 */
 export interface RoleMeta {
@@ -242,6 +246,14 @@ export const PAGES: readonly PageMeta[] = Object.freeze([
     visibleTo: ['system'],
     icon: IconUserGroup,
   },
+  {
+    id: 'updates',
+    title: '系统更新',
+    group: '系统',
+    crumb: '系统 / 系统更新',
+    visibleTo: ['system'],
+    icon: IconCloudDownload,
+  },
 ]);
 
 /**
@@ -281,7 +293,7 @@ export const ACTION_MATRIX: Readonly<Record<Role, readonly Action[]>> = Object.f
     'code.view',
   ],
   system: [
-    // 系统管理员：厂商侧全部 19 项操作权限（发码 / 废弃 / 重发 / 换机 / 密钥 / 租户 / 账号 / 审计）
+    // 系统管理员：厂商侧全部 21 项操作权限（发码 / 废弃 / 重发 / 换机 / 密钥 / 租户 / 账号 / 审计 / 系统更新）
     'code.view',
     'code.issue',
     'code.revoke',
@@ -301,6 +313,8 @@ export const ACTION_MATRIX: Readonly<Record<Role, readonly Action[]>> = Object.f
     'audit.export',
     'account.view',
     'account.update',
+    'update.view',
+    'update.publish',
   ],
 });
 

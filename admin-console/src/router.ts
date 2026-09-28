@@ -88,6 +88,12 @@ const routes: readonly RouteRecordRaw[] = [
     component: () => import('./pages/AccountsPage.vue'),
     meta: { title: '账号与角色', rbPage: 'accounts' },
   },
+  {
+    path: '/updates',
+    name: 'updates',
+    component: () => import('./pages/UpdatesPage.vue'),
+    meta: { title: '系统更新', rbPage: 'updates' },
+  },
   { path: '/:pathMatch(.*)*', redirect: '/overview' },
 ];
 

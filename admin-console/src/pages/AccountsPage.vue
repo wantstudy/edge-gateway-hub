@@ -303,6 +303,8 @@ const ACTION_LABEL: Readonly<Record<Action, string>> = Object.freeze({
   'audit.export': '导出审计日志',
   'account.view': '查看账号',
   'account.update': '修改账号状态',
+  'update.view': '查看系统更新',
+  'update.publish': '发布 / 停用系统更新（高危）',
 });
 
 /** 列定义。 */

@@ -31,7 +31,7 @@
  *    总览聚合的计数契约本身即 String（`OverviewResponse` 全 String）。
  *  · **不改 mock-data.ts 本身**（它是契约与 fallback）。
  */
-import { reactive } from 'vue';
+import { reactive, ref } from 'vue';
 import {
   repo as mockRepo,
   type AdminUser,
@@ -343,6 +343,45 @@ export interface AdminRepo {
    * `date` 为 UTC 日锚点 unix 秒（**String** 原文，大数红线）；计数为 String。
    */
   activationTrend(days: number): Promise<ActivationTrendPoint[]>;
+
+  // ---------- 系统更新（OTA 升级包仓库） ----------
+  /**
+   * 升级包列表（real：`GET /admin/updates`，任意已登录角色可读；
+   * mock：内存演示数据）。real 模式加载失败返回空数组并把**真实原因**
+   * 写入 `updatesLoadError`（页面据此展示诚实空态，绝不回退 mock）。
+   */
+  listUpdates(): Promise<OtaPackageRecord[]>;
+  /**
+   * 上传并签名升级包（real：`POST /admin/updates`，**仅 system**；落库为 `draft`）。
+   * `reason` / `noteDetail` / `confirm` 为**彼此独立**的三个字段，绝不拼接；
+   * `confirm` 必须等于版本号（大小写不敏感精确匹配）。
+   */
+  uploadUpdate(input: {
+    version: string;
+    channel: string;
+    payloadB64: string;
+    note: string;
+    reason: string;
+    noteDetail: string;
+    confirm: string;
+    actor: string;
+  }): Promise<OtaPackageRecord | null>;
+  /**
+   * 发布升级包（real：`POST /admin/updates/:version/publish`，**仅 system**；
+   * `draft` / `disabled` → `published`）。
+   */
+  publishUpdate(
+    version: string,
+    input: { channel: string; reason: string; note: string; confirm: string; actor: string },
+  ): Promise<OtaPackageRecord | null>;
+  /**
+   * 停用升级包（real：`POST /admin/updates/:version/disable`，**仅 system**；
+   * `published` → `disabled`，可逆）。
+   */
+  disableUpdate(
+    version: string,
+    input: { channel: string; reason: string; note: string; confirm: string; actor: string },
+  ): Promise<OtaPackageRecord | null>;
 }
 
 /** 激活趋势单日聚合（`ActivationStatsDay` 前端镜像；字段一律 String 原文透传）。 */
@@ -356,6 +395,47 @@ export interface ActivationTrendPoint {
   /** 当日废弃次数（String）。 */
   revoke: string;
 }
+
+// ===========================================================================
+// 系统更新（OTA 升级包仓库，后端 GET/POST /admin/updates）
+// ===========================================================================
+
+/**
+ * OTA 升级包列表记录（`OtaPackageItem` 前端镜像）。
+ *
+ * **大数红线**：`version` / `size` 一律 **String 原文透传**，绝不 `Number()` / `parseInt`——
+ * 版本号为 u64 单调序十进制串，包体字节数同理，后端契约本身即 String。
+ * `publishedAt` 已在**映射边界**格式化为可读文本（裸 epoch 秒串严禁进页面），
+ * 未发布时为 `'—'`。
+ */
+export interface OtaPackageRecord {
+  /** 版本号（u64 十进制字符串，原文透传）。 */
+  version: string;
+  /** 通道（`stable` / `beta`）。 */
+  channel: string;
+  /** 包体字节数（String 原文透传，绝不数值化）。 */
+  size: string;
+  /** 包体 SHA-256（小写 hex，原文透传）。 */
+  payloadSha256: string;
+  /** 签名密钥标识。 */
+  kid: string;
+  /** 状态（`draft` / `published` / `disabled` / `revoked` 原文）。 */
+  status: string;
+  /** 发布时间（**已格式化**的可读文本；未发布为 `'—'`）。 */
+  publishedAt: string;
+  /** 发布人。 */
+  publishedBy: string;
+  /** 发布说明。 */
+  note: string;
+}
+
+/**
+ * 系统更新列表 real 模式最近一次加载失败的真实原因（空串 = 无错误）。
+ *
+ * 供页面**诚实空态**展示：拿不到数据时给出后端返回的真实原因，
+ * 绝不回落 mock、绝不伪造成功。
+ */
+export const updatesLoadError = ref('');
 
 // ===========================================================================
 // mock 模式适配器：mockRepo + async 包装（行为逐行零回归）
@@ -389,6 +469,54 @@ function mockOverviewToContract(): OverviewStats {
 
 /** mock 模式下「新增租户」的本地追加列表（不改 mock-data.ts 契约本体）。 */
 const mockCreatedTenants: TenantRecord[] = [];
+
+/**
+ * mock 模式下「系统更新」的内存演示数据（不改 mock-data.ts 契约本体）。
+ *
+ * 字段口径与后端 `OtaPackageItem` 逐字段对齐：`version` / `size` 为十进制**字符串**，
+ * `publishedAt` 已是可读文本（与 real 模式映射后的形状一致），未发布为 `'—'`。
+ */
+const mockOtaPackages: OtaPackageRecord[] = [
+  {
+    version: '151',
+    channel: 'beta',
+    size: '45088768',
+    payloadSha256: 'c2f5a9d1b7e46a0c8f3d5e2b9a17c40f6d8e3b5a1c9f7d2e4b6a8c0f1d3e5b7a',
+    kid: 'kid-2026Q3',
+    status: 'draft',
+    publishedAt: '—',
+    publishedBy: '—',
+    note: '新增北向 MQTT 批量上报（beta 验证中）',
+  },
+  {
+    version: '150',
+    channel: 'stable',
+    size: '41943040',
+    payloadSha256: '7d1e4b8a0c3f6d9e2b5a8c1f4d7e0b3a6c9f2d5e8b1a4c7f0d3e6b9a2c5f8d1e',
+    kid: 'kid-2026Q3',
+    status: 'published',
+    publishedAt: '2026-06-21 04:10:00',
+    publishedBy: '李工（系统）',
+    note: '修复采集断连后重连抖动',
+  },
+  {
+    version: '148',
+    channel: 'stable',
+    size: '40894464',
+    payloadSha256: 'a4c7f0d3e6b9a2c5f8d1e7d1e4b8a0c3f6d9e2b5a8c1f4d7e0b3a6c9f2d5e8b1',
+    kid: 'kid-2026Q2',
+    status: 'disabled',
+    publishedAt: '2026-04-02 09:30:00',
+    publishedBy: '李工（系统）',
+    note: '回滚备用（已停用）',
+  },
+];
+
+/** mock：按版本号找升级包（返回引用，用于就地改状态）。 */
+function findMockOta(version: string): OtaPackageRecord | null {
+  const v = version.trim();
+  return mockOtaPackages.find((p) => p.version === v) ?? null;
+}
 
 function buildMockRepo(): AdminRepo {
   return {
@@ -436,6 +564,82 @@ function buildMockRepo(): AdminRepo {
     },
     // mock 模式无后端聚合：诚实空态（绝不伪造趋势曲线）。
     activationTrend: () => Promise.resolve([]),
+
+    // ---------- 系统更新（mock：内存演示数据） ----------
+    listUpdates: () => Promise.resolve(mockOtaPackages.map((p) => ({ ...p }))),
+    uploadUpdate: (input) => {
+      const version = input.version.trim();
+      if (!version) {
+        pushNotice('error', '上传升级包失败：版本号不能为空。');
+        return Promise.resolve(null);
+      }
+      if (mockOtaPackages.some((p) => p.version === version)) {
+        pushNotice('error', `上传升级包失败：版本号 ${version} 已存在。`);
+        return Promise.resolve(null);
+      }
+      if (!input.payloadB64) {
+        pushNotice('error', '上传升级包失败：未读取到包体内容。');
+        return Promise.resolve(null);
+      }
+      if (!input.reason.trim()) {
+        pushNotice('error', '上传升级包失败：未选择操作原因（原因将记入审计）。');
+        return Promise.resolve(null);
+      }
+      if (input.noteDetail.trim().length < 10) {
+        pushNotice('error', '上传升级包失败：补充说明不足 10 字。');
+        return Promise.resolve(null);
+      }
+      if (input.confirm.trim().toLowerCase() !== version.toLowerCase()) {
+        pushNotice('error', '上传升级包失败：二次确认串与版本号不一致。');
+        return Promise.resolve(null);
+      }
+      // 由 base64 原文长度推包体字节数（演示；非 JSON 大数，不做 Number 化解析）。
+      const size = String(Math.floor((input.payloadB64.replace(/=+$/, '').length * 3) / 4));
+      const record: OtaPackageRecord = {
+        version,
+        channel: input.channel === 'beta' ? 'beta' : 'stable',
+        size,
+        payloadSha256: '—',
+        kid: 'kid-2026Q3',
+        status: 'draft',
+        publishedAt: '—',
+        publishedBy: '—',
+        note: input.note.trim(),
+      };
+      mockOtaPackages.unshift(record);
+      return Promise.resolve({ ...record });
+    },
+    publishUpdate: (version, input) => {
+      const target = findMockOta(version);
+      if (!target) {
+        pushNotice('error', `发布升级包失败：未找到版本 ${version}。`);
+        return Promise.resolve(null);
+      }
+      if (input.confirm.trim().toLowerCase() !== target.version.toLowerCase()) {
+        pushNotice('error', '发布升级包失败：二次确认串与版本号不一致。');
+        return Promise.resolve(null);
+      }
+      target.status = 'published';
+      target.publishedAt = nowText();
+      target.publishedBy = input.actor || '（未知操作者）';
+      if (input.note.trim()) {
+        target.note = input.note.trim();
+      }
+      return Promise.resolve({ ...target });
+    },
+    disableUpdate: (version, input) => {
+      const target = findMockOta(version);
+      if (!target) {
+        pushNotice('error', `停用升级包失败：未找到版本 ${version}。`);
+        return Promise.resolve(null);
+      }
+      if (input.confirm.trim().toLowerCase() !== target.version.toLowerCase()) {
+        pushNotice('error', '停用升级包失败：二次确认串与版本号不一致。');
+        return Promise.resolve(null);
+      }
+      target.status = 'disabled';
+      return Promise.resolve({ ...target });
+    },
     updateTenant: (input) => Promise.resolve(mockRepo.updateTenant(input)),
     setTenantEnabled: (input) => Promise.resolve(mockRepo.setTenantEnabled(input)),
     resolveAnomaly: (input) => Promise.resolve(mockRepo.resolveAnomaly(input)),
@@ -804,6 +1008,27 @@ function buildSigningKeyRecord(raw: Record<string, unknown>): SigningKey {
   };
 }
 
+/**
+ * 后端升级包行（`OtaPackageItem`）→ 页面 `OtaPackageRecord`。
+ *
+ * 大数红线：`version` / `size` 原文透传，绝不数值化；`published_at` 是**裸 UTC 秒串**，
+ * 在此映射边界即用 `formatDateTime` 格式化（页面 / 组件严禁裸显 epoch），空串给 `'—'`。
+ */
+function buildOtaPackageRecord(raw: Record<string, unknown>): OtaPackageRecord {
+  const publishedAt = pickStr(raw, 'published_at', '');
+  return {
+    version: pickStr(raw, 'version', ''),
+    channel: pickStr(raw, 'channel', ''),
+    size: pickStr(raw, 'size', ''),
+    payloadSha256: pickStr(raw, 'payload_sha256', ''),
+    kid: pickStr(raw, 'kid', ''),
+    status: pickStr(raw, 'status', ''),
+    publishedAt: publishedAt === '' ? '—' : formatDateTime(publishedAt),
+    publishedBy: pickStr(raw, 'published_by', ''),
+    note: pickStr(raw, 'note', ''),
+  };
+}
+
 /** 审计日志行（AuditLogItem）→ 页面 AuditEntry。 */
 function buildAuditRecord(raw: Record<string, unknown>, idx: number): AuditEntry {
   const actor = pickStr(raw, 'actor', '');
@@ -1044,6 +1269,12 @@ function buildRealRepo(): AdminRepo {
     }
     pushNotice('error', `${prefix}失败：${describeCause(cause)}`);
     return false;
+  }
+
+  /** OTA 写操作失败：推全局横幅（真实原因）并返回 null。 */
+  function failOta(prefix: string, cause: unknown): null {
+    pushNotice('error', `${prefix}失败：${describeCause(cause)}`);
+    return null;
   }
 
   /** 确保目标码具备完整码值与租户归属（列表仅掩码，confirm_tail8 需详情端点回填）。 */
@@ -1582,6 +1813,75 @@ function buildRealRepo(): AdminRepo {
       } catch (cause) {
         pushNoticeOnce('load-activation-trend', 'warn', `激活趋势加载失败：${describeCause(cause)}`);
         return [];
+      }
+    },
+
+    // ---------- 系统更新（GET /admin/updates 任意角色可读；写仅 system） ----------
+    async listUpdates(): Promise<OtaPackageRecord[]> {
+      try {
+        const data = await adminRequest<unknown>('/admin/updates', { method: 'GET' });
+        const rec = asRecord(data);
+        const items = Array.isArray(data) ? data : Array.isArray(rec.items) ? (rec.items as unknown[]) : [];
+        // 加载成功：清空上一次失败原因（诚实空态依赖它区分「无数据」与「加载失败」）
+        updatesLoadError.value = '';
+        // 字段一律 String 原文透传（大数红线），published_at 在映射边界格式化。
+        return items.map((raw) => buildOtaPackageRecord(asRecord(raw)));
+      } catch (cause) {
+        // 加载失败：记录**真实原因**供页面诚实空态展示，绝不回落 mock。
+        updatesLoadError.value = describeCause(cause);
+        pushNoticeOnce('load-updates', 'warn', `系统更新列表加载失败：${describeCause(cause)}`);
+        return [];
+      }
+    },
+
+    async uploadUpdate(input): Promise<OtaPackageRecord | null> {
+      try {
+        const data = await adminRequest<unknown>('/admin/updates', {
+          method: 'POST',
+          body: {
+            version: input.version.trim(),
+            channel: input.channel,
+            payload_b64: input.payloadB64,
+            note: input.note.trim(),
+            // reason / note_detail / confirm 为**彼此独立**的三个字段，绝不拼接
+            reason: input.reason,
+            note_detail: input.noteDetail.trim(),
+            confirm: input.confirm,
+          },
+        });
+        return buildOtaPackageRecord(asRecord(data));
+      } catch (cause) {
+        return failOta('上传升级包', cause);
+      }
+    },
+
+    async publishUpdate(version, input): Promise<OtaPackageRecord | null> {
+      try {
+        const data = await adminRequest<unknown>(
+          `/admin/updates/${encodeURIComponent(version)}/publish`,
+          {
+            method: 'POST',
+            body: { channel: input.channel, reason: input.reason, note: input.note, confirm: input.confirm },
+          },
+        );
+        return buildOtaPackageRecord(asRecord(data));
+      } catch (cause) {
+        return failOta('发布升级包', cause);
+      }
+    },
+
+    async disableUpdate(version, input): Promise<OtaPackageRecord | null> {
+      try {
+        const data = await adminRequest<unknown>(
+          `/admin/updates/${encodeURIComponent(version)}/disable`,
+          {
+            method: 'POST',
+            body: { channel: input.channel, reason: input.reason, note: input.note, confirm: input.confirm },
+          },
+        );
+        return buildOtaPackageRecord(asRecord(data));
+      } catch (cause) {
+        return failOta('停用升级包', cause);
       }
     },
   };
