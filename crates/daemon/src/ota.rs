@@ -492,6 +492,59 @@ pub fn verify_manifest_signature(
     })
 }
 
+/// 从标准 base64 编码的 32 字节 Ed25519 **公钥**构造 [`VerifyingKey`]。
+///
+/// 用途：`[gateway.ota].signing_key_b64` 注入（配置层到验签层的桥）。
+///
+/// # Errors
+/// base64 解码失败 / 长度 ≠ 32 / 非法 Ed25519 曲线点 → `ConfigError`（零 panic）。
+pub fn verifying_key_from_b64(b64: &str) -> DaemonResult<VerifyingKey> {
+    let bytes = BASE64_STANDARD.decode(b64.trim().as_bytes()).map_err(|e| {
+        DaemonError::ConfigError(format!("ota signing_key_b64 is not valid base64: {e}"))
+    })?;
+    let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        DaemonError::ConfigError(format!(
+            "ota signing_key_b64 must decode to 32 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    VerifyingKey::from_bytes(&array).map_err(|e| {
+        DaemonError::ConfigError(format!(
+            "ota signing_key_b64 is not a valid Ed25519 public key: {e}"
+        ))
+    })
+}
+
+/// 读取授权端 manifest 端点的 `available` 标志（诚实空态协议）。
+///
+/// 授权端 `GET /updates/manifest` 在无可下发版本时返回 `available = false`
+/// 且其余字段为空串——调用方须先看该标志，**不可**直接喂给 [`parse_manifest`]
+/// （空串版本号必然解析失败）。
+///
+/// # Errors
+/// JSON 解析失败 / 缺 `available` 字段 / 字段非布尔 → `ProtocolError`。
+pub fn manifest_available(raw: &[u8]) -> DaemonResult<bool> {
+    let value: Value = serde_json::from_slice(raw).map_err(|e| {
+        DaemonError::ProtocolError(format!("ota manifest response json parse: {e}"))
+    })?;
+    value
+        .get("available")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            DaemonError::ProtocolError(
+                "ota manifest response missing boolean field \"available\"".to_string(),
+            )
+        })
+}
+
+/// 读取 `available = false` 时授权端给出的**面向用户**说明（缺省空串，零 panic）。
+pub fn manifest_unavailable_reason(raw: &[u8]) -> String {
+    serde_json::from_slice::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default()
+}
+
 // ---- 手写 HTTP/1.1 GET（风格复用 driver/http.rs；V1 仅 http://，无 TLS） ----
 
 /// 解析 `http://host[:port]/path` URL（V1 仅 http，理由见模块文档）。
@@ -683,6 +736,36 @@ pub enum OtaBootDecision {
     RolledBackTo { version: u64 },
 }
 
+// ---- 轮询结果（授权端 `/updates/manifest` 端点接线用） ----
+
+/// [`OtaManager::poll_and_stage`] 的单轮结果。
+///
+/// 调度任务据此决定日志级别：`NoUpdate` / `AlreadyPending` **不计失败**，
+/// `Applied` 记 info，`Rejected` 记 warn（附真实原因）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtaPollOutcome {
+    /// 授权端诚实空态（`available = false`）：暂无可下发版本，**不计失败**。
+    NoUpdate {
+        /// 授权端给出的人类可读说明（可能为空串）。
+        reason: String,
+    },
+    /// 已有 pending 版本（上次已暂存，等待启动确认）→ 本轮跳过，避免重复暂存。
+    AlreadyPending {
+        /// 已暂存的待确认版本号（字符串，大数红线）。
+        version: String,
+    },
+    /// 已下载、验签通过、版本严格更新并写入 pending 槽。
+    Applied {
+        /// 新版本号（u64 单调序）。
+        version: u64,
+    },
+    /// 有可用包但被拒绝（网络失败 / 报文非法 / 版本不新 / 验签失败），带**真实原因**。
+    Rejected {
+        /// 拒绝原因（原样来自管线错误）。
+        reason: String,
+    },
+}
+
 // ---- OtaManager ----
 
 /// OTA 升级管理器（状态机 + 两槽位切换协议 + 审计）。
@@ -869,6 +952,100 @@ impl OtaManager {
         });
         self.state = OtaState::Applied;
         Ok(())
+    }
+
+    /// 单轮 OTA 轮询（授权端 `GET /updates/manifest` 端点接线）：拉取 → 读
+    /// `available` → 复用 [`parse_manifest`] + [`verify_manifest_signature`] 验签 →
+    /// 版本单调性 → 写入 pending 槽。
+    ///
+    /// 与 [`OtaManager::fetch_update`] 的区别：① 先读授权端诚实空态标志
+    /// `available`（`false` 时**不计失败**）；② 不依赖既有状态机前置态，可被
+    /// 调度任务周期性重复调用；③ 已有 pending 版本时直接跳过（避免每轮重复暂存
+    /// 与失败噪音）。
+    ///
+    /// 全程零 panic：网络失败 / 报文非法 / 版本不新 / 验签失败一律收敛为
+    /// [`OtaPollOutcome::Rejected`] 且带真实原因，并落对应审计（旧版本不受影响）。
+    pub async fn poll_and_stage(&mut self, url: &str) -> OtaPollOutcome {
+        // 已有 pending 版本（等待启动确认）→ 本轮跳过（幂等，防重复暂存）。
+        match self.store.load_meta().await {
+            Ok(Some(meta))
+                if meta
+                    .pending_version
+                    .as_deref()
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false) =>
+            {
+                return OtaPollOutcome::AlreadyPending {
+                    version: meta.pending_version.unwrap_or_default(),
+                };
+            }
+            _ => {}
+        }
+
+        self.audit(OtaAudit::DownloadStarted {
+            url: url.to_string(),
+        });
+        let raw = match fetch_http(url, self.timeout).await {
+            Ok(raw) => raw,
+            Err(err) => {
+                self.audit(OtaAudit::DownloadFailed {
+                    url: url.to_string(),
+                    reason: err.to_string(),
+                });
+                return OtaPollOutcome::Rejected {
+                    reason: err.to_string(),
+                };
+            }
+        };
+
+        // 授权端诚实空态：`available = false` → 暂无可下发版本，不算失败。
+        match manifest_available(&raw) {
+            Ok(false) => {
+                return OtaPollOutcome::NoUpdate {
+                    reason: manifest_unavailable_reason(&raw),
+                };
+            }
+            Ok(true) => {}
+            Err(err) => {
+                self.audit(OtaAudit::VerifyFailed {
+                    reason: err.to_string(),
+                });
+                return OtaPollOutcome::Rejected {
+                    reason: err.to_string(),
+                };
+            }
+        }
+
+        // 复用既有下载后管线（解析 + 版本单调性 + 验签 + Downloaded 审计）。
+        match self.verify_and_stage(&raw) {
+            Ok(manifest) => {
+                let version = manifest.version;
+                self.audit(OtaAudit::Verified {
+                    version: version.to_string(),
+                });
+                self.staged = Some(manifest);
+                self.state = OtaState::ReadyToApply;
+                match self.apply().await {
+                    Ok(()) => OtaPollOutcome::Applied { version },
+                    Err(err) => {
+                        // apply 失败（存储故障等）已由 apply 内部记审计；收敛 Failed。
+                        self.state = OtaState::Failed;
+                        OtaPollOutcome::Rejected {
+                            reason: err.to_string(),
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                self.audit(OtaAudit::VerifyFailed {
+                    reason: err.to_string(),
+                });
+                self.state = OtaState::Failed;
+                OtaPollOutcome::Rejected {
+                    reason: err.to_string(),
+                }
+            }
+        }
     }
 
     /// 手动回滚：清除 pending 槽、保留 current 槽（旧版本字节原样保留）。
@@ -1085,6 +1262,46 @@ mod tests {
             "sig_b64": BASE64_STANDARD.encode(sig.to_bytes()),
         });
         serde_json::to_vec(&json).expect("test manifest json serialize")
+    }
+
+    /// 构造授权端 `GET /updates/manifest` 的响应体（`OtaManifestResponse` 形状）：
+    /// 在 manifest 六字段之外附带 `available` / `kid` / `reason`。
+    ///
+    /// `available = false` 时按授权端协议把其余字段置空串（诚实空态）。
+    fn build_manifest_response_json(
+        key: &SigningKey,
+        version: u64,
+        payload: &[u8],
+        available: bool,
+    ) -> Vec<u8> {
+        if !available {
+            let json = serde_json::json!({
+                "available": false,
+                "version": "",
+                "ts_ns": "",
+                "size": "",
+                "payload_sha256": "",
+                "payload_b64": "",
+                "sig_b64": "",
+                "kid": "kid-1",
+                "reason": "当前没有可下发的版本；请在授权端发布升级包后重试",
+            });
+            return serde_json::to_vec(&json).expect("test unavailable response json");
+        }
+        let sha = sha256_hex(payload);
+        let sig = key.sign(&ota_signing_message(version, &sha));
+        let json = serde_json::json!({
+            "available": true,
+            "version": version.to_string(),
+            "ts_ns": "1763000000000000000",
+            "size": payload.len().to_string(),
+            "payload_sha256": sha,
+            "payload_b64": BASE64_STANDARD.encode(payload),
+            "sig_b64": BASE64_STANDARD.encode(sig.to_bytes()),
+            "kid": "kid-1",
+            "reason": "",
+        });
+        serde_json::to_vec(&json).expect("test available response json")
     }
 
     /// mock HTTP 服务器：读到请求头结束即按 handler 回放响应，随后断开
@@ -1512,6 +1729,201 @@ mod tests {
             .expect_err("second fetch from ReadyToApply must fail");
         assert!(err.to_string().contains("fetch_update"), "{err}");
         assert_eq!(ota.state(), OtaState::ReadyToApply, "状态不被非法迁移破坏");
+    }
+
+    // ---- 轮询接线（poll_and_stage，授权端 /updates/manifest） ----
+
+    /// QA Happy：`available = true` + 版本更新 + 验签通过 → 写入 pending 槽 + 审计；
+    /// 之后再次轮询（已有 pending）→ 跳过，**不再发请求**（URL 故意不可达仍返回跳过）。
+    #[tokio::test]
+    async fn poll_applies_newer_version_and_writes_pending() {
+        let payload = firmware_payload(0xE1);
+        let body = build_manifest_response_json(&key_a(), 2, &payload, true);
+        let addr = spawn_http_mock(move |_| ok_response(&body)).await;
+
+        let (mut ota, store) = manager_with_store(1);
+        let url = format!("http://{addr}/updates/manifest");
+        let outcome = ota.poll_and_stage(&url).await;
+        assert_eq!(outcome, OtaPollOutcome::Applied { version: 2 });
+        assert_eq!(ota.state(), OtaState::Applied);
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("pending"),
+            Some(payload),
+            "pending 槽持有新包字节"
+        );
+        let meta = store
+            .load_meta()
+            .await
+            .expect("meta")
+            .expect("meta present");
+        assert_eq!(meta.pending_version, Some("2".to_string()));
+
+        // 审计含 Applied（版本为字符串——大数红线）。
+        let records: Vec<&OtaAudit> = ota.audit_log().iter().map(|e| &e.record).collect();
+        assert!(
+            records.contains(&&OtaAudit::Applied {
+                version: "2".to_string()
+            }),
+            "{records:?}"
+        );
+
+        // 已有 pending → 跳过且不下载（用不可达 URL 证明没有发请求）。
+        let outcome = ota
+            .poll_and_stage("http://127.0.0.1:1/updates/manifest")
+            .await;
+        assert_eq!(
+            outcome,
+            OtaPollOutcome::AlreadyPending {
+                version: "2".to_string()
+            }
+        );
+    }
+
+    /// QA 诚实空态：`available = false` → `NoUpdate`，**不计失败**、不写 pending、
+    /// 审计只有 DownloadStarted（无 DownloadFailed / VerifyFailed）。
+    #[tokio::test]
+    async fn poll_available_false_is_normal_empty_state() {
+        let body = build_manifest_response_json(&key_a(), 0, &[], false);
+        let addr = spawn_http_mock(move |_| ok_response(&body)).await;
+        let (mut ota, store) = manager_with_store(1);
+        let url = format!("http://{addr}/updates/manifest");
+
+        let outcome = ota.poll_and_stage(&url).await;
+        match outcome {
+            OtaPollOutcome::NoUpdate { reason } => {
+                assert!(reason.contains("没有可下发"), "空态原因原样透传: {reason}");
+            }
+            other => panic!("expected NoUpdate, got {other:?}"),
+        }
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("pending"),
+            None,
+            "空态不写 pending 槽"
+        );
+        let records: Vec<&OtaAudit> = ota.audit_log().iter().map(|e| &e.record).collect();
+        assert_eq!(
+            records,
+            vec![&OtaAudit::DownloadStarted { url }],
+            "空态只记下载开始，不计失败"
+        );
+    }
+
+    /// QA Error：manifest 不可达 → `Rejected`（真实原因）+ `DownloadFailed` 审计，
+    /// **不 panic**、旧版本不受影响。
+    #[tokio::test]
+    async fn poll_unreachable_manifest_is_rejected_with_reason() {
+        let mut ota = manager(1).with_timeout(Duration::from_secs(2));
+        let outcome = ota
+            .poll_and_stage("http://127.0.0.1:1/updates/manifest")
+            .await;
+        match outcome {
+            OtaPollOutcome::Rejected { reason } => {
+                assert!(!reason.trim().is_empty(), "拒绝原因必须非空");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(matches!(
+            ota.audit_log().last().map(|e| &e.record),
+            Some(OtaAudit::DownloadFailed { .. })
+        ));
+        assert_eq!(ota.current_version(), 1);
+    }
+
+    /// QA Error：版本不新（等于当前）→ 拒绝应用，**不写 pending 槽**（防重放）。
+    #[tokio::test]
+    async fn poll_rejects_non_newer_version_without_pending() {
+        let payload = firmware_payload(0xE2);
+        let body = build_manifest_response_json(&key_a(), 1, &payload, true); // 当前即 1
+        let addr = spawn_http_mock(move |_| ok_response(&body)).await;
+        let (mut ota, store) = manager_with_store(1);
+        let outcome = ota
+            .poll_and_stage(&format!("http://{addr}/updates/manifest"))
+            .await;
+        match outcome {
+            OtaPollOutcome::Rejected { reason } => {
+                assert!(
+                    reason.contains("regression"),
+                    "须明确说明版本单调性: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(
+            store.load_bytes(SLOT_PENDING).await.expect("pending"),
+            None,
+            "版本不新绝不写 pending 槽"
+        );
+        assert!(matches!(
+            ota.audit_log().last().map(|e| &e.record),
+            Some(OtaAudit::VerifyFailed { .. })
+        ));
+    }
+
+    /// QA 大数红线回归：`size` 写成 JSON **number** → 拒绝（`VerifyFailed`），绝不应用。
+    #[tokio::test]
+    async fn poll_rejects_numeric_size_field() {
+        let payload = firmware_payload(0xE3);
+        let base = build_manifest_response_json(&key_a(), 2, &payload, true);
+        let mut value: Value = serde_json::from_slice(&base).expect("base json");
+        value["size"] = serde_json::json!(payload.len()); // number（红线违规）
+        let body = serde_json::to_vec(&value).expect("json");
+        let addr = spawn_http_mock(move |_| ok_response(&body)).await;
+
+        let (mut ota, store) = manager_with_store(1);
+        let outcome = ota
+            .poll_and_stage(&format!("http://{addr}/updates/manifest"))
+            .await;
+        match outcome {
+            OtaPollOutcome::Rejected { reason } => {
+                assert!(
+                    reason.contains("big-number"),
+                    "数值型 size 必须被拒: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(store.load_bytes(SLOT_PENDING).await.expect("pending"), None);
+    }
+
+    /// QA：`available` 字段形状校验（缺字段 / 非布尔 / 非 JSON → ProtocolError）；
+    /// 空态 `reason` 读取（缺省空串，零 panic）。
+    #[test]
+    fn manifest_available_requires_boolean_field() {
+        assert!(manifest_available(br#"{"available":true}"#).expect("bool true"));
+        assert!(!manifest_available(br#"{"available":false}"#).expect("bool false"));
+        assert!(matches!(
+            manifest_available(br#"{"available":"yes"}"#),
+            Err(DaemonError::ProtocolError(_))
+        ));
+        assert!(matches!(
+            manifest_available(b"{}"),
+            Err(DaemonError::ProtocolError(_))
+        ));
+        assert!(matches!(
+            manifest_available(b"not json"),
+            Err(DaemonError::ProtocolError(_))
+        ));
+        assert_eq!(
+            manifest_unavailable_reason(br#"{"available":false,"reason":"none available"}"#),
+            "none available"
+        );
+        assert_eq!(manifest_unavailable_reason(b"junk"), "");
+    }
+
+    /// QA：`signing_key_b64` 解析（合法 32 字节通过；坏 base64 / 长度错 → ConfigError）。
+    #[test]
+    fn verifying_key_from_b64_validates_shape() {
+        let key = key_a().verifying_key();
+        let b64 = BASE64_STANDARD.encode(key.to_bytes());
+        assert_eq!(verifying_key_from_b64(&b64).expect("valid key"), key);
+        assert!(matches!(
+            verifying_key_from_b64("not-base64!!"),
+            Err(DaemonError::ConfigError(_))
+        ));
+        assert!(matches!(
+            verifying_key_from_b64("AAAA"),
+            Err(DaemonError::ConfigError(_))
+        ));
     }
 
     // ---- 启动判定（boot_commit_or_rollback） ----

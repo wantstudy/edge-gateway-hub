@@ -13,12 +13,15 @@ gateway_id = "gw-local-dev"
 # data_dir 缺省 ./data（点位数据库/队列/遥测落盘位置），可按需覆盖：
 # data_dir = "./data"
 
-# ── 云端授权（task 22-24；本地页面测试可不配；不配 = 纯本地 C 档雏形）──
+# ── 云端授权（**必配**：否则激活 / 心跳不可用）──
+# ⚠️ 必须配置本段（至少 `cloud_url`），否则新装实例「激活必然不通」，
+#    心跳与授权状态判定均不可用；仅在纯离线本地联调时才可整段留空。
+#    `cloud_url` 指向**部署方自有的授权服务基址**，勿填任何示例 / 看似真实的域名。
 # [gateway.licensing]
-# cloud_url = "https://licensing.example.com/v1"  # 云授权服务基址
+# cloud_url = "https://<授权端主机>:<端口>/v1"     # 【必配】云授权服务基址
 # heartbeat_interval_secs = 86400                 # 心跳间隔（秒，默认 24h）
-# trial_days = 3                                  # 试用天数（默认 3，计划 task 23）
-# grace_days = 7                                  # 离线宽限天数（默认 7，计划 task 22）
+# trial_days = 3                                  # 试用天数（默认 3）
+# grace_days = 7                                  # 离线宽限天数（默认 7）
 # ⚠️ activation_code（敏感凭据）：
 #   - 下方只允许**占位符**；仓库 / 日志 / 配置导出**绝不允许出现真实激活码**；
 #   - Debug 输出已脱敏（<redacted>），serde 序列化不携带该字段；
@@ -28,6 +31,20 @@ gateway_id = "gw-local-dev"
 # 服务端响应签名（TOFU，2026-09-25 主理人决策）：激活响应携带 server_pubkey 并被客户端
 # 钉定；心跳响应用钉定公钥验签——缺签 / 篡改 / 异钥一律 fail-closed（状态不推进）。
 # 契约细节见 docs/design/licensing-api.md §1.1/§1.2 与 daemon/auth/client.rs 模块注释。
+
+# ── 系统更新（OTA；可选，缺省关闭 = 不做任何检查）──
+# 网关按 poll_interval_secs 周期拉取授权端 `GET /updates/manifest`；下载后先做
+# Ed25519 验签，再按版本单调性（新版本号必须**严格大于** current_version）写入
+# pending 槽，等待重启确认（防降级 / 防重放旧包）。授权端无包可发时返回
+# available=false（诚实空态），网关**不计失败**、不重试风暴。
+# 说明：V1 下载通道仅支持 `http://`（明文，无 TLS），完整性由 Ed25519 签名兜底，
+#       机密性无保障；生产部署建议走可信内网。未配置 / enabled=false = 不发请求。
+# [gateway.ota]
+# enabled = false                                 # 【总开关】true 才启用检查；缺省 false
+# manifest_url = "http://<授权端主机>:<端口>/updates/manifest"   # 授权端下发端点（http）
+# signing_key_b64 = "<授权端 OTA Ed25519 公钥 base64（32 字节）>"  # 验签公钥（缺则视为未配置）
+# poll_interval_secs = 3600                       # 轮询周期（秒，默认 3600；首个周期后才检查）
+# current_version = 0                             # 网关当前 OTA 版本号（u64 单调；缺省 0）
 
 # ── 北向出口（本地页面测试可不配；留空数组即不转发）──
 # [[outlets]]

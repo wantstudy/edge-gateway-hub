@@ -880,6 +880,12 @@ impl BootstrapBuilder {
         // 计划重启调度（每日 `[ops] scheduled_restart_at`；未配置 = 空转不触发）。
         let restart_task = crate::scheduler::scheduled_restart::spawn(shared.clone());
 
+        // OTA 系统更新轮询（`[gateway.ota]`；未启用 / 未配置 = no-op 空转）。
+        // 轮询任务按 `poll_interval_secs` 周期拉授权端 `GET /updates/manifest`，
+        // 复用 `ota::OtaManager` 的解析 + 验签管线并写入 pending 槽；
+        // `available = false`（授权端诚实空态）不计失败，网络/验签失败记真实原因 warn。
+        let ota_task = crate::scheduler::ota_poll::spawn(shared.clone());
+
         // ②-b 免费版配额闸门（**启动装配期**，fail-closed）：Degraded（免费版）
         //     状态下配置超额（设备数 > 8 / 非 Modbus / 间隔 < 1s）→ 拒绝启动，
         //     错误含字段名 / 标识值与恢复路径。闸门通过后 reloader 继续服务热重载。
@@ -1063,6 +1069,7 @@ impl BootstrapBuilder {
         watchdog_task.abort();
         reload_task.abort();
         restart_task.abort();
+        ota_task.abort();
         reloader.stop();
 
         info!("bootstrap: daemon stopped");

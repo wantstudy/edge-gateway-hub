@@ -518,6 +518,74 @@ pub struct AlarmsSection {
     pub rules: Vec<AlarmRuleConfig>,
 }
 
+/// OTA 轮询默认周期（秒）：保守值 1 小时。
+fn default_ota_poll_interval_secs() -> u64 {
+    3_600
+}
+
+/// `[gateway.ota]` 系统更新段（**可选**；缺省 `enabled = false` = 不做任何检查）。
+///
+/// 语义（诚实降级）：
+/// - `enabled = false`（默认）→ 调度任务 no-op，**不发任何网络请求**、不报错；
+/// - `enabled = true` 但 `manifest_url` / `signing_key_b64` 缺失 → 视为**未配置**：
+///   调度任务记一次 `warn!` 说明「OTA 未配置，跳过升级检查」并附配置键名，
+///   绝不 panic、绝不静默；
+/// - `manifest_url` 指向授权端 `GET /updates/manifest`（V1 仅支持 `http://` 明文，
+///   完整性由 Ed25519 验签兜底，理由见 [`crate::ota`] 模块文档）；
+/// - `signing_key_b64` 是 Ed25519 **公钥**（32 字节，标准 base64）——用于校验
+///   下发的 manifest 签名，签名者是持有对应私钥的授权端；
+/// - `current_version` 是网关当前 OTA 版本号（u64 单调序）；新包版本必须**严格大于**
+///   该值（防降级 / 防重放旧包）。缺省 `0`。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OtaSection {
+    /// 是否启用 OTA 检查（缺省 **false** = 不动作）。
+    pub enabled: bool,
+    /// 授权端 manifest 端点（如 `http://licensing.internal:7080/updates/manifest`）。
+    pub manifest_url: Option<String>,
+    /// 轮询周期（秒；缺省 3600）。`0` 在运行时按 1 秒兜底。
+    pub poll_interval_secs: u64,
+    /// 授权端 OTA 签名公钥（Ed25519 公钥 32 字节的标准 base64）。
+    pub signing_key_b64: Option<String>,
+    /// 网关当前 OTA 版本号（u64 单调序；缺省 0）。
+    pub current_version: u64,
+}
+
+impl Default for OtaSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            manifest_url: None,
+            poll_interval_secs: default_ota_poll_interval_secs(),
+            signing_key_b64: None,
+            current_version: 0,
+        }
+    }
+}
+
+impl OtaSection {
+    /// 是否**已配置**（enabled + manifest_url + signing_key_b64 三者齐备）。
+    ///
+    /// `enabled = false`、URL 为空串 / 全空白、公钥缺失 → 均视为未配置。
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && !self.manifest_url.as_deref().unwrap_or("").trim().is_empty()
+            && !self
+                .signing_key_b64
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+    }
+
+    /// 未配置时的**面向运维**提示（含配置键名与怎么配）。
+    pub fn config_hint(&self) -> &'static str {
+        "OTA 未配置，跳过升级检查；如需启用请在 [gateway.ota] 段配置 \
+         enabled = true、manifest_url = \"http://<授权端主机>:<端口>/updates/manifest\"、\
+         signing_key_b64 = \"<授权端 Ed25519 公钥 base64>\"（poll_interval_secs 可选，缺省 3600）"
+    }
+}
+
 /// `[gateway]` 命名空间。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -532,6 +600,8 @@ pub struct GatewaySection {
     pub cache: CacheSection,
     /// 安全配置。
     pub security: SecuritySection,
+    /// 系统更新（OTA）配置。
+    pub ota: OtaSection,
 }
 
 impl Default for GatewaySection {
@@ -542,6 +612,7 @@ impl Default for GatewaySection {
             licensing: LicensingSection::default(),
             cache: CacheSection::default(),
             security: SecuritySection::default(),
+            ota: OtaSection::default(),
         }
     }
 }
@@ -1289,6 +1360,70 @@ frequency_ms = 100
             licensing.grace_days, 7,
             "grace_days default = 7 (GRACE_DAYS)"
         );
+    }
+
+    /// OTA 配置层（`[gateway.ota]`）：
+    /// 1. 缺省 = enabled=false / 无 URL / 无公钥 / 周期 3600 / current_version 0，
+    ///    且 `is_configured()` 为 false（未配置 → 不动作）；
+    /// 2. 显式段解析出各字段；
+    /// 3. **enabled=true 但缺 URL / 缺公钥** → 仍判定「未配置」（诚实降级，不 panic）。
+    #[test]
+    fn ota_section_defaults_and_unconfigured_detection() {
+        // 1) 空文档 → OTA 全缺省。
+        let config = GatewayConfig::parse("").expect("empty toml defaults");
+        let ota = &config.gateway.ota;
+        assert_eq!(
+            ota,
+            &OtaSection::default(),
+            "缺省等于 OtaSection::default()"
+        );
+        assert!(!ota.enabled, "OTA 缺省关闭");
+        assert_eq!(ota.manifest_url, None);
+        assert_eq!(ota.signing_key_b64, None);
+        assert_eq!(ota.poll_interval_secs, 3_600, "缺省轮询周期为保守值 3600s");
+        assert_eq!(ota.current_version, 0);
+        assert!(!ota.is_configured(), "空配置 = 未配置");
+
+        // 2) 显式段解析。
+        let parsed = GatewayConfig::parse(
+            r#"
+[gateway.ota]
+enabled = true
+manifest_url = "http://licensing.internal:7080/updates/manifest"
+poll_interval_secs = 60
+signing_key_b64 = "AAAA"
+current_version = 7
+"#,
+        )
+        .expect("parse ota section");
+        let ota = parsed.gateway.ota;
+        assert!(ota.enabled);
+        assert_eq!(
+            ota.manifest_url.as_deref(),
+            Some("http://licensing.internal:7080/updates/manifest")
+        );
+        assert_eq!(ota.poll_interval_secs, 60);
+        assert_eq!(ota.signing_key_b64.as_deref(), Some("AAAA"));
+        assert_eq!(ota.current_version, 7);
+        assert!(ota.is_configured(), "三要素齐备 = 已配置");
+
+        // 3) enabled=true 但 URL 为空 / 全空白 → 未配置；缺公钥同样未配置。
+        let no_url = OtaSection {
+            enabled: true,
+            manifest_url: Some("   ".to_string()),
+            signing_key_b64: Some("AAAA".to_string()),
+            ..OtaSection::default()
+        };
+        assert!(!no_url.is_configured(), "空白 URL = 未配置");
+        assert!(no_url.config_hint().contains("[gateway.ota]"));
+
+        let no_key = OtaSection {
+            enabled: true,
+            manifest_url: Some("http://host/updates/manifest".to_string()),
+            signing_key_b64: None,
+            ..OtaSection::default()
+        };
+        assert!(!no_key.is_configured(), "缺公钥 = 未配置");
     }
 
     /// 激活码脱敏纪律（task 19 尾巴）：
