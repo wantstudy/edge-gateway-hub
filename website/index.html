@@ -1352,8 +1352,8 @@ a:hover { text-decoration: underline; }
 
       <!-- 快速部署：单行命令 -->
       <div class="pull-cmd deploy-quick reveal" style="--d:.04s">
-        <code>docker run -d -p 9011:9011 -p 9012:9012 -e IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing wantstudy/iot-daq-gateway:0.1.0</code>
-        <button class="copy-btn" type="button" data-copy="docker run -d -p 9011:9011 -p 9012:9012 -e IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing wantstudy/iot-daq-gateway:0.1.0">复制</button>
+        <code>docker run -d -p 9011:9011 -p 9012:9012 wantstudy/iot-daq-gateway:0.1.0</code>
+        <button class="copy-btn" type="button" data-copy="docker run -d -p 9011:9011 -p 9012:9012 wantstudy/iot-daq-gateway:0.1.0">复制</button>
       </div>
 
       <div class="deploy-grid reveal" style="--d:.08s">
@@ -1368,7 +1368,6 @@ a:hover { text-decoration: underline; }
 <pre><code>docker run -d --name iot-daq-gateway \
   -p 9011:9011 \
   -p 9012:9012 \
-  -e IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing \
   wantstudy/iot-daq-gateway:0.1.0</code></pre>
           </div>
         </div>
@@ -1387,8 +1386,6 @@ a:hover { text-decoration: underline; }
     ports:
       - "9011:9011"   # API
       - "9012:9012"   # Web 控制台
-    environment:
-      - IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing
     restart: unless-stopped</code></pre>
           </div>
         </div>
@@ -1398,7 +1395,7 @@ a:hover { text-decoration: underline; }
         <span><b>镜像</b> wantstudy/iot-daq-gateway:0.1.0</span>
         <span><b>9011</b> API 端口</span>
         <span><b>9012</b> Web 控制台</span>
-        <span><b>环境变量</b> IOT_DAQ_LICENSE_SERVER_URL</span>
+        <span><b>授权地址</b> 已内置，无需配置</span>
       </div>
     </div>
   </section>

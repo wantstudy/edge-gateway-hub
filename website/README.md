@@ -61,13 +61,13 @@ scp F:/prod-fee-prj/edge-gateway-hub/website/index.html \
 - **首屏**：数据流拓扑（采集侧 → 网关 → MQTT 北向）
 - **核心特性**：多协议采集 / 北向转发 / 本地韧性 / 规则与公式 / Web 控制台 / 安全设计
 - **快速下载**：Windows 安装包（GitHub Releases）+ Docker 镜像
-- **Docker 部署**：简化版 `docker run` 与 `docker-compose.yml`（镜像 `wantstudy/iot-daq-gateway:0.1.0`，端口 `9011` API / `9012` Web，环境变量 `IOT_DAQ_LICENSE_SERVER_URL`）
+- **Docker 部署**：简化版 `docker run` 与 `docker-compose.yml`（镜像 `wantstudy/iot-daq-gateway:0.1.0`，端口 `9011` API / `9012` Web，授权地址已内置、无需配置）
 - **快速开始**：三步部署
 - **页脚**：联系方式 + ICP 备案号
 
 ## 修改说明（相对 v2.html 源）
 
-- 新增「Docker 部署」独立章节，采用简化部署指令（9011 / 9012 端口，环境变量 `IOT_DAQ_LICENSE_SERVER_URL=http://license.webscad.cn/licensing`）。
+- 新增「Docker 部署」独立章节，采用简化部署指令（9011 / 9012 端口，授权服务地址已内置镜像，无需任何环境变量）。
 - 删除短语「最小配置即可启动」（配置章节标题改为「极简配置，快速接入」，终端注释同步调整）。
 - Web 控制台访问地址更新为 `http://127.0.0.1:9012`（与部署端口一致）。
 - 联系方式与 ICP 备案号沿用 v2.html 源中的内容（见页脚），如需更新请直接编辑 `index.html` 页脚对应字段。
