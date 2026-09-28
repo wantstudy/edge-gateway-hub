@@ -69,7 +69,7 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// 默认请求超时（秒）。
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// 试用天数（3 天）。
-pub const TRIAL_DAYS: i64 = 3;
+pub const TRIAL_DAYS: i64 = 30;
 /// 离线宽限天数（7 天）。
 pub const GRACE_DAYS: i64 = 7;
 /// 一天秒数。

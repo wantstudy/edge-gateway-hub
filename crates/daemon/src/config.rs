@@ -233,9 +233,9 @@ fn default_heartbeat_secs() -> u64 {
     86_400
 }
 
-/// 试用天数默认（3 天，计划 task 23；与 `auth::client::TRIAL_DAYS` 口径一致）。
+/// 试用天数默认（30 天，计划 task 23；与 `auth::client::TRIAL_DAYS` 口径一致）。
 fn default_trial_days() -> u32 {
-    3
+    30
 }
 
 /// 离线宽限天数默认（7 天，计划 task 22；与 `auth::client::GRACE_DAYS` 口径一致）。
@@ -1560,7 +1560,7 @@ frequency_ms = 100
             Some("IOTDAQ-0000-0000-0000-0000"),
             "activation_code must be configurable (placeholder in examples)"
         );
-        assert_eq!(config.gateway.licensing.trial_days, 3);
+        assert_eq!(config.gateway.licensing.trial_days, 30);
         assert_eq!(config.gateway.licensing.grace_days, 7);
         assert_eq!(config.gateway.cache.retention_days, 7);
         assert!(config.gateway.security.web_auth_enabled);
@@ -1596,8 +1596,8 @@ frequency_ms = 100
         let licensing = &config.gateway.licensing;
         assert_eq!(licensing.activation_code, None);
         assert_eq!(
-            licensing.trial_days, 3,
-            "trial_days default = 3 (TRIAL_DAYS)"
+            licensing.trial_days, 30,
+            "trial_days default = 30 (TRIAL_DAYS)"
         );
         assert_eq!(
             licensing.grace_days, 7,
@@ -2214,7 +2214,7 @@ password_hash = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a
             licensing.activation_code, None,
             "template must not enable cloud activation by default"
         );
-        assert_eq!(licensing.trial_days, 3);
+        assert_eq!(licensing.trial_days, 30);
         assert_eq!(licensing.grace_days, 7);
 
         // 缓存 / 安全段在 [gateway] 命名空间内。
