@@ -782,7 +782,7 @@ describe('激活码字符集跨端契约（回归护栏）', () => {
 
   /** 取出服务端 `CODE_ALPHABET` 常量（跨层读 Rust 源码）。 */
   const serverCharSet = (): Set<string> => {
-    const serviceSrc = readUp('../../../crates/licensing-server/src/service.rs');
+    const serviceSrc = readUp('../../../../crates/licensing-server/src/service.rs');
     return new Set([...constFrom(serviceSrc, 'CODE_ALPHABET')]);
   };
 

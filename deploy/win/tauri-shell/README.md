@@ -38,7 +38,7 @@ tauri-shell/
 
 ```bash
 # 1) 安装依赖（首次）
-npm --prefix ../web-console ci
+npm --prefix ../../../frontends/web-console ci
 npm --prefix . ci
 
 # 2) 调试运行（热重载 web-console）
@@ -49,7 +49,7 @@ npm run build
 # 产物：src-tauri/target/release/bundle/nsis/IoT-DAQ Gateway_0.1.0_x64-setup.exe
 ```
 
-> 若本地已 `npm --prefix ../web-console run build` 过，`npm run build`（tauri build）的
+> 若本地已 `npm --prefix ../../../frontends/web-console run build` 过，`npm run build`（tauri build）的
 > `beforeBuildCommand` 也会自动构建 `web-console`，无需手动预构建。
 
 ## daemon 侧车（核心进程）
@@ -67,7 +67,7 @@ npm run build
   ```bash
   cargo build --release -p daemon --bin iot-daq-daemon
   mkdir -p src-tauri/resources
-  cp ../../target/release/iot-daq-daemon.exe src-tauri/resources/
+  cp ../../../target/release/iot-daq-daemon.exe src-tauri/resources/
   ```
 - **daemon 运行参数**（`resource_dir()` 拉起时走默认值；需要定制时经壳内环境变量注入）：
   `IOT_DAQ_CONFIG`（默认 `./config.toml`）、`IOT_DAQ_MGMT_BIND`（默认 `127.0.0.1:8080`）、
@@ -86,7 +86,7 @@ CI 会把证书导入当前用户证书存储，并用 `Set-AuthenticodeSignatur
 
 ## CI 流水线
 
-见 [`.github/workflows/release-windows.yml`](../../.github/workflows/release-windows.yml)：
+见 [`.github/workflows/release-windows.yml`](../../../.github/workflows/release-windows.yml)：
 
 1. Checkout → 装 Rust（MSVC target）+ Node 22
 2. `npm ci` 安装 web-console 与 tauri-cli 依赖

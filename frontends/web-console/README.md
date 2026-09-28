@@ -34,7 +34,7 @@
 ## 2. 快速开始
 
 ```bash
-cd web-console
+cd frontends/web-console
 npm install          # 会同时以 file:../ui-kit 安装共享包
 npm run dev          # 开发服务器 http://localhost:5274
 ```
@@ -242,7 +242,7 @@ web-console/
 **mock 模式（默认）**：
 
 ```bash
-cd web-console
+cd frontends/web-console
 npm run dev          # http://localhost:5274
 ```
 
@@ -255,7 +255,7 @@ export IOT_DAQ_DEV_ADMIN_PASS='your-dev-pass'
 iot-daq-daemon   # 以仓库实际 daemon 启动命令为准
 
 # 2. 新终端：real 模式启动前端（Windows Git Bash）
-cd web-console
+cd frontends/web-console
 export VITE_API_MODE=real
 npm run dev          # http://localhost:5274，未登录会被守卫引导到 /login
 ```

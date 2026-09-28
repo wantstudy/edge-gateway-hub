@@ -11,9 +11,9 @@
 docs
 .omo
 .workbuddy
-admin-console/dist
-ui-kit/dist
-web-console/dist
+frontends/admin-console/dist
+frontends/ui-kit/dist
+frontends/web-console/dist
 deploy/out
 *.tar
 *.tar.gz

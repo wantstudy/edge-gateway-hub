@@ -150,9 +150,9 @@ src_contains "4.11 换机唯一路径 = 厂商后台废弃+重发（文档红线
 src_contains "4.12 客户端红线注释：连方法都不提供" \
     "${DA_CRS}/auth/client.rs" "红线：客户端没有「解绑 / 重置试用 / 换机」入口"
 src_contains "4.13 管理端写端点后端契约 = licensing-server/src/http.rs" \
-    "admin-console/src/api/repo.ts" "crates/licensing-server/src/http\.rs" "*.ts"
+    "frontends/admin-console/src/api/repo.ts" "crates/licensing-server/src/http\.rs" "*.ts"
 src_contains "4.14 管理端写端点路径为 /admin/codes/issue|/revoke|/reissue" \
-    "admin-console/src/api/repo.ts" "/admin/codes(/issue|:id/revoke|:id/reissue)" "*.ts"
+    "frontends/admin-console/src/api/repo.ts" "/admin/codes(/issue|:id/revoke|:id/reissue)" "*.ts"
 
 # ===========================================================================
 section "契约 5：二次校验分档 A/B/C（默认 B）；客户自建 Broker 时服务端无消息级落点"
@@ -240,25 +240,25 @@ src_contains "6.5 北向闸门实现在 Rust 侧（NorthForwardGate）" \
 
 # 前端只读展示、不下判定：web-console 只映射 GET /api/license/status
 src_contains "6.6 网关前端授权状态只走 GET /api/license/status（只读）" \
-    "web-console/src/api/model.ts" "授权状态    ↔ \`GET /api/license/status\`" "*.ts"
+    "frontends/web-console/src/api/model.ts" "授权状态    ↔ \`GET /api/license/status\`" "*.ts"
 src_contains "6.6b 前端状态拉取函数只发 GET /api/license/status" \
-    "web-console/src/api/repo.ts" "await apiRequest<Record<string, unknown>>\('/api/license/status'\)" "*.ts"
+    "frontends/web-console/src/api/repo.ts" "await apiRequest<Record<string, unknown>>\('/api/license/status'\)" "*.ts"
 
 # 6.7：前端 activate 是「提交」触点，但**必须永不成功**（后端无此端点 → ok:false）。
 # 断言的是返回值（真实代码路径的返回形状），不是「字符串不存在」。
 src_contains "6.7 前端 activate 触点永不成功（后端无激活端点 → ok:false）" \
-    "web-console/src/api/repo.ts" "后端未提供激活接口（POST /api/license/activate 未落地）" "*.ts"
+    "frontends/web-console/src/api/repo.ts" "后端未提供激活接口（POST /api/license/activate 未落地）" "*.ts"
 src_contains "6.7b 该触点签名返回 ok:boolean（fail-closed，无法自行点亮授权）" \
-    "web-console/src/api/repo.ts" "Promise<\{ ok: boolean; message: string \}>" "*.ts"
+    "frontends/web-console/src/api/repo.ts" "Promise<\{ ok: boolean; message: string \}>" "*.ts"
 src_absent "6.7c 前端不得注册授权写路由" \
-    "web-console/src" "apiRequest(('|')?[^)]*license/(unbind|reset|revoke|reissue)" "*.ts"
+    "frontends/web-console/src" "apiRequest(('|')?[^)]*license/(unbind|reset|revoke|reissue)" "*.ts"
 
 # 6.8：northForwardAllowed 只能来自只读 GET 的映射，不得由用户输入决定。
 src_contains "6.8 前端北向判据仅由只读 status 映射而来（pickBool 兜底 false）" \
-    "web-console/src/api/repo.ts" "northForwardAllowed: pickBool\(raw, 'north_forward_allowed', false\)" "*.ts"
+    "frontends/web-console/src/api/repo.ts" "northForwardAllowed: pickBool\(raw, 'north_forward_allowed', false\)" "*.ts"
 src_contains "6.8b 状态来源标注为只读 GET" \
-    "web-console/src/api/repo.ts" "拉取授权状态：\`GET /api/license/status\`" "*.ts"
+    "frontends/web-console/src/api/repo.ts" "拉取授权状态：\`GET /api/license/status\`" "*.ts"
 src_absent "6.8c 前端不得写入授权状态（无赋值来源为输入）" \
-    "web-console/src" "realCache\.license = \{[^}]*(input|formData|payload)" "*.ts"
+    "frontends/web-console/src" "realCache\.license = \{[^}]*(input|formData|payload)" "*.ts"
 
 report "contract-static.sh"

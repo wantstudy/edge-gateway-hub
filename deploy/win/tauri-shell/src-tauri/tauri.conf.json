@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.iotdaq.gateway",
   "build": {
-    "beforeDevCommand": "npm --prefix ../web-console run dev",
+    "beforeDevCommand": "npm --prefix ../../../frontends/web-console run dev",
     "devUrl": "http://localhost:5274",
-    "beforeBuildCommand": "npm --prefix ../web-console run build",
-    "frontendDist": "../../web-console/dist"
+    "beforeBuildCommand": "npm --prefix ../../../frontends/web-console run build",
+    "frontendDist": "../../../../frontends/web-console/dist"
   },
   "app": {
     "security": {

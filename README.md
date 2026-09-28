@@ -6,7 +6,7 @@
 
 交付形态两端：
 
-- **Windows**：`tauri-shell/` 桌面壳（Tauri 2.x 承载 `web-console` + 拉起 daemon 侧车）→ NSIS 安装包 `.exe`
+- **Windows**：`deploy/win/tauri-shell/` 桌面壳（Tauri 2.x 承载 `web-console` + 拉起 daemon 侧车）→ NSIS 安装包 `.exe`
 - **Linux**：Docker 容器（容器内置 nginx 提供静态页面 + `/api/*` 反代到 daemon，非 root / 只读根文件系统 / 宿主锚定）
 
 设计基线见 `docs/design/`，任务计划见 `.omo/plans/iot-daq-gateway.md`
@@ -79,31 +79,32 @@ F:/xy/iot-daq
 │   │                           admin_auth、device_auth、audit、model、proto
 │   └── protocol-proto/         北向 protobuf：proto/telemetry.proto + build.rs + 往返测试
 │
-├── web-console/                网关侧控制台（Vue 3；dev 5274；dev 代理 /api → 127.0.0.1:8080）
-│   ├── src/api/                client（运行期 API base 解析）/ repo（唯一数据层）/ stream(SSE) / shell(桌面壳桥)
-│   ├── src/pages/              18 个页面组件
-│   ├── src/guards/             授权端隔离守卫测试（防两端口径回流）
-│   └── public/                 favicon / logo 素材
-├── admin-console/              厂商后台（Vue 3；dev 5273；dev 代理 /licensing → 127.0.0.1:7080 并剥前缀）
-│   ├── src/api/                client（baseURL 硬编码同源前缀 `/licensing`）/ repo
-│   ├── src/pages/              12 个页面组件
-│   └── .env.production         生产构建：VITE_API_MODE=real
-├── ui-kit/                     两端共用（源码级共享，无独立产物）
-│   ├── src/components/         17 个共享组件（StatusTag/StatCard/PageHeader/EmptyState/DangerConfirmModal/
-│   │                           MachineCodeDisplay/MaskedCode/CodeLifecycleTimeline/RoleGate/Ui*）
-│   ├── src/                    rbac / mask / status-map / theme / time / tokens.(ts|css) / icons
-│   └── tests/                  vitest（6 文件 / 101 用例）
-├── tauri-shell/                Windows 桌面壳（独立 Cargo 工程，脱离根 workspace）
-│   └── src-tauri/              main.rs（建窗+拉侧车）/ supervisor.rs（端口探测 8080→8089 + 看门狗）/
-│                               tauri.conf.json（NSIS + 资源 + CSP）/ nsis-hooks.nsh（安装目录清理）/ icons/
+├── frontends/                  三个前端工程同父目录（`../ui-kit` 兄弟别名共享，搬移免改别名）
+│   ├── web-console/            网关侧控制台（Vue 3；dev 5274；dev 代理 /api → 127.0.0.1:8080）
+│   │   ├── src/api/            client（运行期 API base 解析）/ repo（唯一数据层）/ stream(SSE) / shell(桌面壳桥)
+│   │   ├── src/pages/          18 个页面组件
+│   │   ├── src/guards/         授权端隔离守卫测试（防两端口径回流）
+│   │   └── public/             favicon / logo 素材
+│   ├── admin-console/          厂商后台（Vue 3；dev 5273；dev 代理 /licensing → 127.0.0.1:7080 并剥前缀）
+│   │   ├── src/api/            client（baseURL 硬编码同源前缀 `/licensing`）/ repo
+│   │   ├── src/pages/          12 个页面组件
+│   │   └── .env.production     生产构建：VITE_API_MODE=real
+│   └── ui-kit/                 两端共用（源码级共享，无独立产物）
+│       ├── src/components/     17 个共享组件（StatusTag/StatCard/PageHeader/EmptyState/DangerConfirmModal/
+│       │                       MachineCodeDisplay/MaskedCode/CodeLifecycleTimeline/RoleGate/Ui*）
+│       ├── src/                rbac / mask / status-map / theme / time / tokens.(ts|css) / icons
+│       └── tests/              vitest（6 文件 / 101 用例）
 │
 ├── deploy/
+│   ├── win/tauri-shell/        Windows 桌面壳（独立 Cargo 工程，脱离根 workspace）
+│   │   └── src-tauri/          main.rs（建窗+拉侧车）/ supervisor.rs（端口探测 8080→8089 + 看门狗）/
+│   │                           tauri.conf.json（NSIS + 资源 + CSP）/ nsis-hooks.nsh（安装目录清理）/ icons/
 │   ├── docker/                 网关容器：Dockerfile(+.rendered) / docker-compose.yml / start.sh /
 │   │   │                       entrypoint.sh（shell 版，调试用）/ nginx.conf.template + mime.types
 │   │   ├── config/gateway.default.toml   容器内默认配置模板
 │   │   ├── context/web-console-dist/     ★ 打进镜像的前端产物（跟踪入库，CI 守卫对象）
-│   │   └── healthprobe/main.rs           零依赖 TCP 探针（distroless 无 shell）
-│   ├── licensing/              授权端单机部署：docker-compose.yml + .env.example
+│   │   ├── healthprobe/main.rs           零依赖 TCP 探针（distroless 无 shell）
+│   │   └── licensing/          授权端单机部署：docker-compose.yml + .env.example
 │   ├── nginx/                  宝塔宿主 nginx vhost：iot-daq-licensing.conf（线上落地名 iot-daq-both.conf，`:9013`）
 │   │                           + iot-daq-license-domain.conf（公网域名 `license.webscad.cn` 的 `:80` 入口）
 │   ├── scripts/                install/uninstall/build-offline-bundle/sign-and-verify/
@@ -112,14 +113,10 @@ F:/xy/iot-daq
 │   ├── base-images.lock.yaml   基础镜像 tag↔digest 锁文件（禁手写，由渲染脚本注入）
 │   └── .env.example            全部环境变量命名权威（唯一入口）
 │
-├── headless/                   Linux headless 交付形态的占位说明（仅 README.md，尚未建 Cargo 工程）
-│
 ├── .omo/                       计划与会话状态（未入库，禁删）
 ├── .workbuddy/                 工作区记忆与验收证据（未入库，禁删）
 ├── docs/                       设计（design/）/ 手册（manual/）/ 运维（handbook/）（未入库，禁删）
-├── archive/                    本地历史配置备份归拢处（未跟踪；config-backup/）
-├── data/                       运行期数据：audit.db / trial.marker / license/ / 验证日志（未跟踪）
-├── pki/                        OPC UA PKI（trusted/ rejected/，未跟踪）
+├── data/                       运行期数据（运行时自动生成；2026-09-28 已清理历史 audit.db/私钥/试用标记）
 └── target/ target-*/           cargo 构建缓存（未跟踪、可重建；多个 target-* 是并行构建目录）
 ```
 
@@ -157,9 +154,9 @@ cargo run -p daemon --bin iot-daq-daemon -- --config config.toml
 - **管理面监听 `127.0.0.1:8080`**（默认值，见 `crates/daemon/src/bin/iot-daq-daemon.rs:145`）。
   覆盖方式：`--bind <addr>` 或环境变量 `IOT_DAQ_MGMT_BIND`（亦兼容 `IOT_DAQ_HTTP_BIND`/`IOT_DAQ_HTTP_PORT`）。
   注意：**daemon 自己不做端口顺延**，8080 被占用会直接启动失败——自动换端口是
-  **Windows 桌面壳**的能力（`tauri-shell/src-tauri/src/supervisor.rs:74` `pick_mgmt_addr` 从
+  **Windows 桌面壳**的能力（`deploy/win/tauri-shell/src-tauri/src/supervisor.rs:74` `pick_mgmt_addr` 从
   8080 顺延探测到 8089，前端经 `api_base` 命令读取实际基址）。
-- 静态页面根：`IOT_DAQ_WEB_DIST`（默认 `./web-dist`）；把 `web-console/dist` 指过去即可由 daemon 直接托管。
+- 静态页面根：`IOT_DAQ_WEB_DIST`（默认 `./web-dist`）；把 `frontends/web-console/dist` 指过去即可由 daemon 直接托管。
 - 配置文件路径：`--config` 或 `IOT_DAQ_CONFIG`（默认 `./config.toml`；**文件不存在会 fail-fast 退出码 1**）。
 - 日志：`IOT_DAQ_LOG_LEVEL`（如 `info`）/ `IOT_DAQ_LOG_JSON=1` 结构化输出。
 - 数据根：`IOT_DAQ_DATA_DIR`（默认 `./data`）。
@@ -213,7 +210,7 @@ cd /f/xy/iot-daq/admin-console && npm install && npm run dev   # → http://loca
 - 路由为 **hash 路由**，静态托管无需 SPA fallback。
 - 测试：`npm run test`（vitest）。
 
-**授权端 baseURL 的前缀陷阱**：`admin-console/src/api/client.ts` 里 `BASE_PATH = '/licensing'` 是
+**授权端 baseURL 的前缀陷阱**：`frontends/admin-console/src/api/client.ts` 里 `BASE_PATH = '/licensing'` 是
 **硬编码同源相对前缀**，而后端路由本身不带前缀（如 `/admin/auth/login`）。因此
 **生产环境的宿主 nginx 必须 `proxy_pass http://127.0.0.1:9010/`（带尾斜杠）来剥前缀**
 ——见 `deploy/nginx/iot-daq-licensing.conf`（线上落地名 `iot-daq-both.conf`）。少写尾斜杠会导致 404。
@@ -236,8 +233,8 @@ cd /f/xy/iot-daq
 # ① 先产出 daemon 侧车（★ 必须，否则打包缺资源失败）
 #    tauri.conf.json 的 bundle.resources 声明了 resources/iot-daq-daemon.exe
 cargo build --release -p daemon --bin iot-daq-daemon
-mkdir -p tauri-shell/src-tauri/resources
-cp target/release/iot-daq-daemon.exe tauri-shell/src-tauri/resources/
+mkdir -p deploy/win/tauri-shell/src-tauri/resources
+cp target/release/iot-daq-daemon.exe deploy/win/tauri-shell/src-tauri/resources/
 
 # ② 安装依赖（tauri-cli + web-console）
 npm --prefix web-console ci
@@ -246,17 +243,17 @@ cd tauri-shell && npm ci
 # ③ 本地调试（热重载 web-console）
 npm run dev
 
-# ④ 出包（必须在 tauri-shell/ 目录内执行）
+# ④ 出包（必须在 deploy/win/tauri-shell/ 目录内执行）
 npm run build          # = tauri build；beforeBuildCommand 会自动构建 web-console
 ```
 
 **产物路径**
 
 ```
-tauri-shell/src-tauri/target/release/bundle/nsis/IoT-DAQ Gateway_0.1.0_x64-setup.exe
+deploy/win/tauri-shell/src-tauri/target/release/bundle/nsis/IoT-DAQ Gateway_0.1.0_x64-setup.exe
 ```
 
-（版本号取自 `tauri-shell/src-tauri/tauri.conf.json` 的 `version`，**不会**跟随 git tag；
+（版本号取自 `deploy/win/tauri-shell/src-tauri/tauri.conf.json` 的 `version`，**不会**跟随 git tag；
 `release-windows.yml` 已加 tag↔version 一致性校验，不一致直接非零退出。）
 
 **`nsis-hooks.nsh` 的作用**：历史版本把 `config.example.toml` 铺到安装目录 `$INSTDIR`，
@@ -365,14 +362,14 @@ iot-daq 在线上占用**专用端口段 `9010-9013`**（宿主 `80/443` 已被�
 | 网关 web（容器内置 nginx） | `8080` | **`9012`** | `IOT_DAQ_WEB_PORT` |
 | 授权端 vhost（IP 直连） | — | **`9013`** | 宿主 nginx `iot-daq-both.conf` |
 | 授权端域名入口 | — | **`80`**（`license.webscad.cn`） | 宿主 nginx `iot-daq-license-domain.conf` |
-| admin-console dev 代理目标 | `127.0.0.1:7080` | — | `admin-console/vite.config.ts`（**不随部署改变**） |
+| admin-console dev 代理目标 | `127.0.0.1:7080` | — | `frontends/admin-console/vite.config.ts`（**不随部署改变**） |
 
 > 口径：代码内 `DEFAULT_LISTEN_ADDR`（授权端）/ daemon 管理面默认端口是**本地直跑**默认值，
 > 容器部署一律由 env 覆盖为 `901x`。
 
 ### 5.3 授权端（licensing-server）部署
 
-**① 本地构建镜像**（详见 `deploy/licensing/docker-compose.yml` 头部注释）
+**① 本地构建镜像**（详见 `deploy/docker/licensing/docker-compose.yml` 头部注释）
 
 ```bash
 ./deploy/scripts/render-dockerfile-digests.sh --output deploy/docker/licensing-server.Dockerfile.rendered
@@ -393,7 +390,7 @@ ssh root@60.205.8.146 'cd /opt/iot-daq/licensing && docker load -i licensing-ser
 
 ```bash
 mkdir -p /opt/iot-daq/licensing/data && chown -R 65532:65532 /opt/iot-daq/licensing/data
-cp deploy/licensing/.env.example /opt/iot-daq/licensing/.env   # 填真实值；.env 严禁入库
+cp deploy/docker/licensing/.env.example /opt/iot-daq/licensing/.env   # 填真实值；.env 严禁入库
 # 关键变量：IOTDAQ_ADMIN_USER / IOTDAQ_ADMIN_PASSWORD_SHA256（64 hex）/ IOTDAQ_JWT_SECRET
 #           IOT_DAQ_LICENSE_SIGNING_KID + IOT_DAQ_LICENSE_SIGNING_KEY（成对，缺则签发 fail-closed）
 #           IOT_DAQ_LISTEN_ADDR / IOT_DAQ_HTTP_PORT（容器部署统一 9010）
@@ -415,7 +412,7 @@ curl -fsS http://127.0.0.1:9010/healthz
 scp deploy/nginx/iot-daq-licensing.conf root@60.205.8.146:/www/server/panel/vhost/nginx/iot-daq-both.conf
 # 公网域名 80 入口（:80，server_name license.webscad.cn）
 scp deploy/nginx/iot-daq-license-domain.conf root@60.205.8.146:/www/server/panel/vhost/nginx/
-scp -r admin-console/dist/* root@60.205.8.146:/www/wwwroot/iot-daq-licensing/
+scp -r frontends/admin-console/dist/* root@60.205.8.146:/www/wwwroot/iot-daq-licensing/
 ssh root@60.205.8.146 'nginx -t && nginx -s reload'
 ```
 
@@ -431,7 +428,7 @@ ssh root@60.205.8.146 'nginx -t && nginx -s reload'
 > 验证：`curl -sS -o /dev/null -w '%{http_code}\n' http://license.webscad.cn/licensing/admin/overview`
 > 期望 **401**（无 Bearer）——401 恰证明「域名 → nginx 剥前缀 → 授权端容器」链路是通的。
 
-> 前端必须用 `VITE_API_MODE=real` 构建（`admin-console/.env.production` 已内置），
+> 前端必须用 `VITE_API_MODE=real` 构建（`frontends/admin-console/.env.production` 已内置），
 > 否则页面走 mock 根本不打后端。
 
 ### 5.4 网关端（iot-daq-gateway）部署
@@ -537,7 +534,7 @@ curl -fsS http://127.0.0.1:${IOT_DAQ_WEB_PORT}/healthz    # 200，body 的 mode 
   新增依赖须过 `cargo deny`（配置见 `deny.toml`）。
 - **防逆向 Tier-1**：release 产物 `strip + LTO + panic=abort`（根 `Cargo.toml [profile.release]` 已落实）。
 - **密钥红线**：仓库内**不提交**任何激活码 / 私钥 / 真实机器码 / 口令；`config.toml*`、`.env*`、
-  `*.pem|key|p12|pfx`、`data/`、`archive/` 均在 `.gitignore` 中。
+  `*.pem|key|p12|pfx`、`data/` 均在 `.gitignore` 中。
 - **授权判定始终在 Rust 侧**：WebView / JS 只做展示，`RoleGate` 仅控制可见性，不做授权判定。
 - **JSON 编码约定**：纳秒时间戳 / uint64 计数器在 JSON 路径必须字符串编码（int64 → string），见 `crates/protocol-proto`。
 
@@ -565,6 +562,5 @@ cargo deny check --locked
   收工后可清理，只保留一个统一 `CARGO_TARGET_DIR`。
 - `deploy/docker/context/web-console-dist/` 是**跟踪入库**的前端构建产物（镜像 COPY 输入 + CI 守卫对象），
   不是源码；改前端后需重新构建并覆盖该目录（CI 会自动做，本地需手动）。
-- `headless/` 目前只有说明文档，无 Cargo 工程；Linux 的实际交付形态是 `deploy/docker/` 容器镜像。
 - `admin-console` 的 `src/mock/mock-data.ts` 是 mock 模式的契约本体（`src/api/repo.ts` 仍在 import），
   **不是死代码**；`VITE_API_MODE=real` 构建时数据层走真实接口。

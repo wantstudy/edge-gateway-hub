@@ -5,13 +5,12 @@ members = [
     "crates/licensing-server",
     "crates/protocol-proto",
 ]
-# 以下目录为后续 Wave 的成员/资产占位，当前阶段（Wave 1）不参与 Cargo 构建：
-# - tauri-shell/   Windows Tauri 桌面壳（task 32 / 打包 task 38）
-# - headless/      Linux headless 服务，容器镜像运行体（task 33）
-# - web-console/   网关侧 Vue 3 管理界面（task 27）
-# - admin-console/ 厂商总管理后台（task 47）
-# - ui-kit/        两端共用前端基础包（task 27）
-# - deploy/        容器与部署资产目录，非 Cargo 成员（task 60）
+# 以下目录为非 Cargo 成员的工程/资产（当前阶段不参与根 workspace 构建）：
+# - deploy/win/tauri-shell/  Windows Tauri 桌面壳（独立 Cargo 工程；task 32 / 打包 task 38）
+# - frontends/web-console/   网关侧 Vue 3 管理界面（task 27）
+# - frontends/admin-console/ 厂商总管理后台（task 47）
+# - frontends/ui-kit/        两端共用前端基础包（task 27）
+# - deploy/                  容器与部署资产目录（docker / win / nginx / scripts），非 Cargo 成员（task 60）
 
 [workspace.package]
 version = "0.1.0"

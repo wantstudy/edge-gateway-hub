@@ -66,7 +66,7 @@ if grep -Eq 'TEST_ONLY placeholder|replaced by CI build|<title>[^<]*placeholder|
      CI 绿、构建绿、日志无异常，只有打开页面才会发现 —— 属交付事故。
 修复：构建真实产物并覆盖本目录，例如
      cd web-console && npm ci && npm run build      # build = vue-tsc --noEmit && vite build
-     # 产物目录为 web-console/dist，拷贝到 deploy/docker/context/web-console-dist/
+     # 产物目录为 frontends/web-console/dist，拷贝到 deploy/docker/context/web-console-dist/
      本目录只允许存放真实前端产物，占位页必须消失。"
 fi
 

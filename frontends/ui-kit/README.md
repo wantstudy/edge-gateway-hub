@@ -104,7 +104,7 @@ import './styles/global.css';          // 3) 应用自有样式
 ## 4. 开发与测试
 
 ```bash
-cd ui-kit
+cd frontends/ui-kit
 npm install
 npm run test        # Vitest（jsdom），覆盖 rbac / mask / status-map / DangerConfirmModal
 npm run test:watch  # 监听模式

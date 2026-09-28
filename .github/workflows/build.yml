@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 交付形态仅覆盖 Windows（Tauri 桌面）与 Linux（headless/Docker）。
+        # 交付形态仅覆盖 Windows（Tauri 桌面）与 Linux（Docker）。
         # 设计定稿明确不引入 macos-latest（浪费 CI 配额且增加无关失败面）。
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
@@ -72,21 +72,21 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: web-console/package-lock.json
+          cache-dependency-path: frontends/web-console/package-lock.json
 
       - name: npm ci 并安装依赖
-        working-directory: web-console
+        working-directory: frontends/web-console
         run: npm ci
 
       - name: 构建 web-console 真实产物
-        working-directory: web-console
+        working-directory: frontends/web-console
         run: npm run build
 
       - name: 以真实产物覆盖 web-console-dist 交付目录
         run: |
           set -euo pipefail
           rm -rf deploy/docker/context/web-console-dist
-          cp -r web-console/dist deploy/docker/context/web-console-dist
+          cp -r frontends/web-console/dist deploy/docker/context/web-console-dist
 
       # web-console 交付物守卫（fail-closed）：占位页会让 docker build 静默「成功」，
       # 却把写着 placeholder 的假界面打进镜像，故在构建前显式拒绝。
