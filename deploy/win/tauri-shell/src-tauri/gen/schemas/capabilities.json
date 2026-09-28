@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"web-console 桌面壳默认权限（仅承载 UI，无授权判定）","local":true,"windows":["main"],"permissions":["core:default"]}}
