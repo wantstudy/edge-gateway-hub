@@ -3,8 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IoT-DAQ Gateway — 工业边缘数据采集网关</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='5' fill='%230a0d11'/><rect x='4' y='4' width='24' height='24' rx='3' fill='none' stroke='%23ffb224' stroke-width='2'/><text x='16' y='21' font-family='monospace' font-size='12' font-weight='700' fill='%23ffb224' text-anchor='middle'>GW</text></svg>">
+<title>IoT-DAQ Gateway — 工业边缘数据采集网关 | Modbus / OPC UA / MQTT</title>
+<meta name="description" content="IoT-DAQ Gateway 是开源工业边缘数据采集网关：Modbus TCP/RTU、OPC UA 多协议采集，MQTT 北向转发，SQLite 断网续传，规则与告警边缘计算，提供 Web 控制台，支持 Windows 安装包与 Docker 一键部署。">
+<meta name="keywords" content="工业网关,数据采集网关,Modbus,OPC UA,MQTT,边缘计算,IoT-DAQ,北向转发,断网续传,SCADA,协议转换">
+<link rel="canonical" href="https://edge.webscad.cn/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="IoT-DAQ Gateway — 工业边缘数据采集网关">
+<meta property="og:description" content="Modbus / OPC UA 多协议采集，MQTT 北向转发，断网续传，Web 控制台全功能管理。Windows 安装包与 Docker 一键部署。">
+<meta property="og:url" content="https://edge.webscad.cn/">
+<meta property="og:site_name" content="IoT-DAQ Gateway">
+<meta property="og:locale" content="zh_CN">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"IoT-DAQ Gateway","operatingSystem":"Windows 10/11, Linux, Docker","applicationCategory":"Industrial Application","description":"开源工业边缘数据采集网关：多协议采集、MQTT 北向转发、断网续传、Web 控制台。","url":"https://edge.webscad.cn/","downloadUrl":"https://github.com/wantstudy/edge-gateway-hub/releases","offers":{"@type":"Offer","price":"0","priceCurrency":"CNY"}}
+</script>
+<link rel="icon" type="image/png" href="/favicon.png">
+<script async charset="utf-8" src="https://zz.bdstatic.com/linksubmit/push.js"></script>
 <script>document.documentElement.classList.add('js');</script>
 <style>
 /* ============ Design Tokens ============ */
@@ -486,14 +499,8 @@ a:hover { text-decoration: underline; }
   margin-top: 0.1rem;
 }
 
-/* ============ 配置示例 ============ */
+/* ============ 配置示例（区块已移除，保留 .config 兜底） ============ */
 .config { padding: clamp(3rem, 6vw, 5rem) 0; }
-.config-inner {
-  display: grid;
-  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
-  gap: clamp(1.8rem, 4vw, 3.6rem);
-  align-items: center;
-}
 .config-copy .sec-title { margin-top: 1rem; }
 .config-points {
   list-style: none;
@@ -991,7 +998,7 @@ a:hover { text-decoration: underline; }
   border-radius: var(--radius-2);
   padding: 5px;
 }
-.footer-wx span {
+.footer-wx span, .footer-wx figcaption {
   display: block;
   margin-top: 0.5rem;
   font-family: var(--font-mono);
@@ -1020,7 +1027,6 @@ a:hover { text-decoration: underline; }
   .hero-inner { grid-template-columns: 1fr; }
   .hero-visual { max-width: 640px; }
   .protocols-inner { grid-template-columns: repeat(2, 1fr); }
-  .config-inner { grid-template-columns: 1fr; }
   .spec-grid { grid-template-columns: 1fr; }
   .media-grid { grid-template-columns: 1fr; }
   .deploy-grid { grid-template-columns: 1fr; }
@@ -1048,7 +1054,7 @@ a:hover { text-decoration: underline; }
   .hero-desc, .sec-sub, .spec p, .media-meta li, .step p { color: #333; }
   .terminal, .pull-cmd { background: #f4f4f4; border-color: #bbb; }
   .footer, .footer-main, .footer-bottom { background: #fff !important; border-color: #bbb; }
-  .footer-copy, .footer-col-title, .footer-brand-sub, .footer-wx span { color: #333; }
+  .footer-copy, .footer-col-title, .footer-brand-sub, .footer-wx span, .footer-wx figcaption { color: #333; }
   .footer-contact-list a, .footer-links a, .footer-beian a, .footer-contact-list .fc-value { color: #333; }
   .fc-key { color: #a86600; border-color: #bbb; }
   a { color: #111; }
@@ -1073,14 +1079,13 @@ a:hover { text-decoration: underline; }
 <header class="topbar">
   <div class="container topbar-inner">
     <a class="brand" href="#top" aria-label="IoT-DAQ Gateway 首页">
-      <span class="brand-mark" aria-hidden="true">GW</span>
+      <span class="brand-mark" aria-hidden="true"><img src="/logo-mark.png" alt="" style="width:22px;height:22px;object-fit:contain;display:block;"></span>
       <span class="brand-name">IoT-DAQ Gateway</span>
     </a>
     <nav aria-label="主导航">
       <ul class="topnav">
         <li><a href="#features">核心特性</a></li>
         <li><a href="#download">快速下载</a></li>
-        <li><a href="#docker">Docker 部署</a></li>
         <li><a href="#start">快速开始</a></li>
       </ul>
     </nav>
@@ -1231,47 +1236,6 @@ a:hover { text-decoration: underline; }
       <div class="proto">
         <span class="proto-led" aria-hidden="true"></span>
         <div><div class="proto-name">SQLITE QUEUE</div><div class="proto-desc">断网续传保障</div></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ===== 配置示例 ===== -->
-  <section class="config" id="config">
-    <div class="container config-inner">
-      <div class="config-copy reveal">
-        <p class="eyebrow">CONFIG // GETTING STARTED</p>
-        <h2 class="sec-title">极简配置，快速接入</h2>
-        <p class="sec-sub" style="max-width:26em;">一段 <code>gateway.toml</code> 定义采集设备与北向转发；更复杂的点位、规则与告警，全部在 Web 控制台完成。</p>
-        <ul class="config-points">
-          <li><span class="pc">01</span><span>声明设备：<b>Modbus TCP</b> 指向 PLC 地址与端口，一条即可接入。</span></li>
-          <li><span class="pc">02</span><span>声明北向：<b>MQTT v5</b> 指定 broker，数据自动转发上云。</span></li>
-          <li><span class="pc">03</span><span>本地韧性：<b>SQLite 队列</b> 断网缓存、恢复后自动补传。</span></li>
-        </ul>
-      </div>
-      <div class="terminal reveal" style="--d:.12s">
-        <div class="term-bar">
-          <span class="term-dot d1" aria-hidden="true"></span>
-          <span class="term-dot d2" aria-hidden="true"></span>
-          <span class="term-dot d3" aria-hidden="true"></span>
-          <span class="term-file">gateway.toml — <b>最小可运行配置</b></span>
-          <span class="term-live">READY</span>
-        </div>
-        <div class="term-body">
-<pre><code><span class="tok-c"># 一份最小可运行配置</span>
-<span class="tok-s">[gateway]</span>
-name = <span class="tok-v">"plant-01-gw"</span>
-
-<span class="tok-c"># 设备采集：Modbus TCP</span>
-<span class="tok-s">[[devices]]</span>
-driver = <span class="tok-v">"modbus-tcp"</span>
-host = <span class="tok-v">"192.168.1.100"</span>
-port = <span class="tok-n">502</span>
-
-<span class="tok-c"># 北向转发：MQTT v5</span>
-<span class="tok-s">[northbound]</span>
-protocol = <span class="tok-v">"mqtt"</span>
-broker = <span class="tok-v">"tcp://mqtt-server:1883"</span></code></pre>
-        </div>
       </div>
     </div>
   </section>
@@ -1474,7 +1438,7 @@ broker = <span class="tok-v">"tcp://mqtt-server:1883"</span></code></pre>
   <div class="container">
     <div class="footer-main">
       <div class="footer-brand">
-        <span class="brand-mark" aria-hidden="true">GW</span>
+        <span class="brand-mark" aria-hidden="true"><img src="/logo-mark.png" alt="" style="width:20px;height:20px;object-fit:contain;display:block;"></span>
         <div>
           <div class="footer-brand-name">IoT-DAQ Gateway</div>
           <div class="footer-brand-sub">开源 · 工业级 · 边缘计算</div>
@@ -1498,8 +1462,16 @@ broker = <span class="tok-v">"tcp://mqtt-server:1883"</span></code></pre>
         </ul>
       </div>
       <div class="footer-wx">
-        <img src="https://base-agent-images.tos.coze.site/agent-images/session/3e/3e4b4319e57d011fecf1fe2ea26d55892a0d79af44224b8fc5493773ff4e88d5.jpg?sign=1793175504-a18811e4c1-0-d1506a9b074f7621007f5da326ba2944dea63d414d9f0a8d511d8a2cce164933" alt="微信二维码，扫码添加微信" width="110" height="110">
-        <span>WECHAT QR</span>
+        <div style="display:flex;gap:18px;justify-content:center;flex-wrap:wrap;">
+          <figure style="margin:0;text-align:center;">
+            <img src="/wechat-qr.jpg" alt="微信二维码，扫码添加微信" width="110" height="110" loading="lazy" style="display:block;margin:0 auto;">
+            <figcaption class="footer-wx-caption">微信扫码添加</figcaption>
+          </figure>
+          <figure style="margin:0;text-align:center;">
+            <img src="/qq-qr.png" alt="QQ 二维码，扫码添加 QQ 460604059" width="110" height="110" loading="lazy" style="display:block;margin:0 auto;">
+            <figcaption class="footer-wx-caption">QQ 扫码添加</figcaption>
+          </figure>
+        </div>
       </div>
     </div>
     <div class="footer-bottom">
