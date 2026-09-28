@@ -4,7 +4,7 @@
 //! - 标记为 JSON + HMAC-SHA256 签名：`sig = HMAC-SHA256(key, 规范化字段拼接)`；
 //!   **签名不符 / 字段缺失 / 解析失败 ⇒ 视为试用已结束**（[`TrialVerdict::ExpiredDegrade`]，
 //!   降级免费版）——**绝不允许重置试用期**，容器重建、删标记文件都绕不过。
-//! - 试用期 [`TRIAL_DURATION_MS`] = 72h；到期 ⇒ [`TrialVerdict::ExpiredDegrade`]
+//! - 试用期 [`TRIAL_DURATION_MS`] = 30天；到期 ⇒ [`TrialVerdict::ExpiredDegrade`]
 //!   （降级免费基础版，见 `auth/limits.rs`，**不停用本地采集**）。
 //! - 时间戳字段以**字符串**编码进 JSON（[`u64_as_string`]）——JSON 大数红线：
 //!   JS `Number` 只能安全表示 2^53 以内整数，毫秒时间戳超界会被静默截断。
@@ -27,8 +27,8 @@ use crate::auth::clock::{RollbackVerdict, TrustedClock};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// 试用期时长（72 小时，毫秒）。task 23 契约常量。
-pub const TRIAL_DURATION_MS: u64 = 72 * 60 * 60 * 1000;
+/// 试用期时长（30 天，毫秒）。task 23 契约常量。
+pub const TRIAL_DURATION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// 标记格式版本（升级标记结构时递增；旧版本标记一律视为已结束）。
 pub const TRIAL_MARKER_FORMAT_VERSION: u32 = 1;
