@@ -39,7 +39,7 @@
  *  - 写操作只改本模块内存数组 + 深拷贝返回，**绝不**让页面层拿到引用后误改真相
  */
 
-import { normalizeMachineCodeInput } from '@ui-kit';
+import { maskMachineCode, normalizeMachineCodeInput } from '@ui-kit';
 
 /** 校验档位。 */
 export type Grade = 'A' | 'B' | 'C';
@@ -225,6 +225,13 @@ export interface TransferTicket {
   status: string;
   /** 处理说明 */
   resolution: string;
+  /**
+   * 处理时间（`YYYY-MM-DD HH:mm:ss`；未处理 / 驳回为 `undefined`）。
+   *
+   * 仅由 `repo.processTransfer` 在工单被处理时写入，用于总览「平均处理时长」的
+   * `processedAt - submittedAt` 真实求均值；演示数据集本身不带该字段（不伪造）。
+   */
+  processedAt?: string;
 }
 
 /** 审计日志条目。 */
@@ -1304,6 +1311,8 @@ export const repo = {
     ticket.resolution = newCode
       ? `已废弃旧码并重发 ${maskOf(newCode.code)}`
       : '仅废弃旧码（客户将获得新码后自行激活）';
+    // 记录处理时刻：总览「平均处理时长」据此按 processedAt - submittedAt 真实求均值
+    ticket.processedAt = now();
 
     pushAudit({
       actor: input.actor,
@@ -1317,6 +1326,83 @@ export const repo = {
     });
 
     return { ok: true, ticket: clone(ticket), newCode, message: ticket.resolution };
+  },
+
+  /**
+   * 受理换机申请（客服代客户录入，对应补齐端点 `POST /admin/transfers`）。
+   * 追加一条 `pending` 工单，落审计；机器码归一到匹配态并生成掩码摘要。
+   */
+  createTransfer(input: {
+    tenant: string;
+    oldMachineCode: string;
+    newMachineCode: string;
+    sourceCodeId: string;
+    reason: string;
+    actor: string;
+  }): TransferTicket | null {
+    const reason = input.reason.trim();
+    if (!input.tenant.trim() || !input.sourceCodeId.trim() || !reason) {
+      return null;
+    }
+    const oldNorm = normalizeMachineCodeInput(input.oldMachineCode.trim());
+    const newNorm = normalizeMachineCodeInput(input.newMachineCode.trim());
+    // 受理入口传租户 id（与真实端点 tenant_id 同口径）；演示集按 id→名称展示，
+    // 找不到映射时原样保留（绝不编造）。
+    const tenantName = tenants.find((t) => t.id === input.tenant)?.name ?? input.tenant;
+    const serial = String(transfers.length + 1).padStart(4, '0');
+    const ticket: TransferTicket = {
+      id: `RV-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${serial}`,
+      tenant: tenantName,
+      oldMachineSummary: oldNorm ? maskMachineCode(oldNorm) : '—',
+      oldMachineCode: oldNorm,
+      newMachineCode: newNorm,
+      sourceCodeId: input.sourceCodeId,
+      reason,
+      submittedAt: now(),
+      status: 'pending',
+      resolution: '',
+    };
+    transfers.unshift(ticket);
+    pushAudit({
+      actor: input.actor,
+      actorType: 'human',
+      action: '受理换机工单',
+      entityType: 'transfer_ticket',
+      entityId: ticket.id,
+      entityLabel: '换机工单',
+      detail: `${input.tenant} · ${reason}`,
+      result: 'success',
+    });
+    return clone(ticket);
+  },
+
+  /**
+   * 驳回换机工单（对应补齐端点 `POST /admin/transfers/{id}/reject`）。
+   * 仅 `pending` → `rejected`；**不改动**原激活码状态与绑定关系。
+   */
+  rejectTransfer(input: {
+    ticketId: string;
+    resolution: string;
+    note: string;
+    actor: string;
+  }): TransferTicket | null {
+    const ticket = transfers.find((t) => t.id === input.ticketId);
+    if (!ticket || ticket.status !== 'pending') {
+      return null;
+    }
+    ticket.status = 'rejected';
+    ticket.resolution = input.resolution;
+    pushAudit({
+      actor: input.actor,
+      actorType: 'human',
+      action: '驳回换机工单',
+      entityType: 'transfer_ticket',
+      entityId: ticket.id,
+      entityLabel: '换机工单',
+      detail: input.resolution,
+      result: 'success',
+    });
+    return clone(ticket);
   },
 
   // ---------- 密钥 ----------
@@ -1533,6 +1619,11 @@ export const repo = {
     receiptMissing: number;
     receiptBadSig: number;
     pendingTransfers: number;
+    /**
+     * 已处理工单平均处理时长（**秒**）；无已处理工单为 `null`（页面显示 `—`）。
+     * 口径 = `AVG(processedAt - submittedAt)`，与后端 `avg_transfer_secs` 同源同义。
+     */
+    avgTransferSecs: number | null;
     pendingAnomalies: number;
     currentKid: string;
     kidRetireInDays: number;
@@ -1545,6 +1636,14 @@ export const repo = {
     const gap = devices.filter((d) => d.receiptStatus === 'receipt_gap').length;
     const missing = devices.filter((d) => d.receiptStatus === 'receipt_missing').length;
     const badSig = devices.filter((d) => d.receiptStatus === 'receipt_bad_sig').length;
+    // 平均处理时长 = 已处理工单 (processedAt - submittedAt) 的真实均值；无已处理工单 → null。
+    const durations = transfers
+      .filter((t) => t.status === 'processed' && t.processedAt)
+      .map((t) => (Date.parse(t.processedAt!.replace(' ', 'T')) - Date.parse(t.submittedAt.replace(' ', 'T'))) / 1000)
+      .filter((s) => Number.isFinite(s) && s >= 0);
+    const avgTransferSecs = durations.length
+      ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
+      : null;
     return {
       tenantCount: tenants.length,
       licensedDevices: devices.filter((d) => d.licenseStatus !== 'inactive').length,
@@ -1556,6 +1655,7 @@ export const repo = {
       receiptMissing: missing,
       receiptBadSig: badSig,
       pendingTransfers: transfers.filter((t) => t.status === 'pending').length,
+      avgTransferSecs,
       pendingAnomalies: anomalies.filter((a) => !a.verified).length,
       currentKid: keys.find((k) => k.status === 'key_active')?.kid ?? '—',
       kidRetireInDays: 14,

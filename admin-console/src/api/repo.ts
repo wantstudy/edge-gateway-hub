@@ -22,7 +22,11 @@
  *        （重发）——废弃的 `confirm_tail8` 由详情端点的完整码值自动计算；
  *      - **账号 / 角色可配置**（缺口 #9 修复）：`GET/POST/PUT/DELETE /admin/accounts`
  *        + `GET /admin/roles`（GET 仅系统角色可见，非系统 403 静默）；
- *      - 后端确实没有的端点（租户策略写、换机工单、密钥轮换、异常处置）：
+ *      - 换机工单已接通（缺口 #6 消失）：`GET /admin/transfers`、
+ *        `POST /admin/transfers`（受理，契约未定义的补齐端点）、
+ *        `POST /admin/transfers/{id}/process`（废弃 + 重发单事务）、
+ *        `POST /admin/transfers/{id}/reject`（驳回，补齐端点）；
+ *      - 后端确实没有的端点（租户策略写、密钥轮换、异常处置）：
  *        读取型方法返回**诚实的空结果**（绝不回退假数据），写入型方法返回 false
  *        并把「后端缺口」写入全局提示横幅（`adminNotices`），做到清晰报错；
  *        后端未提供的数据维度以 `'—'` 展示，绝不编造。
@@ -56,6 +60,7 @@ export * from '../mock/mock-data';
 
 import { API_MODE, ApiError, adminRequest } from './client';
 import { formatDateTime, formatTimestampText } from '../utils/time';
+import { maskMachineCode, normalizeMachineCodeInput } from '@ui-kit';
 
 // 再导出模式常量，页面可统一从本模块取用
 export { API_MODE } from './client';
@@ -152,6 +157,26 @@ function tail8Of(code: string): string {
   return code.replace(/[^0-9A-Za-z]/g, '').slice(-8).toUpperCase();
 }
 
+/**
+ * 平均处理时长（**秒**）→ 展示文本（`2.1h` / `45.0min` / `30s`）。
+ *
+ * 口径：后端 `avg_transfer_secs` / mock `avgTransferSecs` 均为
+ * `AVG(processed_at - submitted_at)`（秒，小值业务计数，非 epoch、非大数）。
+ * `null` / 非法 / 负数（无已处理工单）→ `'—'`，**绝不**写死演示值。
+ */
+function formatDurationSecs(secs: number | null): string {
+  if (secs === null || !Number.isFinite(secs) || secs < 0) {
+    return '—';
+  }
+  if (secs < 60) {
+    return `${Math.round(secs)}s`;
+  }
+  if (secs < 3600) {
+    return `${(secs / 60).toFixed(1)}min`;
+  }
+  return `${(secs / 3600).toFixed(1)}h`;
+}
+
 // ===========================================================================
 // 统一仓库接口（读：同步缓存视图；写：async——real 模式必须等后端确认）
 // ===========================================================================
@@ -174,6 +199,13 @@ export interface OverviewStats {
   receiptMissing: string;
   receiptBadSig: string;
   pendingTransfers: string;
+  /**
+   * 已处理换机工单的平均处理时长（展示文本，如 `2.1h` / `45.0min` / `30s`）。
+   *
+   * 口径 = `AVG(processed_at - submitted_at)`（后端 `avg_transfer_secs` 秒串，映射边界
+   * 格式化）；**无已处理工单为 `'—'`**（绝不写死演示值）。
+   */
+  avgTransferDuration: string;
   pendingAnomalies: string;
   currentKid: string;
   kidRetireInDays: string;
@@ -273,15 +305,59 @@ export interface AdminRepo {
 
   // ---------- 换机工单 ----------
   allTransfers(): TransferTicket[];
+  /**
+   * 处理换机工单（real：`POST /admin/transfers/{id}/process`；mock：本地执行
+   * 「废弃 + 重发」）。real 模式「废弃 + 重发」在**服务端单事务**内完成，失败**不再**
+   * 退化为两次前端调用。
+   *
+   * 危险操作四要素为**彼此独立**的字段：`reason`（必填）/ `note`（≥10 字）/
+   * `confirm`（**工单编号原文**，大小写不敏感精确匹配，不符 → 412 `CONFIRM_MISMATCH`）/
+   * `resolution`（处理结果说明，必填）——绝不拼接。
+   */
   processTransfer(input: {
     ticketId: string;
+    /** 工单所属租户（real：作为 `X-Tenant-Id` 防跨租户操作）。 */
+    tenant: string;
+    reason: string;
+    note: string;
+    confirm: string;
+    resolution: string;
     prebindNew: boolean;
     inheritTier: string;
     validUntil: string;
-    note: string;
     actor: string;
     reissue: boolean;
   }): Promise<ProcessTransferResult>;
+  /**
+   * 受理换机工单（real：`POST /admin/transfers`；mock：本地追加 pending 工单）。
+   *
+   * 契约文档未定义提交端点，此端点为补齐「工单可从无到有被创建」而新增；
+   * `oldMachineCode` / `newMachineCode` 提交前经 `normalizeMachineCodeInput` 归一
+   * （展示态 → 匹配态，避免后端把同机判成异机）。失败返回 null 并推真实原因横幅。
+   */
+  createTransfer(input: {
+    tenant: string;
+    oldMachineCode: string;
+    newMachineCode: string;
+    sourceCodeId: string;
+    reason: string;
+    actor: string;
+  }): Promise<TransferTicket | null>;
+  /**
+   * 驳回换机工单（real：`POST /admin/transfers/{id}/reject`；mock：本地置 rejected）。
+   *
+   * 仅 `pending → rejected`（终态）；**不改动**原激活码状态与任何绑定关系。
+   * 四要素口径同 `processTransfer`（`confirm` = 工单编号原文）。
+   */
+  rejectTransfer(input: {
+    ticketId: string;
+    tenant: string;
+    reason: string;
+    note: string;
+    confirm: string;
+    resolution: string;
+    actor: string;
+  }): Promise<TransferTicket | null>;
 
   // ---------- 密钥 ----------
   allKeys(): SigningKey[];
@@ -455,6 +531,7 @@ function mockOverviewToContract(): OverviewStats {
     receiptMissing: String(o.receiptMissing),
     receiptBadSig: String(o.receiptBadSig),
     pendingTransfers: String(o.pendingTransfers),
+    avgTransferDuration: formatDurationSecs(o.avgTransferSecs),
     pendingAnomalies: String(o.pendingAnomalies),
     currentKid: o.currentKid,
     kidRetireInDays: String(o.kidRetireInDays),
@@ -644,6 +721,8 @@ function buildMockRepo(): AdminRepo {
     setTenantEnabled: (input) => Promise.resolve(mockRepo.setTenantEnabled(input)),
     resolveAnomaly: (input) => Promise.resolve(mockRepo.resolveAnomaly(input)),
     processTransfer: (input) => Promise.resolve(mockRepo.processTransfer(input)),
+    createTransfer: (input) => Promise.resolve(mockRepo.createTransfer(input)),
+    rejectTransfer: (input) => Promise.resolve(mockRepo.rejectTransfer(input)),
     rotateKey: (input) => Promise.resolve(mockRepo.rotateKey(input)),
     retireKey: (input) => Promise.resolve(mockRepo.retireKey(input)),
     logReveal: (input) => Promise.resolve(mockRepo.logReveal(input)),
@@ -731,6 +810,17 @@ const realAuditLogs = reactive<AuditEntry[]>([]);
 /** real 模式管理员账号缓存（GET /admin/accounts；缺口 #9 修复）。 */
 const realAccounts = reactive<AdminUser[]>([]);
 
+/** real 模式换机工单缓存（GET /admin/transfers；缺口 #6 已消除）。 */
+const realTransfers = reactive<TransferTicket[]>([]);
+
+/**
+ * real 模式换机工单列表最近一次加载失败的真实原因（空串 = 无错误）。
+ *
+ * 供 TransfersPage **诚实空态**展示：拿不到数据时给出后端返回的真实原因，
+ * 绝不回落 mock、绝不伪造成功（与 `updatesLoadError` 同口径）。
+ */
+export const transfersLoadError = ref('');
+
 /** real 模式总览聚合（GET /admin/overview；计数契约 String，未提供维度 '—'）。 */
 const realStats = reactive<OverviewStats>({
   tenantCount: '—',
@@ -743,6 +833,7 @@ const realStats = reactive<OverviewStats>({
   receiptMissing: '—',
   receiptBadSig: '—',
   pendingTransfers: '—',
+  avgTransferDuration: '—',
   pendingAnomalies: '—',
   currentKid: '—',
   kidRetireInDays: '—',
@@ -1088,6 +1179,55 @@ async function fetchAccounts(): Promise<void> {
   }
 }
 
+/**
+ * 换机工单行（`TransferTicketItem`）→ 页面 `TransferTicket`。
+ *
+ * **大数红线**：`submitted_at` / `processed_at` 为 UTC 秒 String，在**映射边界**用
+ * `formatDateTime` 格式化（绝不裸显 epoch）；`old_machine_code` / `new_machine_code`
+ * 已是归一匹配态，列表仅展示掩码摘要（`oldMachineSummary`）。
+ */
+function buildTransferRecord(raw: Record<string, unknown>): TransferTicket {
+  const submitted = pickStr(raw, 'submitted_at', '');
+  const processed = raw.processed_at;
+  const oldCode = pickStr(raw, 'old_machine_code', '');
+  return {
+    id: pickStr(raw, 'ticket_id', ''),
+    tenant: pickStr(raw, 'tenant_id', ''),
+    oldMachineSummary: oldCode ? maskMachineCode(oldCode) : '—',
+    oldMachineCode: oldCode,
+    newMachineCode: pickStr(raw, 'new_machine_code', ''),
+    sourceCodeId: pickStr(raw, 'source_code_id', ''),
+    reason: pickStr(raw, 'reason', ''),
+    submittedAt: submitted ? formatDateTime(submitted) : '—',
+    status: pickStr(raw, 'status', 'pending'),
+    resolution: pickStr(raw, 'resolution', ''),
+    processedAt:
+      typeof processed === 'string' && processed !== '' ? formatDateTime(processed) : undefined,
+  };
+}
+
+/**
+ * 拉取换机工单列表（GET /admin/transfers；缺口 #6 已消除）。
+ *
+ * 失败时**记录真实原因并返回空数组**（缓存清空 → 诚实空态），绝不回退 mock：
+ * 空列表 + 顶部横幅给出真实原因，是「无工单」与「加载失败」的正确区分。
+ */
+async function fetchTransfers(): Promise<void> {
+  try {
+    const rows = await fetchAllPaged('/admin/transfers', {}, buildTransferRecord);
+    realTransfers.splice(0, realTransfers.length, ...(rows as TransferTicket[]));
+    // 加载成功：清空上一次失败原因（诚实空态依赖它区分「无工单」与「加载失败」）
+    transfersLoadError.value = '';
+    if (rows.length >= FETCH_CAP) {
+      pushNoticeOnce('transfers-truncated', 'warn', `换机工单较多，列表仅加载前 ${FETCH_CAP} 条。`);
+    }
+  } catch (cause) {
+    realTransfers.splice(0, realTransfers.length);
+    transfersLoadError.value = describeCause(cause);
+    pushNoticeOnce('load-transfers', 'warn', `换机工单列表加载失败：${describeCause(cause)}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // real 模式拉取动作（preload 并行执行；各失败独立提示，不互相阻断）
 // ---------------------------------------------------------------------------
@@ -1101,6 +1241,13 @@ async function fetchOverview(): Promise<void> {
     realStats.licensedDevices = pickStr(data, 'codes_bound', '—');
     realStats.receiptGap = anomalous;
     realStats.pendingAnomalies = anomalous;
+    realStats.pendingTransfers = pickStr(data, 'pending_transfers', '—');
+    // 平均处理时长：后端 `avg_transfer_secs` 为秒串或 null（无已处理工单）；
+    // 小值时长（非 epoch / 非大数）转数值仅供格式化，null → '—'。
+    const avgSecs = data.avg_transfer_secs;
+    realStats.avgTransferDuration = formatDurationSecs(
+      typeof avgSecs === 'string' && avgSecs !== '' ? Number(avgSecs) : null,
+    );
     const activeKid = data.active_kid;
     realStats.currentKid = typeof activeKid === 'string' && activeKid !== '' ? activeKid : '—';
   } catch (cause) {
@@ -1626,48 +1773,129 @@ function buildRealRepo(): AdminRepo {
       return Promise.resolve(false);
     },
 
-    // ---------- 换机工单（工单实体后端不存在；可用废弃+重发替代） ----------
+    // ---------- 换机工单（GET/POST /admin/transfers 已接通；缺口 #6 已消除） ----------
     allTransfers(): TransferTicket[] {
-      pushNoticeOnce(
-        'gap-transfers',
-        'warn',
-        '后端缺口 #6：换机工单为纯前端实体，后端无对应端点——real 模式请直接在「激活码管理」页执行废弃 / 重发。',
-      );
-      return [];
+      // 读缓存（preload / 处理 / 驳回后刷新）；**不再**推「后端缺口 #6」横幅。
+      return JSON.parse(JSON.stringify(realTransfers)) as TransferTicket[];
     },
 
     async processTransfer(input): Promise<ProcessTransferResult> {
-      // real 模式没有工单实体：若源码在缓存中，则退化为「废弃 + 重发」组合
-      const source = findCached(input.ticketId);
-      if (!source) {
-        pushNoticeOnce(
-          'gap-transfers-process',
-          'warn',
-          '后端缺口 #6：换机工单端点缺失且工单实体仅存在于 mock——real 模式请直接对激活码执行废弃 / 重发。',
+      try {
+        const data = await adminRequest<unknown>(
+          `/admin/transfers/${encodeURIComponent(input.ticketId)}/process`,
+          {
+            // 租户取工单所属租户（防跨租户操作，与 revoke / reissue 同口径）
+            headers: { 'X-Tenant-Id': input.tenant },
+            body: {
+              // 危险操作四要素：三个主字段彼此独立，绝不拼接
+              reason: input.reason,
+              note: input.note.trim(),
+              // 契约：confirm = **工单编号原文**（大小写不敏感精确匹配，非激活码末 8 位）
+              confirm: input.confirm,
+              resolution: input.resolution.trim(),
+              reissue: input.reissue,
+              prebind_new: input.prebindNew,
+              // 页面总给出明确档位：不继承，走 tier 覆盖（与 reissueCode 显式覆盖同口径）
+              inherit_tier: false,
+              tier: input.inheritTier || null,
+              valid_until: input.validUntil ? dateToUtcSecs(input.validUntil) : null,
+            },
+          },
         );
-        return { ok: false, ticket: null, newCode: null, message: '后端未提供换机工单端点（缺口 #6）' };
-      }
-      if (source.status !== 'revoked') {
-        const revoked = await this.revokeCode({ id: source.id, reason: '客户更换硬件', note: input.note, actor: input.actor });
-        if (!revoked) {
-          return { ok: false, ticket: null, newCode: null, message: '废弃旧码失败（见上方提示）' };
+        const rec = asRecord(data);
+        const ticket = buildTransferRecord(asRecord(rec.ticket));
+        let newCode: CodeRecord | null = null;
+        const newCodeRaw = rec.new_code;
+        if (newCodeRaw !== null && newCodeRaw !== undefined && typeof newCodeRaw === 'object') {
+          const view = parseIssuedRow(newCodeRaw, 0);
+          const stamp = nowText();
+          newCode = {
+            id: view.codeId,
+            code: view.code,
+            status: view.status as CodeStatus,
+            tenant: ticket.tenant,
+            tier: input.inheritTier,
+            validFrom: stamp.slice(0, 10),
+            validUntil: input.validUntil,
+            orderId: '—',
+            createdAt: stamp,
+            boundDeviceSummary: null,
+            boundDeviceName: null,
+            prebindMachineCode: view.prebind,
+            reissuedFrom: view.reissuedFrom,
+            reissuedTo: null,
+            timeline: [
+              {
+                time: stamp,
+                action: '重发' as LifecycleAction,
+                tone: 'warn' as const,
+                operator: input.actor,
+                ...(view.reissuedFrom ? { target: `源码 ${view.reissuedFrom}` } : {}),
+                detail: '换机工单处理：废弃旧码并重发',
+              },
+            ],
+            receiptContinuity: '尚未激活，无回执',
+            note: ticket.resolution,
+          };
+          upsertCodeRecord(JSON.parse(JSON.stringify(newCode)) as CodeRecord);
         }
+        void fetchTransfers();
+        void fetchCodes();
+        void fetchOverview();
+        return { ok: true, ticket, newCode, message: ticket.resolution || '处理完成' };
+      } catch (cause) {
+        // 失败绝不退化为「前端两次调用」：真实原因走横幅，调用方保留弹窗重试。
+        pushNotice('error', `处理换机工单失败：${describeCause(cause)}`);
+        return { ok: false, ticket: null, newCode: null, message: describeCause(cause) };
       }
-      if (!input.reissue) {
-        return { ok: true, ticket: null, newCode: null, message: '已废弃旧码' };
+    },
+
+    async createTransfer(input): Promise<TransferTicket | null> {
+      try {
+        const data = await adminRequest<unknown>('/admin/transfers', {
+          method: 'POST',
+          body: {
+            tenant_id: input.tenant,
+            // 展示态 → 匹配态（与后端 normalize_machine_code 同一套规则）
+            old_machine_code: normalizeMachineCodeInput(input.oldMachineCode),
+            new_machine_code: normalizeMachineCodeInput(input.newMachineCode),
+            source_code_id: input.sourceCodeId.trim(),
+            reason: input.reason.trim(),
+          },
+        });
+        const ticket = buildTransferRecord(asRecord(data));
+        void fetchTransfers();
+        void fetchOverview();
+        return ticket;
+      } catch (cause) {
+        pushNotice('error', `受理换机工单失败：${describeCause(cause)}`);
+        return null;
       }
-      const newCode = await this.reissueCode({
-        sourceId: source.id,
-        inheritTier: input.inheritTier,
-        inheritValidUntil: input.validUntil,
-        // real 模式无工单实体可提供「新机器码」，一律留待首次激活绑定
-        prebindMachineCode: '',
-        note: input.note,
-        actor: input.actor,
-      });
-      return newCode
-        ? { ok: true, ticket: null, newCode, message: `已重发新码 ${newCode.id}` }
-        : { ok: false, ticket: null, newCode: null, message: '重发失败（见上方提示）' };
+    },
+
+    async rejectTransfer(input): Promise<TransferTicket | null> {
+      try {
+        const data = await adminRequest<unknown>(
+          `/admin/transfers/${encodeURIComponent(input.ticketId)}/reject`,
+          {
+            headers: { 'X-Tenant-Id': input.tenant },
+            body: {
+              reason: input.reason,
+              note: input.note.trim(),
+              // 契约：confirm = 工单编号原文（同 process）
+              confirm: input.confirm,
+              resolution: input.resolution.trim(),
+            },
+          },
+        );
+        const ticket = buildTransferRecord(asRecord(asRecord(data).ticket));
+        void fetchTransfers();
+        void fetchOverview();
+        return ticket;
+      } catch (cause) {
+        pushNotice('error', `驳回换机工单失败：${describeCause(cause)}`);
+        return null;
+      }
     },
 
     // ---------- 密钥（GET /admin/keys 已接通；轮换写端点缺失） ----------
@@ -1898,7 +2126,7 @@ let preloadStarted = false;
  * 预取真实数据（real 模式专用；mock 模式直接返回 false）。
  *
  * 并行拉取全部 GET 查询端点进 reactive 缓存（overview / codes / devices /
- * tenants / anomalies / keys / audit）；单端点失败独立提示、不互相阻断。
+ * tenants / anomalies / keys / audit / accounts / transfers）；单端点失败独立提示、不互相阻断。
  * 总超时护栏 10s（超时后缓存保持部分结果，页面空态给出重试路径）。
  *
  * @returns real 模式返回 true（已进入加载态）；mock 模式返回 false
@@ -1922,6 +2150,7 @@ export async function preloadRealData(): Promise<boolean> {
       fetchKeys(),
       fetchAudit(),
       fetchAccounts(),
+      fetchTransfers(),
     ]),
     new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), TIMEOUT_MS)),
   ]);

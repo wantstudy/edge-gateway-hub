@@ -666,6 +666,11 @@ pub struct OverviewResponse {
     pub codes_reissued: String,
     /// 异常回执数（`gap_flag = 1`：跳空 / 回退 / 缺失）。
     pub receipts_anomalous: String,
+    /// 待处理换机工单数（真实计数：`transfer_ticket.status = 'pending'`）。
+    pub pending_transfers: String,
+    /// 已处理工单平均处理时长（秒，十进制 String）；无已处理工单为 `None`
+    /// （前端显示 `—`，**绝不**写死演示值）。
+    pub avg_transfer_secs: Option<String>,
     /// 当前活跃签名密钥 kid（无活跃密钥为 `None`）。
     pub active_kid: Option<String>,
 }
@@ -898,6 +903,152 @@ pub struct AdminRolesResponse {
 }
 
 // ============================================================================
+// §2.8 换机工单（`docs/design/ui-admin-console.md:203`：
+//      `GET /admin/transfers`、`POST /admin/transfers/{id}/process`）
+// ============================================================================
+
+/// 换机工单列表项（`GET /admin/transfers`）。
+///
+/// 时间字段一律 **String**（大数红线：JSON 路径不进 number）；`processed_at` 未处理为 `None`。
+/// `old_machine_code` / `new_machine_code` 为**归一后**的匹配态（无分隔符小写），
+/// 便于前端掩码展示与二次核对。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferTicketItem {
+    /// 工单 ID。
+    pub ticket_id: String,
+    /// 所属租户。
+    pub tenant_id: String,
+    /// 原机器码（归一后，可能为空串 = 客户未提供）。
+    pub old_machine_code: String,
+    /// 新机器码（归一后，空串 = 留待新机首次激活绑定）。
+    pub new_machine_code: String,
+    /// 原激活码 ID。
+    pub source_code_id: String,
+    /// 换机原因。
+    pub reason: String,
+    /// 提交时间（UTC 秒 String）。
+    pub submitted_at: String,
+    /// 状态（`pending` / `processed` / `rejected`）。
+    pub status: String,
+    /// 处理结果（未处理为空串）。
+    pub resolution: String,
+    /// 处理时间（UTC 秒 String；未处理为 `None`）。
+    pub processed_at: Option<String>,
+    /// 处理人（未处理为 `None`）。
+    pub processed_by: Option<String>,
+    /// 处理备注。
+    pub note: String,
+}
+
+/// `GET /admin/transfers` 查询参数（状态 / 租户过滤 + 分页）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransferListQuery {
+    /// 按租户筛选。
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// 按状态筛选（`pending` / `processed` / `rejected`；未知值 → 400）。
+    #[serde(default)]
+    pub status: Option<String>,
+    /// 页码（从 1 起）。
+    #[serde(default)]
+    pub page: Option<u32>,
+    /// 每页条数（缺省 20，上限 200）。
+    #[serde(default)]
+    pub page_size: Option<u32>,
+}
+
+/// `POST /admin/transfers` 请求体（**契约文档未定义提交端点**——本端点为补齐
+/// 「工单可从无到有地被创建」而新增；见 `http.rs` 路由注释）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateTransferRequest {
+    /// 目标租户。
+    #[serde(default)]
+    pub tenant_id: String,
+    /// 原机器码（可选，经归一；空串 = 客户未提供）。
+    #[serde(default)]
+    pub old_machine_code: String,
+    /// 新机器码（可选，经归一；空串 = 留待新机首次激活绑定）。
+    #[serde(default)]
+    pub new_machine_code: String,
+    /// 原激活码 ID（必填，须属于该租户）。
+    #[serde(default)]
+    pub source_code_id: String,
+    /// 换机原因（必填非空白）。
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// `POST /admin/transfers/{id}/process` 请求体。
+///
+/// 危险操作四要素按既有写端点口径为**彼此独立**的三个字段
+/// `reason` / `note` / `confirm`，**绝不拼接**；`confirm` 为**工单编号原文**
+/// （与前端 `DangerConfirmModal` 的 `confirmMode='full'` 精确匹配一致）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProcessTransferRequest {
+    /// 操作原因（必填，写审计）。
+    #[serde(default)]
+    pub reason: String,
+    /// 补充说明（≥10 字符，写审计）。
+    #[serde(default)]
+    pub note: String,
+    /// 二次确认：工单编号原文（大小写不敏感精确匹配，否则 412 `CONFIRM_MISMATCH`）。
+    #[serde(default)]
+    pub confirm: String,
+    /// 处理结果说明（必填非空白）。
+    #[serde(default)]
+    pub resolution: String,
+    /// 是否重发新码（`false` = 仅废弃旧码）。
+    #[serde(default)]
+    pub reissue: bool,
+    /// 重发时是否预绑定工单里的新机器码。
+    #[serde(default)]
+    pub prebind_new: bool,
+    /// 重发时是否沿用原码 tier（`false` 时用 `tier` 覆盖）。
+    #[serde(default)]
+    pub inherit_tier: bool,
+    /// 重发覆盖 tier（`inherit_tier=false` 且为空 → 沿用原码 tier）。
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// 重发覆盖到期日（UTC 秒 String；缺省 → 沿用原码 `valid_until`）。
+    #[serde(default)]
+    pub valid_until: Option<String>,
+}
+
+/// `POST /admin/transfers/{id}/process` 响应体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessTransferResponse {
+    /// 处理后的工单（状态 `processed`）。
+    pub ticket: TransferTicketItem,
+    /// 重发产出的新码（未重发为 `None`）。
+    pub new_code: Option<IssuedCode>,
+}
+
+/// `POST /admin/transfers/{id}/reject` 请求体（**契约文档未定义驳回端点**——
+/// 本端点为补齐「`rejected` 终态可达」而新增；见 `http.rs` 路由注释）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RejectTransferRequest {
+    /// 操作原因（必填，写审计）。
+    #[serde(default)]
+    pub reason: String,
+    /// 补充说明（≥10 字符，写审计）。
+    #[serde(default)]
+    pub note: String,
+    /// 二次确认：工单编号原文（大小写不敏感精确匹配，否则 412 `CONFIRM_MISMATCH`）。
+    #[serde(default)]
+    pub confirm: String,
+    /// 驳回说明（必填非空白，落 `resolution`）。
+    #[serde(default)]
+    pub resolution: String,
+}
+
+/// `POST /admin/transfers/{id}/reject` 响应体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectTransferResponse {
+    /// 驳回后的工单（状态 `rejected`）。
+    pub ticket: TransferTicketItem,
+}
+
+// ============================================================================
 // 统一响应包裹
 // ============================================================================
 
@@ -997,6 +1148,8 @@ pub mod codes {
     pub const ACTIVATION_PUBKEY_MISMATCH: &str = "ACTIVATION_PUBKEY_MISMATCH";
     /// 发放激活码缺少预绑定机器码（400；2026-09-27 主理人决策：一机一码发放侧闭环）。
     pub const MACHINE_CODE_REQUIRED: &str = "MACHINE_CODE_REQUIRED";
+    /// 换机工单已非待处理（重复处理 / 重复驳回；409）。
+    pub const TICKET_NOT_PENDING: &str = "TICKET_NOT_PENDING";
 }
 
 /// 业务码 → HTTP 状态码映射（设计 §0「HTTP 状态码 + 业务码双重表达」）。
@@ -1026,7 +1179,8 @@ pub fn http_status(code: &str) -> u16 {
         codes::CODE_REISSUED
         | codes::NONCE_REPLAY
         | codes::ALREADY_REISSUED
-        | codes::ORIGINAL_NOT_REVOKED => 409,
+        | codes::ORIGINAL_NOT_REVOKED
+        | codes::TICKET_NOT_PENDING => 409,
         codes::CONFIRM_MISMATCH => 412,
         codes::FIELD_WHITELIST_VIOLATION => 422,
         _ => 500,

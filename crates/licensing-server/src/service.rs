@@ -34,16 +34,19 @@ use crate::keys::{current_year, KeyRing};
 use crate::model::{
     normalize_machine_code, now_ns_id, now_unix_secs, ota_signing_message, ActivationCode,
     ActorType, AuditLog, CodeStatus, Device, DeviceStatus, Heartbeat, HeartbeatResult, Lease,
-    LeaseStatus, OtaPackage, OtaStatus, Tenant, VerifyMode, MAX_OTA_PAYLOAD_BYTES,
+    LeaseStatus, OtaPackage, OtaStatus, Tenant, TicketStatus, TransferTicket, VerifyMode,
+    MAX_OTA_PAYLOAD_BYTES,
 };
 use crate::proto::{
-    ActivationRequest, ActivationResponse, AuditReceiptRequest, AuditReceiptResponse, GapKind,
-    HeartbeatRequest, HeartbeatResponse, IssueCodesRequest, IssueCodesResponse, IssuedCode,
-    OtaManifestResponse, OtaStatusRequest, ReceiptCursor, ReissueCodeRequest, ReissueCodeResponse,
-    RevokeCodeRequest, UploadOtaRequest, VerifyRequest, VerifyResponse, OTA_CHANNELS,
+    ActivationRequest, ActivationResponse, AuditReceiptRequest, AuditReceiptResponse,
+    CreateTransferRequest, GapKind, HeartbeatRequest, HeartbeatResponse, IssueCodesRequest,
+    IssueCodesResponse, IssuedCode, OtaManifestResponse, OtaStatusRequest, ProcessTransferRequest,
+    ProcessTransferResponse, ReceiptCursor, ReissueCodeRequest, ReissueCodeResponse,
+    RejectTransferRequest, RejectTransferResponse, RevokeCodeRequest, TransferTicketItem,
+    UploadOtaRequest, VerifyRequest, VerifyResponse, OTA_CHANNELS,
 };
 use crate::receipt;
-use crate::store::Store;
+use crate::store::{Store, TransferCompletion, TransferFilter};
 use crate::token::{issue_lease_token, LeaseClaims, LeaseToken};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -917,6 +920,405 @@ impl LicensingService {
         Ok(ReissueCodeResponse {
             new_code: Self::to_issued_code(&new_code),
         })
+    }
+
+    // ----------------------------- 换机工单（transfer ticket） -----------------------------
+
+    /// 工单行 → 对外响应（大数红线：时间一律十进制 **String**）。
+    fn to_transfer_item(t: &TransferTicket) -> TransferTicketItem {
+        TransferTicketItem {
+            ticket_id: t.ticket_id.clone(),
+            tenant_id: t.tenant_id.clone(),
+            old_machine_code: t.old_machine_code.clone(),
+            new_machine_code: t.new_machine_code.clone(),
+            source_code_id: t.source_code_id.clone(),
+            reason: t.reason.clone(),
+            submitted_at: t.submitted_at.to_string(),
+            status: t.status.as_str().to_string(),
+            resolution: t.resolution.clone(),
+            processed_at: t.processed_at.map(|v| v.to_string()),
+            processed_by: t.processed_by.clone(),
+            note: t.note.clone(),
+        }
+    }
+
+    /// `POST /admin/transfers`：受理客户换机申请（**契约文档未定义提交端点**，
+    /// 本方法为补齐「工单可从无到有地被创建」而新增）。
+    ///
+    /// 校验：租户存在 + `source_code_id` 存在且属于该租户 + `reason` 非空白。
+    /// `old_machine_code` / `new_machine_code` **一律经 [`normalize_machine_code`] 归一**
+    /// （复用云端唯一归一函数：剥 `-` `:` `_` 与空白 + 小写；库内值与之同口径），
+    /// 空串归一后仍为空串（= 未提供）。
+    pub fn admin_create_transfer_ticket(
+        &self,
+        req: &CreateTransferRequest,
+        actor_id: &str,
+    ) -> LicenseResult<TransferTicketItem> {
+        let tenant_id = req.tenant_id.trim();
+        if tenant_id.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "create transfer requires a non-empty tenant_id".into(),
+            ));
+        }
+        if self.store.get_tenant(tenant_id)?.is_none() {
+            return Err(LicenseError::tenant_not_found(format!(
+                "unknown tenant: {tenant_id}; verify the X-Tenant-Id header"
+            )));
+        }
+        if req.reason.trim().is_empty() {
+            return Err(LicenseError::reason_required(
+                "create transfer requires a non-empty reason",
+            ));
+        }
+        let source_code_id = req.source_code_id.trim();
+        if source_code_id.is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "create transfer requires a non-empty source_code_id".into(),
+            ));
+        }
+        let source = self.store.get_code_by_id(source_code_id)?.ok_or_else(|| {
+            LicenseError::KeyStateIllegal(format!("activation code not found: {source_code_id}"))
+        })?;
+        if source.tenant_id != tenant_id {
+            return Err(LicenseError::KeyStateIllegal(
+                "activation code belongs to a different tenant".into(),
+            ));
+        }
+
+        let now = now_unix_secs();
+        let ticket = TransferTicket::new_pending(
+            now_ns_id("tr"),
+            tenant_id.to_string(),
+            normalize_machine_code(req.old_machine_code.trim()),
+            normalize_machine_code(req.new_machine_code.trim()),
+            source_code_id.to_string(),
+            req.reason.trim().to_string(),
+            now,
+        );
+        self.store.insert_transfer_ticket(&ticket)?;
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            "transfer_submit",
+            "transfer_ticket",
+            &ticket.ticket_id,
+            &Self::transfer_audit_detail(&ticket.reason, ""),
+            now,
+        )?;
+        Ok(Self::to_transfer_item(&ticket))
+    }
+
+    /// `GET /admin/transfers`：工单列表（**只读**；状态 / 租户过滤 + 分页）。
+    pub fn admin_list_transfer_tickets(
+        &self,
+        filter: &TransferFilter,
+        page: u32,
+        page_size: u32,
+    ) -> LicenseResult<Vec<TransferTicketItem>> {
+        Ok(self
+            .store
+            .list_transfer_tickets(filter, page, page_size)?
+            .iter()
+            .map(Self::to_transfer_item)
+            .collect())
+    }
+
+    /// `POST /admin/transfers/{id}/process`：处理换机工单（**核心**）。
+    ///
+    /// # 语义边界（一机一码红线，见 [`crate::model::TransferTicket`]）
+    /// 工单**只是受理凭据**；处理动作 = 既有「废弃 + 重发」链路：
+    /// 原码 `issued|bound → revoked`（**立即失效**），可选 `revoked → reissued` + 新码
+    /// （可预绑定新机器码）+ `reissued_from_id` 溯源。**绝不**解绑旧机器码 / 改绑新机器码；
+    /// 旧 `device` 行与其 `machine_code` 原样保留作历史。
+    ///
+    /// # 事务边界
+    /// 工单终结 + 废弃 + 重发在 **`Store::complete_transfer_ticket` 的单个事务**内完成，
+    /// 复用 store 的状态机原语（`revoke_code_tx` / `insert_code_tx` / `mark_code_reissued_tx`）
+    /// —— 与 `LicensingService::revoke` / `reissue` 走的是**同一份 SQL 与判定**，
+    /// 没有第二套状态机实现。审计（best-effort，与既有 revoke/reissue 同口径）
+    /// 在事务提交后写入。
+    ///
+    /// # 危险操作四要素
+    /// `reason`（必填）/ `note`（≥10 字符）/ `confirm`（**工单编号原文**，大小写不敏感精确匹配，
+    /// 不符 → 412 `CONFIRM_MISMATCH`）/ `resolution`（处理结果，必填非空白）——
+    /// 三个主字段**彼此独立**，绝不拼接。
+    pub fn admin_process_transfer_ticket(
+        &self,
+        tenant_id: &str,
+        ticket_id: &str,
+        req: &ProcessTransferRequest,
+        actor_id: &str,
+    ) -> LicenseResult<ProcessTransferResponse> {
+        let now = now_unix_secs();
+        let tenant_id = tenant_id.trim();
+        let ticket_id = ticket_id.trim();
+
+        Self::validate_transfer_danger_fields(&req.reason, &req.note, &req.confirm, ticket_id)?;
+        if req.resolution.trim().is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "transfer process requires a non-empty resolution".into(),
+            ));
+        }
+
+        let ticket = self.load_pending_ticket(tenant_id, ticket_id)?;
+        let source = self
+            .store
+            .get_code_by_id(&ticket.source_code_id)?
+            .ok_or_else(|| {
+                LicenseError::KeyStateIllegal(format!(
+                    "activation code not found: {}",
+                    ticket.source_code_id
+                ))
+            })?;
+        if source.tenant_id != tenant_id {
+            return Err(LicenseError::KeyStateIllegal(
+                "activation code belongs to a different tenant".into(),
+            ));
+        }
+
+        // 幂等：同工单已重发过（存在 `reissued_from == 原码` 的新码）→ 原样返回既有新码，
+        // 绝不签发第二张（与 `LicensingService::reissue` 的 fail-closed 幂等同口径）。
+        let existing_reissue = self.store.find_code_by_reissued_from(&source.code_id)?;
+
+        let mut reissue_pair: Option<(ActivationCode, String)> = None;
+        if req.reissue && existing_reissue.is_none() {
+            let prebind = if req.prebind_new {
+                let raw = ticket.new_machine_code.trim();
+                if raw.is_empty() {
+                    return Err(LicenseError::KeyStateIllegal(
+                        "prebind_new requires the ticket to carry a new machine code".into(),
+                    ));
+                }
+                let normalized = normalize_machine_code(raw);
+                // G3 预绑定冲突检测（复用既有判定，见 `check_prebind_conflict`）。
+                self.check_prebind_conflict(tenant_id, &normalized)?;
+                Some(normalized)
+            } else {
+                None
+            };
+            let new_code =
+                Self::build_transfer_reissue_code(&source, &prebind, req, now, actor_id)?;
+            reissue_pair = Some((new_code, source.code_id.clone()));
+        }
+
+        // 仅当原码仍可废弃时纳入事务（已 `revoked`/`reissued` = 幂等跳过，不报错）。
+        let revoke = matches!(source.status, CodeStatus::Issued | CodeStatus::Bound)
+            .then(|| (source.code_id.as_str(), req.reason.trim()));
+
+        let completion = TransferCompletion {
+            ticket_id,
+            resolution: req.resolution.trim(),
+            note: req.note.trim(),
+            processed_at: now,
+            processed_by: actor_id,
+            revoke,
+            reissue: reissue_pair
+                .as_ref()
+                .map(|(code, original)| (code, original.as_str())),
+        };
+        self.store.complete_transfer_ticket(&completion)?;
+
+        // 审计：沿用既有动作名与实体（`revoke` / `reissue` 指向 `activation_code`），
+        // 不另造格式；工单本身再落一条 `transfer_process`。
+        if revoke.is_some() {
+            self.audit(
+                tenant_id,
+                actor_id,
+                "revoke",
+                "activation_code",
+                &source.code_id,
+                now,
+            )?;
+        }
+        if reissue_pair.is_some() {
+            self.audit(
+                tenant_id,
+                actor_id,
+                "reissue",
+                "activation_code",
+                &source.code_id,
+                now,
+            )?;
+        }
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            "transfer_process",
+            "transfer_ticket",
+            ticket_id,
+            &Self::transfer_audit_detail(req.reason.trim(), req.resolution.trim()),
+            now,
+        )?;
+
+        let updated = self
+            .store
+            .get_transfer_ticket(ticket_id)?
+            .ok_or_else(|| LicenseError::Storage("transfer ticket vanished after commit".into()))?;
+        let new_code = reissue_pair
+            .as_ref()
+            .map(|(code, _)| Self::to_issued_code(code))
+            .or_else(|| existing_reissue.as_ref().map(Self::to_issued_code));
+        Ok(ProcessTransferResponse {
+            ticket: Self::to_transfer_item(&updated),
+            new_code,
+        })
+    }
+
+    /// `POST /admin/transfers/{id}/reject`：驳回换机工单（**契约文档未定义驳回端点**，
+    /// 本方法为补齐「`rejected` 终态可达」而新增）。
+    ///
+    /// `pending → rejected`（终态），写 `resolution` = 驳回说明；**不改动任何绑定 / 码状态**
+    /// （[`TicketStatus::Rejected`] 的既定语义）。危险操作四要素同 `process`。
+    pub fn admin_reject_transfer_ticket(
+        &self,
+        tenant_id: &str,
+        ticket_id: &str,
+        req: &RejectTransferRequest,
+        actor_id: &str,
+    ) -> LicenseResult<RejectTransferResponse> {
+        let now = now_unix_secs();
+        let tenant_id = tenant_id.trim();
+        let ticket_id = ticket_id.trim();
+
+        Self::validate_transfer_danger_fields(&req.reason, &req.note, &req.confirm, ticket_id)?;
+        if req.resolution.trim().is_empty() {
+            return Err(LicenseError::KeyStateIllegal(
+                "transfer reject requires a non-empty resolution".into(),
+            ));
+        }
+        self.load_pending_ticket(tenant_id, ticket_id)?;
+
+        self.store.reject_transfer_ticket(
+            ticket_id,
+            req.resolution.trim(),
+            now,
+            actor_id,
+            req.note.trim(),
+        )?;
+        self.write_audit(
+            ActorType::Admin,
+            actor_id,
+            "transfer_reject",
+            "transfer_ticket",
+            ticket_id,
+            &Self::transfer_audit_detail(req.reason.trim(), req.resolution.trim()),
+            now,
+        )?;
+
+        let updated = self
+            .store
+            .get_transfer_ticket(ticket_id)?
+            .ok_or_else(|| LicenseError::Storage("transfer ticket vanished after commit".into()))?;
+        Ok(RejectTransferResponse {
+            ticket: Self::to_transfer_item(&updated),
+        })
+    }
+
+    /// 非法危险操作四要素校验（`reason` / `note` / `confirm` **三个独立字段**）。
+    ///
+    /// - `reason` 空白 → [`LicenseError::ReasonRequired`]（400）；
+    /// - `note` < 10 字符（`trim` 后按 Unicode 字符计数）→ [`LicenseError::KeyStateIllegal`]（400）；
+    /// - `confirm` 与工单编号（`trim` 后）大小写不敏感**精确匹配**失败 → [`LicenseError::ConfirmMismatch`]（412）。
+    fn validate_transfer_danger_fields(
+        reason: &str,
+        note: &str,
+        confirm: &str,
+        ticket_id: &str,
+    ) -> LicenseResult<()> {
+        if reason.trim().is_empty() {
+            return Err(LicenseError::reason_required(
+                "transfer operation requires a non-empty reason",
+            ));
+        }
+        if note.trim().chars().count() < 10 {
+            return Err(LicenseError::KeyStateIllegal(
+                "transfer note must be at least 10 characters".into(),
+            ));
+        }
+        let supplied = confirm.trim();
+        if supplied.is_empty() || !supplied.eq_ignore_ascii_case(ticket_id) {
+            return Err(LicenseError::confirm_mismatch(
+                "confirm does not match the transfer ticket id",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 载入工单并断言「属于该租户 + 处于 `pending`」（终态不可复写）。
+    fn load_pending_ticket(&self, tenant_id: &str, ticket_id: &str) -> LicenseResult<TransferTicket> {
+        let ticket = self.store.get_transfer_ticket(ticket_id)?.ok_or_else(|| {
+            LicenseError::KeyStateIllegal(format!("transfer ticket not found: {ticket_id}"))
+        })?;
+        if ticket.tenant_id != tenant_id {
+            return Err(LicenseError::KeyStateIllegal(
+                "transfer ticket belongs to a different tenant".into(),
+            ));
+        }
+        if !matches!(ticket.status, TicketStatus::Pending) {
+            return Err(LicenseError::ticket_not_pending(format!(
+                "transfer ticket {ticket_id} is {}",
+                ticket.status.as_str()
+            )));
+        }
+        Ok(ticket)
+    }
+
+    /// 构造换机重发新码（**复用** `reissue` 的字段口径：tier / 有效期继承或覆盖、
+    /// 预绑定归一、`reissued_from_id` 溯源、`validate()` 不变量校验）。
+    ///
+    /// 与 `LicensingService::reissue` 的差异仅在**落库方式**：本函数只构造对象，
+    /// 由 `Store::complete_transfer_ticket` 在同一事务内落库（故不在此处 `insert_code`）。
+    fn build_transfer_reissue_code(
+        original: &ActivationCode,
+        prebind: &Option<String>,
+        req: &ProcessTransferRequest,
+        now: i64,
+        actor_id: &str,
+    ) -> LicenseResult<ActivationCode> {
+        let tier = if req.inherit_tier {
+            original.tier.clone()
+        } else {
+            req.tier
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| original.tier.clone())
+        };
+        let valid_until = match req
+            .valid_until
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            Some(raw) => Self::parse_ts(raw)?,
+            None => original.valid_until,
+        };
+        if valid_until <= now {
+            return Err(LicenseError::KeyStateIllegal(
+                "transfer reissue: resulting validity window is empty".into(),
+            ));
+        }
+        let mut code = ActivationCode::new_issued(
+            now_ns_id("ac"),
+            Self::generate_code_value(),
+            original.tenant_id.clone(),
+            tier,
+            now,
+            valid_until,
+            Some(original.source_order_id.clone().unwrap_or_default()),
+            actor_id.to_string(),
+            now,
+        );
+        code = code.with_prebind(prebind.clone());
+        code.reissued_from_id = Some(original.code_id.clone());
+        code.validate()?;
+        Ok(code)
+    }
+
+    /// 工单审计详情（JSON；`reason` / `resolution` 均为**操作者输入**，不承载任何敏感值）。
+    fn transfer_audit_detail(reason: &str, resolution: &str) -> String {
+        serde_json::json!({ "reason": reason, "resolution": resolution }).to_string()
     }
 
     // ----------------------------- 心跳（heartbeat） -----------------------------
@@ -2207,12 +2609,15 @@ mod tests {
     use crate::audit::ReceiptLedger;
     use crate::error::{LicenseError, PrebindKind};
     use crate::keys::{current_year, KeyRing};
-    use crate::model::{now_ns_id, now_unix_secs, CodeStatus, Device, LeaseStatus, Tenant};
-    use crate::proto::{
-        ActivationRequest, GapKind, HeartbeatRequest, IssueCodesRequest, Prebind, ReceiptCursor,
-        ReissueCodeRequest, RevokeCodeRequest,
+    use crate::model::{
+        now_ns_id, now_unix_secs, CodeStatus, Device, LeaseStatus, Tenant, TicketStatus,
     };
-    use crate::store::{AuditFilter, Store};
+    use crate::proto::{
+        ActivationRequest, CreateTransferRequest, GapKind, HeartbeatRequest, IssueCodesRequest,
+        Prebind, ProcessTransferRequest, ReceiptCursor, ReissueCodeRequest, RejectTransferRequest,
+        RevokeCodeRequest,
+    };
+    use crate::store::{AuditFilter, Store, TransferFilter};
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
@@ -4011,5 +4416,408 @@ mod tests {
                 .unwrap_or_else(|| panic!("码未落库: {}", issued.code));
             assert_eq!(stored.code, issued.code);
         }
+    }
+
+    // ================= 换机工单（transfer ticket） =================
+
+    fn create_transfer_req(
+        tenant: &str,
+        old: &str,
+        new: &str,
+        source_code_id: &str,
+        reason: &str,
+    ) -> CreateTransferRequest {
+        CreateTransferRequest {
+            tenant_id: tenant.to_string(),
+            old_machine_code: old.to_string(),
+            new_machine_code: new.to_string(),
+            source_code_id: source_code_id.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn process_transfer_req(
+        ticket_id: &str,
+        reason: &str,
+        note: &str,
+        resolution: &str,
+        reissue: bool,
+        prebind_new: bool,
+    ) -> ProcessTransferRequest {
+        ProcessTransferRequest {
+            reason: reason.to_string(),
+            note: note.to_string(),
+            confirm: ticket_id.to_string(),
+            resolution: resolution.to_string(),
+            reissue,
+            prebind_new,
+            inherit_tier: true,
+            tier: None,
+            valid_until: None,
+        }
+    }
+
+    fn reject_transfer_req(
+        ticket_id: &str,
+        reason: &str,
+        note: &str,
+        resolution: &str,
+    ) -> RejectTransferRequest {
+        RejectTransferRequest {
+            reason: reason.to_string(),
+            note: note.to_string(),
+            confirm: ticket_id.to_string(),
+            resolution: resolution.to_string(),
+        }
+    }
+
+    /// 受理：机器码归一（展示态 → 无分隔符小写）+ 租户 / 源码校验 + 落 `pending`。
+    #[test]
+    fn transfer_create_normalizes_and_validates() {
+        let svc = build_service();
+        let issued = svc
+            .issue_codes(&issue_req("t-1", Some("M1"), "tr-issue-1"))
+            .unwrap();
+        let code_id = issued.codes[0].code_id.clone();
+
+        let item = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req(
+                    "t-1",
+                    "8F3A-91C2-7D04-5BE6",
+                    "",
+                    &code_id,
+                    "主板损坏返修",
+                ),
+                "客服甲",
+            )
+            .unwrap();
+        assert_eq!(item.status, "pending");
+        assert_eq!(
+            item.old_machine_code, "8f3a91c27d045be6",
+            "原机器码必须归一为无分隔符小写"
+        );
+        assert_eq!(item.new_machine_code, "");
+        assert!(
+            item.submitted_at.parse::<i64>().expect("submitted_at 必须是 epoch 秒串") > 0,
+            "提交时间必须为大数十进制串"
+        );
+        assert!(item.processed_at.is_none());
+        assert!(item.processed_by.is_none());
+
+        // 列表可见。
+        let list = svc
+            .admin_list_transfer_tickets(&TransferFilter::default(), 1, 20)
+            .unwrap();
+        assert_eq!(list.len(), 1);
+
+        // reason 空白 → REASON_REQUIRED。
+        let err = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req("t-1", "", "", &code_id, "   "),
+                "客服甲",
+            )
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::ReasonRequired(_)), "{err:?}");
+
+        // 未知租户 → TENANT_NOT_FOUND。
+        let err = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req("t-none", "", "", &code_id, "换机"),
+                "客服甲",
+            )
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::TenantNotFound(_)), "{err:?}");
+
+        // 未知源码 → KeyStateIllegal。
+        let err = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req("t-1", "", "", "c-none", "换机"),
+                "客服甲",
+            )
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::KeyStateIllegal(_)), "{err:?}");
+    }
+
+    /// 处理：单事务「废弃 + 重发」；原码 → reissued；新码溯源 + 预绑定归一；工单 → processed；
+    /// 重复处理 → `TicketNotPending`（409 语义）。
+    #[test]
+    fn transfer_process_revoke_and_reissue_single_shot() {
+        let svc = build_service();
+        let issued = svc
+            .issue_codes(&issue_req("t-1", Some("M1"), "tr-issue-2"))
+            .unwrap();
+        let code = &issued.codes[0];
+        let source_code_id = code.code_id.clone();
+        let source_value = code.code.clone();
+
+        let ticket = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req(
+                    "t-1",
+                    "M1",
+                    "B83D-5F90-A2C4-1D77",
+                    &source_code_id,
+                    "设备整体更换",
+                ),
+                "客服甲",
+            )
+            .unwrap();
+
+        let resp = svc
+            .admin_process_transfer_ticket(
+                "t-1",
+                &ticket.ticket_id,
+                &process_transfer_req(
+                    &ticket.ticket_id,
+                    "客户更换硬件",
+                    "客户已确认这是换机而非误操作",
+                    "已废弃旧码并重发新码（预绑定新机器码）",
+                    true,
+                    true,
+                ),
+                "客服乙",
+            )
+            .unwrap();
+
+        assert_eq!(resp.ticket.status, "processed");
+        assert_eq!(resp.ticket.processed_by.as_deref(), Some("客服乙"));
+        assert!(resp.ticket.processed_at.is_some());
+        let new_code = resp.new_code.expect("重发必须有新码");
+        assert_eq!(
+            new_code.reissued_from.as_deref(),
+            Some(source_code_id.as_str()),
+            "新码必须溯源到原码"
+        );
+        assert_eq!(new_code.prebind.as_deref(), Some("b83d5f90a2c41d77"));
+        // 原码 revoked → reissued（单向）。
+        let stored = svc
+            .store()
+            .get_code_by_id(&source_code_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, CodeStatus::Reissued);
+        // 旧码值不可再激活。
+        assert!(svc.activate(&activate_req(&source_value, "M1")).is_err());
+
+        // 重复处理 → TicketNotPending（绝不产生第二个新码）。
+        let err = svc
+            .admin_process_transfer_ticket(
+                "t-1",
+                &ticket.ticket_id,
+                &process_transfer_req(
+                    &ticket.ticket_id,
+                    "客户更换硬件",
+                    "客户已确认这是换机而非误操作",
+                    "再次处理",
+                    true,
+                    true,
+                ),
+                "客服乙",
+            )
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::TicketNotPending(_)), "{err:?}");
+    }
+
+    /// 处理：`reissue=false` 仅废弃；工单终结但新码为 `None`。
+    #[test]
+    fn transfer_process_only_revoke() {
+        let svc = build_service();
+        let issued = svc
+            .issue_codes(&issue_req("t-1", Some("M1"), "tr-issue-3"))
+            .unwrap();
+        let source_code_id = issued.codes[0].code_id.clone();
+        let ticket = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req("t-1", "M1", "", &source_code_id, "设备报废"),
+                "客服甲",
+            )
+            .unwrap();
+
+        let resp = svc
+            .admin_process_transfer_ticket(
+                "t-1",
+                &ticket.ticket_id,
+                &process_transfer_req(
+                    &ticket.ticket_id,
+                    "设备报废",
+                    "客户确认设备报废不再使用",
+                    "仅废弃旧码",
+                    false,
+                    false,
+                ),
+                "客服乙",
+            )
+            .unwrap();
+        assert!(resp.new_code.is_none());
+        assert_eq!(
+            svc.store()
+                .get_code_by_id(&source_code_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            CodeStatus::Revoked
+        );
+    }
+
+    /// 危险操作四要素：reason / note / confirm / resolution 各自独立校验。
+    #[test]
+    fn transfer_process_danger_fields_are_enforced() {
+        let svc = build_service();
+        let issued = svc
+            .issue_codes(&issue_req("t-1", Some("M1"), "tr-issue-4"))
+            .unwrap();
+        let source_code_id = issued.codes[0].code_id.clone();
+        let ticket = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req("t-1", "M1", "", &source_code_id, "换机"),
+                "客服甲",
+            )
+            .unwrap();
+
+        // reason 空白。
+        let mut req = process_transfer_req(
+            &ticket.ticket_id,
+            "  ",
+            "客户已确认这是换机而非误操作",
+            "已处理",
+            false,
+            false,
+        );
+        assert!(matches!(
+            svc.admin_process_transfer_ticket("t-1", &ticket.ticket_id, &req, "客服")
+                .unwrap_err(),
+            LicenseError::ReasonRequired(_)
+        ));
+        // note 不足 10 字符。
+        req.reason = "客户更换硬件".into();
+        req.note = "太短".into();
+        assert!(matches!(
+            svc.admin_process_transfer_ticket("t-1", &ticket.ticket_id, &req, "客服")
+                .unwrap_err(),
+            LicenseError::KeyStateIllegal(_)
+        ));
+        // confirm 与工单号不符。
+        req.note = "客户已确认这是换机而非误操作".into();
+        req.confirm = "WRONG-ID".into();
+        assert!(matches!(
+            svc.admin_process_transfer_ticket("t-1", &ticket.ticket_id, &req, "客服")
+                .unwrap_err(),
+            LicenseError::ConfirmMismatch(_)
+        ));
+        // resolution 空白。
+        req.confirm = ticket.ticket_id.clone();
+        req.resolution = "   ".into();
+        assert!(matches!(
+            svc.admin_process_transfer_ticket("t-1", &ticket.ticket_id, &req, "客服")
+                .unwrap_err(),
+            LicenseError::KeyStateIllegal(_)
+        ));
+        // 工单始终未被改动（拒绝路径零写入）。
+        assert_eq!(
+            svc.store()
+                .get_transfer_ticket(&ticket.ticket_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TicketStatus::Pending
+        );
+    }
+
+    /// 驳回：`pending → rejected`，码状态原样；终态不可二次驳回。
+    #[test]
+    fn transfer_reject_keeps_codes_untouched() {
+        let svc = build_service();
+        let issued = svc
+            .issue_codes(&issue_req("t-1", Some("M1"), "tr-issue-5"))
+            .unwrap();
+        let source_code_id = issued.codes[0].code_id.clone();
+        let ticket = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req("t-1", "M1", "", &source_code_id, "换机"),
+                "客服甲",
+            )
+            .unwrap();
+
+        let resp = svc
+            .admin_reject_transfer_ticket(
+                "t-1",
+                &ticket.ticket_id,
+                &reject_transfer_req(
+                    &ticket.ticket_id,
+                    "误发放",
+                    "客户未提供任何换机凭证",
+                    "客户材料不全，驳回",
+                ),
+                "客服乙",
+            )
+            .unwrap();
+        assert_eq!(resp.ticket.status, "rejected");
+        assert_eq!(resp.ticket.resolution, "客户材料不全，驳回");
+        // 码状态原样保留（Issued）。
+        assert_eq!(
+            svc.store()
+                .get_code_by_id(&source_code_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            CodeStatus::Issued
+        );
+        // 终态不可二次驳回。
+        let err = svc
+            .admin_reject_transfer_ticket(
+                "t-1",
+                &ticket.ticket_id,
+                &reject_transfer_req(
+                    &ticket.ticket_id,
+                    "误发放",
+                    "客户未提供任何换机凭证",
+                    "再次驳回",
+                ),
+                "客服乙",
+            )
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::TicketNotPending(_)), "{err:?}");
+    }
+
+    /// 跨租户防护：工单与他租户请求不匹配 → 拒绝。
+    #[test]
+    fn transfer_process_rejects_tenant_mismatch() {
+        let svc = build_service();
+        svc.store()
+            .insert_tenant(&Tenant::new(
+                "t-2".into(),
+                "Tenant 2".into(),
+                "ops2@x".into(),
+                now_unix_secs(),
+            ))
+            .unwrap();
+        let issued = svc
+            .issue_codes(&issue_req("t-1", Some("M1"), "tr-issue-6"))
+            .unwrap();
+        let source_code_id = issued.codes[0].code_id.clone();
+        let ticket = svc
+            .admin_create_transfer_ticket(
+                &create_transfer_req("t-1", "M1", "", &source_code_id, "换机"),
+                "客服甲",
+            )
+            .unwrap();
+
+        let err = svc
+            .admin_process_transfer_ticket(
+                "t-2",
+                &ticket.ticket_id,
+                &process_transfer_req(
+                    &ticket.ticket_id,
+                    "客户更换硬件",
+                    "客户已确认这是换机而非误操作",
+                    "已处理",
+                    false,
+                    false,
+                ),
+                "客服乙",
+            )
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::KeyStateIllegal(_)), "{err:?}");
     }
 }

@@ -48,6 +48,8 @@ pub const ERR_LICENSE_TENANT: u16 = 1200;
 /// 授权域错误码：发放激活码缺少预绑定机器码（2026-09-27 主理人决策：一机一码
 /// 从发放侧闭环，`prebind_machine_code` 必填非空白，HTTP 400）。
 pub const ERR_LICENSE_MACHINE_CODE: u16 = 1210;
+/// 授权域错误码：换机工单已非待处理（重复处理 / 重复驳回，`pending` 才可终结，HTTP 409）。
+pub const ERR_LICENSE_TRANSFER: u16 = 1220;
 
 /// licensing-server 主错误枚举。
 #[derive(Debug, thiserror::Error)]
@@ -209,6 +211,15 @@ pub enum LicenseError {
     /// 一机一码从发放侧闭环，发放时机器码必填；消息**不含**任何机器码值。
     #[error("LicenseError: machine code required: {0}")]
     MachineCodeRequired(String),
+
+    /// 换机工单已非「待处理」（重复处理 / 重复驳回）。
+    ///
+    /// 对应业务码 `TICKET_NOT_PENDING`（HTTP **409**）。工单状态机单向：
+    /// `pending → processed | rejected`，两个终态均不可二次终结；独立变体让 HTTP 层
+    /// 精确映射 409 而**不是**用 `msg.contains` 反查（一旦改文案就会静默退化为 400）。
+    /// 消息**不含**机器码值。
+    #[error("LicenseError: transfer ticket is not pending: {0}")]
+    TicketNotPending(String),
 }
 
 /// 预绑定冲突的细分种类。
@@ -352,6 +363,11 @@ impl LicenseError {
         LicenseError::MachineCodeRequired(message.into())
     }
 
+    /// 构造「换机工单非待处理」错误（HTTP 409，`TICKET_NOT_PENDING`）。
+    pub fn ticket_not_pending(message: impl Into<String>) -> Self {
+        LicenseError::TicketNotPending(message.into())
+    }
+
     /// 错误码（u16，非零）。
     pub fn error_code(&self) -> u16 {
         match self {
@@ -377,6 +393,7 @@ impl LicenseError {
             LicenseError::Forbidden(_) => ERR_LICENSE_ADMIN_RBAC,
             LicenseError::TenantNotFound(_) => ERR_LICENSE_TENANT,
             LicenseError::MachineCodeRequired(_) => ERR_LICENSE_MACHINE_CODE,
+            LicenseError::TicketNotPending(_) => ERR_LICENSE_TRANSFER,
         }
     }
 }
@@ -478,6 +495,10 @@ mod tests {
             (
                 LicenseError::machine_code_required("issue requires machine code"),
                 ERR_LICENSE_MACHINE_CODE,
+            ),
+            (
+                LicenseError::ticket_not_pending("transfer ticket is processed"),
+                ERR_LICENSE_TRANSFER,
             ),
         ];
         let mut seen = std::collections::HashSet::new();

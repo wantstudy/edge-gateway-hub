@@ -22,14 +22,14 @@
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::admin_auth::AdminAccount;
 use crate::error::{LicenseError, LicenseResult};
 use crate::model::{
     now_unix_secs, ActivationCode, ActorType, AuditLog, AuditReceipt, CodeStatus, DeployMode,
     Device, DeviceStatus, Heartbeat, HeartbeatResult, Lease, LeaseStatus, NonceCache, OtaPackage,
-    OtaStatus, SigningKey, SigningKeyStatus, Tenant, VerifyMode,
+    OtaStatus, SigningKey, SigningKeyStatus, Tenant, TicketStatus, TransferTicket, VerifyMode,
 };
 
 /// **增量列迁移表**：`(表名, 列名, 补齐该列的 DDL)`。
@@ -120,6 +120,17 @@ pub struct CodeFilter {
     pub tier: Option<String>,
     /// 按来源订单过滤（`activation_code.source_order_id`）。
     pub order_id: Option<String>,
+}
+
+/// `transfer_ticket` 列表过滤条件（`None` 字段 = 不施加该条件）。
+///
+/// **字段集合由 service 层契约固定**：`{ tenant_id, status }`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferFilter {
+    /// 按租户过滤（`transfer_ticket.tenant_id`）。
+    pub tenant_id: Option<String>,
+    /// 按工单状态过滤。
+    pub status: Option<TicketStatus>,
 }
 
 /// `audit_log` 列表过滤条件（`None` 字段 = 不施加该条件）。
@@ -304,6 +315,28 @@ const SCHEMA: &[&str] = &[
         created_at      INTEGER NOT NULL,
         updated_at      INTEGER NOT NULL
     )"#,
+    // 换机工单（客户换机申请的受理单；**只是受理凭据**，处理动作走既有「废弃 + 重发」链路，
+    // 见 `model::TransferTicket` 的语义边界）。`status` 落库用 `TicketStatus::as_str()`
+    // 的稳定字符串（`pending` / `processed` / `rejected`），行映射以 `TicketStatus::parse`
+    // 严格解析——未知值一律 `Err`，绝不静默兜底为 `pending`（那会让脏数据工单被重复处理）。
+    // `old_machine_code` / `new_machine_code` 存**归一后**匹配态（无分隔符小写）。
+    r#"CREATE TABLE IF NOT EXISTS transfer_ticket (
+        ticket_id        TEXT PRIMARY KEY,
+        tenant_id        TEXT NOT NULL REFERENCES tenant(tenant_id),
+        old_machine_code TEXT NOT NULL DEFAULT '',
+        new_machine_code TEXT NOT NULL DEFAULT '',
+        source_code_id   TEXT NOT NULL REFERENCES activation_code(code_id),
+        reason           TEXT NOT NULL,
+        submitted_at     INTEGER NOT NULL,
+        status           TEXT NOT NULL,
+        resolution       TEXT NOT NULL DEFAULT '',
+        processed_at     INTEGER,
+        processed_by     TEXT,
+        note             TEXT NOT NULL DEFAULT ''
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_transfer_status ON transfer_ticket(status)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_transfer_tenant ON transfer_ticket(tenant_id)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_transfer_submitted ON transfer_ticket(submitted_at)"#,
 ];
 
 // ---- 行映射辅助 ----
@@ -415,6 +448,33 @@ fn row_to_code(row: &Row<'_>) -> rusqlite::Result<ActivationCode> {
         prebind_machine_code: row.get(15)?,
     })
 }
+
+/// 从行读取 `TransferTicket`。
+///
+/// `status` 经 [`TicketStatus::parse`] **严格解析**：未知落库串一律 `Err`
+/// （`conversion_error` → `Storage`），**绝不静默兜底为 `pending`**——否则脏数据工单
+/// 会被当成待处理而**重复处理**。
+fn row_to_transfer_ticket(row: &Row<'_>) -> rusqlite::Result<TransferTicket> {
+    let status_raw: String = row.get(7)?;
+    Ok(TransferTicket {
+        ticket_id: row.get(0)?,
+        tenant_id: row.get(1)?,
+        old_machine_code: row.get(2)?,
+        new_machine_code: row.get(3)?,
+        source_code_id: row.get(4)?,
+        reason: row.get(5)?,
+        submitted_at: row.get(6)?,
+        status: parse_enum(&status_raw, TicketStatus::parse)?,
+        resolution: row.get(8)?,
+        processed_at: row.get(9)?,
+        processed_by: row.get(10)?,
+        note: row.get(11)?,
+    })
+}
+
+/// `transfer_ticket` 选择列（行映射顺序与 [`row_to_transfer_ticket`] 严格对应）。
+const TRANSFER_COLUMNS: &str = "ticket_id, tenant_id, old_machine_code, new_machine_code, \
+     source_code_id, reason, submitted_at, status, resolution, processed_at, processed_by, note";
 
 /// 从行读取 `Lease`。
 fn row_to_lease(row: &Row<'_>) -> rusqlite::Result<Lease> {
@@ -591,6 +651,117 @@ fn push_audit_filter(
         sql.push_str(" AND entity_id = ?");
         args.push(Box::new(entity_id.clone()));
     }
+}
+
+// ---- 事务级共享原语 ----
+//
+// 为什么需要这一组：`Store` 是「单连接 + Mutex」，每个公开方法各自取锁并**自开事务**。
+// 换机工单处理必须把「工单终结 + 废弃原码 + 重发新码」放进**同一个**事务，
+// 逐个调用公开方法会重复取锁（`parking_lot::Mutex` 不可重入 → 死锁），也无法共享
+// `&mut Connection` 的事务句柄。故把三处状态机 SQL 抽成以 `&Transaction` 为参数的
+// 函数：公开方法与单事务组合**共用同一份 SQL 与判定**，状态机只有一处实现，
+// 绝不复制粘贴（见 `Store::revoke_code` / `insert_code` / `mark_code_reissued` 的委托）。
+
+/// 插入激活码（共享原语；`code` 唯一约束由数据库仲裁）。
+fn insert_code_tx(tx: &Transaction<'_>, code: &ActivationCode) -> LicenseResult<()> {
+    tx.execute(
+        "INSERT INTO activation_code
+           (code_id, code, status, bound_device_id, tenant_id, tier, valid_from, valid_until,
+            source_order_id, reissued_from_id, issued_by, revoked_at, revoked_reason,
+            idempotency_key, created_at, prebind_machine_code)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            code.code_id,
+            code.code,
+            code.status.as_str(),
+            code.bound_device_id,
+            code.tenant_id,
+            code.tier,
+            code.valid_from,
+            code.valid_until,
+            code.source_order_id,
+            code.reissued_from_id,
+            code.issued_by,
+            code.revoked_at,
+            code.revoked_reason,
+            code.idempotency_key,
+            code.created_at,
+            code.prebind_machine_code,
+        ],
+    )?;
+    Ok(())
+}
+
+/// 废弃激活码（共享原语）：只允许 `issued` / `bound` → `revoked`（单向状态机）。
+fn revoke_code_tx(
+    tx: &Transaction<'_>,
+    code_id: &str,
+    reason: &str,
+    now: i64,
+) -> LicenseResult<()> {
+    if reason.trim().is_empty() {
+        return Err(LicenseError::KeyStateIllegal(
+            "revoke requires a non-empty reason".into(),
+        ));
+    }
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT status FROM activation_code WHERE code_id = ?1",
+            params![code_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let status = match current {
+        None => {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "activation code not found: {code_id}"
+            )));
+        }
+        Some(raw) => CodeStatus::parse(&raw)?,
+    };
+    if !matches!(status, CodeStatus::Issued | CodeStatus::Bound) {
+        return Err(LicenseError::KeyStateIllegal(format!(
+            "cannot revoke activation code {code_id} in status {}",
+            status.as_str()
+        )));
+    }
+    tx.execute(
+        "UPDATE activation_code
+            SET status = 'revoked', revoked_at = ?2, revoked_reason = ?3
+          WHERE code_id = ?1",
+        params![code_id, now, reason],
+    )?;
+    Ok(())
+}
+
+/// 标记原码 `revoked → reissued`（共享原语；仅 `revoked` 可迁移）。
+fn mark_code_reissued_tx(tx: &Transaction<'_>, original_code_id: &str) -> LicenseResult<()> {
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT status FROM activation_code WHERE code_id = ?1",
+            params![original_code_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let status = match current {
+        None => {
+            return Err(LicenseError::KeyStateIllegal(format!(
+                "activation code not found: {original_code_id}"
+            )));
+        }
+        Some(raw) => CodeStatus::parse(&raw)?,
+    };
+    if !matches!(status, CodeStatus::Revoked) {
+        return Err(LicenseError::KeyStateIllegal(format!(
+            "reissue requires a revoked activation code; {original_code_id} is {}",
+            status.as_str()
+        )));
+    }
+    tx.execute(
+        "UPDATE activation_code SET status = 'reissued' WHERE code_id = ?1",
+        params![original_code_id],
+    )?;
+    Ok(())
 }
 
 // ---- Store ----
@@ -970,32 +1141,10 @@ impl Store {
     /// 插入激活码（`code` 唯一）。**不在此处校验 `validate()`**——由 service 层显式调用，
     /// 以便错误语义（`KeyStateIllegal`）不被降级为 `Storage`。
     pub fn insert_code(&self, code: &ActivationCode) -> LicenseResult<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO activation_code
-               (code_id, code, status, bound_device_id, tenant_id, tier, valid_from, valid_until,
-                source_order_id, reissued_from_id, issued_by, revoked_at, revoked_reason,
-                idempotency_key, created_at, prebind_machine_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![
-                code.code_id,
-                code.code,
-                code.status.as_str(),
-                code.bound_device_id,
-                code.tenant_id,
-                code.tier,
-                code.valid_from,
-                code.valid_until,
-                code.source_order_id,
-                code.reissued_from_id,
-                code.issued_by,
-                code.revoked_at,
-                code.revoked_reason,
-                code.idempotency_key,
-                code.created_at,
-                code.prebind_machine_code,
-            ],
-        )?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        insert_code_tx(&tx, code)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1219,40 +1368,9 @@ impl Store {
     /// 只允许从 `issued` / `bound` 迁移（`revoked` / `reissued` 重复废弃返回
     /// [`LicenseError::KeyStateIllegal`]，保证状态机单向）。
     pub fn revoke_code(&self, code_id: &str, reason: &str, now: i64) -> LicenseResult<()> {
-        if reason.trim().is_empty() {
-            return Err(LicenseError::KeyStateIllegal(
-                "revoke requires a non-empty reason".into(),
-            ));
-        }
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let current: Option<String> = tx
-            .query_row(
-                "SELECT status FROM activation_code WHERE code_id = ?1",
-                params![code_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let status = match current {
-            None => {
-                return Err(LicenseError::KeyStateIllegal(format!(
-                    "activation code not found: {code_id}"
-                )));
-            }
-            Some(raw) => CodeStatus::parse(&raw)?,
-        };
-        if !matches!(status, CodeStatus::Issued | CodeStatus::Bound) {
-            return Err(LicenseError::KeyStateIllegal(format!(
-                "cannot revoke activation code {code_id} in status {}",
-                status.as_str()
-            )));
-        }
-        tx.execute(
-            "UPDATE activation_code
-                SET status = 'revoked', revoked_at = ?2, revoked_reason = ?3
-              WHERE code_id = ?1",
-            params![code_id, now, reason],
-        )?;
+        revoke_code_tx(&tx, code_id, reason, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -1265,31 +1383,7 @@ impl Store {
     pub fn mark_code_reissued(&self, original_code_id: &str) -> LicenseResult<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let current: Option<String> = tx
-            .query_row(
-                "SELECT status FROM activation_code WHERE code_id = ?1",
-                params![original_code_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let status = match current {
-            None => {
-                return Err(LicenseError::KeyStateIllegal(format!(
-                    "activation code not found: {original_code_id}"
-                )));
-            }
-            Some(raw) => CodeStatus::parse(&raw)?,
-        };
-        if !matches!(status, CodeStatus::Revoked) {
-            return Err(LicenseError::KeyStateIllegal(format!(
-                "reissue requires a revoked activation code; {original_code_id} is {}",
-                status.as_str()
-            )));
-        }
-        tx.execute(
-            "UPDATE activation_code SET status = 'reissued' WHERE code_id = ?1",
-            params![original_code_id],
-        )?;
+        mark_code_reissued_tx(&tx, original_code_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -2163,6 +2257,260 @@ impl Store {
             )));
         }
         Ok(())
+    }
+
+    // ================= transfer_ticket =================
+
+    /// 插入换机工单（`pending`；`status` 落 `as_str()` 稳定串）。
+    pub fn insert_transfer_ticket(&self, ticket: &TransferTicket) -> LicenseResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO transfer_ticket
+               (ticket_id, tenant_id, old_machine_code, new_machine_code, source_code_id,
+                reason, submitted_at, status, resolution, processed_at, processed_by, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                ticket.ticket_id,
+                ticket.tenant_id,
+                ticket.old_machine_code,
+                ticket.new_machine_code,
+                ticket.source_code_id,
+                ticket.reason,
+                ticket.submitted_at,
+                ticket.status.as_str(),
+                ticket.resolution,
+                ticket.processed_at,
+                ticket.processed_by,
+                ticket.note,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按 ID 查询工单。
+    pub fn get_transfer_ticket(&self, ticket_id: &str) -> LicenseResult<Option<TransferTicket>> {
+        let conn = self.conn.lock();
+        let sql = format!("SELECT {TRANSFER_COLUMNS} FROM transfer_ticket WHERE ticket_id = ?1");
+        conn.query_row(&sql, params![ticket_id], row_to_transfer_ticket)
+            .optional()
+            .map_err(LicenseError::from)
+    }
+
+    /// 按过滤条件分页列出工单（`page` 从 1 起）。
+    ///
+    /// **排序契约：按 `submitted_at` 升序、同秒再按 `rowid` 升序**（提交越早越先处理；
+    /// `rowid` 保证同秒稳定序，不因随机主键后缀抖动）。
+    pub fn list_transfer_tickets(
+        &self,
+        filter: &TransferFilter,
+        page: u32,
+        page_size: u32,
+    ) -> LicenseResult<Vec<TransferTicket>> {
+        let page = page.max(1);
+        let page_size = page_size.max(1);
+        let offset = to_i64(((page - 1) as usize) * page_size as usize, "transfer offset")?;
+
+        let mut sql = format!("SELECT {TRANSFER_COLUMNS} FROM transfer_ticket WHERE 1 = 1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        push_transfer_filter(&mut sql, &mut args, filter);
+        sql.push_str(" ORDER BY submitted_at ASC, rowid ASC LIMIT ? OFFSET ?");
+        args.push(Box::new(i64::from(page_size)));
+        args.push(Box::new(offset));
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), row_to_transfer_ticket)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 已处理工单的平均处理时长（秒）= `AVG(processed_at - submitted_at)`。
+    ///
+    /// 无已处理工单（或无有效 `processed_at`）→ `None`（前端据此显示 `—`，
+    /// **绝不**写死一个演示值）。取整用 `CAST(... AS INTEGER)`（统计量非大数）。
+    pub fn avg_transfer_processing_secs(&self) -> LicenseResult<Option<i64>> {
+        let conn = self.conn.lock();
+        let avg: Option<i64> = conn.query_row(
+            "SELECT CAST(AVG(processed_at - submitted_at) AS INTEGER)
+               FROM transfer_ticket
+              WHERE status = 'processed' AND processed_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(avg)
+    }
+
+    /// 按过滤条件统计工单数。
+    pub fn count_transfer_tickets(&self, filter: &TransferFilter) -> LicenseResult<u64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM transfer_ticket WHERE 1 = 1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        push_transfer_filter(&mut sql, &mut args, filter);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let count: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0))?;
+        to_u64(count, "transfer count")
+    }
+
+    /// 更新工单终结字段（**仅 `pending` 可终结**；否则 [`LicenseError::TicketNotPending`]）。
+    ///
+    /// 单事务；条件 UPDATE + `rows_affected` 判定是**唯一的重复处理防线**——
+    /// 先 SELECT 再 UPDATE 会让两个并发请求同时看到 `pending` 而双双处理成功。
+    pub fn update_transfer_ticket_status(
+        &self,
+        ticket_id: &str,
+        status: TicketStatus,
+        resolution: &str,
+        processed_at: Option<i64>,
+        processed_by: Option<&str>,
+        note: &str,
+    ) -> LicenseResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        update_transfer_ticket_status_tx(
+            &tx,
+            ticket_id,
+            status,
+            resolution,
+            processed_at,
+            processed_by,
+            note,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// **换机工单处理（核心，单事务）**：工单 `pending → processed`，并在**同一事务内**
+    /// 复用既有状态机原语完成「废弃原码」（可选）与「重发新码」（可选）。
+    ///
+    /// 三者要么全部生效、要么全部回滚：绝不出现「码已废弃但工单仍待处理」的中间态。
+    /// `TicketStatus::Processed` 的终态字段（`resolution` / `processed_at` / `processed_by` /
+    /// `note`）一并落库。
+    pub fn complete_transfer_ticket(&self, completion: &TransferCompletion<'_>) -> LicenseResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        // 1) 原子占位（重复处理 / 并发 → TicketNotPending，事务自动回滚）。
+        update_transfer_ticket_status_tx(
+            &tx,
+            completion.ticket_id,
+            TicketStatus::Processed,
+            completion.resolution,
+            Some(completion.processed_at),
+            Some(completion.processed_by),
+            completion.note,
+        )?;
+        // 2) 废弃原码（共享原语；`issued`/`bound` → `revoked`）。
+        if let Some((code_id, reason)) = completion.revoke {
+            revoke_code_tx(&tx, code_id, reason, completion.processed_at)?;
+        }
+        // 3) 重发新码（共享原语）：插入新码 + 原码 `revoked → reissued`。
+        if let Some((new_code, original_code_id)) = completion.reissue {
+            insert_code_tx(&tx, new_code)?;
+            mark_code_reissued_tx(&tx, original_code_id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// **驳回换机工单（单事务）**：`pending → rejected`（终态），**不改动任何绑定 / 码状态**
+    /// （`TicketStatus::Rejected` 的既定语义）。
+    pub fn reject_transfer_ticket(
+        &self,
+        ticket_id: &str,
+        resolution: &str,
+        processed_at: i64,
+        processed_by: &str,
+        note: &str,
+    ) -> LicenseResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        update_transfer_ticket_status_tx(
+            &tx,
+            ticket_id,
+            TicketStatus::Rejected,
+            resolution,
+            Some(processed_at),
+            Some(processed_by),
+            note,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// 换机工单处理的单事务入参（见 [`Store::complete_transfer_ticket`]）。
+#[derive(Debug)]
+pub struct TransferCompletion<'a> {
+    /// 工单 ID。
+    pub ticket_id: &'a str,
+    /// 处理结果说明（落 `resolution`）。
+    pub resolution: &'a str,
+    /// 处理备注。
+    pub note: &'a str,
+    /// 处理时刻（UTC 秒；同时用作废弃时间）。
+    pub processed_at: i64,
+    /// 处理人。
+    pub processed_by: &'a str,
+    /// `Some((原码 ID, 废弃原因))` = 同一事务内废弃原码。
+    pub revoke: Option<(&'a str, &'a str)>,
+    /// `Some((新码, 原码 ID))` = 同一事务内插入新码并把原码置 `reissued`。
+    pub reissue: Option<(&'a ActivationCode, &'a str)>,
+}
+
+/// 终结工单（共享原语；**仅 `pending` 可终结**，条件 UPDATE + `rows_affected` 判定）。
+fn update_transfer_ticket_status_tx(
+    tx: &Transaction<'_>,
+    ticket_id: &str,
+    status: TicketStatus,
+    resolution: &str,
+    processed_at: Option<i64>,
+    processed_by: Option<&str>,
+    note: &str,
+) -> LicenseResult<()> {
+    let affected = tx.execute(
+        "UPDATE transfer_ticket
+            SET status = ?2, resolution = ?3, processed_at = ?4, processed_by = ?5, note = ?6
+          WHERE ticket_id = ?1 AND status = 'pending'",
+        params![ticket_id, status.as_str(), resolution, processed_at, processed_by, note],
+    )?;
+    if affected != 1 {
+        // 不存在 / 已终结 / 并发抢先：均按「非待处理」拒绝（终态不可复写）。
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM transfer_ticket WHERE ticket_id = ?1",
+                params![ticket_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return Err(match current {
+            None => LicenseError::KeyStateIllegal(format!(
+                "transfer ticket not found: {ticket_id}"
+            )),
+            Some(raw) => LicenseError::ticket_not_pending(format!(
+                "transfer ticket {ticket_id} is {raw}, not pending"
+            )),
+        });
+    }
+    Ok(())
+}
+
+/// 追加 `transfer_ticket` 过滤条件（**只用绑定参数**）。
+fn push_transfer_filter(
+    sql: &mut String,
+    args: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    filter: &TransferFilter,
+) {
+    if let Some(tenant_id) = &filter.tenant_id {
+        sql.push_str(" AND tenant_id = ?");
+        args.push(Box::new(tenant_id.clone()));
+    }
+    if let Some(status) = filter.status {
+        sql.push_str(" AND status = ?");
+        args.push(Box::new(status.as_str().to_string()));
     }
 }
 
@@ -3505,5 +3853,276 @@ mod tests {
             store.get_device(&id).expect("get").expect("some").device_id,
             id
         );
+    }
+
+    // ---------------- transfer_ticket ----------------
+
+    fn sample_ticket(ticket_id: &str, source_code_id: &str) -> TransferTicket {
+        TransferTicket::new_pending(
+            ticket_id.into(),
+            "t-1".into(),
+            "aaaa1111".into(),
+            "bbbb2222".into(),
+            source_code_id.into(),
+            "主板损坏返修".into(),
+            1_700_000_000,
+        )
+    }
+
+    /// 工单 round-trip：插入 / 直查 / 过滤分页 / 计数 / 终结字段 / 终态不可复写。
+    #[test]
+    fn transfer_ticket_round_trip_and_filters() {
+        let (store, _) = fixture();
+        store
+            .insert_code(&sample_code("c-t1", "IOT-TRANSFER-1"))
+            .expect("code1");
+        store
+            .insert_code(&sample_code("c-t2", "IOT-TRANSFER-2"))
+            .expect("code2");
+        let mut second = sample_ticket("tr-2", "c-t2");
+        second.submitted_at = 1_700_000_100;
+        store.insert_transfer_ticket(&sample_ticket("tr-1", "c-t1")).expect("t1");
+        store.insert_transfer_ticket(&second).expect("t2");
+
+        // 直查 round-trip（终态字段留空）。
+        let got = store
+            .get_transfer_ticket("tr-1")
+            .expect("get")
+            .expect("some");
+        assert_eq!(got.status, TicketStatus::Pending);
+        assert_eq!(got.resolution, "");
+        assert_eq!(got.processed_at, None);
+        assert_eq!(got.processed_by, None);
+        assert!(store.get_transfer_ticket("tr-none").expect("get").is_none());
+
+        // 全量（按 submitted_at 升序）。
+        let all = store
+            .list_transfer_tickets(&TransferFilter::default(), 1, 20)
+            .expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].ticket_id, "tr-1");
+        assert_eq!(all[1].ticket_id, "tr-2");
+        assert_eq!(
+            store
+                .count_transfer_tickets(&TransferFilter::default())
+                .expect("count"),
+            2
+        );
+
+        // 状态过滤：无 processed。
+        let pending = store
+            .list_transfer_tickets(
+                &TransferFilter {
+                    status: Some(TicketStatus::Pending),
+                    ..Default::default()
+                },
+                1,
+                20,
+            )
+            .expect("pending");
+        assert_eq!(pending.len(), 2);
+
+        // 终结（pending → processed），终态字段落库。
+        store
+            .update_transfer_ticket_status(
+                "tr-1",
+                TicketStatus::Processed,
+                "已废弃旧码并重发",
+                Some(1_700_000_500),
+                Some("admin"),
+                "补充说明不少于十个字符",
+            )
+            .expect("process tr-1");
+        let done = store
+            .get_transfer_ticket("tr-1")
+            .expect("get")
+            .expect("some");
+        assert_eq!(done.status, TicketStatus::Processed);
+        assert_eq!(done.resolution, "已废弃旧码并重发");
+        assert_eq!(done.processed_at, Some(1_700_000_500));
+        assert_eq!(done.processed_by.as_deref(), Some("admin"));
+
+        // 终态不可复写。
+        let err = store
+            .update_transfer_ticket_status(
+                "tr-1",
+                TicketStatus::Rejected,
+                "驳回",
+                Some(1_700_000_600),
+                Some("admin"),
+                "补充说明不少于十个字符",
+            )
+            .expect_err("already processed");
+        assert!(matches!(err, LicenseError::TicketNotPending(_)), "{err:?}");
+        assert_eq!(err.error_code(), crate::error::ERR_LICENSE_TRANSFER);
+        // 未知工单 → 也按「非待处理」语义（KeyStateIllegal / TicketNotPending 二者之一：此处为不存在）。
+        assert!(store
+            .update_transfer_ticket_status(
+                "tr-none",
+                TicketStatus::Rejected,
+                "驳回",
+                None,
+                None,
+                "",
+            )
+            .is_err());
+    }
+
+    /// 未知 `status` 落库串 → **严格 `Err`**（绝不静默兜底为 pending）。
+    #[test]
+    fn transfer_ticket_unknown_status_is_rejected() {
+        let (store, _) = fixture();
+        store
+            .insert_code(&sample_code("c-bad", "IOT-TRANSFER-BAD"))
+            .expect("code");
+        // 直接写入脏 status（仓储层之外的落库串），验证行映射严格性。
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "INSERT INTO transfer_ticket
+                   (ticket_id, tenant_id, old_machine_code, new_machine_code, source_code_id,
+                    reason, submitted_at, status, resolution, processed_at, processed_by, note)
+                 VALUES ('tr-bad', 't-1', '', '', 'c-bad', 'r', 1700000000, 'weird', '', NULL, NULL, '')",
+                [],
+            )
+            .expect("seed dirty row");
+        }
+        let err = store.get_transfer_ticket("tr-bad").expect_err("dirty status");
+        assert!(matches!(err, LicenseError::Storage(_)), "{err:?}");
+        assert!(err.to_string().contains("unknown transfer_ticket.status"), "{err}");
+    }
+
+    /// 换机处理单事务：工单终结 + 废弃 + 重发一并生效；重复处理 → `TicketNotPending`（回滚）。
+    #[test]
+    fn complete_transfer_ticket_is_single_transaction() {
+        let (store, _) = fixture();
+        store
+            .insert_code(&sample_code("c-src", "IOT-TRANSFER-SRC"))
+            .expect("code");
+        store
+            .insert_transfer_ticket(&sample_ticket("tr-tx", "c-src"))
+            .expect("ticket");
+
+        // 新码（issued，带溯源）。
+        let mut new_code = sample_code("c-new", "IOT-TRANSFER-NEW");
+        new_code.reissued_from_id = Some("c-src".into());
+        let completion = TransferCompletion {
+            ticket_id: "tr-tx",
+            resolution: "已废弃旧码并重发",
+            note: "补充说明不少于十个字符",
+            processed_at: 1_700_000_900,
+            processed_by: "admin",
+            revoke: Some(("c-src", "客户更换硬件")),
+            reissue: Some((&new_code, "c-src")),
+        };
+        store.complete_transfer_ticket(&completion).expect("complete");
+
+        let ticket = store
+            .get_transfer_ticket("tr-tx")
+            .expect("get")
+            .expect("some");
+        assert_eq!(ticket.status, TicketStatus::Processed);
+        // 原码 revoked → reissued；新码已插入并溯源。
+        assert_eq!(
+            store
+                .get_code_by_id("c-src")
+                .expect("src")
+                .expect("some")
+                .status,
+            CodeStatus::Reissued
+        );
+        assert_eq!(
+            store
+                .find_code_by_reissued_from("c-src")
+                .expect("find")
+                .expect("some")
+                .code_id,
+            "c-new"
+        );
+
+        // 重复处理 → TicketNotPending（且不会插入第二张新码 / 不改码状态）。
+        let mut dup = sample_code("c-new-2", "IOT-TRANSFER-NEW2");
+        dup.reissued_from_id = Some("c-src".into());
+        let dup_completion = TransferCompletion {
+            ticket_id: "tr-tx",
+            resolution: "再次处理",
+            note: "补充说明不少于十个字符",
+            processed_at: 1_700_001_000,
+            processed_by: "admin",
+            revoke: None,
+            reissue: Some((&dup, "c-src")),
+        };
+        let err = store
+            .complete_transfer_ticket(&dup_completion)
+            .expect_err("dup process");
+        assert!(matches!(err, LicenseError::TicketNotPending(_)), "{err:?}");
+        assert!(
+            store.get_code_by_id("c-new-2").expect("get").is_none(),
+            "重复处理不得插入新码（事务回滚）"
+        );
+    }
+
+    /// 平均处理时长：无已处理工单 → `None`；处理后 = 真实均值。
+    #[test]
+    fn transfer_avg_processing_secs_is_real() {
+        let (store, _) = fixture();
+        assert_eq!(store.avg_transfer_processing_secs().expect("avg"), None);
+
+        store
+            .insert_code(&sample_code("c-avg", "IOT-TRANSFER-AVG"))
+            .expect("code");
+        store
+            .insert_transfer_ticket(&sample_ticket("tr-avg", "c-avg"))
+            .expect("ticket");
+        // submitted_at = 1_700_000_000；处理时刻顺延 3600 秒。
+        store
+            .update_transfer_ticket_status(
+                "tr-avg",
+                TicketStatus::Processed,
+                "done",
+                Some(1_700_003_600),
+                Some("a"),
+                "note note note",
+            )
+            .expect("process");
+        assert_eq!(
+            store.avg_transfer_processing_secs().expect("avg"),
+            Some(3_600)
+        );
+    }
+
+    /// 驳回：`pending → rejected`，**不改动任何码状态**。
+    #[test]
+    fn reject_transfer_ticket_keeps_codes_untouched() {
+        let (store, _) = fixture();
+        store
+            .insert_code(&sample_code("c-rj", "IOT-TRANSFER-RJ"))
+            .expect("code");
+        store
+            .insert_transfer_ticket(&sample_ticket("tr-rj", "c-rj"))
+            .expect("ticket");
+
+        store
+            .reject_transfer_ticket("tr-rj", "客户材料不全，驳回", 1_700_001_100, "admin", "补充说明不少于十个字符")
+            .expect("reject");
+        let ticket = store
+            .get_transfer_ticket("tr-rj")
+            .expect("get")
+            .expect("some");
+        assert_eq!(ticket.status, TicketStatus::Rejected);
+        assert_eq!(ticket.resolution, "客户材料不全，驳回");
+        // 码状态原样保留。
+        assert_eq!(
+            store
+                .get_code_by_id("c-rj")
+                .expect("code")
+                .expect("some")
+                .status,
+            CodeStatus::Issued
+        );
+        // 终态不可二次驳回。
+        assert!(store
+            .reject_transfer_ticket("tr-rj", "再次驳回", 1_700_001_200, "admin", "补充说明不少于十个字符")
+            .is_err());
     }
 }

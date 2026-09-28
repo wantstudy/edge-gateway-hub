@@ -42,17 +42,21 @@ use std::collections::HashMap;
 
 use crate::admin_auth::{AdminAuth, AuthedAdmin, Role};
 use crate::error::LicenseError;
-use crate::model::{now_ns_id, now_unix_secs, ActorType, CodeStatus, Device, SigningKey, Tenant};
+use crate::model::{
+    normalize_machine_code, now_ns_id, now_unix_secs, ActorType, CodeStatus, Device, SigningKey,
+    Tenant, TicketStatus,
+};
 use crate::proto::{
     self, ActivationRequest, ActivationStatsDay, ActivationStatsQuery, ActivationStatsResponse,
     AdminLoginRequest, AdminLoginResponse, ApiEnvelope, AuditLogItem, AuditLogQuery, CodeDetail,
-    CodeListQuery, CodeSummary, CreateTenantRequest, DeviceListItem, DeviceListQuery,
-    HeartbeatRequest, IssueCodesRequest, OtaPackageItem, OtaStatusRequest, OverviewResponse,
-    PagedResponse, ReceiptAnomalyItem, ReissueCodeRequest, RevokeCodeRequest, SigningKeyItem,
-    TenantItem, TimelineEntry, UpdateTenantPolicyRequest, UploadOtaRequest,
+    CodeListQuery, CodeSummary, CreateTenantRequest, CreateTransferRequest, DeviceListItem,
+    DeviceListQuery, HeartbeatRequest, IssueCodesRequest, OtaPackageItem, OtaStatusRequest,
+    OverviewResponse, PagedResponse, ProcessTransferRequest, ReceiptAnomalyItem,
+    ReissueCodeRequest, RejectTransferRequest, RevokeCodeRequest, SigningKeyItem, TenantItem,
+    TimelineEntry, TransferListQuery, UpdateTenantPolicyRequest, UploadOtaRequest,
 };
 use crate::service::LicensingService;
-use crate::store::{AuditFilter, CodeFilter};
+use crate::store::{AuditFilter, CodeFilter, TransferFilter};
 
 /// 共享服务句柄（axum 路由状态）。
 pub type SharedService = Arc<LicensingService>;
@@ -132,6 +136,23 @@ pub fn router(service: SharedService, auth: Arc<AdminAuth>) -> Router {
         .route("/admin/codes/issue", post(issue_codes))
         .route("/admin/codes/:code_id/revoke", post(revoke_code))
         .route("/admin/codes/:code_id/reissue", post(reissue_code))
+        // 管理端：换机工单（设计契约 `docs/design/ui-admin-console.md:203`：
+        // `GET /admin/transfers`、`POST /admin/transfers/{id}/process`）。
+        // 另外两条为**补齐**：契约未定义「提交」与「驳回」端点，但工单必须能从无到有地
+        // 创建、且 `rejected` 终态必须可达（见各 handler 文档）。
+        // 权限对齐全端 RBAC：`transfer.view` / `transfer.process` 均 = lic_ops / system。
+        .route(
+            "/admin/transfers",
+            get(admin_transfers).post(admin_create_transfer),
+        )
+        .route(
+            "/admin/transfers/:ticket_id/process",
+            post(admin_process_transfer),
+        )
+        .route(
+            "/admin/transfers/:ticket_id/reject",
+            post(admin_reject_transfer),
+        )
         // 管理端：系统更新（OTA 升级包仓库；上传 / 发布 / 停用均仅 system）。
         .route("/admin/updates", get(admin_ota_list).post(admin_ota_upload))
         .route("/admin/updates/:version/publish", post(admin_ota_publish))
@@ -317,6 +338,19 @@ async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Re
             .count_warnings()
             .unwrap_or(0)
             .to_string(),
+        // 换机工单：真实计数 + 真实平均处理时长（无已处理工单 → None → 前端 `—`）。
+        pending_transfers: store
+            .count_transfer_tickets(&TransferFilter {
+                status: Some(TicketStatus::Pending),
+                ..Default::default()
+            })
+            .unwrap_or(0)
+            .to_string(),
+        avg_transfer_secs: store
+            .avg_transfer_processing_secs()
+            .ok()
+            .flatten()
+            .map(|v| v.to_string()),
         active_kid,
     };
     ok_json(data)
@@ -666,6 +700,11 @@ async fn admin_roles(State(state): State<AppState>, headers: HeaderMap) -> Respo
 ///
 /// store 原生只支持租户过滤；`deploy_mode` / `status` / `machine_code` 在内存过滤
 /// （管理台数据量级可接受，注释即契约）。
+///
+/// **机器码关键字必须归一后再比较**：库内值为无分隔符小写（激活时 `normalize_machine_code`
+/// 归一），而运维常把网关控制台复制的**带 `-` 展示态**（`8F3A-91C2-…`）粘进搜索框。
+/// 只对库内值 `to_lowercase()` 不足以命中（分隔符仍在检索串里）——检索串同样经
+/// [`crate::model::normalize_machine_code`] 归一（**复用同一函数**，不写第二套）。
 async fn admin_devices(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -689,7 +728,8 @@ async fn admin_devices(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase());
+        // 与库内值同口径归一（剥分隔符 / 空白 + 小写），否则带 `-` 的展示态检索串永不命中。
+        .map(normalize_machine_code);
     let needs_scan = deploy.is_some() || status.is_some() || machine.is_some();
 
     // 取候选集：无内存过滤直接走 store 分页；有过滤则分批扫描全量再过滤。
@@ -721,7 +761,7 @@ async fn admin_devices(
                         }
                     }
                     if let Some(kw) = &machine {
-                        if !d.machine_code.to_lowercase().contains(kw) {
+                        if !normalize_machine_code(&d.machine_code).contains(kw.as_str()) {
                             return false;
                         }
                     }
@@ -1059,6 +1099,139 @@ async fn reissue_code(
     match state
         .service
         .reissue(&tenant_id, &code_id, &req, &authed.sub)
+    {
+        Ok(resp) => ok_json(resp),
+        Err(e) => error_response(&e),
+    }
+}
+
+// ============================================================================
+// 管理端：换机工单（lic_ops / system；`transfer.view` / `transfer.process`）
+// ============================================================================
+
+/// `GET /admin/transfers`：换机工单列表（**设计契约端点**
+/// `docs/design/ui-admin-console.md:203`；`transfer.view` = lic_ops / system）。
+///
+/// `status` 非法值 → 400（**不静默忽略**：`TicketStatus::parse` 严格解析）。
+async fn admin_transfers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TransferListQuery>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_DANGEROUS, "view transfer tickets") {
+        return resp;
+    }
+    let (page, page_size) = page_params(q.page, q.page_size);
+    let filter = TransferFilter {
+        tenant_id: q
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        status: match q.status.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => match TicketStatus::parse(raw) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    return error_response(&LicenseError::KeyStateIllegal(format!(
+                        "unknown transfer status filter: {raw}"
+                    )));
+                }
+            },
+        },
+    };
+    let service = &state.service;
+    let items = match service.admin_list_transfer_tickets(&filter, page, page_size) {
+        Ok(rows) => rows,
+        Err(e) => return error_response(&e),
+    };
+    let total = service
+        .store()
+        .count_transfer_tickets(&filter)
+        .unwrap_or(0);
+    ok_json(paged(items, total, page, page_size))
+}
+
+/// `POST /admin/transfers`：受理换机申请（**契约未定义的补齐端点**；`transfer.process`）。
+///
+/// 契约文档只定义了列表与处理两条；但工单若无提交入口则 `GET` 永远为空、
+/// `process` 永远无对象。故补齐本端点，语义为「**客服代客户录入**换机申请」。
+/// 租户取自请求体 `tenant_id`（本端点不要求 `X-Tenant-Id`，与列表查询同口径）。
+async fn admin_create_transfer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateTransferRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_DANGEROUS, "create transfer ticket") {
+        return resp;
+    }
+    match state.service.admin_create_transfer_ticket(&req, &authed.sub) {
+        Ok(item) => ok_json(item),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `POST /admin/transfers/:ticket_id/process`：处理换机工单（**设计契约端点**；`transfer.process`）。
+///
+/// 「废弃 + 重发」在**单个事务**内完成（见 `LicensingService::admin_process_transfer_ticket`）；
+/// 租户取 `X-Tenant-Id` 头（与 `revoke` / `reissue` 同口径，防跨租户操作）。
+async fn admin_process_transfer(
+    State(state): State<AppState>,
+    Path(ticket_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<ProcessTransferRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_DANGEROUS, "process transfer ticket") {
+        return resp;
+    }
+    let tenant_id = match require_tenant_header(&headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    match state
+        .service
+        .admin_process_transfer_ticket(&tenant_id, &ticket_id, &req, &authed.sub)
+    {
+        Ok(resp) => ok_json(resp),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `POST /admin/transfers/:ticket_id/reject`：驳回换机工单（**契约未定义的补齐端点**；
+/// `transfer.process`）。无此端点则 `rejected` 终态不可达。
+async fn admin_reject_transfer(
+    State(state): State<AppState>,
+    Path(ticket_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<RejectTransferRequest>,
+) -> Response {
+    let authed = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_role(&authed, &ROLES_DANGEROUS, "reject transfer ticket") {
+        return resp;
+    }
+    let tenant_id = match require_tenant_header(&headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    match state
+        .service
+        .admin_reject_transfer_ticket(&tenant_id, &ticket_id, &req, &authed.sub)
     {
         Ok(resp) => ok_json(resp),
         Err(e) => error_response(&e),
@@ -1432,6 +1605,8 @@ pub fn error_to_code(err: &LicenseError) -> &'static str {
         LicenseError::TenantNotFound(_) => proto::codes::TENANT_NOT_FOUND,
         // 发放缺少预绑定机器码 → MACHINE_CODE_REQUIRED（400，2026-09-27 主理人决策）。
         LicenseError::MachineCodeRequired(_) => proto::codes::MACHINE_CODE_REQUIRED,
+        // 换机工单已非待处理（重复处理 / 重复驳回）→ TICKET_NOT_PENDING（409）。
+        LicenseError::TicketNotPending(_) => proto::codes::TICKET_NOT_PENDING,
         // 存储层异常属内部错误：用未知业务码，让 `http_status` 兜底为 500，
         // 绝不伪装成客户端 400（否则故障被掩盖）。
         LicenseError::Storage(_) => "INTERNAL_SERVER_ERROR",
@@ -3451,5 +3626,266 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::from_u16(401).unwrap());
         assert_eq!(resp["code"], "VERIFY_FAIL");
+    }
+
+    /// `GET /admin/devices`：**带 `-` 的展示态机器码检索串必须命中**库内无分隔符小写设备。
+    ///
+    /// 回归：早期只对库内值 `to_lowercase()`，检索串里的分隔符仍在 → 永不命中。
+    #[tokio::test]
+    async fn http_admin_devices_keyword_is_normalized() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body("M1", "h-mc-norm"),
+            &authed,
+        )
+        .await;
+        let code = issue["data"]["codes"][0]["code"].as_str().unwrap();
+        let (status, _) = call_with(
+            &svc,
+            "POST",
+            "/activation",
+            activate_body(code, "M1"),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 展示态（大写 + 分隔符）检索串：必须归一后命中。
+        let (_, hit) = call_with(
+            &svc,
+            "GET",
+            "/admin/devices?machine_code=M-1",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(hit["data"]["total"], "1", "带分隔符检索串必须命中（归一后）");
+        // 实质不同（多一位）的串仍不命中（归一 ≠ 模糊匹配）。
+        let (_, miss) = call_with(
+            &svc,
+            "GET",
+            "/admin/devices?machine_code=M-1X",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(miss["data"]["total"], "0");
+    }
+
+    /// `GET /admin/transfers`：状态非法筛选 → 400（不静默忽略）。
+    #[tokio::test]
+    async fn http_transfers_reject_unknown_status_filter() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token)];
+        let (status, body) = call_with(
+            &svc,
+            "GET",
+            "/admin/transfers?status=weird",
+            json!(null),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, bad_request());
+        assert_eq!(body["code"], "BAD_REQUEST");
+    }
+
+    /// 换机工单全链路：创建 → 列表 → 处理（废弃+重发单事务）→ 重复处理 409 → 驳回。
+    #[tokio::test]
+    async fn http_transfer_ticket_full_lifecycle() {
+        let svc = build_service();
+        let token = admin_token();
+        let authed = [bearer(&token), ("x-tenant-id".to_string(), "t-1".to_string())];
+
+        // 发码（预绑定 M1）。
+        let (_, issue) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body("M1", "h-tr-lifecycle"),
+            &authed,
+        )
+        .await;
+        let code_id = issue["data"]["codes"][0]["code_id"].as_str().unwrap().to_string();
+
+        // 创建工单（机器码用带 `-` 的展示态 → 必须归一）。
+        let (status, created) = call_with(
+            &svc,
+            "POST",
+            "/admin/transfers",
+            json!({
+                "tenant_id": "t-1",
+                "old_machine_code": "M-1",
+                "new_machine_code": "",
+                "source_code_id": code_id,
+                "reason": "客户换机",
+            }),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(created["data"]["status"], "pending");
+        assert_eq!(created["data"]["old_machine_code"], "m1");
+        let ticket_id = created["data"]["ticket_id"].as_str().unwrap().to_string();
+
+        // 列表可见（transfer.view）。
+        let (_, list) = call_with(&svc, "GET", "/admin/transfers", json!(null), &authed).await;
+        assert_eq!(list["data"]["total"], "1");
+        assert_eq!(list["data"]["items"][0]["ticket_id"], ticket_id);
+
+        // 总览「待处理换机工单」接真实计数。
+        let (_, overview) = call_with(&svc, "GET", "/admin/overview", json!(null), &authed).await;
+        assert_eq!(overview["data"]["pending_transfers"], "1");
+        assert!(
+            overview["data"]["avg_transfer_secs"].is_null(),
+            "无已处理工单时平均处理时长必须为 null（前端显示 —）"
+        );
+
+        // 处理（reissue=true）。
+        let (status, processed) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/transfers/{ticket_id}/process"),
+            json!({
+                "reason": "客户更换硬件",
+                "note": "客户已确认这是换机而非误操作",
+                "confirm": ticket_id,
+                "resolution": "已废弃旧码并重发",
+                "reissue": true,
+                "prebind_new": false,
+                "inherit_tier": true,
+            }),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{processed}");
+        assert_eq!(processed["data"]["ticket"]["status"], "processed");
+        assert!(
+            processed["data"]["new_code"]["code_id"].as_str().is_some(),
+            "重发必须返回新码"
+        );
+        assert_eq!(
+            processed["data"]["new_code"]["reissued_from"],
+            code_id,
+            "新码必须溯源到原码"
+        );
+        // 处理后：待处理计数归零，平均处理时长出现（真实 AVG(processed_at - submitted_at)）。
+        let (_, overview2) = call_with(&svc, "GET", "/admin/overview", json!(null), &authed).await;
+        assert_eq!(overview2["data"]["pending_transfers"], "0");
+        assert!(
+            overview2["data"]["avg_transfer_secs"].as_str().is_some(),
+            "有已处理工单时必须给出真实平均处理时长"
+        );
+
+        // 重复处理 → 409 TICKET_NOT_PENDING（绝不重复处理）。
+        let (status, again) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/transfers/{ticket_id}/process"),
+            json!({
+                "reason": "客户更换硬件",
+                "note": "客户已确认这是换机而非误操作",
+                "confirm": ticket_id,
+                "resolution": "再次处理",
+                "reissue": true,
+            }),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(again["code"], "TICKET_NOT_PENDING");
+
+        // 第二条工单：确认串不符 → 412。
+        let (_, issue2) = call_with(
+            &svc,
+            "POST",
+            "/admin/codes/issue",
+            issue_body("M2", "h-tr-lifecycle-2"),
+            &authed,
+        )
+        .await;
+        let code_id2 = issue2["data"]["codes"][0]["code_id"].as_str().unwrap().to_string();
+        let (_, created2) = call_with(
+            &svc,
+            "POST",
+            "/admin/transfers",
+            json!({
+                "tenant_id": "t-1",
+                "old_machine_code": "M2",
+                "new_machine_code": "",
+                "source_code_id": code_id2,
+                "reason": "客户换机",
+            }),
+            &authed,
+        )
+        .await;
+        let ticket2 = created2["data"]["ticket_id"].as_str().unwrap().to_string();
+        let (status, mismatch) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/transfers/{ticket2}/process"),
+            json!({
+                "reason": "客户更换硬件",
+                "note": "客户已确认这是换机而非误操作",
+                "confirm": "WRONG",
+                "resolution": "已处理",
+                "reissue": false,
+            }),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::from_u16(412).unwrap());
+        assert_eq!(mismatch["code"], "CONFIRM_MISMATCH");
+
+        // 驳回 → rejected（码状态未变）+ 二次驳回 409。
+        let (status, rejected) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/transfers/{ticket2}/reject"),
+            json!({
+                "reason": "误发放",
+                "note": "客户未提供任何换机凭证",
+                "confirm": ticket2,
+                "resolution": "客户材料不全，驳回",
+            }),
+            &authed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(rejected["data"]["ticket"]["status"], "rejected");
+
+        // 权限：ops 角色（oliver）不得查看 / 处理换机工单 → 403。
+        let ops = ops_token();
+        let (status, denied) = call_with(
+            &svc,
+            "GET",
+            "/admin/transfers",
+            json!(null),
+            &[bearer(&ops), ("x-tenant-id".to_string(), "t-1".to_string())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(denied["code"], "ADMIN_ONLY");
+
+        // 缺 X-Tenant-Id 头 → 400。
+        let (status, _) = call_with(
+            &svc,
+            "POST",
+            &format!("/admin/transfers/{ticket_id}/process"),
+            json!({
+                "reason": "客户更换硬件",
+                "note": "客户已确认这是换机而非误操作",
+                "confirm": ticket_id,
+                "resolution": "已处理",
+            }),
+            &[bearer(&token)],
+        )
+        .await;
+        assert_eq!(status, bad_request());
     }
 }

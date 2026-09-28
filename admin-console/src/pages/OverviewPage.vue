@@ -101,7 +101,7 @@
           <div class="ac-list__item">
             <div>
               <div class="ac-list__title">换机工单 待处理 {{ data.pendingTransfers }} 单</div>
-              <div class="ac-list__desc">目标 ≤3 次点击完成</div>
+              <div class="ac-list__desc">平均处理时长 {{ data.avgTransferDuration }} · 目标 ≤3 次点击完成</div>
             </div>
             <div class="ac-list__ops">
               <button type="button" class="ac-btn ac-btn--sm ac-btn--primary" @click="go('transfers')">去处理</button>
@@ -204,6 +204,7 @@ function exportCsv(): void {
     ['回执缺失 >24h', data.receiptMissing],
     ['回执签名无效', data.receiptBadSig],
     ['待处理换机工单', data.pendingTransfers],
+    ['换机工单平均处理时长', data.avgTransferDuration],
     ['待核查回执异常', data.pendingAnomalies],
     ['当前签署 kid', data.currentKid],
     ['kid 剩余有效期（天）', data.kidRetireInDays],
