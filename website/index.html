@@ -1393,7 +1393,7 @@ wantstudy/iot-daq-gateway:latest</code></pre>
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - /data/edge-gateway:/var/lib/iot-daq
+      - /data/edge-gateway:/var/lib/iot-daq:rw
       - /etc/machine-id:/host/etc/machine-id:ro
       - /sys/class/dmi/id:/host/sys/class/dmi/id:ro</code></pre>
           </div>
