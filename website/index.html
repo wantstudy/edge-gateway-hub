@@ -15,7 +15,7 @@
 <meta property="og:site_name" content="IoT-DAQ Gateway">
 <meta property="og:locale" content="zh_CN">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"SoftwareApplication","name":"IoT-DAQ Gateway","operatingSystem":"Windows 10/11, Linux, Docker","applicationCategory":"Industrial Application","description":"开源工业边缘数据采集网关：多协议采集、MQTT 北向转发、断网续传、Web 控制台。","url":"https://edge.webscad.cn/","downloadUrl":"https://github.com/wantstudy/edge-gateway-hub/releases","offers":{"@type":"Offer","price":"0","priceCurrency":"CNY"}}
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"IoT-DAQ Gateway","operatingSystem":"Windows 10/11, Linux, Docker","applicationCategory":"Industrial Application","description":"开源工业边缘数据采集网关：多协议采集、MQTT 北向转发、断网续传、Web 控制台。","url":"https://edge.webscad.cn/","downloadUrl":"https://github.com/wantstudy/edge-gateway-hub/raw/main/downloads/IoT-DAQ-Gateway_0.2.0_x64-setup.exe","offers":{"@type":"Offer","price":"0","priceCurrency":"CNY"}}
 </script>
 <link rel="icon" type="image/png" href="/favicon.png">
 <script async charset="utf-8" src="https://zz.bdstatic.com/linksubmit/push.js"></script>
@@ -1071,6 +1071,16 @@ a:hover { text-decoration: underline; }
   }
   .js .reveal { opacity: 1; transform: none; }
 }
+
+/* ===== 网关程序系统图 ===== */
+.diagrams{padding:72px 0;background:linear-gradient(180deg,var(--bg-2),var(--bg))}
+.diagrams-head{text-align:center;margin-bottom:36px}
+.diagram-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.diagram-card{margin:0;background:var(--surface);border:1px solid #1b2330;border-radius:16px;overflow:hidden;transition:transform .2s ease,border-color .2s ease}
+.diagram-card:hover{transform:translateY(-4px);border-color:#17C3B2}
+.diagram-card img{display:block;width:100%;height:auto;background:#0a0e1a}
+.diagram-card figcaption{padding:14px 16px;font-size:13px;color:#8b98a9;border-top:1px solid #1b2330}
+@media(max-width:900px){.diagram-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -1091,7 +1101,7 @@ a:hover { text-decoration: underline; }
       </ul>
     </nav>
     <div class="topbar-right">
-      <span class="ver-tag">v0.1.0</span>
+      <span class="ver-tag">v0.2.0</span>
       <a class="btn btn-primary btn-nav" href="https://github.com/wantstudy/edge-gateway-hub" target="_blank" rel="noopener noreferrer">GitHub <span class="arrow">↗</span></a>
     </div>
   </div>
@@ -1111,7 +1121,7 @@ a:hover { text-decoration: underline; }
           <a class="btn btn-ghost" href="#start">快速开始 <span class="arrow">↓</span></a>
         </div>
         <div class="hero-stats" role="list" aria-label="产品信息">
-          <div class="stat" role="listitem"><b>v0.1.0</b><span>当前版本</span></div>
+          <div class="stat" role="listitem"><b>v0.2.0</b><span>当前版本</span></div>
           <div class="stat" role="listitem"><b>93.8 MB</b><span>Docker 镜像</span></div>
           <div class="stat" role="listitem"><b>5.3 MB</b><span>Windows 安装包</span></div>
         </div>
@@ -1160,7 +1170,7 @@ a:hover { text-decoration: underline; }
             <rect class="gw-body" x="244" y="86" width="182" height="150" rx="4"/>
             <rect class="gw-accent" x="244" y="86" width="182" height="24" rx="4"/>
             <text x="252" y="101" class="t-strong" font-size="10.5">IoT-DAQ GATEWAY</text>
-            <text x="410" y="101" text-anchor="end" font-size="9.5">v0.1.0</text>
+            <text x="410" y="101" text-anchor="end" font-size="9.5">v0.2.0</text>
             <circle cx="268" cy="128" r="4" fill="#4ede80" class="led"/>
             <circle cx="284" cy="128" r="4" fill="#3fd8bf" class="led l2"/>
             <circle cx="300" cy="128" r="4" fill="#ffb224" class="led l3"/>
@@ -1286,6 +1296,31 @@ a:hover { text-decoration: underline; }
     </div>
   </section>
 
+  <!-- ===== 网关程序系统图 ===== -->
+  <section class="diagrams" id="architecture">
+    <div class="container">
+      <div class="diagrams-head reveal">
+        <p class="eyebrow">ARCH // SYSTEM</p>
+        <h2 class="sec-title">网关程序系统图</h2>
+        <p class="sec-sub">从现场设备到云平台的完整数据链路，一眼看懂网关如何工作</p>
+      </div>
+      <div class="diagram-grid">
+        <figure class="diagram-card reveal">
+          <img src="/diagram-arch.svg" alt="系统架构图" loading="lazy" />
+          <figcaption>系统架构 · 现场设备 → 网关 → 云平台</figcaption>
+        </figure>
+        <figure class="diagram-card reveal" style="--d:.08s">
+          <img src="/diagram-flow.svg" alt="数据采集流程图" loading="lazy" />
+          <figcaption>数据采集流程 · 采集 → 缓存 → 规则/公式 → 北向</figcaption>
+        </figure>
+        <figure class="diagram-card reveal" style="--d:.16s">
+          <img src="/diagram-deploy.svg" alt="部署拓扑图" loading="lazy" />
+          <figcaption>部署拓扑 · 单容器 host 网络 · 非 root</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
   <!-- ===== 快速下载 ===== -->
   <section class="download" id="download">
     <div class="container">
@@ -1307,11 +1342,11 @@ a:hover { text-decoration: underline; }
           <ul class="media-meta">
             <li><span class="mk">OS</span><span>Windows 10 / 11 x64</span></li>
             <li><span class="mk">SIZE</span><span>约 5.3 MB · 安装即用</span></li>
-            <li><span class="mk">PKG</span><span>IoT-DAQ-Gateway_0.1.0_x64-setup.exe</span></li>
+            <li><span class="mk">PKG</span><span>IoT-DAQ-Gateway_0.2.0_x64-setup.exe</span></li>
           </ul>
           <div class="media-foot">
-            <a class="btn btn-primary" href="https://github.com/wantstudy/edge-gateway-hub/raw/main/downloads/IoT-DAQ-Gateway_0.1.0_x64-setup.exe" target="_blank" rel="noopener noreferrer">下载 <span class="arrow">↓</span></a>
-            <span class="media-size">v0.1.0</span>
+            <a class="btn btn-primary" href="https://github.com/wantstudy/edge-gateway-hub/raw/main/downloads/IoT-DAQ-Gateway_0.2.0_x64-setup.exe" target="_blank" rel="noopener noreferrer">下载 <span class="arrow">↓</span></a>
+            <span class="media-size">v0.2.0</span>
           </div>
         </article>
 
@@ -1323,16 +1358,16 @@ a:hover { text-decoration: underline; }
           <h3 class="media-title">Docker 镜像</h3>
           <ul class="media-meta">
             <li><span class="mk">OS</span><span>Linux AMD64 · 93.8 MB</span></li>
-            <li><span class="mk">IMG</span><span>wantstudy/iot-daq-gateway:latest</span></li>
+            <li><span class="mk">IMG</span><span>wantstudy/iot-daq-gateway:0.2.0</span></li>
             <li><span class="mk">RUN</span><span>host 网络 · 端口 9011/9012</span></li>
           </ul>
           <div class="pull-cmd">
-            <code>docker pull wantstudy/iot-daq-gateway:latest</code>
-            <button class="copy-btn" type="button" data-copy="docker pull wantstudy/iot-daq-gateway:latest">复制</button>
+            <code>docker pull wantstudy/iot-daq-gateway:0.2.0</code>
+            <button class="copy-btn" type="button" data-copy="docker pull wantstudy/iot-daq-gateway:0.2.0">复制</button>
           </div>
           <div class="media-foot">
             <a class="btn btn-ghost" href="#docker">部署方式 <span class="arrow">↓</span></a>
-            <span class="media-size">v0.1.0</span>
+            <span class="media-size">v0.2.0</span>
           </div>
         </article>
       </div>
@@ -1352,30 +1387,11 @@ a:hover { text-decoration: underline; }
 
       <!-- 快速部署：单行命令 -->
       <div class="pull-cmd deploy-quick reveal" style="--d:.04s">
-        <code>docker run -d --name edge-gateway-hub --network host --restart=always -v /data/edge-gateway:/var/lib/iot-daq:rw -v /etc/machine-id:/host/etc/machine-id:ro -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro -e TZ=Asia/Shanghai wantstudy/iot-daq-gateway:latest</code>
-        <button class="copy-btn" type="button" data-copy="docker run -d --name edge-gateway-hub --network host --restart=always -v /data/edge-gateway:/var/lib/iot-daq:rw -v /etc/machine-id:/host/etc/machine-id:ro -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro -e TZ=Asia/Shanghai wantstudy/iot-daq-gateway:latest">复制</button>
+        <code>docker run -d --name edge-gateway-hub --network host --restart=always -v /data/edge-gateway:/var/lib/iot-daq:rw -v /etc/machine-id:/host/etc/machine-id:ro -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro -e TZ=Asia/Shanghai wantstudy/iot-daq-gateway:0.2.0</code>
+        <button class="copy-btn" type="button" data-copy="docker run -d --name edge-gateway-hub --network host --restart=always -v /data/edge-gateway:/var/lib/iot-daq:rw -v /etc/machine-id:/host/etc/machine-id:ro -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro -e TZ=Asia/Shanghai wantstudy/iot-daq-gateway:0.2.0">复制</button>
       </div>
 
       <div class="deploy-grid reveal" style="--d:.08s">
-        <div class="terminal">
-          <div class="term-bar">
-            <span class="term-dot d1" aria-hidden="true"></span>
-            <span class="term-dot d2" aria-hidden="true"></span>
-            <span class="term-dot d3" aria-hidden="true"></span>
-            <span class="term-file">docker run — <b>单容器</b></span>
-          </div>
-          <div class="term-body">
-<pre><code>docker run -d \
---name edge-gateway-hub \
---network host \
---restart=always \
--v /data/edge-gateway:/var/lib/iot-daq:rw \
--v /etc/machine-id:/host/etc/machine-id:ro \
--v /sys/class/dmi/id:/host/sys/class/dmi/id:ro \
--e TZ=Asia/Shanghai \
-wantstudy/iot-daq-gateway:latest</code></pre>
-          </div>
-        </div>
         <div class="terminal">
           <div class="term-bar">
             <span class="term-dot d1" aria-hidden="true"></span>
@@ -1386,7 +1402,7 @@ wantstudy/iot-daq-gateway:latest</code></pre>
           <div class="term-body">
 <pre><code>services:
   edge-gateway-hub:
-    image: wantstudy/iot-daq-gateway:latest
+    image: wantstudy/iot-daq-gateway:0.2.0
     container_name: edge-gateway-hub
     network_mode: host
     restart: always
@@ -1401,7 +1417,7 @@ wantstudy/iot-daq-gateway:latest</code></pre>
       </div>
 
       <div class="deploy-note reveal" style="--d:.12s">
-        <span><b>镜像</b> wantstudy/iot-daq-gateway:latest</span>
+        <span><b>镜像</b> wantstudy/iot-daq-gateway:0.2.0</span>
         <span><b>host 网络</b> 9011 API / 9012 Web</span>
         <span><b>数据</b> /data/edge-gateway</span>
         <span><b>授权地址</b> 已内置，无需配置</span>

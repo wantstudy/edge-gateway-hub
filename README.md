@@ -16,7 +16,7 @@
 | 交付物 | 说明 |
 |---|---|
 | `IoT-DAQ-Gateway_0.2.0_x64-setup.exe` | Windows 10/11 x64 安装包（约 5.3MB） |
-| Docker 镜像 | `iot-daq-gateway-0.2.0-linux-amd64.tar.gz`（linux/amd64，载入：`docker load < 文件名`） |
+| Docker 镜像 | `wantstudy/iot-daq-gateway:0.2.0`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:0.2.0`） |
 
 ---
 
@@ -34,8 +34,8 @@
 ### 一键部署
 
 ```bash
-# 先载入镜像（从本仓库 downloads/ 取得 tar.gz）
-docker load < iot-daq-gateway-0.2.0-linux-amd64.tar.gz
+# 拉取镜像（Docker Hub）
+docker pull wantstudy/iot-daq-gateway:0.2.0
 
 docker run -d \
 --name edge-gateway-hub \
