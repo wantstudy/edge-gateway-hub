@@ -832,6 +832,7 @@ a:hover { text-decoration: underline; }
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 1.2rem;
 }
+.term-bar .copy-mini { margin-left: auto; }
 .deploy-note {
   margin: 1.4rem 0 0;
   display: flex;
@@ -1455,12 +1456,12 @@ a:hover { text-decoration: underline; }
           <h3 class="media-title">Docker 镜像</h3>
           <ul class="media-meta">
             <li><span class="mk">OS</span><span>Linux AMD64 · 93.8 MB</span></li>
-            <li><span class="mk">IMG</span><span>wantstudy/iot-daq-gateway:0.2.0</span></li>
+            <li><span class="mk">IMG</span><span>wantstudy/iot-daq-gateway:latest</span></li>
             <li><span class="mk">RUN</span><span>host 网络 · 端口 9011/9012</span></li>
           </ul>
           <div class="pull-cmd">
-            <code>docker pull wantstudy/iot-daq-gateway:0.2.0</code>
-            <button class="copy-btn" type="button" data-copy="docker pull wantstudy/iot-daq-gateway:0.2.0">复制</button>
+            <code>docker pull wantstudy/iot-daq-gateway:latest</code>
+            <button class="copy-btn" type="button" data-copy="docker pull wantstudy/iot-daq-gateway:latest">复制</button>
           </div>
           <div class="media-foot">
             <a class="btn btn-ghost" href="#docker">部署方式 <span class="arrow">↓</span></a>
@@ -1482,13 +1483,29 @@ a:hover { text-decoration: underline; }
         </div>
       </div>
 
-      <!-- 快速部署：单行命令 -->
-      <div class="pull-cmd deploy-quick reveal" style="--d:.04s">
-        <code>docker run -d --name edge-gateway-hub --network host --restart=always -v /data/edge-gateway:/var/lib/iot-daq:rw -v /etc/machine-id:/host/etc/machine-id:ro -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro -e TZ=Asia/Shanghai wantstudy/iot-daq-gateway:0.2.0</code>
-        <button class="copy-btn" type="button" data-copy="docker run -d --name edge-gateway-hub --network host --restart=always -v /data/edge-gateway:/var/lib/iot-daq:rw -v /etc/machine-id:/host/etc/machine-id:ro -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro -e TZ=Asia/Shanghai wantstudy/iot-daq-gateway:0.2.0">复制</button>
-      </div>
-
       <div class="deploy-grid reveal" style="--d:.08s">
+        <!-- 左：docker run 启动命令 -->
+        <div class="terminal">
+          <div class="term-bar">
+            <span class="term-dot d1" aria-hidden="true"></span>
+            <span class="term-dot d2" aria-hidden="true"></span>
+            <span class="term-dot d3" aria-hidden="true"></span>
+            <span class="term-file">docker run — <b>启动命令</b></span>
+            <button class="copy-mini" type="button" data-copy="docker run -d --name edge-gateway-hub --network host --restart=always -v /data/edge-gateway:/var/lib/iot-daq:rw -v /etc/machine-id:/host/etc/machine-id:ro -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro -e TZ=Asia/Shanghai wantstudy/iot-daq-gateway:latest">复制</button>
+          </div>
+          <div class="term-body">
+<pre><code>docker run -d \
+  --name edge-gateway-hub \
+  --network host \
+  --restart=always \
+  -v /data/edge-gateway:/var/lib/iot-daq:rw \
+  -v /etc/machine-id:/host/etc/machine-id:ro \
+  -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro \
+  -e TZ=Asia/Shanghai \
+  wantstudy/iot-daq-gateway:latest</code></pre>
+          </div>
+        </div>
+        <!-- 右：docker-compose 编排 -->
         <div class="terminal">
           <div class="term-bar">
             <span class="term-dot d1" aria-hidden="true"></span>
@@ -1499,7 +1516,7 @@ a:hover { text-decoration: underline; }
           <div class="term-body">
 <pre><code>services:
   edge-gateway-hub:
-    image: wantstudy/iot-daq-gateway:0.2.0
+    image: wantstudy/iot-daq-gateway:latest
     container_name: edge-gateway-hub
     network_mode: host
     restart: always
@@ -1514,7 +1531,8 @@ a:hover { text-decoration: underline; }
       </div>
 
       <div class="deploy-note reveal" style="--d:.12s">
-        <span><b>镜像</b> wantstudy/iot-daq-gateway:0.2.0</span>
+        <span><b>镜像</b> wantstudy/iot-daq-gateway:latest</span>
+        <span><b>标签</b> latest · 每次拉取均为最新版本</span>
         <span><b>host 网络</b> 9011 API / 9012 Web</span>
         <span><b>数据</b> /data/edge-gateway</span>
         <span><b>授权地址</b> 已内置，无需配置</span>
