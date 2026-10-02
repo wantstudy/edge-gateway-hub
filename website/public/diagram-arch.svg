@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 400" font-family="'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <linearGradient id="gw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#16314f"/>
+      <stop offset="1" stop-color="#0f1b3d"/>
+    </linearGradient>
+    <marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#17C3B2"/>
+    </marker>
+  </defs>
+
+  <!-- title -->
+  <text x="20" y="30" fill="#e6edf3" font-size="18" font-weight="700">系统架构</text>
+  <text x="20" y="50" fill="#8aa0b5" font-size="12">工业边缘数据采集网关 · 边云协同</text>
+
+  <!-- field devices -->
+  <rect x="20" y="80" width="150" height="250" rx="12" fill="#101d33" stroke="#27405e"/>
+  <text x="95" y="104" fill="#17C3B2" font-size="13" font-weight="700" text-anchor="middle">现场设备</text>
+  <g fill="#cbd5e1" font-size="12" text-anchor="middle">
+    <rect x="40" y="120" width="110" height="34" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="95" y="142">PLC</text>
+    <rect x="40" y="164" width="110" height="34" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="95" y="186"> Modbus</text>
+    <rect x="40" y="208" width="110" height="34" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="95" y="230">OPC UA</text>
+    <rect x="40" y="252" width="110" height="34" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="95" y="274">仪表/传感器</text>
+  </g>
+
+  <!-- gateway -->
+  <rect x="350" y="70" width="220" height="270" rx="14" fill="url(#gw)" stroke="#17C3B2"/>
+  <text x="460" y="96" fill="#17C3B2" font-size="14" font-weight="700" text-anchor="middle">IoT-DAQ Gateway</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="372" y="112" width="176" height="40" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="460" y="137" fill="#cbd5e1">多协议采集引擎</text>
+    <rect x="372" y="160" width="176" height="40" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="460" y="185" fill="#cbd5e1">本地缓存 (SQLite)</text>
+    <rect x="372" y="208" width="176" height="40" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="460" y="233" fill="#cbd5e1">规则 / 公式引擎</text>
+    <rect x="372" y="256" width="176" height="40" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="460" y="281" fill="#cbd5e1">北向编码 (MQTT)</text>
+  </g>
+  <text x="460" y="324" fill="#8aa0b5" font-size="11" text-anchor="middle">Windows 安装包 / Docker 镜像</text>
+
+  <!-- cloud -->
+  <rect x="750" y="120" width="150" height="170" rx="12" fill="#101d33" stroke="#27405e"/>
+  <text x="825" y="146" fill="#17C3B2" font-size="13" font-weight="700" text-anchor="middle">云平台</text>
+  <g fill="#cbd5e1" font-size="12" text-anchor="middle">
+    <rect x="770" y="162" width="110" height="34" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="825" y="184">MQTT Broker</text>
+    <rect x="770" y="206" width="110" height="34" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="825" y="228">时序数据库</text>
+    <rect x="770" y="250" width="110" height="34" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="825" y="272">可视化 / 告警</text>
+  </g>
+
+  <!-- web console -->
+  <rect x="350" y="350" width="220" height="0" />
+  <g>
+    <rect x="600" y="318" width="160" height="40" rx="20" fill="#0f1b3d" stroke="#17C3B2"/>
+    <text x="680" y="343" fill="#e6edf3" font-size="12" text-anchor="middle">Web 控制台 (9012)</text>
+  </g>
+
+  <!-- arrows -->
+  <line x1="170" y1="200" x2="345" y2="195" stroke="#17C3B2" stroke-width="2" marker-end="url(#arw)"/>
+  <line x1="575" y1="210" x2="745" y2="205" stroke="#17C3B2" stroke-width="2" marker-end="url(#arw)"/>
+  <line x1="680" y1="318" x2="560" y2="300" stroke="#17C3B2" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arw)"/>
+  <text x="260" y="190" fill="#8aa0b5" font-size="11" text-anchor="middle">采集</text>
+  <text x="660" y="200" fill="#8aa0b5" font-size="11" text-anchor="middle">转发</text>
+</svg>

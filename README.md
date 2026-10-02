@@ -15,14 +15,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.1.0_x64-setup.exe` | Windows 10/11 x64 安装包（约 5.3MB） |
-| Docker 镜像 | `iot-daq-gateway-0.1.7-linux-amd64.tar.gz`（linux/amd64，载入：`docker load < 文件名`） |
+| `IoT-DAQ-Gateway_0.2.0_x64-setup.exe` | Windows 10/11 x64 安装包（约 5.3MB） |
+| Docker 镜像 | `iot-daq-gateway-0.2.0-linux-amd64.tar.gz`（linux/amd64，载入：`docker load < 文件名`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.1.0_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.0_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:8080`）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -35,7 +35,7 @@
 
 ```bash
 # 先载入镜像（从本仓库 downloads/ 取得 tar.gz）
-docker load < iot-daq-gateway-0.1.7-linux-amd64.tar.gz
+docker load < iot-daq-gateway-0.2.0-linux-amd64.tar.gz
 
 docker run -d \
 --name edge-gateway-hub \
@@ -45,7 +45,7 @@ docker run -d \
 -v /etc/machine-id:/host/etc/machine-id:ro \
 -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro \
 -e TZ=Asia/Shanghai \
-iot-daq-gateway:0.1.7
+iot-daq-gateway:0.2.0
 ```
 
 > 机器码自动取自宿主机（machine-id / DMI）；指纹密钥与授权状态随 `/data/edge-gateway` 持久化，首次启动自动生成，无需手工初始化。授权服务地址已内置镜像，无需任何环境变量。
@@ -91,7 +91,7 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.1.0**
+- 当前版本：**v0.2.0**
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## License

@@ -19,7 +19,7 @@
           </div>
           <div class="hero-stats">
             <div class="stat">
-              <span class="stat-value">v0.1.0</span>
+              <span class="stat-value">v0.2.0</span>
               <span class="stat-label">当前版本</span>
             </div>
             <div class="stat">
@@ -107,6 +107,30 @@ broker = <span class="string">"tcp://mqtt-server:1883"</span></code></pre>
       </div>
     </section>
 
+    <!-- System Diagrams -->
+    <section class="diagrams" id="diagrams">
+      <div class="container">
+        <div class="section-header">
+          <h2>网关程序系统图</h2>
+          <p>一图看懂采集、边缘计算与北向转发</p>
+        </div>
+        <div class="diagram-grid">
+          <figure class="diagram-card">
+            <img src="/diagram-arch.svg" alt="系统架构图" loading="lazy" />
+            <figcaption>系统架构 · 边云协同</figcaption>
+          </figure>
+          <figure class="diagram-card">
+            <img src="/diagram-flow.svg" alt="数据采集流程图" loading="lazy" />
+            <figcaption>数据采集流程 · 本地韧性</figcaption>
+          </figure>
+          <figure class="diagram-card">
+            <img src="/diagram-deploy.svg" alt="部署拓扑图" loading="lazy" />
+            <figcaption>部署拓扑 · 最小权限容器</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
     <!-- Download -->
     <section class="download" id="download">
       <div class="container">
@@ -115,7 +139,7 @@ broker = <span class="string">"tcp://mqtt-server:1883"</span></code></pre>
           <p>选择适合您环境的交付形态</p>
         </div>
         <div class="download-cards">
-          <a href="https://github.com/wantstudy/edge-gateway-hub/releases/download/v0.1.0/IoT-DAQ-Gateway_0.1.0_x64-setup.exe" class="download-card" target="_blank">
+          <a href="https://github.com/wantstudy/edge-gateway-hub/raw/main/downloads/IoT-DAQ-Gateway_0.2.0_x64-setup.exe" class="download-card" target="_blank">
             <div class="card-icon">🪟</div>
             <div class="card-info">
               <h3>Windows 安装包</h3>
@@ -126,12 +150,12 @@ broker = <span class="string">"tcp://mqtt-server:1883"</span></code></pre>
               <a-button type="primary" shape="round">下载</a-button>
             </div>
           </a>
-          <a href="https://github.com/wantstudy/edge-gateway-hub" class="download-card" target="_blank">
+          <a href="https://github.com/wantstudy/edge-gateway-hub/raw/main/downloads/iot-daq-gateway-0.2.0-linux-amd64.tar.gz" class="download-card" target="_blank">
             <div class="card-icon">🐳</div>
             <div class="card-info">
               <h3>Docker 镜像</h3>
               <p>Linux AMD64 · 93.8MB</p>
-              <span class="card-tag">docker pull wantstudy/iot-daq-gateway:0.1.0</span>
+              <span class="card-tag">docker load &lt; iot-daq-gateway-0.2.0-linux-amd64.tar.gz</span>
             </div>
             <div class="card-action">
               <a-button type="secondary" shape="round">查看文档</a-button>
@@ -445,6 +469,37 @@ pre {
 .step-content p {
   font-size: 14px;
   color: var(--text-muted);
+}
+
+.diagrams { padding: 80px 0; background: var(--surface); }
+.diagram-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 24px;
+}
+.diagram-card {
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 0;
+  transition: all 0.2s;
+}
+.diagram-card:hover {
+  border-color: rgba(23,195,178,0.3);
+  background: rgba(23,195,178,0.05);
+}
+.diagram-card img {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #0f1b3d;
+}
+.diagram-card figcaption {
+  padding: 14px 16px;
+  font-size: 14px;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 @media (max-width: 900px) {

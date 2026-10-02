@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 300" font-family="'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="arw2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#17C3B2"/>
+    </marker>
+  </defs>
+  <text x="20" y="30" fill="#e6edf3" font-size="18" font-weight="700">数据采集流程</text>
+  <text x="20" y="50" fill="#8aa0b5" font-size="12">设备 → 采集 → 边缘计算 → 北向转发</text>
+
+  <!-- pipeline -->
+  <g font-size="13" text-anchor="middle">
+    <rect x="20" y="90" width="140" height="70" rx="12" fill="#16263f" stroke="#27405e"/>
+    <text x="90" y="120" fill="#e6edf3" font-weight="600">设备连接</text>
+    <text x="90" y="142" fill="#8aa0b5" font-size="11">Modbus/OPC UA</text>
+
+    <rect x="200" y="90" width="140" height="70" rx="12" fill="#16263f" stroke="#27405e"/>
+    <text x="270" y="120" fill="#e6edf3" font-weight="600">周期采集</text>
+    <text x="270" y="142" fill="#8aa0b5" font-size="11">驱动轮询</text>
+
+    <rect x="380" y="90" width="140" height="70" rx="12" fill="#16263f" stroke="#27405e"/>
+    <text x="450" y="120" fill="#e6edf3" font-weight="600">本地缓存</text>
+    <text x="450" y="142" fill="#8aa0b5" font-size="11">SQLite 队列</text>
+
+    <rect x="560" y="90" width="140" height="70" rx="12" fill="#16263f" stroke="#27405e"/>
+    <text x="630" y="120" fill="#e6edf3" font-weight="600">规则 / 公式</text>
+    <text x="630" y="142" fill="#8aa0b5" font-size="11">边缘计算</text>
+
+    <rect x="740" y="90" width="160" height="70" rx="12" fill="#0f1b3d" stroke="#17C3B2"/>
+    <text x="820" y="120" fill="#17C3B2" font-weight="700">北向 MQTT</text>
+    <text x="820" y="142" fill="#8aa0b5" font-size="11">protobuf/JSON</text>
+  </g>
+
+  <g stroke="#17C3B2" stroke-width="2" marker-end="url(#arw2)">
+    <line x1="162" y1="125" x2="196" y2="125"/>
+    <line x1="342" y1="125" x2="376" y2="125"/>
+    <line x1="522" y1="125" x2="556" y2="125"/>
+    <line x1="702" y1="125" x2="736" y2="125"/>
+  </g>
+
+  <!-- resilience note -->
+  <rect x="20" y="200" width="880" height="64" rx="12" fill="#101d33" stroke="#27405e"/>
+  <text x="40" y="226" fill="#e6edf3" font-size="13" font-weight="600">本地韧性</text>
+  <text x="40" y="248" fill="#cbd5e1" font-size="12">断网时数据写入 SQLite 离线队列，网络恢复后自动补传（背压控制，确保不丢数、不溢出）。</text>
+</svg>

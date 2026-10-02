@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 360" font-family="'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="arw3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#17C3B2"/>
+    </marker>
+  </defs>
+  <text x="20" y="30" fill="#e6edf3" font-size="18" font-weight="700">部署拓扑</text>
+  <text x="20" y="50" fill="#8aa0b5" font-size="12">宿主机器 / Linux 容器 · 最小权限 · 机器码绑定</text>
+
+  <!-- host -->
+  <rect x="40" y="80" width="840" height="250" rx="14" fill="#0f1b3d" stroke="#27405e"/>
+  <text x="60" y="106" fill="#8aa0b5" font-size="12">宿主 (Host)</text>
+
+  <!-- container -->
+  <rect x="70" y="120" width="380" height="190" rx="12" fill="#101d33" stroke="#17C3B2"/>
+  <text x="260" y="146" fill="#17C3B2" font-size="13" font-weight="700" text-anchor="middle">IoT-DAQ Gateway 容器</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="90" y="160" width="150" height="44" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="165" y="184" fill="#cbd5e1">nginx (9012)</text>
+    <text x="165" y="200" fill="#8aa0b5" font-size="10">Web 控制台</text>
+    <rect x="270" y="160" width="150" height="44" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="345" y="184" fill="#cbd5e1">daemon (9011)</text>
+    <text x="345" y="200" fill="#8aa0b5" font-size="10">管理 API</text>
+    <rect x="90" y="220" width="330" height="40" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="255" y="245" fill="#cbd5e1">采集引擎 + 北向转发</text>
+    <rect x="90" y="270" width="330" height="30" rx="8" fill="#16263f" stroke="#27405e"/>
+    <text x="255" y="290" fill="#8aa0b5" font-size="11">非 root · 只读根 · cap_drop ALL</text>
+  </g>
+
+  <!-- persistence -->
+  <rect x="490" y="150" width="180" height="120" rx="12" fill="#101d33" stroke="#27405e"/>
+  <text x="580" y="176" fill="#17C3B2" font-size="12" font-weight="700" text-anchor="middle">持久卷</text>
+  <g font-size="11" text-anchor="middle" fill="#cbd5e1">
+    <text x="580" y="200">/data/edge-gateway</text>
+    <text x="580" y="220">· 授权状态</text>
+    <text x="580" y="240">· 配置 / 数据</text>
+    <text x="580" y="260">· 机器指纹</text>
+  </g>
+
+  <!-- machine binding -->
+  <rect x="700" y="150" width="160" height="120" rx="12" fill="#101d33" stroke="#27405e"/>
+  <text x="780" y="176" fill="#17C3B2" font-size="12" font-weight="700" text-anchor="middle">机器码绑定</text>
+  <g font-size="11" text-anchor="middle" fill="#cbd5e1">
+    <text x="780" y="200">machine-id</text>
+    <text x="780" y="220">DMI</text>
+    <text x="780" y="240">MAC</text>
+    <text x="780" y="260">→ 宿主锚点</text>
+  </g>
+
+  <!-- arrows -->
+  <line x1="450" y1="200" x2="488" y2="200" stroke="#17C3B2" stroke-width="2" marker-end="url(#arw3)"/>
+  <line x1="450" y1="230" x2="698" y2="210" stroke="#17C3B2" stroke-width="2" marker-end="url(#arw3)"/>
+  <line x1="580" y1="290" x2="580" y2="270" stroke="#17C3B2" stroke-width="2" marker-end="url(#arw3)"/>
+</svg>
