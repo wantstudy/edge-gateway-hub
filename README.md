@@ -16,7 +16,7 @@
 | 交付物 | 说明 |
 |---|---|
 | `IoT-DAQ-Gateway_0.2.0_x64-setup.exe` | Windows 10/11 x64 安装包（约 5.3MB） |
-| Docker 镜像 | `wantstudy/iot-daq-gateway:0.2.0`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:0.2.0`） |
+| Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
@@ -35,7 +35,7 @@
 
 ```bash
 # 拉取镜像（Docker Hub）
-docker pull wantstudy/iot-daq-gateway:0.2.0
+docker pull wantstudy/iot-daq-gateway:latest
 
 docker run -d \
 --name edge-gateway-hub \
@@ -45,8 +45,10 @@ docker run -d \
 -v /etc/machine-id:/host/etc/machine-id:ro \
 -v /sys/class/dmi/id:/host/sys/class/dmi/id:ro \
 -e TZ=Asia/Shanghai \
-iot-daq-gateway:0.2.0
+wantstudy/iot-daq-gateway:latest
 ```
+
+> 镜像同时发布固定版本标签（如 `0.2.0`）与滚动标签 `latest`：上面示例使用 `latest`，每次拉取都是当前最新版；需要锁定版本时把 `latest` 换成具体版本号，例如 `wantstudy/iot-daq-gateway:0.2.0`。
 
 > 机器码自动取自宿主机（machine-id / DMI）；指纹密钥与授权状态随 `/data/edge-gateway` 持久化，首次启动自动生成，无需手工初始化。授权服务地址已内置镜像，无需任何环境变量。
 

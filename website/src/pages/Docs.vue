@@ -28,7 +28,7 @@
             <a-tabs default-active-key="windows">
               <a-tab-pane key="windows" title="Windows">
                 <ol class="doc-steps">
-                  <li>下载 <a href="https://github.com/wantstudy/edge-gateway-hub/releases/download/v0.1.0/IoT-DAQ-Gateway_0.1.0_x64-setup.exe" target="_blank">IoT-DAQ-Gateway_0.1.0_x64-setup.exe</a></li>
+                  <li>下载 <a href="https://github.com/wantstudy/edge-gateway-hub/releases/download/v0.2.0/IoT-DAQ-Gateway_0.2.0_x64-setup.exe" target="_blank">IoT-DAQ-Gateway_0.2.0_x64-setup.exe</a></li>
                   <li>双击安装包（需要 WebView2 Runtime，Win10/11 通常已内置）</li>
                   <li>从开始菜单启动 <strong>IoT-DAQ Gateway</strong>，桌面控制台自动打开</li>
                   <li>访问 <code>http://127.0.0.1:8080</code> 进入 Web 控制台</li>
@@ -38,7 +38,7 @@
                 <div class="code-block">
                   <div class="code-header"><span>bash</span></div>
                   <pre><code><span class="comment"># 1. 拉取镜像</span>
-docker pull wantstudy/iot-daq-gateway:0.1.0
+docker pull wantstudy/iot-daq-gateway:latest
 
 <span class="comment"># 2. 初始化目录与密钥</span>
 sudo mkdir -p /opt/iot-daq/gateway/{data,secrets}
