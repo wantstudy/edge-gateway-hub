@@ -3,19 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IoT-DAQ Gateway — 工业边缘数据采集网关 | Modbus / OPC UA / MQTT</title>
-<meta name="description" content="IoT-DAQ Gateway 是开源工业边缘数据采集网关：Modbus TCP/RTU、OPC UA 多协议采集，MQTT 北向转发，SQLite 断网续传，规则与告警边缘计算，提供 Web 控制台，支持 Windows 安装包与 Docker 一键部署。">
-<meta name="keywords" content="工业网关,数据采集网关,Modbus,OPC UA,MQTT,边缘计算,IoT-DAQ,北向转发,断网续传,SCADA,协议转换">
+<title>IoT-DAQ Gateway — 工业边缘数据采集网关 | Modbus / OPC UA / HTTP 脚本 / MQTT</title>
+<meta name="description" content="IoT-DAQ Gateway 是开源工业边缘数据采集网关：Modbus、S7、FINS、OPC UA、HTTP 等 8 类协议采集，MQTT 北向转发，HTTP 设备支持前置/后置 JS 脚本与全局变量扩展，SQLite 断网续传与本地历史数据，规则与告警边缘计算，提供 Web 控制台，支持 Windows 安装包与 Docker 一键部署。">
+<meta name="keywords" content="工业网关,数据采集网关,Modbus,OPC UA,MQTT,HTTP 脚本,自定义请求头,历史数据,边缘计算,IoT-DAQ,北向转发,断网续传,SCADA,协议转换">
 <meta name="baidu-site-verification" content="codeva-BpZyVbj3Lj" />
 <link rel="canonical" href="https://edge.webscad.cn/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="IoT-DAQ Gateway — 工业边缘数据采集网关">
-<meta property="og:description" content="Modbus / OPC UA 多协议采集，MQTT 北向转发，断网续传，Web 控制台全功能管理。Windows 安装包与 Docker 一键部署。">
+<meta property="og:description" content="Modbus、S7、FINS、OPC UA、HTTP 等 8 类协议采集，HTTP 设备支持前置/后置脚本扩展，MQTT 北向转发，断网续传与本地历史数据，Web 控制台全功能管理。">
 <meta property="og:url" content="https://edge.webscad.cn/">
 <meta property="og:site_name" content="IoT-DAQ Gateway">
 <meta property="og:locale" content="zh_CN">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"SoftwareApplication","name":"IoT-DAQ Gateway","operatingSystem":"Windows 10/11, Linux, Docker","applicationCategory":"Industrial Application","description":"开源工业边缘数据采集网关：多协议采集、MQTT 北向转发、断网续传、Web 控制台。","url":"https://edge.webscad.cn/","downloadUrl":"https://edge.webscad.cn/downloads/IoT-DAQ-Gateway_0.2.0_x64-setup.exe","offers":{"@type":"Offer","price":"0","priceCurrency":"CNY"}}
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"IoT-DAQ Gateway","version":"0.2.1","operatingSystem":"Windows 10/11, Linux, Docker","applicationCategory":"Industrial Application","description":"开源工业边缘数据采集网关：Modbus、S7、FINS、OPC UA、HTTP 等 8 类协议采集，HTTP 设备支持前置/后置 JS 脚本与全局变量扩展，MQTT 北向转发，断网续传与本地历史数据，规则与告警边缘计算，Web 控制台。","softwareRequirements":"x86_64; Windows 10/11 or Linux with Docker","url":"https://edge.webscad.cn/","downloadUrl":"https://edge.webscad.cn/downloads/IoT-DAQ-Gateway_0.2.1_x64-setup.exe","offers":{"@type":"Offer","price":"0","priceCurrency":"CNY"}}
 </script>
 <link rel="icon" type="image/png" href="/favicon.png">
 <script async charset="utf-8" src="https://zz.bdstatic.com/linksubmit/push.js"></script>
@@ -1032,6 +1032,7 @@ a:hover { text-decoration: underline; }
   .spec-grid { grid-template-columns: 1fr; }
   .media-grid { grid-template-columns: 1fr; }
   .deploy-grid { grid-template-columns: 1fr; }
+  .script-grid { grid-template-columns: 1fr; }
   .steps { grid-template-columns: 1fr; }
   .step:not(:last-child)::after { display: none; }
   .topnav { display: none; }
@@ -1136,6 +1137,49 @@ a:hover { text-decoration: underline; }
 @media (max-width: 900px) {
   .software-grid { grid-template-columns: 1fr; }
 }
+
+/* ============ HTTP 脚本示例 ============ */
+.script-docs {
+  padding: clamp(3rem, 6vw, 5rem) 0;
+  border-top: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.script-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.2rem;
+  margin-top: 1.9rem;
+}
+.api-list {
+  list-style: none;
+  margin: 1.6rem 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem 1.6rem;
+}
+.api-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.api-list code {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.12rem 0.5rem;
+  white-space: nowrap;
+}
+@media (max-width: 900px) {
+  .script-grid { grid-template-columns: 1fr; }
+  .api-list { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -1151,12 +1195,13 @@ a:hover { text-decoration: underline; }
     <nav aria-label="主导航">
       <ul class="topnav">
         <li><a href="#features">核心特性</a></li>
+        <li><a href="#script">HTTP 脚本</a></li>
         <li><a href="#download">快速下载</a></li>
         <li><a href="#start">快速开始</a></li>
       </ul>
     </nav>
     <div class="topbar-right">
-      <span class="ver-tag">v0.2.0</span>
+      <span class="ver-tag">v0.2.1</span>
       <a class="btn btn-primary btn-nav" href="https://github.com/wantstudy/edge-gateway-hub" target="_blank" rel="noopener noreferrer">GitHub <span class="arrow">↗</span></a>
     </div>
   </div>
@@ -1176,9 +1221,9 @@ a:hover { text-decoration: underline; }
           <a class="btn btn-ghost" href="#start">快速开始 <span class="arrow">↓</span></a>
         </div>
         <div class="hero-stats" role="list" aria-label="产品信息">
-          <div class="stat" role="listitem"><b>v0.2.0</b><span>当前版本</span></div>
+          <div class="stat" role="listitem"><b>v0.2.1</b><span>当前版本</span></div>
           <div class="stat" role="listitem"><b>93.8 MB</b><span>Docker 镜像</span></div>
-          <div class="stat" role="listitem"><b>5.3 MB</b><span>Windows 安装包</span></div>
+          <div class="stat" role="listitem"><b>8.3 MB</b><span>Windows 安装包</span></div>
         </div>
       </div>
 
@@ -1225,7 +1270,7 @@ a:hover { text-decoration: underline; }
             <rect class="gw-body" x="244" y="86" width="182" height="150" rx="4"/>
             <rect class="gw-accent" x="244" y="86" width="182" height="24" rx="4"/>
             <text x="252" y="101" class="t-strong" font-size="10.5">IoT-DAQ GATEWAY</text>
-            <text x="410" y="101" text-anchor="end" font-size="9.5">v0.2.0</text>
+            <text x="410" y="101" text-anchor="end" font-size="9.5">v0.2.1</text>
             <circle cx="268" cy="128" r="4" fill="#4ede80" class="led"/>
             <circle cx="284" cy="128" r="4" fill="#3fd8bf" class="led l2"/>
             <circle cx="300" cy="128" r="4" fill="#ffb224" class="led l3"/>
@@ -1322,7 +1367,7 @@ a:hover { text-decoration: underline; }
         <article class="spec">
           <div class="spec-top"><span class="spec-no">SPEC-01</span><span class="spec-tag">采集层</span></div>
           <h3>多协议采集</h3>
-          <p>支持 Modbus TCP / RTU、OPC UA 等主流工业协议，覆盖 PLC、仪表、传感器等设备。</p>
+          <p>Modbus TCP/RTU、S7、FINS、MC、ADS、EtherNet/IP、OPC UA、HTTP 等 8 类协议，覆盖 PLC、仪表与业务系统接口。</p>
         </article>
         <article class="spec">
           <div class="spec-top"><span class="spec-no">SPEC-02</span><span class="spec-tag">转发层</span></div>
@@ -1348,6 +1393,16 @@ a:hover { text-decoration: underline; }
           <div class="spec-top"><span class="spec-no">SPEC-06</span><span class="spec-tag">安全面</span></div>
           <h3>安全设计</h3>
           <p>最小权限容器（非 root、只读根文件系统、cap_drop ALL），降低攻击面。</p>
+        </article>
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-07</span><span class="spec-tag">扩展</span></div>
+          <h3>HTTP 脚本扩展</h3>
+          <p>内置 JS 脚本引擎：前置脚本登录换取 Token，后置脚本解析响应并赋值点表，全局变量跨采集周期缓存，工具栏片段一键插入。</p>
+        </article>
+        <article class="spec">
+          <div class="spec-top"><span class="spec-no">SPEC-08</span><span class="spec-tag">数据</span></div>
+          <h3>历史数据</h3>
+          <p>本地加密时序库，按时间与点位分页查询，图表与表格双视图，密钥轮换后自动逐行降级而不整页报错。</p>
         </article>
       </div>
     </div>
@@ -1403,7 +1458,7 @@ a:hover { text-decoration: underline; }
           </div>
           <figcaption>
             <strong>新增设备</strong>
-            <span>向导式接入，支持 Modbus、S7、OPC UA、MQTT 等十余种协议</span>
+            <span>向导式接入，支持 Modbus、S7、FINS、OPC UA、HTTP 等 8 类协议，HTTP 可配前置/后置脚本</span>
           </figcaption>
         </figure>
         <figure class="software-card" style="--d:.16s">
@@ -1416,6 +1471,74 @@ a:hover { text-decoration: underline; }
           </figcaption>
         </figure>
       </div>
+    </div>
+  </section>
+
+  <!-- ===== HTTP 设备脚本 ===== -->
+  <section class="script-docs" id="script">
+    <div class="container">
+      <div class="features-head reveal">
+        <div>
+          <p class="eyebrow">EXTENSION // HTTP SCRIPTS</p>
+          <h2 class="sec-title">HTTP 设备脚本</h2>
+          <p class="sec-sub">接口要登录、响应带业务码、字段要换算 —— 两段 JavaScript 搞定，不必把 Token 手抄进配置</p>
+        </div>
+      </div>
+
+      <div class="script-grid reveal" style="--d:.08s">
+        <div class="terminal">
+          <div class="term-bar">
+            <span class="term-dot d1" aria-hidden="true"></span>
+            <span class="term-dot d2" aria-hidden="true"></span>
+            <span class="term-dot d3" aria-hidden="true"></span>
+            <span class="term-file">http_pre_script — <b>主请求之前</b></span>
+          </div>
+          <div class="term-body">
+<pre><code><span class="tok-c">// 命中缓存直接用，否则先登录换 Token</span>
+var tok = vars.get('token');
+if (!tok) {
+  var r = http.request('GET', 'https://host.example.com/api/token', {
+    body: JSON.stringify({ user: 'gw', pass: '******' })
+  });
+  if (r.status !== 200) throw new Error('login failed: ' + r.status);
+  tok = r.json().data.token;
+  vars.set('token', tok);
+}
+<span class="tok-c">// 改完即主请求实际使用的请求头</span>
+request.headers['Authorization'] = 'Bearer ' + tok;</code></pre>
+          </div>
+        </div>
+
+        <div class="terminal">
+          <div class="term-bar">
+            <span class="term-dot d1" aria-hidden="true"></span>
+            <span class="term-dot d2" aria-hidden="true"></span>
+            <span class="term-dot d3" aria-hidden="true"></span>
+            <span class="term-file">http_post_script — <b>主请求之后</b></span>
+          </div>
+          <div class="term-body">
+<pre><code><span class="tok-c">// 读响应、校验业务码、换算单位后赋值点表</span>
+var data = response.json().data;
+if (data.code !== 1000) throw new Error('biz error: ' + data.msg);
+
+points.set('water_level', Number(data.level));
+points.set('water_temp', data.level * 0.01 + 20);
+points.set('is_raining', data.rain === 1 ? 1 : 0);
+log('synced ' + points.keys().length + ' points');</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <ul class="api-list reveal" style="--d:.16s">
+        <li><code>vars.get / set / has</code>全局变量：按设备跨采集周期缓存，重启后清空</li>
+        <li><code>http.request(method, url, opts)</code>脚本内再发一次请求，非 2xx 不抛错、状态码原样回显</li>
+        <li><code>request.{method,url,headers,body}</code>前置脚本可改，改完即主请求实际内容</li>
+        <li><code>response.{status,headers,body,json()}</code>后置脚本读主请求响应</li>
+        <li><code>points.set(id, value)</code>赋值点表，脚本值优先于逐点 JSONPath 提取</li>
+        <li><code>自定义请求头</code>分号分隔 Name:Value 静态配置，也可由脚本改写</li>
+        <li><code>死循环 / 时限防护</code>迭代上限 100 万次，超时换 worker，不影响其它设备采集</li>
+        <li><code>纯 Rust JS 引擎</code>无外部运行时依赖，随网关单进程运行</li>
+      </ul>
     </div>
   </section>
 
@@ -1439,12 +1562,12 @@ a:hover { text-decoration: underline; }
           <h3 class="media-title">Windows 安装包</h3>
           <ul class="media-meta">
             <li><span class="mk">OS</span><span>Windows 10 / 11 x64</span></li>
-            <li><span class="mk">SIZE</span><span>约 5.3 MB · 安装即用</span></li>
-            <li><span class="mk">PKG</span><span>IoT-DAQ-Gateway_0.2.0_x64-setup.exe</span></li>
+            <li><span class="mk">SIZE</span><span>约 8.3 MB · 安装即用</span></li>
+            <li><span class="mk">PKG</span><span>IoT-DAQ-Gateway_0.2.1_x64-setup.exe</span></li>
           </ul>
           <div class="media-foot">
-            <a class="btn btn-primary" href="/downloads/IoT-DAQ-Gateway_0.2.0_x64-setup.exe" download>下载 <span class="arrow">↓</span></a>
-            <span class="media-size">v0.2.0</span>
+            <a class="btn btn-primary" href="/downloads/IoT-DAQ-Gateway_0.2.1_x64-setup.exe" download>下载 <span class="arrow">↓</span></a>
+            <span class="media-size">v0.2.1</span>
           </div>
         </article>
 
@@ -1465,7 +1588,7 @@ a:hover { text-decoration: underline; }
           </div>
           <div class="media-foot">
             <a class="btn btn-ghost" href="#docker">部署方式 <span class="arrow">↓</span></a>
-            <span class="media-size">v0.2.0</span>
+            <span class="media-size">latest</span>
           </div>
         </article>
       </div>

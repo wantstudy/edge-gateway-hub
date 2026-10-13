@@ -4,9 +4,11 @@
 
 ## 功能特性
 
-- **多协议采集**：Modbus TCP / RTU、OPC UA
+- **多协议采集**：Modbus TCP/RTU、S7、FINS、MC、ADS、EtherNet/IP、OPC UA、HTTP 等 8 类协议
+- **HTTP 脚本扩展**：前置脚本登录换取 Token、后置脚本解析响应赋值点表；全局变量按设备跨采集周期缓存；纯 Rust JS 引擎，无外部运行时依赖
 - **北向转发**：MQTT（v3.1.1 / v5），每路独立 protobuf / JSON 编码
 - **本地韧性**：断网续传（SQLite 队列）、背压控制
+- **历史数据**：本地加密时序库，按时间/点位分页查询，图表与表格双视图；密钥轮换后旧行逐行隔离降级，不整页报错
 - **规则与公式**：点位级计算、告警规则
 - **Web 控制台**：设备 / 点位 / 转发 / 告警 / 审计全功能管理
 - **安全**：最小权限容器（非 root、只读根、cap_drop ALL）
@@ -15,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.0_x64-setup.exe` | Windows 10/11 x64 安装包（约 5.3MB） |
+| `IoT-DAQ-Gateway_0.2.1_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.0_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.1_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:8080`）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -93,8 +95,20 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.0**
+- 当前版本：**v0.2.1**
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
+
+## 更新日志
+
+### v0.2.1
+
+- **HTTP 设备前置 / 后置脚本**：内置纯 Rust JS 引擎，前置脚本在主请求之前登录换取 Token，后置脚本解析响应并赋值点表；全局变量 `vars` 按设备跨采集周期缓存，控制台内置脚本工具栏与语法速查。
+- **自定义请求头**：`Name:Value` 分号分隔的静态配置，也可由脚本改写；认证方式支持 无 / Bearer / Basic，非法组合（如未知字面量、Bearer 缺 token）在保存时即报错而非静默降级。
+- **修复历史数据接口 500**：数据行解密失败改为逐行隔离并计数，不再因单行损坏导致整页不可用；历史数据默认以图表视图展示。
+
+### v0.2.0
+
+- 历史数据分页与图表视图、公式点位当前值跨组可见、授权地址不入库、重启后遥测续采。
 
 ## License
 
