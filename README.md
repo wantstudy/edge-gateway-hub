@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.1_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
+| `IoT-DAQ-Gateway_0.2.2_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.1_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.2_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:8080`）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -50,7 +50,7 @@ docker run -d \
 wantstudy/iot-daq-gateway:latest
 ```
 
-> 镜像同时发布固定版本标签（如 `0.2.0`）与滚动标签 `latest`：上面示例使用 `latest`，每次拉取都是当前最新版；需要锁定版本时把 `latest` 换成具体版本号，例如 `wantstudy/iot-daq-gateway:0.2.0`。
+> 镜像同时发布固定版本标签（如 `0.2.2`）与滚动标签 `latest`：上面示例使用 `latest`，每次拉取都是当前最新版；需要锁定版本时把 `latest` 换成具体版本号，例如 `wantstudy/iot-daq-gateway:0.2.2`。
 
 > 机器码自动取自宿主机（machine-id / DMI）；指纹密钥与授权状态随 `/data/edge-gateway` 持久化，首次启动自动生成，无需手工初始化。授权服务地址已内置镜像，无需任何环境变量。
 
@@ -95,10 +95,14 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.1**
+- 当前版本：**v0.2.2**
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.2
+
+- 与 v0.2.1 功能一致，同步代码版本。
 
 ### v0.2.1
 
