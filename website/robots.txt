@@ -1,5 +1,10 @@
+# edge.webscad.cn 站点 robots
+#
+# 注意：/assets/ 存放 favicon / logo-mark / 微信与 QQ 二维码等图片资源，**不可屏蔽**。
+# 屏蔽该目录会导致图片既无法被抓取、也无法进入图片搜索；
+# 本站为单文件静态页（index.html 已内联全部 CSS/JS），屏蔽 /assets/ 并不会节省爬虫预算。
+
 User-agent: *
 Allow: /
-Disallow: /assets/
 
 Sitemap: https://edge.webscad.cn/sitemap.xml

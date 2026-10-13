@@ -1,0 +1,35 @@
+# 换行符与二进制规则
+#
+# 背景：本机 core.autocrlf=true，默认检出会把文本文件转成 CRLF。
+# shell 脚本一旦带 CRLF，在 Linux 上会报「exec xxx.sh: no such file or directory」
+# （真因是 `#!/bin/bash\r` 找不到解释器），现象极具误导性。故强制脚本类一律 LF。
+#
+# 新增文件类型时按此表登记，不要在 .sh 上放宽 eol。
+
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# 本文件自身
+.gitattributes text eol=lf
+
+# 文本（统一 LF，避免跨平台 diff 噪音）
+*.md    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+*.ts    text eol=lf
+*.vue   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.xml   text eol=lf
+*.txt   text eol=lf
+*.svg   text eol=lf
+
+# 二进制：禁止任何换行符转换（Windows 安装包 / 镜像 tar / 位图）
+*.exe   binary
+*.gz    binary
+*.tar   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
