@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.4_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
+| `IoT-DAQ-Gateway_0.2.5_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.4_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.5_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -50,7 +50,7 @@ docker run -d \
 wantstudy/iot-daq-gateway:latest
 ```
 
-> 镜像同时发布固定版本标签（如 `0.2.4`）与滚动标签 `latest`：上面示例使用 `latest`，每次拉取都是当前最新版；需要锁定版本时把 `latest` 换成具体版本号，例如 `wantstudy/iot-daq-gateway:0.2.4`。
+> 镜像使用滚动标签 `latest`，每次拉取都是当前最新版；需要锁定版本时把 `latest` 换成具体版本号（例如 `wantstudy/iot-daq-gateway:0.2.3`）。**容器镜像与 Windows 安装包独立出包、版本可能不同步**——以 Docker Hub 上实际存在的标签为准，可用 `docker pull wantstudy/iot-daq-gateway:<tag>` 验证。
 
 > 机器码自动取自宿主机（machine-id / DMI）；指纹密钥与授权状态随 `/data/edge-gateway` 持久化，首次启动自动生成，无需手工初始化。授权服务地址已内置镜像，无需任何环境变量。
 
@@ -98,10 +98,15 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.4**
+- 当前版本：**v0.2.5**（Windows 安装包）
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.5
+
+- **升级安装不再弹「已安装」提示页**：直接覆盖安装、静默卸载旧版后继续，全程无需选择。已安装的版本会被自动识别并原地升级，用户数据（授权、指纹密钥、历史数据）保持不变。
+- **网关起不来时给出真实原因并支持一键重试**：此前 daemon 启动失败后守护会进入启动失败保护并停止重试，界面只显示「网关未启动」，既看不到原因也无法恢复。现在登录页会直接显示 daemon 最近一次的真实失败日志，并提供「重新启动网关」按钮立即重试；系统设置页同步展示失败原因。
 
 ### v0.2.4
 
