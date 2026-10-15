@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.5_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
+| `IoT-DAQ-Gateway_0.2.6_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.5_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.6_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -98,10 +98,16 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.5**（Windows 安装包）
+- 当前版本：**v0.2.6**（Windows 安装包）
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.6
+
+- **在线升级修复**：授权端与网关不在同一前缀下（例如授权端经反向代理部署在 `/licensing` 之后）时，网关解析升级包下载地址会落到网关自己的前端页面，于是「下载回来的不是安装包」。现在直接按授权端给出的相对地址推导同级下载地址并逐个候选重试，不会再被自己的页面劫持；已用生产授权端端到端验证，升级包可完整下载并通过验签。
+- **可视化大屏支持全屏**：大屏页新增全屏按钮，运行时不支持全屏或请求被拒绝时如实提示，不出现假全屏状态。
+- **修复大屏迷你趋势图折线不显示**：折线的模板绑定写法有误（`points=` 应为 `:points=`），导致画布上报错且折线画不出来。
 
 ### v0.2.5
 
