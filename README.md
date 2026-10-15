@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.6_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
+| `IoT-DAQ-Gateway_0.2.7_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.6_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.7_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -98,10 +98,15 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.6**（Windows 安装包）
+- 当前版本：**v0.2.7**（Windows 安装包）
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.7
+
+- **修复「检查更新」报「请求失败（HTTP 0）」**：升级包下载在慢网络下可能耗时十几秒以上，超过浏览器 15 秒默认超时，前端就报「请求失败（HTTP 0）」，但后台其实仍在正常下载——出现「报失败、升级却已完成」的假失败。现在「检查更新」点击后立即返回「正在后台下载 X MB」的进度状态，不再等下载完成；下载完成后自动收敛为「有新版本可安装」，用户无需反复点检查。
+- **升级检查独立超时**：升级检查走独立的 30 秒超时（其他接口仍为 15 秒），慢网络下不再误报超时；升级包仍在后台下载时界面会提示等待，而不是错误地显示失败。
 
 ### v0.2.6
 
