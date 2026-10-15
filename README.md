@@ -17,16 +17,16 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.3_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
+| `IoT-DAQ-Gateway_0.2.4_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.3_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.4_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
-3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:8080`）
+3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
 
 ---
@@ -50,7 +50,7 @@ docker run -d \
 wantstudy/iot-daq-gateway:latest
 ```
 
-> 镜像同时发布固定版本标签（如 `0.2.3`）与滚动标签 `latest`：上面示例使用 `latest`，每次拉取都是当前最新版；需要锁定版本时把 `latest` 换成具体版本号，例如 `wantstudy/iot-daq-gateway:0.2.3`。
+> 镜像同时发布固定版本标签（如 `0.2.4`）与滚动标签 `latest`：上面示例使用 `latest`，每次拉取都是当前最新版；需要锁定版本时把 `latest` 换成具体版本号，例如 `wantstudy/iot-daq-gateway:0.2.4`。
 
 > 机器码自动取自宿主机（machine-id / DMI）；指纹密钥与授权状态随 `/data/edge-gateway` 持久化，首次启动自动生成，无需手工初始化。授权服务地址已内置镜像，无需任何环境变量。
 
@@ -62,21 +62,24 @@ docker logs -f edge-gateway-hub  # 看到 "bootstrap: daemon running" 即成功
 
 ### Web 控制台地址
 
-- **Web 控制台**：`http://<宿主IP>:9012`
-- **管理 API**：`http://<宿主IP>:9011`
+- **Web 控制台**：`http://<宿主IP>:29205`
+- **管理 API**：`http://<宿主IP>:29105`
+
+端口是 IoT-DAQ 专用段默认值；被宿主进程占用时会自动 +1 顺延（上限 10 个），可用 `IOT_DAQ_WEB_PORT` / `IOT_DAQ_HTTP_PORT` / `IOT_DAQ_PORT_PROBES` 覆盖。顺延后的实际端口写入容器内 `/run/iot-daq-ports.env`，容器 healthcheck 会自动跟随。
 
 ---
 
 ## 配置
 
-容器把 `/opt/iot-daq/gateway/data/config/` 挂载为 `/etc/iot-daq`，网关读取其中的 `gateway.toml`。**最小配置即可启动**（文件可以只有注释），设备、点位、北向转发、告警规则全部在 Web 控制台完成配置。
+v2 起配置的唯一真相源是 **SQLite**（`/var/lib/iot-daq/data/iot-daq.db`），**不再读取也不再生成 `gateway.toml` / `config.toml`**。挂载 `config/` 目录不再必要；设备、点位、北向转发、告警规则全部在 Web 控制台完成配置并直接落库。
 
-```toml
-# /opt/iot-daq/gateway/data/config/gateway.toml —— 最小占位
-# 网关名（可选）
-# [gateway]
-# name = "plant-01-gw"
-```
+持久卷里真正需要的只有数据根：
+
+| 卷挂载 | 内容 |
+|---|---|
+| `/data/edge-gateway` → `/var/lib/iot-daq` | SQLite 配置库、断网队列、历史时序库、审计日志、授权/试用状态、指纹密钥 |
+
+删除持久卷等同于重置试用与全部配置。
 
 ## 串口采集（可选）
 
@@ -85,7 +88,7 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 ## 常见问题
 
 **Q: Web 控制台打不开？**
-`curl http://127.0.0.1:9011/api/overview` 有 JSON 返回说明网关正常，检查 9012 端口与防火墙；若 `.env` 改过端口，访问端口要跟着改。
+`curl http://127.0.0.1:29105/api/overview` 有 JSON 返回说明网关正常，检查 29205 端口与防火墙；若改过端口或被顺延，先 `docker exec edge-gateway-hub cat /run/iot-daq-ports.env` 取实际端口。
 
 **Q: Docker 里怎么确认机器码取的是宿主机？**
 容器内锚点已被关闭，机器码只可能来自宿主机 machine-id / DMI / MAC。
@@ -95,10 +98,16 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.3**
+- 当前版本：**v0.2.4**
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.4
+
+- **修复卸载后重装无法启动**：卸载程序会清空整个数据目录树，重装后首次启动时 SQLite 库的父目录不存在，网关直接报 `unable to open database file` 退出。现在数据目录在拉起服务前就地补建（桌面壳 + 服务端双重保险），重装即可正常启动。
+- **不再生成配置文件**：`config.toml` 已彻底移除，其中全部参数固化为代码内置默认值。设置页的「配置备份」会明确提示配置已落 SQLite，并指向数据库级备份接口。
+- **端口改为专用段并支持自动顺延**：管理 API 默认 **29105**、Web 控制台默认 **29205**（避开 `8080` 等常用端口）。任一端口被宿主进程占用时自动 +1 顺延，上限 10 个；桌面端、Docker 端均支持，顺延结果会自动同步给健康检查与前端连接地址。
 
 ### v0.2.3
 
