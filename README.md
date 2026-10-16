@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.7_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
+| `IoT-DAQ-Gateway_0.2.8_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.7_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.8_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -98,10 +98,15 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.7**（Windows 安装包）
+- 当前版本：**v0.2.8**（Windows 安装包）
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.8
+
+- **前端界面清理（13 项）**：移除各页面行内提示与冗余信息——总览 CPU/内存/数据占用量措辞修正（不可用指标诚实显示 `—`、数据目录占用改为离线队列占用）、实时监控筛选项与下拉框同行、新增设备第三步引导、点位与映射顶部筛选整行、实时数据顶部筛选整行、北向转发/转发规则说明行、系统更新进度副文本与更新历史空态、诊断包内容展示模块、系统设置模拟说明、隐藏使用手册、移除顶栏角色信息与授权倒计时圆形图、可视化大屏顶部提示块；新增右上角 Toast 非确认类提示基础设施（3 秒自动消失 + 手动关闭），后续非确认类提示统一改用 `pushToast`。
+- **修复「网关授权模块未就绪」误报**：授权端地址回退读取 supervisor 注入的 `IOT_DAQ_LICENSE_SERVER_URL` 环境变量（此前只读配置文件，联网环境下误判 fail-closed 导致登录页持续提示「未就绪」），现已与配置值取合并；登录页不再误提示。
 
 ### v0.2.7
 
