@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.8_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.7MB） |
+| `IoT-DAQ-Gateway_0.2.9_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.8_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.9_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -98,10 +98,14 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.8**（Windows 安装包）
+- 当前版本：**v0.2.9**（Windows 安装包）
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.9
+
+- **前端界面清理（续）**：延续 0.2.8 的界面整改，进一步清除冗余信息与顶部信息行——总览 / 实时数据 / 实时监控三页移除顶部状态行（KPI 工具条、筛选条、暂停 / 最后更新行），系统更新页移除版本横幅、内联提示与待安装副文案、更新通道状态标签与全部进度占位（改用右上角 Toast 反馈），可视化大屏删除「实时通道状态」徽标并将控制台 / 授权 / 全屏 / 时钟按钮组整体右对齐，点位与映射左侧列表改为高度自适应（不再固定截断）。
 
 ### v0.2.8
 
