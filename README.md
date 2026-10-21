@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.9_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
+| `IoT-DAQ-Gateway_0.2.10_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.9_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.10_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -98,10 +98,16 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.9**（Windows 安装包）
+- 当前版本：**v0.2.10**（Windows 安装包）
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.10
+
+- **修复重启无响应**：桌面「启动与自启 → 立即重启服务」点击后 daemon 以专用退出码 70 退出，由 Supervisor 立即重新拉起，不再因退出码 0 被判为「正常停止」而停止服务。
+- **修复 OTA 升级流程**：改为按需下载——检查更新只标记「有新版本」，点击「开始更新」时才下载并安装；修复重启后「开始更新」按钮误灰（版本重协调不再把未真实安装的偏高版本回填运行时）；登录成功后补弹版本更新提示。
+- **系统更新页清理**：移除「当前没有待安装的新版本」占位提示与「最新可用（授权端最新版本）」整行 KPI。
 
 ### v0.2.9
 
