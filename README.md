@@ -17,14 +17,14 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `IoT-DAQ-Gateway_0.2.10_x64-setup.exe` | Windows 10/11 x64 安装包（约 8.3MB） |
+| `IoT-DAQ-Gateway_0.2.11_x64-setup.exe` | Windows 10/11 x64 安装包（约 7.9MB） |
 | Docker 镜像 | `wantstudy/iot-daq-gateway:latest`（linux/amd64，拉取：`docker pull wantstudy/iot-daq-gateway:latest`） |
 
 ---
 
 ## 快速开始 A：Windows 安装包（推荐）
 
-1. 下载 `IoT-DAQ-Gateway_0.2.10_x64-setup.exe`
+1. 下载 `IoT-DAQ-Gateway_0.2.11_x64-setup.exe`
 2. 双击安装（需要 WebView2 Runtime，Win10/11 通常已内置）
 3. 从开始菜单启动 **IoT-DAQ Gateway**，桌面控制台自动打开（或直接访问 `http://127.0.0.1:29105`；端口被占用时会自动顺延，实际地址见控制台顶栏）
 4. 安装版会以服务方式常驻并开机自启；卸载走「设置 → 应用」或安装目录自带卸载器
@@ -98,10 +98,15 @@ Modbus RTU 等串口场景：编辑 `docker/docker-compose.yml`，取消 `device
 
 ## 版本
 
-- 当前版本：**v0.2.10**（Windows 安装包）
+- 当前版本：**v0.2.11**（Windows 安装包）
 - 反馈问题请提 [Issues](https://github.com/wantstudy/edge-gateway-hub/issues)。
 
 ## 更新日志
+
+### v0.2.11
+
+- **修复 OTA 版本显示与判定不同源（#79）**：`/api/updates/check` 的 `ota_current_version` 现取实际参与版本判定的哨兵值（config + env 注入后的 `OtaManager::current_version()`），不再回落盘 meta 历史值——之前会出现「本机 20261020172104 却按 20261021000000 拒绝 20261020172105」的误判，用户误以为「版本更高却不给升」。同分支下 `NoUpdate` 提示补充可操作指引「请在授权端将更新包版本号设为大于 X 的值」，系统更新页文案避免被 40 字截断。
+- **删除设备免二次确认**：设备删除从「原因下拉 + 备注文本域 + 危险确认」三件套简化为纯确认框（440px、3 条级联影响、按钮 ✕/取消/确认删除）；后端审计自动落默认值「控制台操作」。
 
 ### v0.2.10
 
